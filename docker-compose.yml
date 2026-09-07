@@ -1,0 +1,22 @@
+# Local PostgreSQL for kernel tests and the local runbook.
+# Not a production or deployment definition.
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: orbit-m1-postgres
+    ports:
+      - "127.0.0.1:55439:5432"
+    environment:
+      POSTGRES_USER: orbit
+      POSTGRES_PASSWORD: orbit-local-test
+      POSTGRES_DB: orbit
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orbit -d orbit"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - orbit-m1-postgres:/var/lib/postgresql/data
+
+volumes:
+  orbit-m1-postgres:
