@@ -16,7 +16,7 @@ services:
       timeout: 5s
       retries: 10
     volumes:
-      - orbit-m1-postgres:/var/lib/postgresql/data
+      - orbit-postgres:/var/lib/postgresql/data
 
 volumes:
-  orbit-m1-postgres:
+  orbit-postgres:
