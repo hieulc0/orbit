@@ -1,0 +1,24 @@
+{
+  "operator_token": "REPLACE_WITH_RANDOM_OPERATOR_TOKEN",
+  "workers": {
+    "coder": {
+      "token": "REPLACE_WITH_RANDOM_CODER_TOKEN",
+      "capabilities": ["repository.code"]
+    },
+    "tester": {
+      "token": "REPLACE_WITH_RANDOM_TESTER_TOKEN",
+      "capabilities": ["repository.test"]
+    }
+  },
+  "repositories": {
+    "fixture": {
+      "path": "/absolute/path/to/fixture-repository",
+      "coding_command": {
+        "argv": ["sed", "-i", "s/ - / + /", "calc.sh"],
+        "cwd": ".",
+        "timeout_seconds": 30
+      },
+      "allowed_test_executables": ["sh"]
+    }
+  }
+}

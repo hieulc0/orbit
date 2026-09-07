@@ -1,0 +1,27 @@
+apiVersion: orbit/v0
+kind: Definition
+metadata:
+  name: fix-addition
+inputs:
+  repository_id: fixture
+  # Replace with the full commit ID from your fixture repository.
+  base_revision: REPLACE_WITH_FULL_COMMIT_ID
+  task: Fix calc.sh to add its two inputs. Preserve the existing tests.
+steps:
+  code:
+    uses: repository.code
+    recovery_policy: restart_from_inputs
+    max_attempts: 3
+    timeout_seconds: 120
+    retry_backoff_seconds: 1
+  test:
+    uses: repository.test
+    needs: [code]
+    recovery_policy: restart_from_inputs
+    max_attempts: 2
+    timeout_seconds: 60
+    retry_backoff_seconds: 1
+    commands:
+      - argv: [sh, test.sh]
+        cwd: .
+        timeout_seconds: 10

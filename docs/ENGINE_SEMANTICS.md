@@ -27,7 +27,8 @@ The kernel supports sequential dependencies, immutable plans, leases, attempts,
 bounded retries, deadlines, cancellation, artifacts, and recovery. It does not
 require fan-out, merge integration, agent review, approval workflows, deployment,
 MCP, a web UI, a registry, or general durable workflow code. No Rust implementation
-is included in this specification milestone.
+is prescribed by this specification; the current implementation is tracked in
+[implementation status](IMPLEMENTATION_STATUS.md).
 
 ## Definition and accepted run
 

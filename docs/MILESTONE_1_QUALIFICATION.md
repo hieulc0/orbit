@@ -1,6 +1,8 @@
 # Milestone 1 Qualification: Request to Tested Patch
 
-Status: acceptance specification; no qualification results have been recorded yet.
+Status: acceptance specification. A first kernel and executable qualification
+tests now exist; see [implementation status](IMPLEMENTATION_STATUS.md). The full
+acceptance gate and Orbit-on-Orbit dogfooding are not yet declared complete.
 
 > Orbit coordinates one real repository change from request to tested patch,
 > survives deliberate interruption, and makes every recovery decision understandable.
