@@ -124,6 +124,29 @@ Resolve `NEEDS_INTERVENTION` by cancellation and a new submission with
 
 ## Execution boundary and bootstrap
 
+### Export qualification evidence for review
+
+After running qualification with `ORBIT_EVIDENCE_DIR`, create a separate export:
+
+```sh
+target/debug/orbit export-evidence --source target/qualification \
+  --output target/qualification-review
+```
+
+The output directory must not exist. The exporter includes only scenario run
+snapshots, events, qualification records, regenerated definitions, and referenced
+artifact files. It excludes `fixtures` (including server credentials and cloned
+workspaces), removes structured credential fields recursively, and refuses
+symlinks in selected records. Accepted artifacts must exist and match their
+recorded checksum and size. Unaccepted corrupt artifacts remain useful evidence
+and are preserved as found. `manifest.json` records each exported file's actual
+SHA-256 and size. Original evidence remains untouched.
+
+Review command arguments, repository content, and artifact bytes before sharing:
+field redaction does not detect arbitrary embedded secrets. The export retains
+the original plan digest for attribution; a redacted plan is not a replacement
+executable plan. This command does not certify milestone acceptance.
+
 This runner is for trusted local commands. It clears inherited environment
 variables, provides an attempt-specific HOME, uses separate Git clones, checks
 working-directory containment, and terminates its child process group on observed

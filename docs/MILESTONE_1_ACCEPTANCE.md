@@ -2,8 +2,8 @@
 
 ## Automated qualification
 
-Run on 2026-09-07 in the Linux development environment with Rust 1.98.1 and
-PostgreSQL 17:
+Verified on 2026-09-07 in the Linux development environment with Rust 1.98.1,
+PostgreSQL 17, and the repository's Docker Compose service:
 
 ```sh
 ORBIT_TEST_DATABASE_URL=postgres://orbit:orbit-local-test@127.0.0.1:55439/orbit \
@@ -11,7 +11,7 @@ ORBIT_EVIDENCE_DIR="$PWD/target/qualification" \
 cargo test --locked --features fault-injection --test kernel -- --ignored
 ```
 
-Result: **8 passed, 0 failed** in 12.49 seconds.
+Result: **8 passed, 0 failed** in 12.22 seconds.
 
 The passing suite covered:
 
@@ -25,13 +25,17 @@ The passing suite covered:
 - standalone local recovery without engine mutation.
 
 Evidence was retained under `target/qualification` and occupied approximately
-15 MiB after this run. PostgreSQL and artifact storage were retained during the
+20 MiB after this run. PostgreSQL and artifact storage were retained during the
 run. The generated evidence is ignored and is not committed.
 
 The evidence bundle is not yet safe to distribute: generated fixture
 `server.json` files contain ephemeral runtime test tokens. They are outside Git
 and belong only to the disposable local qualification environment, but an
-evidence-export/redaction step is still required before sharing the bundle.
+`orbit export-evidence` now creates a separate review bundle excluding fixtures
+and removing structured credential fields, with checksums for exported files.
+Command arguments and artifact content still require operator review before
+sharing; arbitrary embedded secrets are not automatically detected. See the
+[local runbook](LOCAL_RUNBOOK.md#export-qualification-evidence-for-review).
 
 ## Current qualification status
 

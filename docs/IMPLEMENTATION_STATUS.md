@@ -15,6 +15,8 @@ This is a first local kernel implementation. It does not declare the full
   patch application/testing, finalized artifact checksums, and persistent storage.
 - Operator/worker token separation, static capability authorization, JSON CLI,
   HTTP worker protocol, bounded subprocess output, and local recovery execution.
+- Qualification evidence export with runtime fixture exclusion, structured token
+  redaction, accepted artifact verification, and a file checksum manifest.
 
 The first database schema stores a whole run in a JSONB aggregate, instead of
 splitting tasks/attempts into separate tables. Run-level locking supplies the
@@ -26,9 +28,10 @@ need follow-up work before sustained deployment.
 ## Executable verification
 
 On 2026-09-07, the two definition/protocol tests and all eight PostgreSQL/process
-integration tests passed on Linux with Rust 1.98.1 and PostgreSQL 17. Formatting
-and Clippy with warnings denied also passed. Local evidence is retained under
-`target/qualification`; it is generated output and is not committed.
+integration tests passed on Linux with Rust 1.98.1 and PostgreSQL 17 using the
+repository's Docker Compose service. Formatting and Clippy with warnings denied
+also passed. Local evidence is retained under `target/qualification`; it is
+generated output and is not committed.
 
 `tests/definition.rs` exercises strict definitions, immutable compilation, and
 the worker message wire format. `tests/kernel.rs` covers:

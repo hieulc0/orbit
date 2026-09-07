@@ -23,6 +23,13 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Commands {
+    /// Export qualification evidence for operator review, excluding runtime fixtures.
+    ExportEvidence {
+        #[arg(long)]
+        source: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Run saved worker inputs locally, without updating any Orbit run.
     ExecuteLocal {
         #[arg(long)]
@@ -85,6 +92,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let client = Client::new(cli.url, cli.token)?;
     let value = match cli.command {
+        Commands::ExportEvidence { source, output } => orbit::evidence::export(&source, &output)?,
         Commands::ExecuteLocal {
             assignment,
             workspaces,
