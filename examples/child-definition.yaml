@@ -1,0 +1,32 @@
+apiVersion: orbit/v1
+kind: Definition
+metadata:
+  name: parent-with-child
+inputs:
+  repository_id: fixture
+  base_revision: REPLACE_WITH_FULL_COMMIT_ID
+  task: Run a pinned child definition and wait for its completion.
+steps:
+  child:
+    uses: engine.child
+    recovery_policy: restart_from_inputs
+    max_attempts: 1
+    timeout_seconds: 60
+    retry_backoff_seconds: 0
+    definition:
+      apiVersion: orbit/v1
+      kind: Definition
+      metadata:
+        name: child-delay
+      inputs:
+        repository_id: fixture
+        base_revision: REPLACE_WITH_FULL_COMMIT_ID
+        task: Wait durably without a worker.
+      steps:
+        delay:
+          uses: engine.timer
+          delay_seconds: 2
+          recovery_policy: restart_from_inputs
+          max_attempts: 1
+          timeout_seconds: 60
+          retry_backoff_seconds: 0

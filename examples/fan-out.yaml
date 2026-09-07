@@ -1,0 +1,61 @@
+apiVersion: orbit/v1
+kind: Definition
+metadata:
+  name: bounded-repository-batch
+inputs:
+  repository_id: fixture
+  base_revision: REPLACE_WITH_FULL_COMMIT_ID
+  task: Run independent repository changes supplied by a signal.
+steps:
+  items:
+    uses: engine.wait
+    recovery_policy: restart_from_inputs
+    max_attempts: 1
+    timeout_seconds: 3600
+    retry_backoff_seconds: 0
+  dispatch:
+    uses: engine.fan_out
+    needs: [items]
+    recovery_policy: restart_from_inputs
+    max_attempts: 1
+    timeout_seconds: 3600
+    retry_backoff_seconds: 0
+    fan_out:
+      signal_from: items
+      max_items: 4
+      max_parallel: 2
+    definition:
+      apiVersion: orbit/v1
+      kind: Definition
+      metadata:
+        name: independent-change
+      max_concurrency: 1
+      inputs:
+        repository_id: fixture
+        base_revision: REPLACE_WITH_FULL_COMMIT_ID
+        task: Replaced by each fan-out item.
+      steps:
+        code:
+          uses: repository.code
+          recovery_policy: restart_from_inputs
+          max_attempts: 3
+          timeout_seconds: 120
+          retry_backoff_seconds: 1
+        test:
+          uses: repository.test
+          needs: [code]
+          recovery_policy: restart_from_inputs
+          max_attempts: 2
+          timeout_seconds: 60
+          retry_backoff_seconds: 1
+          commands:
+            - argv: [sh, test.sh]
+              cwd: .
+              timeout_seconds: 10
+  done:
+    uses: engine.join
+    needs: [dispatch]
+    recovery_policy: restart_from_inputs
+    max_attempts: 1
+    timeout_seconds: 60
+    retry_backoff_seconds: 0

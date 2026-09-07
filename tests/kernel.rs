@@ -9,6 +9,9 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use std::{collections::BTreeMap, path::Path, time::Duration};
 
+#[path = "kernel/phase2.rs"]
+mod phase2;
+
 struct Fixture {
     engine: Engine,
     url: String,
@@ -255,7 +258,14 @@ impl Fixture {
                         .iter()
                         .filter(|a| a.state == State::Succeeded)
                         .collect();
-                    assert_eq!(successes.len(), 1);
+                    assert_eq!(
+                        successes.len(),
+                        usize::from(
+                            !run.plan.definition.steps[&task.step]
+                                .uses
+                                .starts_with("engine.")
+                        )
+                    );
                     for output in &task.accepted_outputs {
                         let artifact = run.artifacts.iter().find(|a| &a.id == output).unwrap();
                         assert!(artifact.finalized);
@@ -273,11 +283,30 @@ impl Fixture {
             if run.state == State::Succeeded {
                 assert!(run.tasks.iter().all(|t| t.state == State::Succeeded));
             }
-            if matches!(
-                run.tasks[1].state,
-                State::Ready | State::Claimed | State::Running | State::Succeeded
-            ) {
-                assert_eq!(run.tasks[0].state, State::Succeeded);
+            for task in &run.tasks {
+                if matches!(
+                    task.state,
+                    State::Ready
+                        | State::Claimed
+                        | State::Running
+                        | State::Waiting
+                        | State::Succeeded
+                ) {
+                    for dependency in run.plan.definition.steps[&task.step]
+                        .needs
+                        .as_deref()
+                        .unwrap_or_default()
+                    {
+                        assert_eq!(
+                            run.tasks
+                                .iter()
+                                .find(|t| &t.step == dependency)
+                                .unwrap()
+                                .state,
+                            State::Succeeded
+                        );
+                    }
+                }
             }
             if run.state == State::Cancelled {
                 assert!(run.tasks.iter().all(|t| t.state.terminal()));
@@ -387,7 +416,9 @@ async fn server_process(f: &Fixture, address: &str, fault: Option<&str>) -> Resu
             .env("ORBIT_FAULT_POINT", point)
             .env("ORBIT_FAULT_MARKER", f.root.path().join("fault.marker"));
     }
-    if fault.is_some() || f.root.path().join("fault.marker").exists() {
+    if fault.is_some_and(|point| !point.starts_with("children_"))
+        || f.root.path().join("fault.marker").exists()
+    {
         // These cases test an exact transaction boundary. Reconciliation is exercised separately.
         command.env("ORBIT_TEST_NO_RECONCILE", "1");
     }
@@ -1020,7 +1051,98 @@ async fn standalone_recovery_never_updates_engine() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires PostgreSQL; set ORBIT_TEST_DATABASE_URL"]
 async fn real_repository_change_via_http_workers() -> Result<()> {
-    let f = Fixture::new().await?;
+    repository_change(false).await
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL; set ORBIT_TEST_DATABASE_URL"]
+async fn graph_fan_out_join_via_http_workers() -> Result<()> {
+    repository_change(true).await
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL; set ORBIT_TEST_DATABASE_URL"]
+async fn graph_failure_fences_parallel_attempts() -> Result<()> {
+    let mut f = Fixture::new().await?;
+    let mut definition = f.plan.definition.clone();
+    definition.api_version = "orbit/v1".into();
+    let code = definition.steps.remove("code").unwrap();
+    definition.steps.clear();
+    definition.steps.insert("left".into(), code.clone());
+    definition.steps.insert("right".into(), code.clone());
+    let mut join = code;
+    join.uses = "engine.join".into();
+    join.needs = Some(vec!["left".into(), "right".into()]);
+    definition.steps.insert("join".into(), join);
+    f.plan = Plan::compile(definition, f.plan.repository.clone())?;
+    let run = f.submit().await?;
+    let left = f.claim("left-worker", "repository.code").await?;
+    let right = f.claim("right-worker", "repository.code").await?;
+    assert_ne!(left.task_id, right.task_id);
+    f.start("left-worker", &left).await?;
+    f.start("right-worker", &right).await?;
+    let failure = operation(
+        &left,
+        Action::Complete {
+            success: false,
+            outputs: vec![],
+            failure: Some(Failure {
+                category: "task_failure".into(),
+                code: "failed".into(),
+                message: "fixture failure".into(),
+                side_effect_status: "none".into(),
+            }),
+        },
+    );
+    assert_eq!(
+        f.engine.operate("left-worker", &failure).await?["status"],
+        "accepted"
+    );
+    assert_eq!(
+        f.engine.operate("left-worker", &failure).await?["status"],
+        "accepted"
+    );
+    assert_eq!(
+        f.engine
+            .operate("right-worker", &operation(&right, Action::Heartbeat))
+            .await?["status"],
+        "ownership_lost"
+    );
+    let document: Value = sqlx::query_scalar("SELECT document FROM orbit_runs WHERE id=$1")
+        .bind(&run)
+        .fetch_one(&f.engine.pool)
+        .await?;
+    let result: Run = serde_json::from_value(document)?;
+    assert_eq!(result.state, State::Failed);
+    assert!(
+        result
+            .tasks
+            .iter()
+            .all(|t| t.state.terminal() && t.attempts.iter().all(|a| a.state.terminal()))
+    );
+    f.engine.reconcile().await?;
+    f.assert_invariants().await?;
+    f.evidence("graph-failure-fencing").await?;
+    Ok(())
+}
+
+async fn repository_change(graph: bool) -> Result<()> {
+    let mut f = Fixture::new().await?;
+    if graph {
+        let mut definition = f.plan.definition.clone();
+        definition.api_version = "orbit/v1".into();
+        let code = definition.steps.remove("code").unwrap();
+        let mut test = definition.steps.remove("test").unwrap();
+        test.needs = Some(vec!["z-code".into()]);
+        definition.steps.insert("z-code".into(), code.clone());
+        definition.steps.insert("a-test".into(), test.clone());
+        definition.steps.insert("b-test".into(), test);
+        let mut join = code;
+        join.uses = "engine.join".into();
+        join.needs = Some(vec!["a-test".into(), "b-test".into()]);
+        definition.steps.insert("0-join".into(), join);
+        f.plan = Plan::compile(definition, f.plan.repository.clone())?;
+    }
     assert!(
         !std::process::Command::new("sh")
             .arg("test.sh")
@@ -1082,7 +1204,15 @@ async fn real_repository_change_via_http_workers() -> Result<()> {
     )
     .await?;
     let coded = client.get(&format!("/runs/{run}")).await?;
-    assert_eq!(coded["tasks"][0]["state"], "SUCCEEDED", "{coded:#}");
+    let code_index = if graph { 3 } else { 0 };
+    assert_eq!(
+        coded["tasks"][code_index]["state"], "SUCCEEDED",
+        "{coded:#}"
+    );
+    if graph {
+        assert_eq!(coded["tasks"][1]["state"], "READY");
+        assert_eq!(coded["tasks"][2]["state"], "READY");
+    }
     worker::run(
         Client::new(url.clone(), test_token.into())?,
         "repository.test".into(),
@@ -1090,10 +1220,26 @@ async fn real_repository_change_via_http_workers() -> Result<()> {
         true,
     )
     .await?;
+    if graph {
+        let partial = client.get(&format!("/runs/{run}")).await?;
+        assert_eq!(partial["state"], "RUNNING");
+        assert_eq!(partial["tasks"][0]["state"], "PENDING");
+        let restarted = Engine::connect(&f.url, f.root.path().join("artifacts"), 3).await?;
+        restarted.reconcile().await?;
+        restarted.reconcile().await?;
+        assert_eq!(restarted.inspect(run).await?, partial);
+        worker::run(
+            Client::new(url.clone(), test_token.into())?,
+            "repository.test".into(),
+            f.root.path().join("workspaces"),
+            true,
+        )
+        .await?;
+    }
     let result = client.get(&format!("/runs/{run}")).await?;
     assert_eq!(result["state"], "SUCCEEDED", "{result:#}");
     assert_ne!(
-        result["tasks"][0]["attempts"][0]["workspace_id"],
+        result["tasks"][code_index]["attempts"][0]["workspace_id"],
         result["tasks"][1]["attempts"][0]["workspace_id"]
     );
     assert!(
@@ -1108,6 +1254,334 @@ async fn real_repository_change_via_http_workers() -> Result<()> {
             .is_err()
     );
     server.abort();
-    f.evidence("real-repository-change").await?;
+    f.evidence(if graph {
+        "graph-fan-out-join"
+    } else {
+        "real-repository-change"
+    })
+    .await?;
+    Ok(())
+}
+
+fn interaction_plan(f: &Fixture, timer: bool, timeout: u64) -> Result<Plan> {
+    let mut definition = f.plan.definition.clone();
+    definition.api_version = "orbit/v1".into();
+    let mut wait = definition
+        .steps
+        .values()
+        .next()
+        .context("fixture step required")?
+        .clone();
+    definition.steps.clear();
+    wait.uses = "engine.wait".into();
+    wait.needs = None;
+    wait.commands = None;
+    wait.delay_seconds = None;
+    wait.timeout_seconds = timeout;
+    if timer {
+        let mut delay = wait.clone();
+        delay.uses = "engine.timer".into();
+        delay.delay_seconds = Some(2);
+        definition.steps.insert("delay".into(), delay);
+        wait.needs = Some(vec!["delay".into()]);
+    }
+    definition.steps.insert("resume".into(), wait.clone());
+    wait.uses = "engine.join".into();
+    wait.needs = Some(vec!["resume".into()]);
+    definition.steps.insert("done".into(), wait);
+    Plan::compile(definition, f.plan.repository.clone())
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL; set ORBIT_TEST_DATABASE_URL"]
+async fn signal_delivery_policies_and_cancellation_races() -> Result<()> {
+    let mut f = Fixture::new().await?;
+    f.plan = interaction_plan(&f, false, 1)?;
+    // Delivery before initial reconciliation is retained, but cannot bypass dependencies.
+    let run = f.submit().await?;
+    let signal = Signal {
+        request_id: id(),
+        step: "resume".into(),
+        payload: json!({"ready":true}),
+    };
+    let (first, duplicate) = tokio::join!(
+        f.engine.signal(&run, &signal),
+        f.engine.signal(&run, &signal)
+    );
+    let first = first?;
+    assert_eq!(first, duplicate?);
+    assert_eq!(f.engine.inspect(&run).await?["state"], "ACCEPTED");
+    f.engine.reconcile().await?;
+    assert_eq!(f.engine.inspect(&run).await?["state"], "SUCCEEDED");
+    assert_eq!(f.engine.signal(&run, &signal).await?, first);
+    let changed = Signal {
+        payload: json!(false),
+        ..signal.clone()
+    };
+    assert!(f.engine.signal(&run, &changed).await.is_err());
+    let other = Signal {
+        request_id: id(),
+        ..signal.clone()
+    };
+    assert!(f.engine.signal(&run, &other).await.is_err());
+    assert_eq!(
+        f.engine
+            .events(&run)
+            .await?
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["event"]["type"] == "SIGNAL_RECEIVED")
+            .count(),
+        1
+    );
+
+    let expired = f.submit().await?;
+    f.engine.reconcile().await?;
+    let before = f.engine.inspect(&expired).await?;
+    let deadline = before["tasks"][1]["deadline_at"].clone();
+    f.engine.reconcile().await?;
+    assert_eq!(
+        f.engine.inspect(&expired).await?["tasks"][1]["deadline_at"],
+        deadline
+    );
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    // A late delivery must fail even when no reconciler has processed expiry yet.
+    assert!(f.engine.signal(&expired, &other).await.is_err());
+    f.engine.reconcile().await?;
+    assert_eq!(f.engine.inspect(&expired).await?["state"], "FAILED");
+
+    f.plan = interaction_plan(&f, false, 30)?;
+    let waiting = f.submit().await?;
+    f.engine.reconcile().await?;
+    for bad in [
+        Signal {
+            request_id: id(),
+            step: "done".into(),
+            payload: json!(null),
+        },
+        Signal {
+            request_id: id(),
+            step: "absent".into(),
+            payload: json!(null),
+        },
+        Signal {
+            request_id: id(),
+            step: "resume".into(),
+            payload: json!("x".repeat(16385)),
+        },
+    ] {
+        assert!(f.engine.signal(&waiting, &bad).await.is_err());
+    }
+    let a = Signal {
+        request_id: id(),
+        ..signal.clone()
+    };
+    let b = Signal {
+        request_id: id(),
+        ..signal.clone()
+    };
+    let (a, b) = tokio::join!(f.engine.signal(&waiting, &a), f.engine.signal(&waiting, &b));
+    assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
+
+    let cancelled = f.submit().await?;
+    f.engine.reconcile().await?;
+    f.engine.cancel(&cancelled).await?;
+    assert!(f.engine.signal(&cancelled, &other).await.is_err());
+    f.engine.reconcile().await?;
+    assert_eq!(f.engine.inspect(&cancelled).await?["state"], "CANCELLED");
+
+    let raced = f.submit().await?;
+    f.engine.reconcile().await?;
+    let racing_signal = Signal {
+        request_id: id(),
+        ..signal
+    };
+    let (signal_result, cancellation) = tokio::join!(
+        f.engine.signal(&raced, &racing_signal),
+        f.engine.cancel(&raced)
+    );
+    cancellation?;
+    f.engine.reconcile().await?;
+    let result = f.engine.inspect(&raced).await?;
+    assert_eq!(
+        result["state"],
+        if signal_result.is_ok() {
+            "SUCCEEDED"
+        } else {
+            "CANCELLED"
+        }
+    );
+    f.evidence("signal-delivery-policies").await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL and local process execution"]
+async fn durable_timer_survives_server_kill_and_cli_signal() -> Result<()> {
+    let mut f = Fixture::new().await?;
+    f.plan = interaction_plan(&f, true, 30)?;
+    let run = f.submit().await?;
+    f.engine.reconcile().await?;
+    let initial = f.engine.inspect(&run).await?;
+    assert_eq!(initial["tasks"][0]["state"], "WAITING");
+    assert_eq!(initial["tasks"][2]["state"], "PENDING");
+    let due = initial["tasks"][0]["next_eligible_at"].clone();
+    let address = address()?;
+    let server = server_process(&f, &address, None).await?;
+    let client = Client::new(format!("http://{address}"), OPERATOR.into())?;
+    assert_eq!(
+        f.engine
+            .claim(
+                "coder",
+                &Claim {
+                    request_id: id(),
+                    capability: "repository.code".into()
+                }
+            )
+            .await?["status"],
+        "no_work"
+    );
+    drop(server);
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    assert_eq!(
+        f.engine.inspect(&run).await?["tasks"][0]["next_eligible_at"],
+        due
+    );
+    let server = server_process(&f, &address, None).await?;
+    let waiting = wait_state(&f, &run, 2, "WAITING").await?;
+    assert_eq!(waiting["tasks"][0]["state"], "SUCCEEDED");
+    assert_eq!(waiting["tasks"][0]["next_eligible_at"], due);
+    let signal = Signal {
+        request_id: id(),
+        step: "resume".into(),
+        payload: json!({"ready":true}),
+    };
+    assert!(
+        Client::new(format!("http://{address}"), CODER.into())?
+            .post(&format!("/runs/{run}/signals"), &signal)
+            .await
+            .is_err()
+    );
+    let payload_path = f.root.path().join("signal.json");
+    std::fs::write(&payload_path, serde_json::to_vec(&signal.payload)?)?;
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_orbit"))
+        .args([
+            "--url",
+            &format!("http://{address}"),
+            "signal",
+            &run,
+            "resume",
+            "--request-id",
+            &signal.request_id,
+            "--payload",
+        ])
+        .arg(payload_path)
+        .env("ORBIT_TOKEN", OPERATOR)
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let receipt: Value = serde_json::from_slice(&output.stdout)?;
+    let finished = f.engine.inspect(&run).await?;
+    assert_eq!(finished["state"], "SUCCEEDED");
+    assert!(
+        finished["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|t| t["attempts"].as_array().unwrap().is_empty())
+    );
+    drop(server);
+    let _server = server_process(&f, &address, None).await?;
+    assert_eq!(
+        client
+            .post(&format!("/runs/{run}/signals"), &signal)
+            .await?,
+        receipt
+    );
+    assert_eq!(f.engine.inspect(&run).await?, finished);
+
+    // Early signals are not lost while a preceding timer is outstanding.
+    let early = f.submit().await?;
+    let early_signal = Signal {
+        request_id: id(),
+        ..signal
+    };
+    client
+        .post(&format!("/runs/{early}/signals"), &early_signal)
+        .await?;
+    let pending = f.engine.inspect(&early).await?;
+    assert_eq!(pending["tasks"][2]["state"], "PENDING");
+    let cancelled_timer = f.submit().await?;
+    f.engine.reconcile().await?;
+    f.engine.cancel(&cancelled_timer).await?;
+    let result = wait_state(&f, &early, 2, "SUCCEEDED").await?;
+    assert_eq!(result["state"], "SUCCEEDED");
+    assert_eq!(
+        f.engine.inspect(&cancelled_timer).await?["state"],
+        "CANCELLED"
+    );
+    f.evidence("timer-server-kill-cli-signal").await?;
+    Ok(())
+}
+
+#[cfg(feature = "fault-injection")]
+#[tokio::test]
+#[ignore = "requires PostgreSQL; uses test-only transaction barriers"]
+async fn signal_server_kills_at_commit_boundaries() -> Result<()> {
+    for point in ["signal_before_commit", "signal_after_commit"] {
+        let mut f = Fixture::new().await?;
+        f.plan = interaction_plan(&f, false, 30)?;
+        let run = f.submit().await?;
+        f.engine.reconcile().await?;
+        let address = address()?;
+        let server = server_process(&f, &address, Some(point)).await?;
+        let client = Client::new(format!("http://{address}"), OPERATOR.into())?;
+        let signal = Signal {
+            request_id: id(),
+            step: "resume".into(),
+            payload: json!({"ready":true}),
+        };
+        let path = format!("/runs/{run}/signals");
+        let request = tokio::spawn({
+            let client = client.clone();
+            let signal = signal.clone();
+            let path = path.clone();
+            async move { client.post(&path, &signal).await }
+        });
+        wait_file(&f.root.path().join("fault.marker")).await?;
+        drop(server);
+        assert!(request.await?.is_err());
+        let after_kill = f.engine.inspect(&run).await?;
+        assert_eq!(
+            after_kill["state"],
+            if point == "signal_before_commit" {
+                "RUNNING"
+            } else {
+                "SUCCEEDED"
+            }
+        );
+        let _server = server_process(&f, &address, None).await?;
+        let receipt = client.post(&path, &signal).await?;
+        let finished = f.engine.inspect(&run).await?;
+        assert_eq!(finished["state"], "SUCCEEDED");
+        assert_eq!(client.post(&path, &signal).await?, receipt);
+        assert_eq!(f.engine.inspect(&run).await?, finished);
+        assert_eq!(
+            f.engine
+                .events(&run)
+                .await?
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| e["event"]["type"] == "SIGNAL_RECEIVED")
+                .count(),
+            1
+        );
+        f.evidence(point).await?;
+    }
     Ok(())
 }

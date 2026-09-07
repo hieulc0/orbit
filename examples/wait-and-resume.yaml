@@ -1,0 +1,30 @@
+apiVersion: orbit/v1
+kind: Definition
+metadata:
+  name: wait-and-resume
+inputs:
+  repository_id: fixture
+  base_revision: REPLACE_WITH_FULL_COMMIT_ID
+  task: Demonstrate durable timer and signal coordination without workers.
+steps:
+  delay:
+    uses: engine.timer
+    delay_seconds: 2
+    recovery_policy: restart_from_inputs
+    max_attempts: 1
+    timeout_seconds: 60
+    retry_backoff_seconds: 0
+  resume:
+    uses: engine.wait
+    needs: [delay]
+    recovery_policy: restart_from_inputs
+    max_attempts: 1
+    timeout_seconds: 3600
+    retry_backoff_seconds: 0
+  done:
+    uses: engine.join
+    needs: [resume]
+    recovery_policy: restart_from_inputs
+    max_attempts: 1
+    timeout_seconds: 60
+    retry_backoff_seconds: 0

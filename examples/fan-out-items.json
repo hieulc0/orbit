@@ -1,0 +1,4 @@
+[
+  "Fix calc.sh to add its two inputs and preserve the tests.",
+  "Independently fix the addition regression in calc.sh."
+]

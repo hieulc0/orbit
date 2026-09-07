@@ -7,7 +7,14 @@ The first kernel implements PostgreSQL-backed runs, immutable plans, worker
 leases and fencing, bounded retries, cancellation, artifact ownership, and crash
 recovery. It ships an HTTP API, JSON CLI, and command-based coding/test workers.
 This is a local development kernel, not a production release or an untrusted-agent
-sandbox. Checkpoint continuation, fan-out, approvals, and deployment are not enabled.
+sandbox. Versioned repository graphs support static fan-out and joins; checkpoint
+continuation, approvals, and deployment are not enabled. Durable timers and
+operator signal waits are available in `orbit/v1`.
+
+Phase 2 is complete: bounded dynamic fan-out, pinned child runs, shared concurrency
+limits and retryable admission backpressure are also available. See
+[Phase 2 execution](docs/PHASE_2_EXECUTION.md) and
+[qualification](docs/PHASE_2_QUALIFICATION.md).
 
 ## Build and verify
 
@@ -69,3 +76,11 @@ Specifications: [semantics](docs/ENGINE_SEMANTICS.md),
 [state machines](docs/STATE_MACHINES.md), [worker protocol](docs/WORKER_PROTOCOL.md),
 and [qualification](docs/MILESTONE_1_QUALIFICATION.md).
 See [implementation status](docs/IMPLEMENTATION_STATUS.md) for evidence and limits.
+
+For parallel repository checks, see the [graph example](examples/parallel-checks.yaml)
+and [graph execution contract](docs/GRAPH_EXECUTION.md). Existing `orbit/v0`
+definitions retain their strict two-step format.
+
+For work that pauses without occupying workers, see
+[durable timers and signals](docs/DURABLE_INTERACTION.md) and the
+[wait-and-resume example](examples/wait-and-resume.yaml).

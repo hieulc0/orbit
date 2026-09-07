@@ -40,12 +40,20 @@ impl IntoResponse for ApiError {
         let message = self.0.to_string();
         let status = if message.contains("unauthorized") {
             StatusCode::UNAUTHORIZED
+        } else if message.starts_with("backpressure:") {
+            StatusCode::TOO_MANY_REQUESTS
         } else if message.contains("conflict") {
             StatusCode::CONFLICT
         } else {
             StatusCode::BAD_REQUEST
         };
-        (status, Json(json!({"error":message}))).into_response()
+        let mut response = (status, Json(json!({"error":message}))).into_response();
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            response
+                .headers_mut()
+                .insert("retry-after", "1".parse().unwrap());
+        }
+        response
     }
 }
 type ApiResult<T> = std::result::Result<T, ApiError>;
@@ -94,10 +102,15 @@ fn bearer(headers: &HeaderMap) -> Result<&str> {
 
 pub fn router(app: App) -> Router {
     Router::new()
+        .route("/limits", get(limits).post(set_limits))
         .route("/runs", get(list).post(submit))
         .route("/runs/{id}", get(inspect))
         .route("/runs/{id}/events", get(events))
         .route("/runs/{id}/cancel", post(cancel))
+        .route(
+            "/runs/{id}/signals",
+            post(signal).layer(DefaultBodyLimit::max(20 * 1024)),
+        )
         .route("/runs/{run_id}/artifacts/{artifact_id}", get(artifact))
         .route("/worker/register", post(register))
         .route("/worker/claim", post(claim))
@@ -140,6 +153,18 @@ async fn list(State(app): State<App>, headers: HeaderMap) -> ApiResult<Json<Valu
     app.operator(&headers)?;
     Ok(Json(app.engine.list().await?))
 }
+async fn limits(State(app): State<App>, headers: HeaderMap) -> ApiResult<Json<Value>> {
+    app.operator(&headers)?;
+    Ok(Json(json!(app.engine.limits().await?)))
+}
+async fn set_limits(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(body): Json<Limits>,
+) -> ApiResult<Json<Value>> {
+    app.operator(&headers)?;
+    Ok(Json(app.engine.set_limits(&body).await?))
+}
 async fn inspect(
     State(app): State<App>,
     headers: HeaderMap,
@@ -163,6 +188,15 @@ async fn cancel(
 ) -> ApiResult<Json<Value>> {
     app.operator(&headers)?;
     Ok(Json(app.engine.cancel(&id).await?))
+}
+async fn signal(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<Signal>,
+) -> ApiResult<Json<Value>> {
+    app.operator(&headers)?;
+    Ok(Json(app.engine.signal(&id, &body).await?))
 }
 #[derive(Deserialize, Serialize)]
 pub struct Registration {

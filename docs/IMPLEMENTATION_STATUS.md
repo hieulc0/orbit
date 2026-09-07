@@ -1,7 +1,59 @@
-# Milestone 1 implementation status
+# Implementation status
 
-This is a first local kernel implementation. It does not declare the full
-[qualification acceptance gate](MILESTONE_1_QUALIFICATION.md) complete.
+Milestone 1 was accepted by the project owner on 2026-09-07. See the
+[acceptance record](MILESTONE_1_ACCEPTANCE.md) for the distinction between that
+decision and the retained automated evidence. Further development follows the
+[delivery roadmap](DELIVERY_ROADMAP.md).
+
+## Phase 2 graph increment
+
+`orbit/v1` now supports bounded static repository graphs with arbitrary step IDs,
+dependency validation, parallel branches, and engine-owned joins. Worker dispatch,
+output checks, and artifact authorization follow capabilities and dependencies.
+Permanent branch failure revokes active sibling attempts and skips unstarted work.
+Existing `orbit/v0` definitions keep their strict shape and plan serialization.
+See [graph semantics](GRAPH_EXECUTION.md) and the
+[example](../examples/parallel-checks.yaml).
+
+On 2026-09-07 all 10 PostgreSQL/process qualification tests passed, including
+`graph_fan_out_join_via_http_workers` and `graph_failure_fences_parallel_attempts`.
+The graph tests cover actual patches through HTTP workers, dependency release,
+join completion, repeated reconciliation through a new engine connection, and
+failure fencing. Existing tests still cover process termination on v0 runs;
+this is not a claim of graph-specific process-kill qualification.
+
+## Phase 2 durable interaction increment
+
+`engine.timer` persists a due time without claiming a worker. `engine.wait`
+accepts one operator signal, retains early deliveries, and enforces a durable
+deadline. The HTTP endpoint and `orbit signal` CLI provide idempotent receipts;
+conflicting, late, and unauthorized deliveries are rejected. See the
+[interaction contract](DURABLE_INTERACTION.md) and
+[example](../examples/wait-and-resume.yaml).
+
+On 2026-09-07 all 13 PostgreSQL/process qualification tests passed both with the
+default concurrent runner (12.55 seconds) and with `--test-threads=1` (23.46 seconds).
+All five regular tests, formatting, and Clippy with warnings denied also passed.
+New cases cover timer recovery after actual server termination,
+CLI/HTTP signals, early and conflicting delivery, deadlines, cancellation, and
+server termination immediately before/after signal commit. The initial concurrent
+run exposed a fixture reuse bug (fixed) and timed out in the existing repository
+process-kill test; subsequent serial and concurrent qualification passed that test.
+
+## Phase 2 complete
+
+On 2026-09-08 Phase 2's remaining capabilities are implemented: runtime bounded
+fan-out, pinned inline child definitions, nested outcome/cancellation propagation,
+per-run/worker/global attempt limits, and retryable root admission backpressure.
+Limits persist in PostgreSQL and apply across servers. The full qualification
+suite passed all 21 database/process tests in 14.01 seconds, including concurrent
+database initialization, two-server claim/admission checks, and kills before/after
+child creation commit. All 6 regular tests, formatting, and Clippy with warnings
+denied also passed.
+
+See [Phase 2 execution](PHASE_2_EXECUTION.md) for the bounded contract, examples,
+and upgrade requirements, and [qualification](PHASE_2_QUALIFICATION.md) for the
+case-by-case evidence mapping. No Phase 2 implementation items remain open.
 
 ## Implemented
 
@@ -20,9 +72,11 @@ This is a first local kernel implementation. It does not declare the full
 
 The first database schema stores a whole run in a JSONB aggregate, instead of
 splitting tasks/attempts into separate tables. Run-level locking supplies the
-atomicity boundary. This is an intentional initial implementation choice, not a
+atomicity boundary. Phase 2 adds a shared database control-row lock for mutations
+across runs and servers. This is an intentional implementation choice, not a
 claim of high-throughput queue performance. Claims and reconciliation currently
-scan active runs. Schema version upgrades, retention, and scheduling optimization
+scan active runs. Startup applies additive schema changes; rolling mixed-version
+upgrades, retention, and scheduling optimization
 need follow-up work before sustained deployment.
 
 ## Executable verification
@@ -62,10 +116,10 @@ dogfooding remain to be demonstrated against a committed, known-good baseline.
 
 Checkpoint continuation is rejected, not simulated. The initial runner is trusted
 host execution, not an enforced untrusted-agent sandbox. There is no secret
-provider, remote repository adapter, SSE stream, web UI, fan-out, business approval,
+provider, remote repository adapter, SSE stream, web UI, business approval,
 deployment, or multi-tenant policy system in this increment.
 
-Qualification still needs a complete case-by-case acceptance report, explicit
+The checked-in evidence still lacks a complete case-by-case acceptance report, explicit
 before/after evidence and recovery measurements for every required matrix row,
 and an operator review of the recovered patch. The current evidence does not
 prove storage-loss recovery, power-loss durability of the deployment, high

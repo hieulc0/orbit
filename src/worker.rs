@@ -174,7 +174,14 @@ pub async fn execute_local(
 ) -> Result<Value> {
     assignment.plan = Plan::compile(assignment.plan.definition, assignment.plan.repository)?;
     ensure!(
-        ["code", "test"].contains(&assignment.step.as_str()),
+        assignment
+            .plan
+            .definition
+            .steps
+            .get(&assignment.step)
+            .is_some_and(
+                |step| ["repository.code", "repository.test"].contains(&step.uses.as_str())
+            ),
         "invalid step"
     );
     let original_attempt = assignment.attempt_id.clone();
@@ -359,7 +366,7 @@ async fn perform(
             .eq_ignore_ascii_case(base),
         "base revision mismatch"
     );
-    if a.step == "code" {
+    if a.plan.definition.steps[&a.step].uses == "repository.code" {
         let cmd = &a.plan.repository.coding_command;
         let (code, stdout, stderr, timed_out) = command(cmd, &repo, &home, a).await?;
         let logs = client.upload(a, "logs", [stdout, stderr].concat()).await?;
@@ -434,7 +441,7 @@ async fn perform(
             reports.push(json!({"phase":"apply_patch","exit_code":code,"timed_out":timed_out}));
         }
         if success {
-            for cmd in a.plan.definition.steps["test"].commands.as_ref().unwrap() {
+            for cmd in a.plan.definition.steps[&a.step].commands.as_ref().unwrap() {
                 let (code, out, err, timed_out) = command(cmd, &repo, &home, a).await?;
                 logs.extend(out);
                 logs.extend(err);

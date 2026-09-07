@@ -23,9 +23,16 @@ impl Engine {
             .max_connections(12)
             .connect(url)
             .await?;
+        let mut migration = pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended(current_schema() || ':orbit:migrations',0))")
+            .execute(&mut *migration).await?;
         sqlx::raw_sql(include_str!("../migrations/0001_kernel.sql"))
-            .execute(&pool)
+            .execute(&mut *migration)
             .await?;
+        sqlx::raw_sql(include_str!("../migrations/0002_coordination.sql"))
+            .execute(&mut *migration)
+            .await?;
+        migration.commit().await?;
         Ok(Self {
             pool,
             artifact_root: artifact_root.canonicalize()?,
@@ -40,10 +47,17 @@ impl Engine {
             "plan digest does not match immutable inputs"
         );
         let mut tx = self.pool.begin().await?;
+        let limits = coordinate(&mut tx).await?;
         let payload = json!({"definition":plan.definition,"parent":parent});
         if let Some(value) = request(&mut tx, "operator:submit", key, &payload).await? {
             return Ok(value);
         }
+        let roots: i64 = sqlx::query_scalar("SELECT count(*) FROM orbit_runs r WHERE r.document->>'parent_task_id' IS NULL AND (r.state IN ('ACCEPTED','RUNNING','NEEDS_INTERVENTION','CANCEL_REQUESTED') OR EXISTS (SELECT 1 FROM orbit_runs c WHERE c.document->>'root_run_id'=r.id AND c.state IN ('ACCEPTED','RUNNING','NEEDS_INTERVENTION','CANCEL_REQUESTED')))")
+            .fetch_one(&mut *tx).await?;
+        ensure!(
+            roots < limits.max_active_roots as i64,
+            "backpressure: active root capacity exhausted; retry submission"
+        );
         if let Some(ref parent) = parent {
             let exists: bool =
                 sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM orbit_runs WHERE id=$1)")
@@ -88,6 +102,28 @@ impl Engine {
         Ok(Value::Array(rows.into_iter().map(|r| json!({"id":r.get::<String,_>("id"),"state":r.get::<String,_>("state"),"created_at":r.get::<String,_>("created_at")})).collect()))
     }
 
+    pub async fn limits(&self) -> Result<Limits> {
+        let value: Value = sqlx::query_scalar("SELECT limits FROM orbit_control WHERE id=1")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(serde_json::from_value(value)?)
+    }
+    pub async fn set_limits(&self, limits: &Limits) -> Result<Value> {
+        limits.validate()?;
+        let mut tx = self.pool.begin().await?;
+        let before = coordinate(&mut tx).await?;
+        sqlx::query("UPDATE orbit_control SET limits=$1 WHERE id=1")
+            .bind(json!(limits))
+            .execute(&mut *tx)
+            .await?;
+        if &before != limits {
+            sqlx::query("INSERT INTO orbit_control_events(event) VALUES($1)")
+                .bind(json!({"type":"LIMITS_CHANGED","actor":"operator","before":before,"after":limits})).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(json!({"status":"accepted","limits":limits}))
+    }
+
     pub async fn claim(&self, worker: &str, claim: &Claim) -> Result<Value> {
         ensure!(
             ["repository.code", "repository.test"].contains(&claim.capability.as_str()),
@@ -96,30 +132,53 @@ impl Engine {
         let actor = format!("worker:{worker}");
         let payload = json!({"claim":claim});
         let mut tx = self.pool.begin().await?;
+        let limits = coordinate(&mut tx).await?;
         if let Some(value) = request(&mut tx, &actor, &claim.request_id, &payload).await? {
             return Ok(value);
         }
         // Each run is an aggregate. Locking it fences state, dependencies and history together.
-        let rows = sqlx::query("SELECT document FROM orbit_runs WHERE state='RUNNING' ORDER BY created_at FOR UPDATE SKIP LOCKED").fetch_all(&mut *tx).await?;
+        let rows = sqlx::query("SELECT document FROM orbit_runs WHERE state IN ('ACCEPTED','RUNNING','NEEDS_INTERVENTION','CANCEL_REQUESTED') ORDER BY created_at,id").fetch_all(&mut *tx).await?;
+        let runs = rows
+            .into_iter()
+            .map(|row| serde_json::from_value::<Run>(row.get("document")))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let now = now(&mut tx).await?;
+        let live = runs
+            .iter()
+            .flat_map(|run| &run.tasks)
+            .flat_map(|task| &task.attempts)
+            .filter(|a| !a.state.terminal() && a.lease_expires_at > now)
+            .collect::<Vec<_>>();
+        let throttled = live.len() >= limits.max_running_attempts as usize
+            || live.iter().filter(|a| a.worker_id == worker).count()
+                >= limits.max_attempts_per_worker as usize;
         let mut response = json!({"status":"no_work","poll_after_ms":500});
-        for row in rows {
-            let mut run: Run = serde_json::from_value(row.get("document"))?;
-            let now = now(&mut tx).await?;
+        if throttled {
+            response["reason"] = json!("concurrency_limit");
+        }
+        for mut run in runs {
+            if throttled {
+                break;
+            }
+            if run.state != State::Running
+                || !tree_running(&mut tx, &run).await?
+                || run
+                    .tasks
+                    .iter()
+                    .flat_map(|task| &task.attempts)
+                    .filter(|a| !a.state.terminal() && a.lease_expires_at > now)
+                    .count()
+                    >= run.plan.definition.max_concurrency.unwrap_or(8) as usize
+            {
+                continue;
+            }
             if let Some(index) = run.tasks.iter().position(|t| {
                 t.state == State::Ready
                     && run.plan.definition.steps[&t.step].uses == claim.capability
                     && t.deadline_at.is_none_or(|deadline| now < deadline)
             }) {
                 let before = run.clone();
-                let input_artifacts = if index == 1 {
-                    run.artifacts
-                        .iter()
-                        .filter(|a| run.tasks[0].accepted_outputs.contains(&a.id))
-                        .cloned()
-                        .collect()
-                } else {
-                    vec![]
-                };
+                let input_artifacts = run.input_artifacts(&run.tasks[index].step);
                 let task = &mut run.tasks[index];
                 let config = &run.plan.definition.steps[&task.step];
                 if task.attempts.len() >= config.max_attempts as usize {
@@ -178,6 +237,7 @@ impl Engine {
         let actor = format!("worker:{worker}");
         let payload = serde_json::to_value(op)?;
         let mut tx = self.pool.begin().await?;
+        coordinate(&mut tx).await?;
         match request(&mut tx, &actor, &op.request_id, &payload).await {
             Ok(Some(value)) => return Ok(value),
             Ok(None) => (),
@@ -224,6 +284,7 @@ impl Engine {
         }
         transitions(&mut tx, &before, &mut run, worker, "worker operation").await?;
         save(&mut tx, &run).await?;
+        propagate(&mut tx, &run).await?;
         remember(&mut tx, &actor, &op.request_id, &payload, &response).await?;
         if matches!(op.action, Action::Complete { .. }) {
             fault("completion_before_commit").await;
@@ -334,7 +395,8 @@ impl Engine {
                         "output artifact corrupt"
                     );
                 }
-                if *success && ti == 0 {
+                let capability = run.plan.definition.steps[&run.tasks[ti].step].uses.as_str();
+                if *success && capability == "repository.code" {
                     ensure!(
                         kinds.contains("patch") && kinds.contains("manifest"),
                         "coding output requires patch and manifest"
@@ -370,7 +432,7 @@ impl Engine {
                         "invalid manifest paths"
                     );
                 }
-                if ti == 1
+                if capability == "repository.test"
                     && (*success
                         || failure
                             .as_ref()
@@ -386,11 +448,7 @@ impl Engine {
                     run.tasks[ti].attempts[ai].state = State::Succeeded;
                     run.tasks[ti].state = State::Succeeded;
                     run.tasks[ti].accepted_outputs = outputs.clone();
-                    if ti == 0 {
-                        run.tasks[1].state = State::Ready;
-                    } else {
-                        run.state = State::Succeeded;
-                    }
+                    advance(run, now);
                 } else {
                     let failure = failure.as_ref().unwrap();
                     run.tasks[ti].attempts[ai].state = State::Failed;
@@ -413,6 +471,7 @@ impl Engine {
         };
         // Check authority before accepting bytes; operate checks it again before publication.
         let mut tx = self.pool.begin().await?;
+        coordinate(&mut tx).await?;
         if let Some(value) = request(
             &mut tx,
             &format!("worker:{worker}"),
@@ -472,8 +531,10 @@ impl Engine {
                 task.attempts.iter().any(|a| {
                     a.worker_id == worker
                         && (a.id == artifact.attempt_id
-                            || (task.step == "test"
-                                && run.tasks[0].accepted_outputs.contains(&artifact.id)))
+                            || run
+                                .input_artifacts(&task.step)
+                                .iter()
+                                .any(|input| input.id == artifact.id))
                 })
             });
             ensure!(authorized, "artifact access denied");
@@ -505,6 +566,7 @@ impl Engine {
 
     pub async fn cancel(&self, run_id: &str) -> Result<Value> {
         let mut tx = self.pool.begin().await?;
+        coordinate(&mut tx).await?;
         let mut run = locked(&mut tx, run_id).await?;
         if !run.state.terminal() && run.state != State::CancelRequested {
             let before = run.clone();
@@ -518,18 +580,92 @@ impl Engine {
             )
             .await?;
             save(&mut tx, &run).await?;
+            propagate(&mut tx, &run).await?;
         }
         tx.commit().await?;
         Ok(json!({"status":"accepted","state":run.state}))
     }
 
+    /// Accept one signal for an explicitly named wait, even before its dependencies finish.
+    pub async fn signal(&self, run_id: &str, signal: &Signal) -> Result<Value> {
+        ensure!(
+            serde_json::to_vec(&signal.payload)?.len() <= 16384,
+            "signal payload exceeds 16384 bytes"
+        );
+        let payload = json!({"run_id":run_id,"signal":signal});
+        let mut tx = self.pool.begin().await?;
+        coordinate(&mut tx).await?;
+        if let Some(response) =
+            request(&mut tx, "operator:signal", &signal.request_id, &payload).await?
+        {
+            return Ok(response);
+        }
+        let mut run = locked(&mut tx, run_id).await?;
+        let now = now(&mut tx).await?;
+        ensure!(
+            tree_running(&mut tx, &run).await?,
+            "signal conflict: execution tree is paused"
+        );
+        ensure!(
+            matches!(run.state, State::Accepted | State::Running),
+            "signal conflict: run is not accepting signals"
+        );
+        let ti = run
+            .tasks
+            .iter()
+            .position(|task| task.step == signal.step)
+            .context("signal step not found")?;
+        ensure!(
+            run.plan.definition.steps[&signal.step].uses == "engine.wait",
+            "signal target must be engine.wait"
+        );
+        let task = &run.tasks[ti];
+        ensure!(
+            matches!(task.state, State::Pending | State::Waiting) && task.signal.is_none(),
+            "signal conflict: wait already resolved"
+        );
+        ensure!(
+            task.deadline_at.is_none_or(|deadline| now < deadline),
+            "signal conflict: wait deadline exceeded"
+        );
+        let before = run.clone();
+        run.tasks[ti].signal = Some(SignalReceipt {
+            request_id: signal.request_id.clone(),
+            accepted_at: now,
+            payload: signal.payload.clone(),
+        });
+        event(&mut tx, &mut run, json!({"type":"SIGNAL_RECEIVED","actor":"operator","step":signal.step,"request_id":signal.request_id,"accepted_at":now,"payload_digest":digest(&serde_json::to_vec(&signal.payload)?)})).await?;
+        advance(&mut run, now);
+        transitions(&mut tx, &before, &mut run, "operator", "signal received").await?;
+        save(&mut tx, &run).await?;
+        propagate(&mut tx, &run).await?;
+        let response = json!({"status":"accepted","run_id":run_id,"step":signal.step,"request_id":signal.request_id,"accepted_at":now});
+        remember(
+            &mut tx,
+            "operator:signal",
+            &signal.request_id,
+            &payload,
+            &response,
+        )
+        .await?;
+        fault("signal_before_commit").await;
+        tx.commit().await?;
+        fault("signal_after_commit").await;
+        Ok(response)
+    }
+
     pub async fn reconcile(&self) -> Result<()> {
         let mut tx = self.pool.begin().await?;
-        let rows = sqlx::query("SELECT document FROM orbit_runs WHERE state IN ('ACCEPTED','RUNNING','NEEDS_INTERVENTION','CANCEL_REQUESTED') ORDER BY created_at FOR UPDATE SKIP LOCKED").fetch_all(&mut *tx).await?;
+        coordinate(&mut tx).await?;
+        let rows = sqlx::query("SELECT id FROM orbit_runs WHERE state IN ('ACCEPTED','RUNNING','NEEDS_INTERVENTION','CANCEL_REQUESTED') ORDER BY created_at,id").fetch_all(&mut *tx).await?;
         for row in rows {
-            let mut run: Run = serde_json::from_value(row.get("document"))?;
+            let mut run = locked(&mut tx, &row.get::<String, _>("id")).await?;
+            if run.state.terminal() {
+                continue;
+            }
             let before = run.clone();
             let now = now(&mut tx).await?;
+            let active_tree = tree_running(&mut tx, &run).await?;
             if run.state == State::CancelRequested {
                 for task in &mut run.tasks {
                     if !task.state.terminal() {
@@ -545,9 +681,9 @@ impl Engine {
                     }
                 }
                 run.state = State::Cancelled;
-            } else if run.state == State::Accepted {
+            } else if run.state == State::Accepted && active_tree {
                 run.state = State::Running;
-                run.tasks[0].state = State::Ready;
+                advance(&mut run, now);
             } else {
                 for ti in 0..run.tasks.len() {
                     if run.tasks[ti].state.terminal() {
@@ -587,6 +723,13 @@ impl Engine {
                         run.tasks[ti].next_eligible_at = None;
                     }
                 }
+                if active_tree {
+                    advance(&mut run, now);
+                }
+            }
+            if active_tree && run.state == State::Running {
+                drive_children(&mut tx, &mut run, now).await?;
+                advance(&mut run, now);
             }
             transitions(
                 &mut tx,
@@ -597,10 +740,221 @@ impl Engine {
             )
             .await?;
             save(&mut tx, &run).await?;
+            propagate(&mut tx, &run).await?;
         }
+        fault("children_before_commit").await;
         tx.commit().await?;
+        fault("children_after_commit").await;
         Ok(())
     }
+}
+
+async fn coordinate(tx: &mut Tx<'_>) -> Result<Limits> {
+    // All writers acquire this before request/run locks. This deliberately trades throughput
+    // for a single auditable cross-run admission, claim and cancellation boundary.
+    let value: Value = sqlx::query_scalar("SELECT limits FROM orbit_control WHERE id=1 FOR UPDATE")
+        .fetch_one(&mut **tx)
+        .await?;
+    Ok(serde_json::from_value(value)?)
+}
+
+async fn tree_running(tx: &mut Tx<'_>, run: &Run) -> Result<bool> {
+    if let Some(root) = &run.root_run_id {
+        let state: String = sqlx::query_scalar("SELECT state FROM orbit_runs WHERE id=$1")
+            .bind(root)
+            .fetch_one(&mut **tx)
+            .await?;
+        Ok(state == "RUNNING")
+    } else {
+        Ok(true)
+    }
+}
+
+async fn drive_children(tx: &mut Tx<'_>, run: &mut Run, now: i64) -> Result<()> {
+    for ti in 0..run.tasks.len() {
+        let config = run.plan.definition.steps[&run.tasks[ti].step].clone();
+        if run.tasks[ti].state != State::Waiting
+            || !["engine.child", "engine.fan_out"].contains(&config.uses.as_str())
+        {
+            continue;
+        }
+        if run.tasks[ti].expansion.is_none() {
+            let items: Result<Vec<String>> = if let Some(fan) = &config.fan_out {
+                let items = if let Some(items) = &fan.items {
+                    Ok(items.clone())
+                } else {
+                    let source = run
+                        .tasks
+                        .iter()
+                        .find(|task| Some(&task.step) == fan.signal_from.as_ref())
+                        .context("fan-out signal source missing")?;
+                    serde_json::from_value(
+                        source
+                            .signal
+                            .as_ref()
+                            .context("fan-out signal receipt missing")?
+                            .payload
+                            .clone(),
+                    )
+                    .context("fan-out signal payload must be an array of strings")
+                };
+                items.and_then(|items| {
+                    fan.validate_items(&items)?;
+                    Ok(items)
+                })
+            } else {
+                Ok(vec![
+                    config.definition.as_ref().unwrap().inputs.task.clone(),
+                ])
+            };
+            match items {
+                Ok(items) => {
+                    event(tx, run, json!({"type":"CHILDREN_EXPANDED","actor":"engine","step":run.tasks[ti].step,"count":items.len(),"inputs_digest":digest(&serde_json::to_vec(&items)?)})).await?;
+                    run.tasks[ti].expansion = Some(items);
+                }
+                Err(error) => {
+                    fail_task(run, ti, &error.to_string());
+                    return Ok(());
+                }
+            }
+        }
+        let mut live = 0;
+        for child_id in run.tasks[ti].child_run_ids.clone() {
+            let child = locked(tx, &child_id).await?;
+            if matches!(
+                child.state,
+                State::Failed | State::Cancelled | State::CancelRequested
+            ) {
+                fail_task(
+                    run,
+                    ti,
+                    &format!("child {} ended {:?}", child.id, child.state),
+                );
+                return Ok(());
+            }
+            if child.state == State::NeedsIntervention {
+                run.tasks[ti].state = State::NeedsIntervention;
+                run.tasks[ti].reason = Some(format!("child {} requires intervention", child.id));
+                run.state = State::NeedsIntervention;
+                return Ok(());
+            }
+            if child.state != State::Succeeded {
+                live += 1;
+            }
+        }
+        let count = run.tasks[ti].expansion.as_ref().unwrap().len();
+        let parallel = config.fan_out.as_ref().map_or(1, |fan| fan.max_parallel) as usize;
+        while run.tasks[ti].child_run_ids.len() < count && live < parallel {
+            let index = run.tasks[ti].child_run_ids.len();
+            let mut definition = *config.definition.clone().unwrap();
+            definition.inputs.task = run.tasks[ti].expansion.as_ref().unwrap()[index].clone();
+            let plan = Plan::compile(definition, run.plan.repository.clone())?;
+            let mut child = Run::new(plan, Some(run.id.clone()));
+            child.parent_task_id = Some(run.tasks[ti].id.clone());
+            child.root_run_id = Some(run.root_run_id.as_ref().unwrap_or(&run.id).clone());
+            sqlx::query("INSERT INTO orbit_runs(id,state,document) VALUES($1,'ACCEPTED',$2)")
+                .bind(&child.id)
+                .bind(json!(&child))
+                .execute(&mut **tx)
+                .await?;
+            event(tx, &mut child, json!({"type":"RUN_ACCEPTED","actor":"engine","parent_run_id":run.id,"parent_task_id":run.tasks[ti].id,"index":index})).await?;
+            save(tx, &child).await?;
+            run.tasks[ti].child_run_ids.push(child.id.clone());
+            event(tx, run, json!({"type":"CHILD_RUN_CREATED","actor":"engine","step":run.tasks[ti].step,"child_run_id":child.id,"index":index,"plan_digest":child.plan.digest,"at_ms":now})).await?;
+            live += 1;
+        }
+        if live == 0 && run.tasks[ti].child_run_ids.len() == count {
+            run.tasks[ti].state = State::Succeeded;
+            run.tasks[ti].reason = Some("all child runs succeeded".into());
+        }
+    }
+    Ok(())
+}
+
+/// Failure/intervention flows up; cancellation intent flows down before releasing the lock.
+async fn propagate(tx: &mut Tx<'_>, run: &Run) -> Result<()> {
+    let mut cursor = run.clone();
+    let mut cancel = vec![];
+    loop {
+        if matches!(
+            cursor.state,
+            State::Failed | State::Cancelled | State::CancelRequested
+        ) {
+            cancel.push(cursor.id.clone());
+        }
+        if !matches!(
+            cursor.state,
+            State::Failed | State::Cancelled | State::CancelRequested | State::NeedsIntervention
+        ) {
+            break;
+        }
+        let Some(task_id) = &cursor.parent_task_id else {
+            break;
+        };
+        let mut parent = locked(
+            tx,
+            cursor
+                .parent_run_id
+                .as_ref()
+                .context("child parent missing")?,
+        )
+        .await?;
+        if parent.state.terminal() || parent.state == State::CancelRequested {
+            break;
+        }
+        let ti = parent
+            .tasks
+            .iter()
+            .position(|task| &task.id == task_id)
+            .context("parent task missing")?;
+        let before = parent.clone();
+        if cursor.state == State::NeedsIntervention {
+            parent.state = State::NeedsIntervention;
+            parent.tasks[ti].state = State::NeedsIntervention;
+            parent.tasks[ti].reason = Some(format!("child {} requires intervention", cursor.id));
+        } else {
+            fail_task(
+                &mut parent,
+                ti,
+                &format!("child {} ended {:?}", cursor.id, cursor.state),
+            );
+        }
+        transitions(
+            tx,
+            &before,
+            &mut parent,
+            "engine",
+            "child outcome propagated",
+        )
+        .await?;
+        save(tx, &parent).await?;
+        cursor = parent;
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(parent) = cancel.pop() {
+        if !seen.insert(parent.clone()) {
+            continue;
+        }
+        let children: Vec<String> = sqlx::query_scalar("SELECT id FROM orbit_runs WHERE document->>'parent_run_id'=$1 AND document->>'parent_task_id' IS NOT NULL").bind(parent).fetch_all(&mut **tx).await?;
+        for child_id in children {
+            let mut child = locked(tx, &child_id).await?;
+            if !child.state.terminal() && child.state != State::CancelRequested {
+                let before = child.clone();
+                child.state = State::CancelRequested;
+                transitions(
+                    tx,
+                    &before,
+                    &mut child,
+                    "engine",
+                    "ancestor stopped; cancellation propagated",
+                )
+                .await?;
+                save(tx, &child).await?;
+            }
+            cancel.push(child_id);
+        }
+    }
+    Ok(())
 }
 
 fn recover(run: &mut Run, ti: usize, now: i64, failure: &Failure) {
@@ -644,11 +998,90 @@ fn fail_task(run: &mut Run, ti: usize, reason: &str) {
         attempt.state = State::Failed;
         attempt.reason = Some(reason.into());
     }
-    if ti == 0 {
-        run.tasks[1].state = State::Skipped;
-        run.tasks[1].reason = Some("coding task failed".into());
+    // Fail fast: no sibling attempt may keep an authoritative lease after the run fails.
+    for task in &mut run.tasks {
+        if !task.state.terminal() {
+            task.state = if task.attempts.last().is_some_and(|a| !a.state.terminal()) {
+                State::Cancelled
+            } else {
+                State::Skipped
+            };
+            task.reason = Some("run failed; external process stopping unconfirmed".into());
+            if let Some(attempt) = task.attempts.last_mut().filter(|a| !a.state.terminal()) {
+                attempt.state = State::Cancelled;
+                attempt.reason = task.reason.clone();
+            }
+        }
     }
     run.state = State::Failed;
+}
+
+/// Advance engine-owned work and dependencies using database time in the current transaction.
+fn advance(run: &mut Run, now: i64) {
+    if run.state != State::Running {
+        return;
+    }
+    loop {
+        let mut changed = false;
+        for ti in 0..run.tasks.len() {
+            if !matches!(run.tasks[ti].state, State::Pending | State::Waiting) {
+                continue;
+            }
+            let config = &run.plan.definition.steps[&run.tasks[ti].step];
+            let ready = config
+                .needs
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .all(|name| {
+                    run.tasks
+                        .iter()
+                        .any(|task| &task.step == name && task.state == State::Succeeded)
+                });
+            if ready && run.tasks[ti].state == State::Pending {
+                match config.uses.as_str() {
+                    "engine.join" => run.tasks[ti].state = State::Succeeded,
+                    "engine.timer" => {
+                        run.tasks[ti].state = State::Waiting;
+                        run.tasks[ti].next_eligible_at =
+                            Some(now + config.delay_seconds.unwrap() as i64 * 1000);
+                    }
+                    "engine.wait" | "engine.child" | "engine.fan_out" => {
+                        run.tasks[ti].state = State::Waiting;
+                        run.tasks[ti].deadline_at =
+                            Some(now + config.timeout_seconds as i64 * 1000);
+                    }
+                    _ => run.tasks[ti].state = State::Ready,
+                }
+                changed = true;
+            }
+            if run.tasks[ti].state == State::Waiting {
+                let task = &run.tasks[ti];
+                if task.deadline_at.is_some_and(|deadline| now >= deadline) {
+                    fail_task(run, ti, "signal wait deadline exceeded");
+                    return;
+                }
+                if task.signal.is_some() || task.next_eligible_at.is_some_and(|due| now >= due) {
+                    run.tasks[ti].state = State::Succeeded;
+                    run.tasks[ti].reason = Some(
+                        if run.tasks[ti].signal.is_some() {
+                            "signal received"
+                        } else {
+                            "timer elapsed"
+                        }
+                        .into(),
+                    );
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    if run.tasks.iter().all(|task| task.state == State::Succeeded) {
+        run.state = State::Succeeded;
+    }
 }
 fn locate(run: &Run, attempt_id: &str) -> Option<(usize, usize)> {
     run.tasks.iter().enumerate().find_map(|(ti, t)| {
@@ -702,7 +1135,7 @@ async fn transitions(
     let mut events = vec![];
     for (old, task) in before.tasks.iter().zip(&run.tasks) {
         if old.state != task.state {
-            events.push(json!({"type":"TASK_STATE_CHANGED","task_id":task.id,"step":task.step,"from":old.state,"to":task.state,"reason":task.reason.as_deref().unwrap_or(reason)}));
+            events.push(json!({"type":"TASK_STATE_CHANGED","task_id":task.id,"step":task.step,"from":old.state,"to":task.state,"deadline_at":task.deadline_at,"next_eligible_at":task.next_eligible_at,"reason":task.reason.as_deref().unwrap_or(reason)}));
         }
         for attempt in &task.attempts {
             let prev = old.attempts.iter().find(|a| a.id == attempt.id);
@@ -742,10 +1175,7 @@ async fn request(
         !key.is_empty() && key.len() <= 200,
         "request ID required (max 200 bytes)"
     );
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
-        .bind(actor)
-        .execute(&mut **tx)
-        .await?;
+    // The database control row already serializes all request writers in this schema.
     let existing =
         sqlx::query("SELECT digest,response FROM orbit_requests WHERE actor=$1 AND request_id=$2")
             .bind(actor)

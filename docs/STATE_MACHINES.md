@@ -4,6 +4,16 @@ Status: implementation specification. Scope and recovery policies are defined in
 [engine semantics](ENGINE_SEMANTICS.md). All transitions below are persisted with
 journal events. Unlisted transitions are rejected. Terminal states are immutable.
 
+This document describes v0. The v1 graph extends it with
+`PENDING → WAITING → SUCCEEDED` for timers and signal waits,
+`WAITING → FAILED` for signal deadlines, and direct `PENDING → SUCCEEDED`
+for joins and waits with early receipts. Engine tasks have no attempts.
+Graph success requires all tasks to succeed. See [graph execution](GRAPH_EXECUTION.md)
+and [durable interaction](DURABLE_INTERACTION.md) for v1 transitions and races.
+Child/fan-out tasks also follow `PENDING → WAITING → SUCCEEDED`, with deadline
+failure or child intervention/failure propagation. Empty fan-out can complete in
+the same activation transaction. See [Phase 2 execution](PHASE_2_EXECUTION.md).
+
 ## Run states
 
 | From | To | Trigger |

@@ -166,3 +166,46 @@ ports, and process groups. Preserve direct `cargo test`, direct local execution,
 and manual patch recovery. The current first implementation is uncommitted, so
 there is not yet a committed Orbit revision containing this kernel to use as a
 known-good bootstrap baseline.
+
+## Durable timers and signals
+
+After configuring a repository binding and starting the server, use
+[wait-and-resume.yaml](../examples/wait-and-resume.yaml) with a full fixture commit
+ID to run coordination without workers:
+
+```sh
+orbit validate examples/wait-and-resume.yaml
+orbit run examples/wait-and-resume.yaml --request-id timer-demo-1
+orbit signal RUN_ID resume --request-id resume-demo-1
+orbit inspect RUN_ID
+```
+
+Signals may arrive before the timer finishes. Add `--payload payload.json` for a
+JSON payload; reuse the same request ID and payload if a response is lost. Use the
+operator credential. See [the durable interaction contract](DURABLE_INTERACTION.md)
+for deadlines, size limits, duplicate handling, and cancellation.
+
+## Child runs, fan-out and shared limits
+
+Use [child-definition.yaml](../examples/child-definition.yaml) for a single child,
+or [fan-out.yaml](../examples/fan-out.yaml) for a batch of independent tested
+patches. Replace every base revision placeholder, including those in the inline
+child definition. The batch uses the same fixture coding/testing workers as the
+v0 example; it keeps at most two child runs active at once.
+
+```sh
+orbit run examples/fan-out.yaml --request-id batch-1
+orbit signal RUN_ID items --request-id batch-items-1 --payload examples/fan-out-items.json
+orbit inspect RUN_ID
+orbit limits
+orbit set-limits --max-active-roots 128 --max-running-attempts 64 --max-attempts-per-worker 8
+```
+
+Inspect child IDs from the parent's tasks with `orbit inspect CHILD_RUN_ID`.
+Limits are shared across servers and require the operator credential to change.
+At capacity, root submissions return HTTP 429 and can be retried using the same
+request ID. See [Phase 2 execution](PHASE_2_EXECUTION.md) for exact semantics.
+
+Stop old server/worker binaries before starting this version. Startup applies
+`0002_coordination.sql` additively and preserves existing limits. Mixed-version
+rolling operation is not supported because old binaries bypass the shared lock.

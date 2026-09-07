@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use orbit::{
     api::{self, App, Config, Submit},
     engine::Engine,
-    model::{Definition, id},
+    model::{Definition, Limits, Signal, id},
     worker::{self, Client},
 };
 use std::{path::PathBuf, time::Duration};
@@ -62,6 +62,17 @@ enum Commands {
         parent_run_id: Option<String>,
     },
     Runs,
+    /// Inspect the shared database scheduler limits.
+    Limits,
+    /// Replace scheduler limits across all servers using this database.
+    SetLimits {
+        #[arg(long)]
+        max_active_roots: u32,
+        #[arg(long)]
+        max_running_attempts: u32,
+        #[arg(long)]
+        max_attempts_per_worker: u32,
+    },
     Inspect {
         run_id: String,
     },
@@ -70,6 +81,16 @@ enum Commands {
     },
     Cancel {
         run_id: String,
+    },
+    /// Deliver one JSON signal to a named engine.wait step.
+    Signal {
+        run_id: String,
+        step: String,
+        #[arg(long)]
+        request_id: Option<String>,
+        /// JSON file containing a payload of at most 16 KiB. Defaults to null.
+        #[arg(long)]
+        payload: Option<PathBuf>,
     },
     Worker {
         #[arg(long)]
@@ -162,11 +183,52 @@ async fn main() -> Result<()> {
                 .await?
         }
         Commands::Runs => client.get("/runs").await?,
+        Commands::Limits => client.get("/limits").await?,
+        Commands::SetLimits {
+            max_active_roots,
+            max_running_attempts,
+            max_attempts_per_worker,
+        } => {
+            let limits = Limits {
+                max_active_roots,
+                max_running_attempts,
+                max_attempts_per_worker,
+            };
+            limits.validate()?;
+            client.post("/limits", &limits).await?
+        }
         Commands::Inspect { run_id } => client.get(&format!("/runs/{run_id}")).await?,
         Commands::Events { run_id } => client.get(&format!("/runs/{run_id}/events")).await?,
         Commands::Cancel { run_id } => {
             client
                 .post(&format!("/runs/{run_id}/cancel"), &serde_json::json!({}))
+                .await?
+        }
+        Commands::Signal {
+            run_id,
+            step,
+            request_id,
+            payload,
+        } => {
+            let payload = match payload {
+                Some(path) => {
+                    let bytes = tokio::fs::read(path).await?;
+                    anyhow::ensure!(bytes.len() <= 16384, "signal payload exceeds 16384 bytes");
+                    serde_json::from_slice(&bytes)?
+                }
+                None => serde_json::Value::Null,
+            };
+            let request_id = request_id.unwrap_or_else(id);
+            eprintln!("signal request_id={request_id}");
+            client
+                .post(
+                    &format!("/runs/{run_id}/signals"),
+                    &Signal {
+                        request_id,
+                        step,
+                        payload,
+                    },
+                )
                 .await?
         }
         Commands::Worker {

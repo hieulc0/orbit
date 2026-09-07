@@ -39,8 +39,10 @@ sharing; arbitrary embedded secrets are not automatically detected. See the
 
 ## Current qualification status
 
-The executable qualification suite passes. The Milestone 1 acceptance gate is
-still **pending** because the specification also requires:
+Milestone 1 is **accepted by the project owner**, as confirmed on 2026-09-07.
+Development may proceed to Phase 2. This records the owner's acceptance decision;
+it does not claim additional automated verification or fabricate evidence for the
+following requirements, whose supporting records are not yet linked here:
 
 1. An operator review of the recovered patch, test report, and redacted evidence.
 2. A case-by-case mapping from the failure matrix to retained evidence.

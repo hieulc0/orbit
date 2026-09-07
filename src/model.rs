@@ -1,8 +1,8 @@
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Component, Path},
 };
 use uuid::Uuid;
@@ -23,6 +23,8 @@ pub struct Definition {
     pub metadata: Metadata,
     pub inputs: Inputs,
     pub steps: BTreeMap<String, Step>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<u32>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -48,6 +50,67 @@ pub struct Step {
     pub retry_backoff_seconds: u64,
     #[serde(default)]
     pub commands: Option<Vec<CommandSpec>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition: Option<Box<Definition>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fan_out: Option<FanOut>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FanOut {
+    pub max_items: u32,
+    pub max_parallel: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub items: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal_from: Option<String>,
+}
+
+impl FanOut {
+    pub fn validate_items(&self, items: &[String]) -> Result<()> {
+        ensure!(
+            items.len() <= self.max_items as usize,
+            "fan-out exceeds max_items"
+        );
+        ensure!(
+            items
+                .iter()
+                .all(|item| !item.trim().is_empty() && item.len() <= 16384),
+            "fan-out inputs must be nonempty strings of at most 16384 bytes"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Limits {
+    pub max_active_roots: u32,
+    pub max_running_attempts: u32,
+    pub max_attempts_per_worker: u32,
+}
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_active_roots: 128,
+            max_running_attempts: 64,
+            max_attempts_per_worker: 8,
+        }
+    }
+}
+impl Limits {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            (1..=1024).contains(&self.max_active_roots)
+                && (1..=4096).contains(&self.max_running_attempts)
+                && (1..=4096).contains(&self.max_attempts_per_worker),
+            "invalid scheduler limits"
+        );
+        Ok(())
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -71,8 +134,14 @@ impl Definition {
         Ok(value)
     }
     pub fn validate(&self) -> Result<()> {
+        self.validate_level(0).map(|_| ())
+    }
+    fn validate_level(&self, depth: usize) -> Result<u32> {
+        ensure!(depth <= 4, "child definition nesting exceeds four levels");
+        let mut tree_size = 1u32;
         ensure!(
-            self.api_version == "orbit/v0" && self.kind == "Definition",
+            ["orbit/v0", "orbit/v1"].contains(&self.api_version.as_str())
+                && self.kind == "Definition",
             "unsupported definition version or kind"
         );
         ensure!(!self.metadata.name.trim().is_empty(), "empty name");
@@ -85,15 +154,50 @@ impl Definition {
             [40, 64].contains(&rev.len()) && rev.bytes().all(|b| b.is_ascii_hexdigit()),
             "full Git commit ID required"
         );
+        if self.api_version == "orbit/v0" {
+            ensure!(
+                self.max_concurrency.is_none(),
+                "max_concurrency requires v1"
+            );
+            ensure!(
+                self.steps.len() == 2
+                    && self.steps.contains_key("code")
+                    && self.steps.contains_key("test"),
+                "exactly code and test steps required"
+            );
+        }
         ensure!(
-            self.steps.len() == 2
-                && self.steps.contains_key("code")
-                && self.steps.contains_key("test"),
-            "exactly code and test steps required"
+            self.max_concurrency.is_none_or(|n| (1..=256).contains(&n)),
+            "max_concurrency must be 1..256"
+        );
+        ensure!(
+            !self.steps.is_empty() && self.steps.len() <= 256,
+            "graph must contain 1..256 steps"
         );
         for (name, step) in &self.steps {
             ensure!(
-                step.uses == format!("repository.{name}"),
+                !name.is_empty()
+                    && name.len() <= 128
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+                "invalid step identifier"
+            );
+            ensure!(
+                if self.api_version == "orbit/v0" {
+                    step.uses == format!("repository.{name}")
+                } else {
+                    [
+                        "repository.code",
+                        "repository.test",
+                        "engine.join",
+                        "engine.timer",
+                        "engine.wait",
+                        "engine.child",
+                        "engine.fan_out",
+                    ]
+                    .contains(&step.uses.as_str())
+                },
                 "invalid capability"
             );
             ensure!(
@@ -105,17 +209,104 @@ impl Definition {
             );
             ensure!(
                 step.recovery_policy != Recovery::ResumeFromCheckpoint,
-                "checkpoint continuation is not supported in v0"
+                "checkpoint continuation is not supported"
             );
-            if name == "code" {
+            if step.uses == "engine.timer" {
                 ensure!(
-                    step.needs.is_none() && step.commands.is_none(),
-                    "code cannot specify needs or commands"
+                    step.delay_seconds
+                        .is_some_and(|delay| (1..=604800).contains(&delay)),
+                    "timer delay_seconds must be 1..604800"
                 );
             } else {
                 ensure!(
-                    step.needs.as_deref() == Some(&["code".to_string()][..]),
-                    "test must depend on code"
+                    step.delay_seconds.is_none(),
+                    "delay_seconds is only supported on timers"
+                );
+            }
+            let needs = step.needs.as_deref().unwrap_or_default();
+            let unique: BTreeSet<_> = needs.iter().collect();
+            ensure!(unique.len() == needs.len(), "duplicate dependency");
+            ensure!(
+                needs
+                    .iter()
+                    .all(|n| n != name && self.steps.contains_key(n)),
+                "unknown or self dependency"
+            );
+            if step.uses == "engine.fan_out" {
+                let fan = step
+                    .fan_out
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("fan_out configuration required"))?;
+                ensure!(
+                    (1..=64).contains(&fan.max_items)
+                        && (1..=fan.max_items).contains(&fan.max_parallel),
+                    "invalid fan-out bounds"
+                );
+                ensure!(
+                    fan.items.is_some() != fan.signal_from.is_some(),
+                    "fan-out requires exactly one of items or signal_from"
+                );
+                if let Some(items) = &fan.items {
+                    fan.validate_items(items)?;
+                }
+                if let Some(source) = &fan.signal_from {
+                    ensure!(
+                        needs.contains(source) && self.steps[source].uses == "engine.wait",
+                        "signal_from must be a direct wait dependency"
+                    );
+                }
+            } else {
+                ensure!(
+                    step.fan_out.is_none(),
+                    "fan_out configuration requires engine.fan_out"
+                );
+            }
+            if ["engine.child", "engine.fan_out"].contains(&step.uses.as_str()) {
+                let child = step
+                    .definition
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("inline child definition required"))?;
+                ensure!(
+                    child.inputs.repository_id == self.inputs.repository_id,
+                    "child must use the parent's repository binding"
+                );
+                let child_size = child.validate_level(depth + 1)?;
+                let count = step.fan_out.as_ref().map_or(1, |fan| fan.max_items);
+                tree_size = tree_size
+                    .checked_add(
+                        child_size
+                            .checked_mul(count)
+                            .context("child tree bound overflow")?,
+                    )
+                    .context("child tree bound overflow")?;
+                ensure!(
+                    tree_size <= 256,
+                    "execution tree may contain at most 256 runs"
+                );
+            } else {
+                ensure!(
+                    step.definition.is_none(),
+                    "inline definition requires a child or fan-out step"
+                );
+            }
+            if step.uses == "repository.code" {
+                ensure!(
+                    step.commands.is_none()
+                        && (self.api_version != "orbit/v0" || step.needs.is_none()),
+                    "code cannot specify commands (or needs in v0)"
+                );
+            } else if step.uses == "repository.test" {
+                ensure!(
+                    if self.api_version == "orbit/v0" {
+                        needs == ["code".to_string()]
+                    } else {
+                        needs
+                            .iter()
+                            .filter(|n| self.steps[*n].uses == "repository.code")
+                            .count()
+                            == 1
+                    },
+                    "test must depend directly on exactly one coding step"
                 );
                 let commands = step
                     .commands
@@ -125,9 +316,33 @@ impl Definition {
                 for cmd in commands {
                     cmd.validate()?;
                 }
+            } else {
+                ensure!(
+                    (step.uses != "engine.join" || !needs.is_empty()) && step.commands.is_none(),
+                    "join requires dependencies; engine steps cannot specify commands"
+                );
             }
         }
-        Ok(())
+        let mut resolved = BTreeSet::new();
+        loop {
+            let before = resolved.len();
+            for (name, step) in &self.steps {
+                if step
+                    .needs
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .all(|n| resolved.contains(n))
+                {
+                    resolved.insert(name.clone());
+                }
+            }
+            if resolved.len() == self.steps.len() {
+                break;
+            }
+            ensure!(resolved.len() > before, "dependency cycle");
+        }
+        Ok(tree_size)
     }
 }
 impl CommandSpec {
@@ -171,13 +386,21 @@ impl Plan {
             Path::new(&repository.path).is_absolute(),
             "repository binding must be absolute"
         );
-        for command in definition.steps["test"].commands.as_ref().unwrap() {
-            ensure!(
-                repository
-                    .allowed_test_executables
-                    .contains(&command.argv[0]),
-                "test executable is not allowed"
-            );
+        let mut definitions = vec![&definition];
+        while let Some(definition) = definitions.pop() {
+            for step in definition.steps.values() {
+                if let Some(child) = &step.definition {
+                    definitions.push(child);
+                }
+                for command in step.commands.iter().flatten() {
+                    ensure!(
+                        repository
+                            .allowed_test_executables
+                            .contains(&command.argv[0]),
+                        "test executable is not allowed"
+                    );
+                }
+            }
         }
         let digest = digest(&serde_json::to_vec(&(&definition, &repository))?);
         Ok(Self {
@@ -196,6 +419,7 @@ pub enum State {
     Ready,
     Claimed,
     Running,
+    Waiting,
     RetryScheduled,
     NeedsIntervention,
     CancelRequested,
@@ -236,6 +460,27 @@ pub struct Task {
     pub attempts: Vec<Attempt>,
     pub accepted_outputs: Vec<String>,
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<SignalReceipt>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub child_run_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expansion: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Signal {
+    pub request_id: String,
+    pub step: String,
+    pub payload: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SignalReceipt {
+    pub request_id: String,
+    pub accepted_at: i64,
+    pub payload: serde_json::Value,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Artifact {
@@ -255,16 +500,24 @@ pub struct Run {
     pub artifacts: Vec<Artifact>,
     pub sequence: i64,
     pub parent_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_run_id: Option<String>,
 }
 impl Run {
     pub fn new(plan: Plan, parent_run_id: Option<String>) -> Self {
         Self {
             id: id(),
             state: State::Accepted,
-            plan,
             sequence: 0,
             parent_run_id,
-            tasks: ["code", "test"]
+            parent_task_id: None,
+            root_run_id: None,
+            tasks: plan
+                .definition
+                .steps
+                .keys()
                 .map(|step| Task {
                     id: id(),
                     step: step.into(),
@@ -274,10 +527,33 @@ impl Run {
                     attempts: vec![],
                     accepted_outputs: vec![],
                     reason: None,
+                    signal: None,
+                    child_run_ids: vec![],
+                    expansion: None,
                 })
-                .into(),
+                .collect(),
+            plan,
             artifacts: vec![],
         }
+    }
+    /// Only direct coding dependencies supply repository patches; joins do not merge artifacts.
+    pub fn input_artifacts(&self, step: &str) -> Vec<Artifact> {
+        let config = &self.plan.definition.steps[step];
+        if config.uses != "repository.test" {
+            return vec![];
+        }
+        let needs = config.needs.as_deref().unwrap_or_default();
+        self.artifacts
+            .iter()
+            .filter(|artifact| {
+                self.tasks.iter().any(|task| {
+                    needs.contains(&task.step)
+                        && self.plan.definition.steps[&task.step].uses == "repository.code"
+                        && task.accepted_outputs.contains(&artifact.id)
+                })
+            })
+            .cloned()
+            .collect()
     }
     pub fn inspect(&self) -> serde_json::Value {
         let mut value = serde_json::to_value(self).unwrap();
