@@ -55,7 +55,28 @@ See [Phase 2 execution](PHASE_2_EXECUTION.md) for the bounded contract, examples
 and upgrade requirements, and [qualification](PHASE_2_QUALIFICATION.md) for the
 case-by-case evidence mapping. No Phase 2 implementation items remain open.
 
-## Implemented
+## Phase 3 complete
+
+Implemented resumable SSE over committed journal pages, optional bounded HTTP
+event cursors, JSONL output, CLI event following, Rust SDK exports and a
+Python worker transport package. See [developer contract](DEVELOPER_SURFACE.md).
+On 2026-09-09 all 28 PostgreSQL/process tests passed with the default concurrent
+runner (13.21 seconds) and serially (50.09 seconds). All seven regular Rust tests,
+the Python transport test, formatting and Clippy with warnings denied passed.
+The live qualification covers multi-page SSE/CLI following, server-kill replay,
+both SDKs, concurrent upload retransmission, cancellation during stalled
+publication, delayed heartbeat acknowledgement and stopping at confirmed lease
+expiry. The runtime also rejects expired start acknowledgements before execution.
+
+Qualification resolved synchronous publication under the shared database lock,
+heartbeat timeouts tied to polling intervals, manual upload fixtures without
+renewal, and an unrelated-run cancellation wait. Lease lengths, retries and task
+deadlines were not relaxed. See [Phase 3 qualification](PHASE_3_QUALIFICATION.md)
+for the case-by-case mapping, earlier diagnostics, commands, evidence review and
+scope limits. The verified local export is `target/qualification-phase3-review`.
+No Phase 3 implementation or qualification item remains open; Phase 4 is next.
+
+## Kernel capabilities
 
 - Strict v0 two-step definitions, server-controlled repository bindings, immutable
   plan digests, and idempotent accepted runs.
@@ -116,7 +137,7 @@ dogfooding remain to be demonstrated against a committed, known-good baseline.
 
 Checkpoint continuation is rejected, not simulated. The initial runner is trusted
 host execution, not an enforced untrusted-agent sandbox. There is no secret
-provider, remote repository adapter, SSE stream, web UI, business approval,
+provider, remote repository adapter, web UI, business approval,
 deployment, or multi-tenant policy system in this increment.
 
 The checked-in evidence still lacks a complete case-by-case acceptance report, explicit

@@ -29,9 +29,21 @@ Build on the accepted kernel in this dependency order:
 Each increment needs executable examples, documented semantics, and relevant
 PostgreSQL recovery/concurrency qualification. Phase 2 completion requires all
 five increments; all five are implemented and mapped to executable evidence in
-[Phase 2 qualification](PHASE_2_QUALIFICATION.md). The next phase is the developer surface.
+[Phase 2 qualification](PHASE_2_QUALIFICATION.md).
 
-## Subsequent phases
+## Complete: Phase 3 developer surface
+
+SSE with durable replay cursors, JSONL and CLI event following, Rust worker SDK
+exports and a dependency-free Python transport SDK are implemented. The existing
+API/CLI compatibility contract and SDK responsibilities are documented in
+[developer surface](DEVELOPER_SURFACE.md). All 28 PostgreSQL/process tests pass
+with both concurrent and serial runners; regular Rust/Python checks also pass.
+Qualification fixes cover publication without blocking lease renewal, confirmed
+lease budgets and race-correct fixtures. See the evidence mapping and bounded
+completion record in [Phase 3 qualification](PHASE_3_QUALIFICATION.md).
+The next phase is compute and artifacts.
+
+## Phase scopes
 
 | Phase | Deliverables |
 | --- | --- |
@@ -43,6 +55,6 @@ five increments; all five are implemented and mapped to executable evidence in
 | 8: Governance | Projects, environments, RBAC, service accounts, secret providers and audit |
 | 9: Ecosystem | Package registry, verification and SDK stabilization; marketplace if justified |
 
-These phases describe distinct release scopes, not implemented capabilities.
+Phases 4 onward describe future release scopes, not implemented capabilities.
 External providers will require selected services and runtime configuration.
 Publishing, deployment, and third-party messages require their own authorization.

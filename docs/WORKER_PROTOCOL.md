@@ -65,6 +65,16 @@ be confirmed before the known lease expires, the worker stops work and attempts
 to terminate its process group. Network isolation MUST NOT justify continued
 authority. Recovery and stale-message rejection remain server responsibilities.
 
+Phase 3 start/heartbeat receipts add `lease_remaining_ms`. A worker anchors this
+duration to its monotonic time immediately before the original request, including
+all retransmission time, never to response receipt. That provides a conservative
+local deadline without assuming synchronized clocks. The heartbeat interval
+schedules renewal; the previous confirmed lease bounds the acknowledgement wait.
+A late start receipt must not start work, and a heartbeat arriving after the
+previous local deadline must not restore authority. The Phase 3 built-in runtime
+requires these duration receipts from a Phase 3 server; older workers ignore the
+additive fields. Rolling mixed-version runtime upgrades remain unqualified.
+
 ## Workspace lifecycle
 
 1. Allocate an attempt-specific directory or worktree from the assigned ID.
@@ -104,6 +114,15 @@ Only references accepted in the completion transaction become downstream inputs.
 An obsolete attempt may leave uploaded objects, but it cannot attach them to a
 new attempt or release dependent work. Artifact readers verify checksums and
 report missing/corrupt content as failures; they never silently regenerate it.
+
+Publication authorizes the upload under the database lock, then releases that
+lock before writing and syncing immutable bytes on a blocking I/O thread. It
+rechecks lease/generation/cancellation authority in the finalization transaction.
+Slow storage therefore does not hold the shared coordination lock or block the
+async executor. Cancellation or lease loss during publication may leave an
+unfinalized object, but cannot finalize it or attach it to task outputs. Concurrent
+retransmissions verify identical bytes and sync the directory before acknowledging
+publication, including when another writer has already created the object.
 
 ## Failure contract
 

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use orbit::{
     api::{self, App, Config, Submit},
     engine::Engine,
@@ -14,12 +14,19 @@ use std::{path::PathBuf, time::Duration};
     about = "Durable repository work, from request to tested patch"
 )]
 struct Cli {
+    #[arg(long, global = true, value_enum, default_value = "json")]
+    output_format: Output,
     #[arg(long, env = "ORBIT_URL", default_value = "http://127.0.0.1:7700")]
     url: String,
     #[arg(long, env = "ORBIT_TOKEN", hide_env_values = true, default_value = "")]
     token: String,
     #[command(subcommand)]
     command: Commands,
+}
+#[derive(Clone, Copy, ValueEnum)]
+enum Output {
+    Json,
+    Jsonl,
 }
 #[derive(Subcommand)]
 enum Commands {
@@ -61,7 +68,10 @@ enum Commands {
         #[arg(long)]
         parent_run_id: Option<String>,
     },
-    Runs,
+    Runs {
+        #[arg(long, value_enum)]
+        output: Option<Output>,
+    },
     /// Inspect the shared database scheduler limits.
     Limits,
     /// Replace scheduler limits across all servers using this database.
@@ -78,6 +88,14 @@ enum Commands {
     },
     Events {
         run_id: String,
+        #[arg(long, value_enum)]
+        output: Option<Output>,
+        /// Exclusive durable journal cursor.
+        #[arg(long)]
+        after: Option<u64>,
+        /// Poll durable events continuously, emitting flushed JSONL records.
+        #[arg(long)]
+        follow: bool,
     },
     Cancel {
         run_id: String,
@@ -111,6 +129,7 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let mut output_format = cli.output_format;
     let client = Client::new(cli.url, cli.token)?;
     let value = match cli.command {
         Commands::ExportEvidence { source, output } => orbit::evidence::export(&source, &output)?,
@@ -182,7 +201,10 @@ async fn main() -> Result<()> {
                 )
                 .await?
         }
-        Commands::Runs => client.get("/runs").await?,
+        Commands::Runs { output } => {
+            output_format = output.unwrap_or(output_format);
+            client.get("/runs").await?
+        }
         Commands::Limits => client.get("/limits").await?,
         Commands::SetLimits {
             max_active_roots,
@@ -198,7 +220,41 @@ async fn main() -> Result<()> {
             client.post("/limits", &limits).await?
         }
         Commands::Inspect { run_id } => client.get(&format!("/runs/{run_id}")).await?,
-        Commands::Events { run_id } => client.get(&format!("/runs/{run_id}/events")).await?,
+        Commands::Events {
+            run_id,
+            output,
+            after,
+            follow,
+        } => {
+            output_format = output.unwrap_or(output_format);
+            if follow {
+                use std::io::Write;
+                let mut cursor = after.unwrap_or(0);
+                loop {
+                    let rows = client
+                        .get(&format!("/runs/{run_id}/events?after={cursor}"))
+                        .await?;
+                    for row in rows
+                        .as_array()
+                        .ok_or_else(|| anyhow::anyhow!("invalid event response"))?
+                    {
+                        println!("{}", serde_json::to_string(row)?);
+                        std::io::stdout().flush()?;
+                        cursor = row["sequence"]
+                            .as_u64()
+                            .ok_or_else(|| anyhow::anyhow!("invalid event sequence"))?;
+                    }
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => return Ok(()),
+                        _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                    }
+                }
+            }
+            let suffix = after.map(|n| format!("?after={n}")).unwrap_or_default();
+            client
+                .get(&format!("/runs/{run_id}/events{suffix}"))
+                .await?
+        }
         Commands::Cancel { run_id } => {
             client
                 .post(&format!("/runs/{run_id}/cancel"), &serde_json::json!({}))
@@ -263,6 +319,17 @@ async fn main() -> Result<()> {
             serde_json::json!({"status":"saved","artifact_id":artifact_id})
         }
     };
-    println!("{}", serde_json::to_string_pretty(&value)?);
+    match output_format {
+        Output::Json => println!("{}", serde_json::to_string_pretty(&value)?),
+        Output::Jsonl => {
+            if let Some(rows) = value.as_array() {
+                for row in rows {
+                    println!("{}", serde_json::to_string(row)?);
+                }
+            } else {
+                println!("{}", serde_json::to_string(&value)?);
+            }
+        }
+    }
     Ok(())
 }

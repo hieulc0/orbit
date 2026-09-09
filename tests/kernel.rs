@@ -11,6 +11,8 @@ use std::{collections::BTreeMap, path::Path, time::Duration};
 
 #[path = "kernel/phase2.rs"]
 mod phase2;
+#[path = "kernel/phase3.rs"]
+mod phase3;
 
 struct Fixture {
     engine: Engine,
@@ -145,6 +147,12 @@ impl Fixture {
         kind: &str,
         bytes: &[u8],
     ) -> Result<String> {
+        assert_eq!(
+            self.engine
+                .operate(worker, &operation(a, Action::Heartbeat))
+                .await?["status"],
+            "accepted"
+        );
         let manifest;
         let bytes = if kind == "manifest" {
             let run = self.engine.inspect(&a.run_id).await?;
@@ -177,20 +185,38 @@ impl Fixture {
             )
             .await?;
         let artifact = result["artifact"]["id"].as_str().unwrap().to_string();
-        let result = self
-            .engine
-            .upload(
-                worker,
-                &operation(
-                    a,
-                    Action::FinalizeArtifact {
-                        artifact_id: artifact.clone(),
-                    },
-                ),
-                bytes,
-            )
-            .await?;
+        let finalize = operation(
+            a,
+            Action::FinalizeArtifact {
+                artifact_id: artifact.clone(),
+            },
+        );
+        let publication = self.engine.upload(worker, &finalize, bytes);
+        tokio::pin!(publication);
+        let renew = async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                assert_eq!(
+                    self.engine
+                        .operate(worker, &operation(a, Action::Heartbeat))
+                        .await?["status"],
+                    "accepted"
+                );
+            }
+            #[allow(unreachable_code)]
+            Ok::<(), anyhow::Error>(())
+        };
+        let result = tokio::select! {
+            result = &mut publication => result?,
+            result = renew => { result?; unreachable!() },
+        };
         assert_eq!(result["status"], "accepted");
+        assert_eq!(
+            self.engine
+                .operate(worker, &operation(a, Action::Heartbeat))
+                .await?["status"],
+            "accepted"
+        );
         Ok(artifact)
     }
     async fn evidence(&self, scenario: &str) -> Result<()> {
@@ -474,7 +500,8 @@ async fn wait_state(f: &Fixture, run: &str, step: usize, expected: &str) -> Resu
             tokio::time::sleep(Duration::from_millis(30)).await;
         }
     })
-    .await?
+    .await
+    .with_context(|| format!("waiting for run {run} step {step} to reach {expected}"))?
 }
 async fn wait_file(path: &Path) -> Result<()> {
     tokio::time::timeout(Duration::from_secs(15), async {
@@ -482,7 +509,8 @@ async fn wait_file(path: &Path) -> Result<()> {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
-    .await?;
+    .await
+    .with_context(|| format!("waiting for fixture marker {}", path.display()))?;
     Ok(())
 }
 
@@ -1520,6 +1548,9 @@ async fn durable_timer_survives_server_kill_and_cli_signal() -> Result<()> {
     f.engine.cancel(&cancelled_timer).await?;
     let result = wait_state(&f, &early, 2, "SUCCEEDED").await?;
     assert_eq!(result["state"], "SUCCEEDED");
+    // The early run may finish before cancellation is reconciled. Wait for the
+    // cancelled run's own terminal transition, not an unrelated run's progress.
+    wait_state(&f, &cancelled_timer, 0, "CANCELLED").await?;
     assert_eq!(
         f.engine.inspect(&cancelled_timer).await?["state"],
         "CANCELLED"

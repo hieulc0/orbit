@@ -2,7 +2,7 @@ use crate::{engine::Engine, model::*};
 use anyhow::{Context, Result, ensure};
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -106,6 +106,7 @@ pub fn router(app: App) -> Router {
         .route("/runs", get(list).post(submit))
         .route("/runs/{id}", get(inspect))
         .route("/runs/{id}/events", get(events))
+        .route("/runs/{id}/events/stream", get(event_stream))
         .route("/runs/{id}/cancel", post(cancel))
         .route(
             "/runs/{id}/signals",
@@ -177,10 +178,83 @@ async fn events(
     State(app): State<App>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    Query(query): Query<EventCursor>,
 ) -> ApiResult<Json<Value>> {
     app.operator(&headers)?;
+    if let Some(after) = query.after {
+        ensure_cursor(after)?;
+        app.engine.inspect(&id).await?;
+        return Ok(Json(json!(app.engine.events_after(&id, after).await?)));
+    }
     Ok(Json(app.engine.events(&id).await?))
 }
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EventCursor {
+    after: Option<i64>,
+}
+
+async fn event_stream(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(query): Query<EventCursor>,
+) -> ApiResult<Response> {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    app.operator(&headers)?;
+    let after = match headers.get("last-event-id") {
+        Some(value) => value
+            .to_str()
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+            .context("invalid Last-Event-ID")
+            .map_err(ApiError)?,
+        None => query.after.unwrap_or(0),
+    };
+    ensure_cursor(after)?;
+    app.engine.inspect(&id).await?;
+    let stream = futures_util::stream::try_unfold(
+        (
+            app.engine,
+            id,
+            after,
+            std::collections::VecDeque::<Value>::new(),
+        ),
+        |(engine, id, mut cursor, mut pending)| async move {
+            loop {
+                if let Some(value) = pending.pop_front() {
+                    cursor = value["sequence"].as_i64().unwrap();
+                    let event = Event::default()
+                        .id(cursor.to_string())
+                        .event("journal")
+                        .data(value.to_string());
+                    return Ok::<_, std::io::Error>(Some((event, (engine, id, cursor, pending))));
+                }
+                pending = engine
+                    .events_after(&id, cursor)
+                    .await
+                    .map_err(|_| std::io::Error::other("journal unavailable"))?
+                    .into();
+                if pending.is_empty() {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+            }
+        },
+    );
+    Ok(Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response())
+}
+
+fn ensure_cursor(after: i64) -> ApiResult<()> {
+    if after < 0 {
+        return Err(ApiError(anyhow::anyhow!(
+            "event cursor must be nonnegative"
+        )));
+    }
+    Ok(())
+}
+
 async fn cancel(
     State(app): State<App>,
     headers: HeaderMap,

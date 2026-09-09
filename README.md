@@ -16,6 +16,12 @@ limits and retryable admission backpressure are also available. See
 [Phase 2 execution](docs/PHASE_2_EXECUTION.md) and
 [qualification](docs/PHASE_2_QUALIFICATION.md).
 
+Phase 3 is complete: resumable SSE journal streaming, JSONL output, CLI event
+following, and Rust/Python worker transport SDKs. All 28 PostgreSQL/process
+qualification cases pass; see the [qualification record](docs/PHASE_3_QUALIFICATION.md) and
+[developer contract](docs/DEVELOPER_SURFACE.md) for usage, compatibility and
+qualification scope.
+
 ## Build and verify
 
 Requires Rust (tested with 1.98.1), Git, and PostgreSQL. Repository
@@ -59,7 +65,9 @@ orbit events RUN_ID
 orbit cancel RUN_ID
 ```
 
-CLI responses are JSON. `ORBIT_URL` defaults to `http://127.0.0.1:7700` and
+CLI responses default to JSON; `--output-format jsonl` emits compact records and
+`orbit events RUN_ID --follow` follows durable events as JSONL.
+`ORBIT_URL` defaults to `http://127.0.0.1:7700` and
 `ORBIT_TOKEN` supplies the operator or worker credential. `orbit run` prints its
 submission key to stderr before sending, so a lost response can be retried using
 the same `--request-id`.

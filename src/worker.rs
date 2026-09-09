@@ -105,7 +105,12 @@ impl Client {
         }
         Err(last.unwrap())
     }
-    async fn upload(&self, assignment: &Assignment, kind: &str, bytes: Vec<u8>) -> Result<String> {
+    pub async fn upload(
+        &self,
+        assignment: &Assignment,
+        kind: &str,
+        bytes: Vec<u8>,
+    ) -> Result<String> {
         if let Some(root) = &self.local_artifacts {
             use tokio::io::AsyncWriteExt;
             let artifact = Artifact {
@@ -259,6 +264,11 @@ pub async fn execute(client: &Client, assignment: &Assignment, root: &Path) -> R
                 .as_u64()
                 .context("server deadline missing")?,
         );
+    let lease_until = confirmed_lease(sent_at, &started)?;
+    ensure!(
+        Instant::now() < lease_until,
+        "start acknowledgement arrived after confirmed lease expiry"
+    );
     let execution = async {
         let outcome = perform(client, assignment, root).await;
         match outcome {
@@ -296,15 +306,30 @@ pub async fn execute(client: &Client, assignment: &Assignment, root: &Path) -> R
     };
     tokio::pin!(execution);
     let heartbeats = async {
+        let mut lease_until = lease_until;
         loop {
-            sleep(Duration::from_millis(assignment.heartbeat_interval)).await;
-            // Each call has a strict timeout below the lease duration. Dropping execution kills its process group.
-            tokio::time::timeout(
-                Duration::from_millis(assignment.heartbeat_interval),
-                client.operation(assignment, Action::Heartbeat),
-            )
-            .await
-            .context("heartbeat deadline elapsed")??;
+            // The interval schedules renewal; the last confirmed lease bounds
+            // how long we can wait for its response. Anchor durations to the
+            // original send, including all retransmissions, never receipt time.
+            let renewal = async {
+                let remaining = lease_until.saturating_duration_since(Instant::now());
+                sleep(Duration::from_millis(assignment.heartbeat_interval).min(remaining / 2))
+                    .await;
+                let sent_at = Instant::now();
+                let renewed = client.operation(assignment, Action::Heartbeat).await?;
+                ensure!(
+                    Instant::now() < lease_until,
+                    "confirmed lease expired before heartbeat acknowledgement"
+                );
+                confirmed_lease(sent_at, &renewed)
+            };
+            lease_until = tokio::time::timeout_at(lease_until, renewal)
+                .await
+                .context("confirmed lease expired before heartbeat acknowledgement")??;
+            ensure!(
+                Instant::now() < lease_until,
+                "heartbeat acknowledgement arrived after confirmed lease expiry"
+            );
         }
         #[allow(unreachable_code)]
         Ok::<(), anyhow::Error>(())
@@ -314,6 +339,15 @@ pub async fn execute(client: &Client, assignment: &Assignment, root: &Path) -> R
         result = heartbeats => result,
         _ = tokio::time::sleep_until(deadline) => anyhow::bail!("task deadline exceeded; execution stopped"),
     }
+}
+
+fn confirmed_lease(sent_at: Instant, response: &Value) -> Result<Instant> {
+    let remaining = response["lease_remaining_ms"]
+        .as_u64()
+        .context("server lease duration missing")?;
+    sent_at
+        .checked_add(Duration::from_millis(remaining))
+        .context("invalid server lease duration")
 }
 
 async fn perform(

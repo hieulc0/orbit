@@ -97,6 +97,13 @@ impl Engine {
         let rows = sqlx::query("SELECT sequence, at::text AS at, event FROM orbit_events WHERE run_id=$1 ORDER BY sequence").bind(run_id).fetch_all(&self.pool).await?;
         Ok(Value::Array(rows.into_iter().map(|row| json!({"sequence":row.get::<i64,_>("sequence"),"at":row.get::<String,_>("at"),"event":row.get::<Value,_>("event")})).collect()))
     }
+    /// Read a bounded, exclusive journal cursor from durable storage.
+    pub async fn events_after(&self, run_id: &str, after: i64) -> Result<Vec<Value>> {
+        ensure!(after >= 0, "event cursor must be nonnegative");
+        let rows = sqlx::query("SELECT sequence, at::text AS at, event FROM orbit_events WHERE run_id=$1 AND sequence>$2 ORDER BY sequence LIMIT 256")
+            .bind(run_id).bind(after).fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(|row| json!({"sequence":row.get::<i64,_>("sequence"),"at":row.get::<String,_>("at"),"event":row.get::<Value,_>("event")})).collect())
+    }
     pub async fn list(&self) -> Result<Value> {
         let rows = sqlx::query("SELECT id,state,created_at::text AS created_at FROM orbit_runs ORDER BY created_at DESC LIMIT 100").fetch_all(&self.pool).await?;
         Ok(Value::Array(rows.into_iter().map(|r| json!({"id":r.get::<String,_>("id"),"state":r.get::<String,_>("state"),"created_at":r.get::<String,_>("created_at")})).collect()))
@@ -293,6 +300,12 @@ impl Engine {
         if matches!(op.action, Action::Complete { .. }) {
             fault("completion_after_commit").await;
         }
+        if matches!(op.action, Action::Heartbeat) {
+            fault("heartbeat_after_commit").await;
+        }
+        if matches!(op.action, Action::Start) {
+            fault("start_after_commit").await;
+        }
         Ok(response)
     }
 
@@ -313,14 +326,17 @@ impl Engine {
                 run.tasks[ti].state = State::Running;
                 run.tasks[ti].attempts[ai].state = State::Running;
                 return Ok(
-                    json!({"status":"accepted","deadline_remaining_ms":run.tasks[ti].deadline_at.unwrap()-now}),
+                    json!({"status":"accepted","deadline_remaining_ms":run.tasks[ti].deadline_at.unwrap()-now,
+                        "lease_remaining_ms":run.tasks[ti].attempts[ai].lease_expires_at-now}),
                 );
             }
             Action::Heartbeat => {
                 let expires =
                     (now + self.lease_seconds * 1000).min(run.tasks[ti].deadline_at.unwrap());
                 run.tasks[ti].attempts[ai].lease_expires_at = expires;
-                return Ok(json!({"status":"accepted","lease_expires_at":expires}));
+                return Ok(
+                    json!({"status":"accepted","lease_expires_at":expires,"lease_remaining_ms":expires-now}),
+                );
             }
             Action::PrepareArtifact {
                 kind,
@@ -505,8 +521,13 @@ impl Engine {
             "artifact content mismatch"
         );
         let path = self.artifact_path(artifact_id)?;
-        publish(&path, bytes)?;
+        // Publication can wait on storage. Do not hold coordination/run locks or
+        // block an async executor while syncing bytes: heartbeats and cancellation
+        // must remain available. Only the final operation grants durable ownership.
         tx.commit().await?;
+        fault("upload_before_publish").await;
+        let bytes = bytes.to_vec();
+        tokio::task::spawn_blocking(move || publish(&path, &bytes)).await??;
         self.operate(worker, op).await
     }
 
@@ -1212,6 +1233,10 @@ fn publish(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     if path.exists() {
         ensure!(std::fs::read(path)? == bytes, "immutable artifact conflict");
+        // A concurrent publisher may have linked the file but not yet synced the
+        // directory. This caller must establish durability before acknowledging.
+        std::fs::File::open(path)?.sync_all()?;
+        std::fs::File::open(path.parent().unwrap())?.sync_all()?;
         return Ok(());
     }
     let tmp = path.with_extension(format!("{}.upload", id()));
@@ -1240,6 +1265,13 @@ async fn fault(point: &str) {
             std::fs::write(marker, point).expect("fault barrier marker must be writable");
         }
         loop {
+            // Tests may release an I/O barrier without killing the server.
+            if std::env::var("ORBIT_FAULT_MARKER")
+                .ok()
+                .is_some_and(|marker| Path::new(&marker).with_extension("release").exists())
+            {
+                return;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     }
