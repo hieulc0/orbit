@@ -1,0 +1,32 @@
+# Both Docker and Podman build this file from the repository root.
+ARG RUST_IMAGE=docker.io/library/rust@sha256:9a73a5088750b4c95158ab26629c854c3d6fc4b173cb7bc8079ad252d8ed7bfa
+ARG NODE_IMAGE=docker.io/library/node@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d
+ARG RUNTIME_IMAGE=docker.io/library/debian@sha256:5ae3c39ebd15e229dcedd5cee596b2497182493d41ff162e824ba13fc1b2b867
+FROM ${NODE_IMAGE} AS console
+WORKDIR /build/ui
+COPY ui/package.json ui/package-lock.json ./
+RUN npm ci --ignore-scripts
+COPY ui/ ./
+RUN npm run build
+
+FROM ${RUST_IMAGE} AS binary
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY src/ src/
+COPY migrations/ migrations/
+RUN cargo build --locked --release --bin orbit
+
+FROM ${RUNTIME_IMAGE} AS server
+RUN mkdir -p /var/lib/orbit/artifacts /etc/orbit /run/orbit /opt/orbit/ui \
+    && chown -R 10001:10001 /var/lib/orbit
+COPY --from=binary /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=binary /build/target/release/orbit /usr/local/bin/orbit
+COPY --from=console /build/ui/dist/ /opt/orbit/ui/
+COPY LICENSE /usr/share/doc/orbit/LICENSE
+USER 10001:10001
+WORKDIR /var/lib/orbit
+EXPOSE 7700
+STOPSIGNAL SIGTERM
+HEALTHCHECK --interval=10s --timeout=4s --start-period=20s --retries=3 CMD ["/usr/local/bin/orbit", "health"]
+ENTRYPOINT ["/usr/local/bin/orbit"]
+CMD ["server", "--config", "/etc/orbit/server.json", "--database-url-file", "/run/orbit/database-url", "--artifacts", "/var/lib/orbit/artifacts", "--listen", "0.0.0.0:7700"]

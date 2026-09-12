@@ -1,0 +1,22 @@
+[Unit]
+Description=Orbit alpha PostgreSQL
+
+[Container]
+Image=docker.io/library/postgres@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73
+ContainerName=orbit-alpha-postgres
+Network=orbit.network
+NetworkAlias=postgres
+Volume=orbit-postgres.volume:/var/lib/postgresql/data
+Volume=%h/.local/share/orbit/secrets/db-password:/run/secrets/db-password:ro,z
+Environment=POSTGRES_USER=orbit POSTGRES_DB=orbit POSTGRES_PASSWORD_FILE=/run/secrets/db-password
+HealthCmd=pg_isready -h 127.0.0.1 -U orbit -d orbit
+HealthInterval=5s
+HealthRetries=12
+
+[Service]
+Restart=on-failure
+TimeoutStartSec=120
+TimeoutStopSec=40
+
+[Install]
+WantedBy=default.target

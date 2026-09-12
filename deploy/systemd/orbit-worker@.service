@@ -1,0 +1,22 @@
+# Dedicated host user. Provision binary/config/credentials before installing.
+[Unit]
+Description=Orbit host worker (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=orbit-worker
+Group=orbit-worker
+EnvironmentFile=/etc/orbit/workers/%i.env
+LoadCredential=token:/etc/orbit/workers/%i.token
+Environment=ORBIT_TOKEN_FILE=%d/token
+ExecStart=/usr/local/bin/orbit worker --capability ${ORBIT_CAPABILITY} --workspaces ${ORBIT_WORKSPACES} --shutdown-grace-seconds 30
+Restart=on-failure
+RestartSec=3
+KillMode=mixed
+TimeoutStopSec=40
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

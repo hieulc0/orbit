@@ -1,0 +1,70 @@
+name: orbit-alpha
+services:
+  postgres:
+    image: docker.io/library/postgres@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73
+    environment:
+      POSTGRES_USER: orbit
+      POSTGRES_DB: orbit
+      POSTGRES_PASSWORD_FILE: /run/secrets/db-password
+    volumes:
+      - postgres:/var/lib/postgresql/data
+      - type: bind
+        source: ${ORBIT_DATA_DIR:?Run scripts/init-deployment.py first}/secrets/db-password
+        target: /run/secrets/db-password
+        read_only: true
+        bind:
+          create_host_path: false
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -h 127.0.0.1 -U orbit -d orbit']
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+    networks: [backend]
+  server:
+    image: ${ORBIT_IMAGE:-localhost/orbit:alpha}
+    user: ${ORBIT_UID:?Set generated UID}:${ORBIT_GID:?Set generated GID}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 256
+    mem_limit: 1g
+    cpus: 2
+    tmpfs: [/tmp:rw,noexec,nosuid,size=16m]
+    environment:
+      ORBIT_URL: http://127.0.0.1:7700
+    healthcheck:
+      test: [CMD, /usr/local/bin/orbit, health]
+      interval: 10s
+      timeout: 4s
+      start_period: 20s
+      retries: 3
+    ports: ['127.0.0.1:${ORBIT_PORT:-7700}:7700']
+    volumes:
+      - type: bind
+        source: ${ORBIT_DATA_DIR}/server.json
+        target: /etc/orbit/server.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${ORBIT_DATA_DIR}/secrets
+        target: /run/orbit
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${ORBIT_DATA_DIR}/artifacts
+        target: /var/lib/orbit/artifacts
+        bind:
+          create_host_path: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+    stop_grace_period: 40s
+    restart: unless-stopped
+    networks: [backend]
+networks:
+  backend: {}
+volumes:
+  postgres: {}

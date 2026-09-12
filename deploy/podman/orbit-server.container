@@ -1,0 +1,35 @@
+[Unit]
+Description=Orbit alpha control plane and console
+Requires=orbit-postgres.service
+After=orbit-postgres.service
+
+[Container]
+Image=localhost/orbit:alpha
+ContainerName=orbit-alpha-server
+Network=orbit.network
+User=10001:10001
+UserNS=keep-id:uid=10001,gid=10001
+PublishPort=127.0.0.1:7700:7700
+Volume=%h/.local/share/orbit/server.json:/etc/orbit/server.json:ro,Z
+Volume=%h/.local/share/orbit/secrets:/run/orbit:ro,z
+Volume=%h/.local/share/orbit/artifacts:/var/lib/orbit/artifacts:Z
+ReadOnly=true
+NoNewPrivileges=true
+DropCapability=all
+Tmpfs=/tmp:rw,noexec,nosuid,size=16m
+HealthCmd=/usr/local/bin/orbit health
+HealthInterval=10s
+HealthStartPeriod=20s
+HealthRetries=3
+PodmanArgs=--pids-limit=256
+
+[Service]
+Restart=on-failure
+RestartSec=3
+TimeoutStartSec=120
+TimeoutStopSec=40
+MemoryMax=1G
+CPUQuota=200%
+
+[Install]
+WantedBy=default.target
