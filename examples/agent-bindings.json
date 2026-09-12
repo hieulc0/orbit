@@ -1,0 +1,10 @@
+{
+  "local-agent": {
+    "model": "fixture-model/revision-1",
+    "runtime": "agent.fixture-v1",
+    "tools": {"summarize": "fixture-summarize/revision-1"},
+    "permissions": ["context.read"],
+    "max_budget": {"tokens": 1000, "cost_microusd": 10000, "calls": 10},
+    "max_delegations": 2
+  }
+}

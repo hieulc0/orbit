@@ -1,0 +1,59 @@
+apiVersion: orbit/v1
+kind: Definition
+metadata:
+  name: agent-review-and-delegate
+inputs:
+  task: Produce a bounded plan, obtain approval, then execute its two work items.
+steps:
+  planner:
+    uses: agent.run
+    recovery_policy: restart_from_inputs
+    max_attempts: 3
+    timeout_seconds: 120
+    retry_backoff_seconds: 0
+    agent:
+      identity: planner
+      binding: local-agent
+      tools: [summarize]
+      permissions: [context.read]
+      budget: {tokens: 1000, cost_microusd: 10000, calls: 10}
+      max_delegations: 2
+      context: {purpose: qualification}
+      output: object
+  review:
+    uses: human.approval
+    needs: [planner]
+    recovery_policy: restart_from_inputs
+    max_attempts: 1
+    timeout_seconds: 3600
+    retry_backoff_seconds: 0
+    approval:
+      assignees: [operator]
+      prompt: Review the planner report before allowing child execution.
+  dispatch:
+    uses: engine.fan_out
+    needs: [planner, review]
+    recovery_policy: restart_from_inputs
+    max_attempts: 1
+    timeout_seconds: 120
+    retry_backoff_seconds: 0
+    fan_out: {agent_from: planner, max_items: 2, max_parallel: 1}
+    definition:
+      apiVersion: orbit/v1
+      kind: Definition
+      metadata: {name: delegated-agent}
+      inputs: {task: Replaced by the bounded planner input}
+      steps:
+        execute:
+          uses: agent.run
+          recovery_policy: restart_from_inputs
+          max_attempts: 3
+          timeout_seconds: 120
+          retry_backoff_seconds: 0
+          agent:
+            identity: executor
+            binding: local-agent
+            tools: [summarize]
+            permissions: [context.read]
+            budget: {tokens: 1000, cost_microusd: 10000, calls: 10}
+            output: object
