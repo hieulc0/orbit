@@ -1,0 +1,34 @@
+{
+  "operator_credential": {"provider": "env", "name": "ORBIT_ADMIN_CREDENTIAL"},
+  "workers": {},
+  "repositories": {},
+  "governance": {
+    "organizations": ["acme"],
+    "projects": [{
+      "organization_id": "acme", "id": "research",
+      "environments": {"development": {
+        "capabilities": ["human.approval", "engine.wait", "engine.timer", "engine.join"],
+        "repository_ids": [], "agent_bindings": [],
+        "max_resources": {"cpu_millis": 0, "memory_mib": 0, "gpu": 0},
+        "max_agent_budget": null, "max_concurrency": 8
+      }}
+    }],
+    "roles": {
+      "developer": ["definition.read", "definition.validate", "run.read", "run.submit", "run.cancel", "run.signal", "artifact.read"],
+      "reviewer": ["run.read", "run.approve"]
+    },
+    "principals": {
+      "developer": {
+        "kind": "service_account",
+        "credential": {"provider": "env", "name": "ORBIT_DEVELOPER_CREDENTIAL"},
+        "grants": [{"scope": {"organization_id": "acme", "project_id": "research", "environment_id": "development"}, "roles": ["developer"]}]
+      },
+      "reviewer": {
+        "kind": "user",
+        "credential": {"provider": "env", "name": "ORBIT_REVIEWER_CREDENTIAL"},
+        "grants": [{"scope": {"organization_id": "acme", "project_id": "research", "environment_id": "development"}, "roles": ["reviewer"]}]
+      }
+    },
+    "default_scope": {"organization_id": "acme", "project_id": "research", "environment_id": "development"}
+  }
+}
