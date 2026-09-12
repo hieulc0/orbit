@@ -1,0 +1,76 @@
+name: Orbit checks
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.18.0'
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
+          rustup default 1.98.1
+      - run: npm --prefix ui ci --ignore-scripts
+      - run: bash scripts/check.sh
+      - name: Browser prerequisites
+        working-directory: ui
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/target/playwright
+        run: npx playwright install --with-deps chromium --only-shell
+      - run: bash scripts/check.sh ui
+  qualification:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.18.0'
+      - run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt && rustup default 1.98.1
+      - run: npm --prefix ui ci --ignore-scripts && npm --prefix ui run build
+      - name: Browser prerequisites
+        working-directory: ui
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/target/playwright
+        run: npx playwright install --with-deps chromium --only-shell
+      - name: Disposable services
+        run: |
+          docker compose --profile compute up -d --wait
+          docker compose --profile compute exec -T minio mc alias set qualification http://127.0.0.1:9000 orbit-local-test orbit-local-test-secret
+          docker compose --profile compute exec -T minio mc mb --ignore-existing qualification/orbit-qualification
+          docker pull docker.io/library/alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
+      - name: Full kernel qualification
+        env:
+          ORBIT_CONTAINER_RUNTIME: docker
+          ORBIT_TEST_DATABASE_URL: postgres://orbit:orbit-local-test@127.0.0.1:55439/orbit
+          ORBIT_TEST_S3_ACCESS_KEY: orbit-local-test
+          ORBIT_TEST_S3_SECRET_KEY: orbit-local-test-secret
+        run: bash scripts/qualify.sh
+      - name: Stop only this runner's disposable services
+        if: always()
+        run: docker compose --profile compute down
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Build server and bundled UI (no publication)
+        run: docker build --file deploy/Containerfile --tag localhost/orbit:alpha .
+      - name: Fresh installation, workflow and restart
+        run: |
+          docker pull docker.io/library/postgres@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73
+          python3 scripts/backup-drill.py --runtime docker --image localhost/orbit:alpha
+      # Do not upload raw qualification/runtime fixtures: they contain credentials.
