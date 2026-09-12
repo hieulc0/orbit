@@ -14,8 +14,8 @@ production readiness or change the separate Milestone 1 evidence-review record.
 | Concurrency | Per-run, per-worker and global authoritative-attempt limits shared across servers |
 | Backpressure | Bounded root admission with retryable HTTP 429; bounded tree size and child parallelism |
 
-See [graph execution](GRAPH_EXECUTION.md), [durable interaction](DURABLE_INTERACTION.md),
-and [Phase 2 execution](PHASE_2_EXECUTION.md) for exact semantics and limits.
+See [graph execution](../reference/graphs.md), [durable interaction](../reference/timers-signals.md),
+and [Phase 2 execution](../reference/children-limits.md) for exact semantics and limits.
 
 ## Executable evidence mapping
 

@@ -1,8 +1,8 @@
 # Phase 2: child runs, fan-out, and scheduling limits
 
 Phase 2 completes the bounded durable interaction layer alongside
-[graphs](GRAPH_EXECUTION.md) and [timers/signals](DURABLE_INTERACTION.md).
-The executable qualification mapping is in [Phase 2 qualification](PHASE_2_QUALIFICATION.md).
+[graphs](graphs.md) and [timers/signals](timers-signals.md).
+The executable qualification mapping is in [Phase 2 qualification](../archive/phase-2-qualification.md).
 
 ## Pinned child definitions
 
@@ -156,10 +156,10 @@ a throughput, high-availability, storage-loss, or production qualification.
 
 ## Examples and inspection
 
-Use [child-definition.yaml](../examples/child-definition.yaml) for a child that
-waits without workers, or [fan-out.yaml](../examples/fan-out.yaml) with
-[fan-out-items.json](../examples/fan-out-items.json) for independent tested patches.
-Configure the fixture binding using the [runbook](LOCAL_RUNBOOK.md), and replace
+Use [child-definition.yaml](../../examples/child-definition.yaml) for a child that
+waits without workers, or [fan-out.yaml](../../examples/fan-out.yaml) with
+[fan-out-items.json](../../examples/fan-out-items.json) for independent tested patches.
+Configure the fixture binding using the [runbook](../guides/local-development.md), and replace
 every revision placeholder in the chosen YAML with a full fixture commit ID.
 
 ```sh

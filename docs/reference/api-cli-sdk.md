@@ -1,11 +1,11 @@
-# Phase 3 developer contract
+# API, CLI and SDK contract
 
 Phase 3 adds journal streaming, JSONL and reusable worker transports. It preserves
 the existing unprefixed HTTP routes, `orbit/v0` worker protocol and both definition
 versions. YAML and JSON definitions use the same parser and validation rules.
 Phase 4 also supports `container.run` through the same transports. See the
-[compute contract](COMPUTE_AND_ARTIFACTS.md) for resources, pools and provider
-metadata. The [private registry](PACKAGE_REGISTRY.md) now supports signed
+[compute contract](compute-artifacts.md) for resources, pools and provider
+metadata. The [private registry](packages.md) now supports signed
 capability descriptors and packaged definitions; worker provisioning remains
 external to the server.
 
@@ -19,7 +19,10 @@ The crate is pre-1.0; this wire compatibility commitment does not promise Rust A
 stability or rolling mixed-version database upgrades.
 
 All data and action routes require bearer authentication; `/protocol` discovery
-and the optional static `/console/` assets are public. Operator and worker
+and the optional static `/console/` assets are public. Coarse `/healthz` and
+`/readyz` probes are also public. `/metrics` requires global `system.read`;
+`POST /workers/{id}/drain` requires global `worker.write`. See
+[operational semantics](../operations/observability.md). Operator and worker
 credentials are distinct. Operator routes are `/runs` (GET/POST), `/runs/{id}` (GET),
 `/runs/{id}/events` (GET), `/runs/{id}/events/stream` (GET),
 `/runs/{id}/cancel` (POST), `/runs/{id}/signals` (POST), and `/limits` (GET/POST).
@@ -28,7 +31,7 @@ commands. Worker capacity and pool membership come from server configuration.
 Worker routes are `/worker/register`, `/worker/claim`, `/worker/operate`,
 `/worker/upload` (POST) and `/worker/runs/{run}/attempts/{attempt}` (GET).
 `/runs/{run}/artifacts/{artifact}` returns binary bytes to operators or authorized
-workers. Worker bodies and lifecycle are defined in [worker protocol](WORKER_PROTOCOL.md).
+workers. Worker bodies and lifecycle are defined in [worker protocol](worker-protocol.md).
 
 Domain errors retain `{"error":"message"}`: 401 for authentication/authorization,
 409 for request conflicts, 429 for admission backpressure (with `Retry-After: 1`),
@@ -149,7 +152,7 @@ The ignored PostgreSQL test `phase3::journal_stream_replay_and_sdk_contract` cov
 operator-only SSE, malformed cursors, replay and resume, typed Rust registration/
 idempotent claim/start/inspection, and CLI JSONL parsing. The Python localhost HTTP
 test checks authentication, unchanged operation retransmission and corrupt artifact
-rejection. Run the full database/process suite using the [runbook](LOCAL_RUNBOOK.md).
+rejection. Run the full database/process suite using the [runbook](../guides/local-development.md).
 `phase3::journal_resume_after_server_kill` reconnects after killing the real server
 and checks the resumed stream against the durable journal, including cancellation
 committed while the server is down.
@@ -158,12 +161,12 @@ package publication. SDK packages remain local source artifacts.
 
 Phase 3 qualification is complete; the full case mapping, runtime/fixture fixes,
 verified evidence export and final concurrent/serial results are recorded in
-[Phase 3 qualification](PHASE_3_QUALIFICATION.md). The built-in Rust runtime uses
+[Phase 3 qualification](../archive/phase-3-qualification.md). The built-in Rust runtime uses
 the server's remaining-lease duration receipts as described in the
-[worker protocol](WORKER_PROTOCOL.md).
+[worker protocol](worker-protocol.md).
 
-[Agent execution](AGENT_EXECUTION.md) adds `agent.run`, budget reservations and
-human approval. [Governance](GOVERNANCE.md) adds scoped submission and resource
-actions; [registry](PACKAGE_REGISTRY.md) adds private package APIs. The
-[SDK compatibility contract](../sdk/PROTOCOL_COMPATIBILITY.md) describes the
+[Agent execution](agents.md) adds `agent.run`, budget reservations and
+human approval. [Governance](governance.md) adds scoped submission and resource
+actions; [registry](packages.md) adds private package APIs. The
+[SDK compatibility contract](../../sdk/PROTOCOL_COMPATIBILITY.md) describes the
 additive wire guarantees; `GET /protocol` exposes supported versions.

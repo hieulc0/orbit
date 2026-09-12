@@ -24,17 +24,17 @@ definition, records a fixture human decision and checks durable completion.
 
 | Scope | Implementation / evidence |
 | --- | --- |
-| 4: Compute and artifacts | [Contract](COMPUTE_AND_ARTIFACTS.md), [five database/OCI/S3 cases plus four regular cases](PHASE_4_QUALIFICATION.md) |
-| 5: Agent execution | [Bindings, budgets, permissions, MCP, delegation, approval and four database cases](AGENT_EXECUTION.md); regular report/budget/binding/MCP tests include a real stdio process |
-| 6: Operations console | [React console](WEB_CONSOLE.md); five browser cases and `web::real_browser_console_edits_submits_and_approves_through_api` |
+| 4: Compute and artifacts | [Contract](../reference/compute-artifacts.md), [five database/OCI/S3 cases plus four regular cases](phase-4-qualification.md) |
+| 5: Agent execution | [Bindings, budgets, permissions, MCP, delegation, approval and four database cases](../reference/agents.md); regular report/budget/binding/MCP tests include a real stdio process |
+| 6: Operations console | [React console](../guides/console.md); five browser cases and `web::real_browser_console_edits_submits_and_approves_through_api` |
 | 7: Definition studio | Canonical graph/source synchronization, schema panels, editing, validation, comparison and export; same browser cases |
-| 8: Governance | [Scoped roles, identities, secret references, environment policies and audit](GOVERNANCE.md); two PostgreSQL cases and four regular cases |
-| 9: Ecosystem | [Private signed registry and package-to-run CLI](PACKAGE_REGISTRY.md); one PostgreSQL case, two regular signature/version cases and [SDK compatibility contract](../sdk/PROTOCOL_COMPATIBILITY.md) |
+| 8: Governance | [Scoped roles, identities, secret references, environment policies and audit](../reference/governance.md); two PostgreSQL cases and four regular cases |
+| 9: Ecosystem | [Private signed registry and package-to-run CLI](../reference/packages.md); one PostgreSQL case, two regular signature/version cases and [SDK compatibility contract](../../sdk/PROTOCOL_COMPATIBILITY.md) |
 
 ## Reproduction
 
 Use the disposable PostgreSQL/MinIO setup and pinned Podman image from
-[Phase 4 qualification](PHASE_4_QUALIFICATION.md). Build the UI and install the
+[Phase 4 qualification](phase-4-qualification.md). Build the UI and install the
 pinned browser before the full ignored suite:
 
 ```sh
@@ -81,7 +81,7 @@ Podman containers. Disposable services and local evidence are retained.
 This is a local implementation/evidence review, not project-owner acceptance or
 permission to distribute the bundle. The manifest keeps `review_required: true`.
 Milestone 1's historical evidence-link and Orbit-on-Orbit dogfooding gaps remain
-as recorded in [its acceptance document](MILESTONE_1_ACCEPTANCE.md).
+as recorded in [its acceptance document](milestone-1-acceptance.md).
 
 ## Findings and review boundaries
 

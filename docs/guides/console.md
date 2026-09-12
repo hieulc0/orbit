@@ -74,5 +74,5 @@ with `npx playwright install chromium --only-shell` first; a local
 All five browser cases pass. The separate PostgreSQL-backed real-browser case
 also passes, including schema editing, submission, assigned approval, CSP/static
 serving and persisted completion. The complete release suite passes all 41 cases;
-see [qualification](RELEASE_QUALIFICATION.md). This is not a production accessibility,
+see [qualification](../archive/release-qualification-2026-09-12.md). This is not a production accessibility,
 large-graph performance or cross-browser certification.

@@ -1,6 +1,6 @@
 # Durable timers and signal waits
 
-`orbit/v1` adds two engine-owned steps to the [graph contract](GRAPH_EXECUTION.md).
+`orbit/v1` adds two engine-owned steps to the [graph contract](graphs.md).
 Both persist in the run aggregate with transactional journal entries. Neither
 claims a worker, starts a process, creates an attempt, or produces artifacts.
 Repository inputs and the server-controlled repository binding remain required
@@ -79,7 +79,7 @@ completion and new signals, but does not reset existing signal wait deadlines.
 
 ## CLI and example
 
-Use [wait-and-resume.yaml](../examples/wait-and-resume.yaml) with a configured
+Use [wait-and-resume.yaml](../../examples/wait-and-resume.yaml) with a configured
 fixture binding and a full base commit ID. This graph needs a server but no
 workers. Start it with `orbit run`, then deliver the signal:
 
@@ -108,4 +108,4 @@ The standard PostgreSQL/process suite includes:
 
 Evidence is retained under `target/qualification` when configured. Review it
 before sharing. Dynamic fan-out, child runs, and concurrency/admission limits are
-documented in [Phase 2 execution](PHASE_2_EXECUTION.md).
+documented in [Phase 2 execution](children-limits.md).

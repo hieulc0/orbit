@@ -1,14 +1,18 @@
-# Milestone 1 Worker Protocol
+# Worker protocol
 
-Status: implementation specification. This document defines transport-independent
-operation contracts; the first implementation may expose them through HTTP.
-See [engine semantics](ENGINE_SEMANTICS.md) and [state machines](STATE_MACHINES.md).
+This document defines the implemented transport-independent operation contracts,
+exposed through HTTP and the Rust/Python SDKs.
+See [engine semantics](engine-semantics.md) and [state machines](state-machines.md).
+
+Worker draining is an additive operational control: existing accepted claims,
+heartbeats and completion remain valid while new claims stop. Registration never
+clears a durable drain flag. See [lifecycle and authorization](../operations/observability.md).
 
 Phase 4 retains the v0 wire protocol and adds `container.run`, optional
 `gpu_devices` in assignments, provider/object-key metadata on artifacts, and
 `data`/`container_report` artifact kinds. Server-authorized capacity and pool
 membership constrain claims; clients cannot supply capacity overrides. See
-[compute and artifacts](COMPUTE_AND_ARTIFACTS.md) for the additional contract.
+[compute and artifacts](compute-artifacts.md) for the additional contract.
 
 ## Registration and claim
 
@@ -174,8 +178,8 @@ must say so explicitly.
 
 Agent assignments add `agent_binding_digest` and pinned `plan.agent_bindings`.
 `reserve_agent_call` reserves tokens, cost and call count per task across attempts;
-success publishes `agent_report` plus logs. See [agent execution](AGENT_EXECUTION.md).
+success publishes `agent_report` plus logs. See [agent execution](agents.md).
 Scoped plans carry immutable `plan.scope`; worker scope permissions come only from
 server configuration and are checked at claim, operation, upload and read. Scope
-cannot be supplied in worker operations. See [governance](GOVERNANCE.md) and the
-[SDK compatibility contract](../sdk/PROTOCOL_COMPATIBILITY.md).
+cannot be supplied in worker operations. See [governance](governance.md) and the
+[SDK compatibility contract](../../sdk/PROTOCOL_COMPATIBILITY.md).

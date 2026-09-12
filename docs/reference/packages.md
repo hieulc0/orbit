@@ -80,7 +80,7 @@ qualifies concurrent publication, immutable conflicts, reconnect verification,
 revocation, unauthorized writes, stored-envelope corruption and the real
 `run-package` CLI path. No worker code is executed by that test.
 
-The [worker compatibility contract](../sdk/PROTOCOL_COMPATIBILITY.md) fixes the
+The [worker compatibility contract](../../sdk/PROTOCOL_COMPATIBILITY.md) fixes the
 additive wire rules shared by Rust/Python runtimes. `GET /protocol`, `orbit
 protocol` and the SDK `protocol()` helpers expose supported versions. Public
 marketplace operations, package dependency resolution, automatic installation,

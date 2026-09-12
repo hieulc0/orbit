@@ -1,4 +1,8 @@
-# Local kernel runbook
+# Local development and repository workflow
+
+For packaged installations use [deployment](../operations/deployment.md). This
+guide runs source-built binaries on the host. The [timer example](../../examples/timer.yaml)
+is the simplest worker-free run; the repository workflow below exercises patches.
 
 ## Prepare a repository and definition
 
@@ -63,7 +67,8 @@ target/debug/orbit worker --capability repository.test \
 
 `--once` waits for and executes one assignment, then exits. Worker identities and
 capabilities are configured statically by the server. A registration request
-validates compatibility; there is no dynamic worker registry or health dashboard.
+validates compatibility and records a persistent worker profile. The CLI and
+console expose recent worker contact and active leases, not proof of process health.
 
 Set `ORBIT_TOKEN` to the operator token when using the operator commands:
 
@@ -163,14 +168,13 @@ The fixture tests do not claim that a Codex integration is installed or qualifie
 Before self-dogfooding, pin a known-good binary outside the candidate checkout.
 Give candidate fault tests separate PostgreSQL schemas, artifact roots, listener
 ports, and process groups. Preserve direct `cargo test`, direct local execution,
-and manual patch recovery. The current first implementation is uncommitted, so
-there is not yet a committed Orbit revision containing this kernel to use as a
-known-good bootstrap baseline.
+and manual patch recovery. Use a reviewed committed revision, not the candidate
+worktree, as the bootstrap baseline. See [dogfooding](../development/dogfooding.md).
 
 ## Durable timers and signals
 
 After configuring a repository binding and starting the server, use
-[wait-and-resume.yaml](../examples/wait-and-resume.yaml) with a full fixture commit
+[wait-and-resume.yaml](../../examples/wait-and-resume.yaml) with a full fixture commit
 ID to run coordination without workers:
 
 ```sh
@@ -182,13 +186,13 @@ orbit inspect RUN_ID
 
 Signals may arrive before the timer finishes. Add `--payload payload.json` for a
 JSON payload; reuse the same request ID and payload if a response is lost. Use the
-operator credential. See [the durable interaction contract](DURABLE_INTERACTION.md)
+operator credential. See [the durable interaction contract](../reference/timers-signals.md)
 for deadlines, size limits, duplicate handling, and cancellation.
 
 ## Child runs, fan-out and shared limits
 
-Use [child-definition.yaml](../examples/child-definition.yaml) for a single child,
-or [fan-out.yaml](../examples/fan-out.yaml) for a batch of independent tested
+Use [child-definition.yaml](../../examples/child-definition.yaml) for a single child,
+or [fan-out.yaml](../../examples/fan-out.yaml) for a batch of independent tested
 patches. Replace every base revision placeholder, including those in the inline
 child definition. The batch uses the same fixture coding/testing workers as the
 v0 example; it keeps at most two child runs active at once.
@@ -204,19 +208,19 @@ orbit set-limits --max-active-roots 128 --max-running-attempts 64 --max-attempts
 Inspect child IDs from the parent's tasks with `orbit inspect CHILD_RUN_ID`.
 Limits are shared across servers and require the operator credential to change.
 At capacity, root submissions return HTTP 429 and can be retried using the same
-request ID. See [Phase 2 execution](PHASE_2_EXECUTION.md) for exact semantics.
+request ID. See [Phase 2 execution](../reference/children-limits.md) for exact semantics.
 
 Stop old server/worker binaries before starting this version. Startup applies
-`0002_coordination.sql` through `0005_registry.sql` additively and preserves
+`0002_coordination.sql` through `0006_operations.sql` additively and preserves
 existing limits. Mixed-version rolling operation is not supported: older binaries
 can bypass coordination, scope and policy checks. Use a coordinated restart with
 the same trusted configuration across replicas.
 
 ## Later runtime surfaces
 
-For repository-free workloads see [compute and artifacts](COMPUTE_AND_ARTIFACTS.md).
-For agent runtimes and durable human decisions see [agent execution](AGENT_EXECUTION.md).
-The [React console/studio](WEB_CONSOLE.md), [scoped governance](GOVERNANCE.md),
-and [private package registry](PACKAGE_REGISTRY.md) are opt-in additions over the
-same server. See [release qualification](RELEASE_QUALIFICATION.md) before treating
+For repository-free workloads see [compute and artifacts](../reference/compute-artifacts.md).
+For agent runtimes and durable human decisions see [agent execution](../reference/agents.md).
+The [React console/studio](console.md), [scoped governance](../reference/governance.md),
+and [private package registry](../reference/packages.md) are opt-in additions over the
+same server. See [release qualification](../archive/release-qualification-2026-09-12.md) before treating
 local test success as an acceptance or deployment decision.

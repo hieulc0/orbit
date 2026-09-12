@@ -54,7 +54,7 @@ walks nested child definitions before admission. These are per-run/task bounds,
 not monthly organizational spending quotas. Model/tool credentials and provider
 billing remain the trusted runtime's responsibility.
 
-See [the example configuration](../examples/server-governance.json). Replace its
+See [the example configuration](../../examples/server-governance.json). Replace its
 credential references with operator-provisioned environment variables or private
 files; it deliberately contains no usable credentials.
 
@@ -103,4 +103,4 @@ and secret-file restrictions. Two PostgreSQL/HTTP cases cover per-project lists,
 cross-project denials, service-account restrictions, actual human decisions,
 environment admission, hash-chain validation, conflicting worker profiles,
 reconnection and immutable child scopes. Both pass in the full release suite;
-see [release qualification](RELEASE_QUALIFICATION.md).
+see [release qualification](../archive/release-qualification-2026-09-12.md).

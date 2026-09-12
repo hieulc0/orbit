@@ -1,6 +1,9 @@
-# Milestone 1 Engine Semantics
+# Core engine semantics (orbit/v0)
 
-Status: implementation specification for the first qualification milestone.
+This is the preserved normative v0 kernel contract. The current system also has
+[graphs](graphs.md), [timers/signals](timers-signals.md), [child runs](children-limits.md),
+[agents](agents.md) and [governance](governance.md). Scope exclusions below describe
+the original kernel subset, not the complete current product.
 
 ## Objective and scope
 
@@ -8,10 +11,10 @@ Status: implementation specification for the first qualification milestone.
 > survives deliberate interruption, and makes every recovery decision understandable.
 
 This document specifies the milestone subset of the
-[architecture vision](ORBIT_VISION_ARCHITECTURE.md). The normative words MUST,
+[architecture vision](../architecture/vision.md). The normative words MUST,
 MUST NOT, and SHOULD describe implementation requirements. Companion contracts:
-[states](STATE_MACHINES.md), [workers](WORKER_PROTOCOL.md), and
-[qualification](MILESTONE_1_QUALIFICATION.md).
+[states](state-machines.md), [workers](worker-protocol.md), and
+[qualification](../archive/milestone-1-qualification.md).
 
 The only required workflow is:
 
@@ -28,7 +31,7 @@ bounded retries, deadlines, cancellation, artifacts, and recovery. It does not
 require fan-out, merge integration, agent review, approval workflows, deployment,
 MCP, a web UI, a registry, or general durable workflow code. No Rust implementation
 is prescribed by this specification; the current implementation is tracked in
-[implementation status](IMPLEMENTATION_STATUS.md).
+[implementation status](../archive/implementation-status-2026-09-12.md).
 
 ## Definition and accepted run
 

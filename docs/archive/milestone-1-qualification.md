@@ -1,14 +1,14 @@
 # Milestone 1 Qualification: Request to Tested Patch
 
 Status: acceptance specification. A first kernel and executable qualification
-tests now exist; see [implementation status](IMPLEMENTATION_STATUS.md). The full
+tests now exist; see [implementation status](implementation-status-2026-09-12.md). The full
 acceptance gate and Orbit-on-Orbit dogfooding are not yet declared complete.
 
 > Orbit coordinates one real repository change from request to tested patch,
 > survives deliberate interruption, and makes every recovery decision understandable.
 
-Normative contracts: [engine semantics](ENGINE_SEMANTICS.md),
-[state machines](STATE_MACHINES.md), [worker protocol](WORKER_PROTOCOL.md).
+Normative contracts: [engine semantics](../reference/engine-semantics.md),
+[state machines](../reference/state-machines.md), [worker protocol](../reference/worker-protocol.md).
 
 ## Qualification fixture
 
@@ -91,7 +91,7 @@ that does not advertise continuation can pass the milestone without building it.
 
 ## Invariant and recovery verification
 
-Automate the invariants in [STATE_MACHINES.md](STATE_MACHINES.md). Include repeated
+Automate the invariants in [STATE_MACHINES.md](../reference/state-machines.md). Include repeated
 server restarts during one run and concurrent duplicate message delivery. Verify
 transactional journal/state agreement and that every accepted artifact maps to
 the successful producing attempt. A cancelled run may retain completed coding

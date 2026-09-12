@@ -3,7 +3,7 @@
 Phase 4's bounded CPU/OCI and artifact contract is implemented and qualified
 with PostgreSQL, MinIO and rootless Podman. Do not infer production readiness,
 hardware GPU qualification or completion of later roadmap phases.
-See [compute and artifact semantics](COMPUTE_AND_ARTIFACTS.md).
+See [compute and artifact semantics](../reference/compute-artifacts.md).
 
 ## Local services and commands
 

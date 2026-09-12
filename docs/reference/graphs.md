@@ -1,9 +1,9 @@
 # Repository graph execution
 
 This Phase 2 increment introduces `orbit/v1`. The v0 contract remains in
-[engine semantics](ENGINE_SEMANTICS.md). Both versions use the existing run
+[engine semantics](engine-semantics.md). Both versions use the existing run
 aggregate and transactional journal. Phase 2 adds the additive coordination
-migration documented in [Phase 2 execution](PHASE_2_EXECUTION.md). Workers
+migration documented in [Phase 2 execution](children-limits.md). Workers
 must be upgraded with the server before submitting v1 definitions because older
 workers assume fixed step names.
 
@@ -31,9 +31,9 @@ All steps retain required recovery policy, attempt, timeout, and backoff fields.
 Joins validate those fields for format consistency but consume no attempts and
 have no independent deadline. Commands are prohibited on coding and engine steps.
 Testing commands are checked against the server binding for every testing step.
-See [durable interaction](DURABLE_INTERACTION.md) for timer durations, wait
+See [durable interaction](timers-signals.md) for timer durations, wait
 deadlines, signals, early delivery, and cancellation semantics.
-See [Phase 2 execution](PHASE_2_EXECUTION.md) for child templates and shared limits.
+See [Phase 2 execution](children-limits.md) for child templates and shared limits.
 
 Coding dependencies control ordering only: each coding step starts from the
 original base revision, not an upstream patch. Tests may have additional testing
@@ -64,8 +64,8 @@ Task history records joins as pending-to-succeeded transitions without attempts.
 
 ## Running the example
 
-Copy [parallel-checks.yaml](../examples/parallel-checks.yaml), set a full fixture
-commit ID, and use the existing [local runbook](LOCAL_RUNBOOK.md) to configure
+Copy [parallel-checks.yaml](../../examples/parallel-checks.yaml), set a full fixture
+commit ID, and use the existing [local runbook](../guides/local-development.md) to configure
 the fixture binding and start coding/testing workers. Submit with `orbit run`.
 The example runs two independent checks against the same patch and joins them.
 It is a static graph, not dynamic fan-out or a general-purpose worker API.

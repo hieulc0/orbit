@@ -12,7 +12,7 @@ No required Phase 3 check was skipped. Earlier unsuccessful runs remain diagnost
 history; completion is based on these final runs after the fixes below.
 
 Scope: the local developer surface, preserving the existing definition and worker
-protocols. See [developer contract](DEVELOPER_SURFACE.md) for API/CLI compatibility,
+protocols. See [developer contract](../reference/api-cli-sdk.md) for API/CLI compatibility,
 SSE cursor semantics and SDK lifecycle responsibilities. This record does not
 change Milestone 1's separate owner acceptance or claim production readiness.
 
@@ -69,7 +69,7 @@ alongside unrelated lease tests; no pagination coverage or bounds are reduced.
 The remaining 21 PostgreSQL/process cases retain Phase 1/2 worker recovery,
 transaction-boundary kills, artifact validation, signals, timers, fan-out, child
 execution and cross-server concurrency/admission regression coverage. See
-[Phase 2 qualification](PHASE_2_QUALIFICATION.md) for their mapping.
+[Phase 2 qualification](phase-2-qualification.md) for their mapping.
 
 ## Commands
 

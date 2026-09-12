@@ -7,7 +7,7 @@ Existing v0 definitions retain their validation and serialized plan digests.
 
 ## Compute contract
 
-See [the executable container definition](../examples/container.yaml). Each
+See [the executable container definition](../../examples/container.yaml). Each
 container has an OCI image pinned by SHA-256 digest, an argv command, explicit
 CPU (`cpu_millis`), memory (`memory_mib`) and optional GPU count. The operator
 must provision that image on a Linux Docker or rootless Podman runner; Orbit
@@ -127,7 +127,7 @@ chosen S3 service must be backed up independently of PostgreSQL.
 
 ## Running the compute example
 
-Copy [the compute server configuration](../examples/server-compute.json) to a
+Copy [the compute server configuration](../../examples/server-compute.json) to a
 local runtime configuration and replace both placeholder tokens with distinct
 credentials. Start the server with that configuration, a persistent local
 artifact directory and the usual database URL. In a separate terminal, provision

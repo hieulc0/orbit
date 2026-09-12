@@ -1,8 +1,12 @@
 # Agent execution
 
+The built-in provider-neutral single-call worker is described in the
+[command-agent guide](../guides/command-agent.md). The contracts below also serve
+external runtimes that reserve each call through the SDK.
+
 `orbit/v1` supports `agent.run` and `human.approval`. See
-[the executable definition](../examples/agent.yaml) and
-[fixture bindings](../examples/agent-bindings.json). Agents are external trusted
+[the executable definition](../../examples/agent.yaml) and
+[fixture bindings](../../examples/agent-bindings.json). Agents are external trusted
 worker runtimes using the existing Rust or Python transport SDK. Orbit does not
 run a model/tool loop in its scheduler or silently select a paid provider.
 
@@ -129,6 +133,6 @@ qualification run found a missing scheduler capability allowlist entry; later
 fixture fixes used the documented retryable failure code and recognized human
 steps as worker-free. No production limits were relaxed. Evidence is under
 `target/qualification-phase5`; the complete release suite also passes all 41
-cases. See [release qualification](RELEASE_QUALIFICATION.md) for export review.
+cases. See [release qualification](../archive/release-qualification-2026-09-12.md) for export review.
 These tests use a
 deterministic local agent, not a paid model, provider billing or hostile tooling.

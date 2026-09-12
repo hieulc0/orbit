@@ -1,9 +1,9 @@
 # Implementation status
 
 Milestone 1 was accepted by the project owner on 2026-09-07. See the
-[acceptance record](MILESTONE_1_ACCEPTANCE.md) for the distinction between that
+[acceptance record](milestone-1-acceptance.md) for the distinction between that
 decision and the retained automated evidence. Further development follows the
-[delivery roadmap](DELIVERY_ROADMAP.md).
+[delivery roadmap](delivery-roadmap-2026-09-12.md).
 
 ## Phase 2 graph increment
 
@@ -12,8 +12,8 @@ dependency validation, parallel branches, and engine-owned joins. Worker dispatc
 output checks, and artifact authorization follow capabilities and dependencies.
 Permanent branch failure revokes active sibling attempts and skips unstarted work.
 Existing `orbit/v0` definitions keep their strict shape and plan serialization.
-See [graph semantics](GRAPH_EXECUTION.md) and the
-[example](../examples/parallel-checks.yaml).
+See [graph semantics](../reference/graphs.md) and the
+[example](../../examples/parallel-checks.yaml).
 
 On 2026-09-07 all 10 PostgreSQL/process qualification tests passed, including
 `graph_fan_out_join_via_http_workers` and `graph_failure_fences_parallel_attempts`.
@@ -28,8 +28,8 @@ this is not a claim of graph-specific process-kill qualification.
 accepts one operator signal, retains early deliveries, and enforces a durable
 deadline. The HTTP endpoint and `orbit signal` CLI provide idempotent receipts;
 conflicting, late, and unauthorized deliveries are rejected. See the
-[interaction contract](DURABLE_INTERACTION.md) and
-[example](../examples/wait-and-resume.yaml).
+[interaction contract](../reference/timers-signals.md) and
+[example](../../examples/wait-and-resume.yaml).
 
 On 2026-09-07 all 13 PostgreSQL/process qualification tests passed both with the
 default concurrent runner (12.55 seconds) and with `--test-threads=1` (23.46 seconds).
@@ -51,15 +51,15 @@ database initialization, two-server claim/admission checks, and kills before/aft
 child creation commit. All 6 regular tests, formatting, and Clippy with warnings
 denied also passed.
 
-See [Phase 2 execution](PHASE_2_EXECUTION.md) for the bounded contract, examples,
-and upgrade requirements, and [qualification](PHASE_2_QUALIFICATION.md) for the
+See [Phase 2 execution](../reference/children-limits.md) for the bounded contract, examples,
+and upgrade requirements, and [qualification](phase-2-qualification.md) for the
 case-by-case evidence mapping. No Phase 2 implementation items remain open.
 
 ## Phase 3 complete
 
 Implemented resumable SSE over committed journal pages, optional bounded HTTP
 event cursors, JSONL output, CLI event following, Rust SDK exports and a
-Python worker transport package. See [developer contract](DEVELOPER_SURFACE.md).
+Python worker transport package. See [developer contract](../reference/api-cli-sdk.md).
 On 2026-09-09 all 28 PostgreSQL/process tests passed with the default concurrent
 runner (13.21 seconds) and serially (50.09 seconds). All seven regular Rust tests,
 the Python transport test, formatting and Clippy with warnings denied passed.
@@ -71,7 +71,7 @@ expiry. The runtime also rejects expired start acknowledgements before execution
 Qualification resolved synchronous publication under the shared database lock,
 heartbeat timeouts tied to polling intervals, manual upload fixtures without
 renewal, and an unrelated-run cancellation wait. Lease lengths, retries and task
-deadlines were not relaxed. See [Phase 3 qualification](PHASE_3_QUALIFICATION.md)
+deadlines were not relaxed. See [Phase 3 qualification](phase-3-qualification.md)
 for the case-by-case mapping, earlier diagnostics, commands, evidence review and
 scope limits. The verified local export is `target/qualification-phase3-review`.
 No Phase 3 implementation or qualification item remains open.
@@ -83,7 +83,7 @@ pool/capability placement, worker/queue inspection and local/S3-compatible
 artifact providers are implemented. Existing repository definition digests and
 the worker protocol remain compatible. Storage I/O and provenance verification
 no longer hold the database coordination lock; ownership is checked again at
-commit. See [the compute contract](COMPUTE_AND_ARTIFACTS.md).
+commit. See [the compute contract](../reference/compute-artifacts.md).
 
 On 2026-09-12 all 33 PostgreSQL/process/S3/OCI cases passed together in 14.14
 seconds, including non-overlapping logical GPU assignments and actual rootless
@@ -93,7 +93,7 @@ contains 1,409 independently checksum-verified files with runtime fixtures and
 structured credentials excluded. This completes the bounded CPU/OCI and artifact
 contract. Physical GPU execution and live Docker behavior on the stalled host
 remain unqualified. Commands and evidence are in
-[Phase 4 qualification](PHASE_4_QUALIFICATION.md).
+[Phase 4 qualification](phase-4-qualification.md).
 
 ## Phases 5–9 bounded implementation
 
@@ -111,9 +111,9 @@ cases and two Python SDK cases passed, as did formatting, Clippy and the strict
 UI build. The local release export has 930 independently checksum-verified files;
 artifact/command review and independent audit-chain/signature checks are recorded
 in the release qualification document. See
-[release qualification](RELEASE_QUALIFICATION.md), [agents](AGENT_EXECUTION.md),
-[console/studio](WEB_CONSOLE.md), [governance](GOVERNANCE.md) and
-[registry](PACKAGE_REGISTRY.md) for contracts, evidence and explicit limitations.
+[release qualification](release-qualification-2026-09-12.md), [agents](../reference/agents.md),
+[console/studio](../guides/console.md), [governance](../reference/governance.md) and
+[registry](../reference/packages.md) for contracts, evidence and explicit limitations.
 No paid model, public marketplace publication or deployment was performed.
 
 ## Kernel capabilities

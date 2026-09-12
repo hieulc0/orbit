@@ -35,7 +35,7 @@ and belong only to the disposable local qualification environment, but an
 and removing structured credential fields, with checksums for exported files.
 Command arguments and artifact content still require operator review before
 sharing; arbitrary embedded secrets are not automatically detected. See the
-[local runbook](LOCAL_RUNBOOK.md#export-qualification-evidence-for-review).
+[local runbook](../guides/local-development.md#export-qualification-evidence-for-review).
 
 ## Current qualification status
 
