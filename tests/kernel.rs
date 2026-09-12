@@ -9,8 +9,14 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use std::{collections::BTreeMap, path::Path, time::Duration};
 
+#[path = "kernel/command_agent.rs"]
+mod command_agent;
+#[path = "kernel/dogfood.rs"]
+mod dogfood;
 #[path = "kernel/governance.rs"]
 mod governance;
+#[path = "kernel/operations.rs"]
+mod operations;
 #[path = "kernel/phase2.rs"]
 mod phase2;
 #[path = "kernel/phase3.rs"]
@@ -254,7 +260,7 @@ impl Fixture {
             std::fs::write(
                 directory.join("qualification.json"),
                 serde_json::to_vec_pretty(
-                    &json!({"scenario":scenario,"result":"passed","repository":"bounded shell calculator fixture; not Orbit self-dogfooding","lease_seconds":self.engine.lease_seconds,"reconciliation_ms":250,"orbit_version":env!("CARGO_PKG_VERSION")}),
+                    &json!({"scenario":scenario,"result":"passed","repository_id":run["plan"]["definition"]["inputs"]["repository_id"],"base_revision":run["plan"]["definition"]["inputs"]["base_revision"],"lease_seconds":self.engine.lease_seconds,"reconciliation_ms":250,"orbit_version":env!("CARGO_PKG_VERSION")}),
                 )?,
             )?;
             for artifact in run["artifacts"].as_array().unwrap() {

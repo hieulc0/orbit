@@ -57,6 +57,7 @@ pub struct WorkerIdentity {
 pub struct App {
     pub engine: Engine,
     pub config: Arc<Config>,
+    pub operations: Arc<crate::ops::Operations>,
 }
 pub struct ApiError(anyhow::Error);
 impl From<anyhow::Error> for ApiError {
@@ -157,6 +158,7 @@ impl App {
         Ok(Self {
             engine,
             config: Arc::new(config),
+            operations: Arc::default(),
         })
     }
     fn actor(&self, headers: &HeaderMap) -> Result<(&str, Option<&crate::governance::Principal>)> {
@@ -209,6 +211,7 @@ impl App {
                     "definition.read",
                     "definition.validate",
                     "worker.read",
+                    "system.read",
                     "queue.read",
                     "limits.read",
                     "audit.read",
@@ -273,7 +276,14 @@ fn bearer(headers: &HeaderMap) -> Result<&str> {
 
 pub fn router(app: App) -> Router {
     let ui_directory = app.config.ui_directory.clone();
+    let operations = app.operations.clone();
     let router = Router::new()
+        .route(
+            "/healthz",
+            get(|| async { Json(json!({"status":"alive"})) }),
+        )
+        .route("/readyz", get(ready))
+        .route("/metrics", get(metrics))
         .route(
             "/definitions/validate",
             post(validate_definition).layer(DefaultBodyLimit::max(1024 * 1024)),
@@ -293,6 +303,7 @@ pub fn router(app: App) -> Router {
         .route("/limits", get(limits).post(set_limits))
         .route("/runs", get(list).post(submit))
         .route("/workers", get(workers))
+        .route("/workers/{id}/drain", post(drain_worker))
         .route("/queues", get(queues))
         .route("/runs/{id}", get(inspect))
         .route("/runs/{id}/events", get(events))
@@ -317,7 +328,7 @@ pub fn router(app: App) -> Router {
         )
         .layer(DefaultBodyLimit::max(70 * 1024 * 1024))
         .with_state(app);
-    if let Some(path) = ui_directory {
+    let router = if let Some(path) = ui_directory {
         let files = tower_http::services::ServeDir::new(path);
         let ui = Router::new()
             .route_service("/", files.clone())
@@ -326,7 +337,55 @@ pub fn router(app: App) -> Router {
         router.nest_service("/console", ui)
     } else {
         router
-    }
+    };
+    router.layer(axum::middleware::from_fn_with_state(
+        operations,
+        crate::ops::observe,
+    ))
+}
+async fn ready(State(app): State<App>) -> Response {
+    let database = tokio::time::timeout(
+        crate::ops::PROBE_TIMEOUT,
+        sqlx::query("SELECT 1").execute(&app.engine.pool),
+    )
+    .await;
+    let ready = app.operations.ready() && matches!(database, Ok(Ok(_)));
+    (
+        if ready {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        Json(json!({"status":if ready { "ready" } else { "unavailable" }})),
+    )
+        .into_response()
+}
+async fn metrics(State(app): State<App>, headers: HeaderMap) -> ApiResult<Response> {
+    app.access(&headers, "system.read", None).await?;
+    Ok((
+        [
+            ("content-type", "text/plain; version=0.0.4; charset=utf-8"),
+            ("cache-control", "no-store"),
+        ],
+        app.operations.metrics(),
+    )
+        .into_response())
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DrainWorker {
+    draining: bool,
+}
+async fn drain_worker(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<DrainWorker>,
+) -> ApiResult<Json<Value>> {
+    app.access(&headers, "worker.write", None).await?;
+    Ok(Json(
+        app.engine.set_worker_draining(&id, body.draining).await?,
+    ))
 }
 async fn secure_ui(mut response: Response) -> Response {
     for (name, value) in [

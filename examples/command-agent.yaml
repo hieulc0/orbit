@@ -1,0 +1,18 @@
+apiVersion: orbit/v1
+kind: Definition
+metadata: {name: command-agent-demo}
+inputs: {task: Demonstrate the command-agent protocol without a paid provider call.}
+steps:
+  execute:
+    uses: agent.run
+    recovery_policy: requires_intervention
+    max_attempts: 2
+    timeout_seconds: 120
+    retry_backoff_seconds: 0
+    agent:
+      identity: offline-demo
+      binding: command-demo
+      tools: []
+      permissions: []
+      budget: {tokens: 1000, cost_microusd: 0, calls: 2}
+      output: object

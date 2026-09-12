@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use orbit::{
     api::{self, App, Config, Submit},
@@ -20,6 +20,8 @@ struct Cli {
     url: String,
     #[arg(long, env = "ORBIT_TOKEN", hide_env_values = true, default_value = "")]
     token: String,
+    #[arg(long, global = true, env = "ORBIT_TOKEN_FILE", hide_env_values = true)]
+    token_file: Option<PathBuf>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -60,6 +62,17 @@ enum Commands {
     Identity,
     Projects,
     Protocol,
+    /// Probe process readiness without credentials (suitable for container health checks).
+    Health {
+        #[arg(long)]
+        live: bool,
+    },
+    /// Stop new assignments to a registered worker; existing attempts keep their leases.
+    DrainWorker {
+        worker_id: String,
+        #[arg(long)]
+        resume: bool,
+    },
     /// Submit a named definition from a currently trusted, digest-pinned package.
     RunPackage {
         digest: String,
@@ -108,8 +121,16 @@ enum Commands {
         artifacts: PathBuf,
     },
     Server {
-        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
-        database_url: String,
+        #[arg(
+            long,
+            env = "DATABASE_URL",
+            hide_env_values = true,
+            conflicts_with = "database_url_file",
+            required_unless_present = "database_url_file"
+        )]
+        database_url: Option<String>,
+        #[arg(long, env = "ORBIT_DATABASE_URL_FILE", hide_env_values = true)]
+        database_url_file: Option<PathBuf>,
         #[arg(long)]
         config: PathBuf,
         #[arg(long)]
@@ -118,6 +139,8 @@ enum Commands {
         listen: String,
         #[arg(long, default_value_t = 30)]
         lease_seconds: i64,
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        shutdown_grace_seconds: u64,
     },
     Validate {
         definition: PathBuf,
@@ -182,6 +205,10 @@ enum Commands {
         workspaces: PathBuf,
         #[arg(long)]
         once: bool,
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        shutdown_grace_seconds: u64,
+        #[arg(long)]
+        agent_runtime: Option<PathBuf>,
     },
     /// Recover a retained artifact through the operator API.
     Artifact {
@@ -195,7 +222,16 @@ enum Commands {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let mut output_format = cli.output_format;
-    let client = Client::new(cli.url, cli.token)?;
+    let token = if let Some(path) = cli.token_file {
+        anyhow::ensure!(
+            cli.token.is_empty(),
+            "choose ORBIT_TOKEN or ORBIT_TOKEN_FILE"
+        );
+        orbit::governance::SecretRef::File { path }.resolve()?
+    } else {
+        cli.token
+    };
+    let client = Client::new(cli.url, token)?;
     let value = match cli.command {
         Commands::PackageDigest { manifest } => {
             let manifest: orbit::registry::Manifest =
@@ -232,6 +268,22 @@ async fn main() -> Result<()> {
         Commands::Identity => client.get("/identity").await?,
         Commands::Projects => client.get("/projects").await?,
         Commands::Protocol => client.get("/protocol").await?,
+        Commands::Health { live } => {
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                client.get(if live { "/healthz" } else { "/readyz" }),
+            )
+            .await??
+        }
+        Commands::DrainWorker { worker_id, resume } => {
+            anyhow::ensure!(orbit::agent::valid_name(&worker_id), "invalid worker ID");
+            client
+                .post(
+                    &format!("/workers/{worker_id}/drain"),
+                    &serde_json::json!({"draining":!resume}),
+                )
+                .await?
+        }
         Commands::RunPackage {
             digest,
             definition,
@@ -320,16 +372,28 @@ async fn main() -> Result<()> {
         }
         Commands::Server {
             database_url,
+            database_url_file,
             config,
             artifacts,
             listen,
             lease_seconds,
+            shutdown_grace_seconds,
         } => {
             let config: Config = serde_json::from_slice(&tokio::fs::read(config).await?)?;
+            let database_url = if let Some(path) = database_url_file {
+                orbit::governance::SecretRef::File { path }.resolve()?
+            } else {
+                database_url.context("database URL required")?
+            };
             let engine = Engine::connect(&database_url, artifacts, lease_seconds).await?;
             let app = App::new(engine.clone(), config)?;
             let listener = tokio::net::TcpListener::bind(&listen).await?;
-            eprintln!("Orbit listening on {listen}");
+            orbit::ops::log(
+                "server_started",
+                serde_json::json!({"listen":listen,"version":env!("CARGO_PKG_VERSION")}),
+            );
+            let operations = app.operations.clone();
+            let reconciliation_ops = operations.clone();
             let reconciler = tokio::spawn(async move {
                 loop {
                     #[cfg(feature = "fault-injection")]
@@ -337,18 +401,41 @@ async fn main() -> Result<()> {
                         tokio::time::sleep(Duration::from_millis(250)).await;
                         continue;
                     }
-                    if let Err(error) = engine.reconcile().await {
-                        eprintln!("reconciliation failed: {error}");
+                    let success = engine.reconcile().await.is_ok();
+                    reconciliation_ops.reconciliation(success);
+                    if !success {
+                        orbit::ops::log("reconciliation_failed", serde_json::json!({}));
                     }
                     tokio::time::sleep(Duration::from_millis(250)).await;
                 }
             });
-            axum::serve(listener, api::router(app))
-                .with_graceful_shutdown(async {
-                    let _ = tokio::signal::ctrl_c().await;
-                })
-                .await?;
+            let (stop, signal) = tokio::sync::watch::channel(false);
+            let signals = tokio::spawn(async move {
+                let result = orbit::ops::shutdown_signal().await;
+                operations.stop();
+                orbit::ops::log(
+                    "server_draining",
+                    serde_json::json!({"signal_listener_ok":result.is_ok()}),
+                );
+                let _ = stop.send(true);
+            });
+            use std::future::IntoFuture;
+            let serving = axum::serve(listener, api::router(app))
+                .with_graceful_shutdown(orbit::ops::stopped(signal.clone()))
+                .into_future();
+            tokio::pin!(serving);
+            tokio::select! {
+                result = &mut serving => { result?; },
+                _ = orbit::ops::stopped(signal) => {
+                    match tokio::time::timeout(Duration::from_secs(shutdown_grace_seconds), &mut serving).await {
+                        Ok(result) => result?,
+                        Err(_) => orbit::ops::log("server_drain_deadline", serde_json::json!({})),
+                    }
+                }
+            }
             reconciler.abort();
+            signals.abort();
+            orbit::ops::log("server_stopped", serde_json::json!({}));
             return Ok(());
         }
         Commands::Validate { definition } => {
@@ -471,8 +558,37 @@ async fn main() -> Result<()> {
             capability,
             workspaces,
             once,
+            shutdown_grace_seconds,
+            agent_runtime,
         } => {
-            worker::run(client, capability, workspaces, once).await?;
+            let mut client = client;
+            if let Some(path) = agent_runtime {
+                anyhow::ensure!(
+                    capability == "agent.run",
+                    "--agent-runtime requires agent.run"
+                );
+                let runtime: orbit::command_agent::CommandAgent =
+                    serde_json::from_slice(&tokio::fs::read(path).await?)?;
+                runtime.validate()?;
+                client.command_agent = Some(std::sync::Arc::new(runtime));
+            }
+            let (stop, signal) = tokio::sync::watch::channel(false);
+            let signals = tokio::spawn(async move {
+                let _ = orbit::ops::shutdown_signal().await;
+                orbit::ops::log("worker_draining", serde_json::json!({}));
+                let _ = stop.send(true);
+            });
+            let result = worker::run_until(
+                client,
+                capability,
+                workspaces,
+                once,
+                signal,
+                Duration::from_secs(shutdown_grace_seconds),
+            )
+            .await;
+            signals.abort();
+            result?;
             return Ok(());
         }
         Commands::Artifact {

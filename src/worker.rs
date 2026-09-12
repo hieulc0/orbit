@@ -20,6 +20,7 @@ pub struct Client {
     pub token: String,
     http: reqwest::Client,
     local_artifacts: Option<PathBuf>,
+    pub command_agent: Option<std::sync::Arc<crate::command_agent::CommandAgent>>,
 }
 impl Client {
     pub fn new(url: String, token: String) -> Result<Self> {
@@ -41,6 +42,7 @@ impl Client {
                 .timeout(Duration::from_secs(30))
                 .build()?,
             local_artifacts: None,
+            command_agent: None,
         })
     }
     pub async fn post<T: Serialize + ?Sized>(&self, path: &str, body: &T) -> Result<Value> {
@@ -224,47 +226,116 @@ pub async fn execute_local(
 }
 
 pub async fn run(client: Client, capability: String, root: PathBuf, once: bool) -> Result<()> {
+    let (_stop, signal) = tokio::sync::watch::channel(false);
+    run_until(
+        client,
+        capability,
+        root,
+        once,
+        signal,
+        Duration::from_secs(30),
+    )
+    .await
+}
+
+pub async fn run_until(
+    client: Client,
+    capability: String,
+    root: PathBuf,
+    once: bool,
+    signal: tokio::sync::watch::Receiver<bool>,
+    grace: Duration,
+) -> Result<()> {
     ensure!(
-        ["repository.code", "repository.test", "container.run"].contains(&capability.as_str()),
+        [
+            "repository.code",
+            "repository.test",
+            "container.run",
+            "agent.run"
+        ]
+        .contains(&capability.as_str()),
         "unsupported built-in worker capability"
     );
     tokio::fs::create_dir_all(&root).await?;
     let root = root.canonicalize()?;
-    client
-        .post(
-            "/worker/register",
-            &Registration {
-                protocol_version: "orbit/v0".into(),
-                capabilities: vec![capability.clone()],
-                recovery_policies: vec![
-                    Recovery::RestartFromInputs,
-                    Recovery::RequiresIntervention,
-                ],
-            },
-        )
-        .await?;
+    let mut capabilities = vec![capability.clone()];
+    if capability == "agent.run" {
+        let runtime = client
+            .command_agent
+            .as_ref()
+            .context("configure --agent-runtime for agent.run")?;
+        runtime.validate()?;
+        capabilities.push(runtime.binding.runtime.clone());
+    }
+    let registration = Registration {
+        protocol_version: "orbit/v0".into(),
+        capabilities,
+        recovery_policies: vec![Recovery::RestartFromInputs, Recovery::RequiresIntervention],
+    };
+    let registering = client.post("/worker/register", &registration);
+    tokio::select! {
+        _ = crate::ops::stopped(signal.clone()) => return Ok(()),
+        registered = registering => { registered?; },
+    }
     loop {
+        if *signal.borrow() {
+            return Ok(());
+        }
         let claim = Claim {
             request_id: id(),
             capability: capability.clone(),
         };
         // A failed claim request retains its identity until its response is known.
         let response = loop {
-            match client.post("/worker/claim", &claim).await {
+            let response = tokio::select! {
+                biased;
+                _ = crate::ops::stopped(signal.clone()) => return Ok(()),
+                response = client.post("/worker/claim", &claim) => response,
+            };
+            match response {
                 Ok(value) => break value,
-                Err(error) => {
-                    eprintln!("claim unavailable: {error}");
-                    sleep(Duration::from_secs(1)).await;
+                Err(_) => {
+                    crate::ops::log("claim_unavailable", json!({}));
+                    tokio::select! {
+                        _ = crate::ops::stopped(signal.clone()) => return Ok(()),
+                        _ = sleep(Duration::from_secs(1)) => {},
+                    }
                 }
             }
         };
         if response["status"] == "no_work" {
-            sleep(Duration::from_millis(500)).await;
+            tokio::select! {
+                _ = crate::ops::stopped(signal.clone()) => return Ok(()),
+                _ = sleep(Duration::from_millis(500)) => {},
+            }
             continue;
         }
+        if *signal.borrow() {
+            return Ok(());
+        }
         let assignment: Assignment = serde_json::from_value(response["assignment"].clone())?;
-        if let Err(error) = execute(&client, &assignment, &root).await {
-            eprintln!("attempt {} stopped: {error}", assignment.attempt_id);
+        let execution = execute(&client, &assignment, &root);
+        tokio::pin!(execution);
+        let result = tokio::select! {
+            result = &mut execution => result,
+            _ = crate::ops::stopped(signal.clone()) => {
+                match tokio::time::timeout(grace, &mut execution).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        crate::ops::log("worker_drain_deadline", json!({"attempt_id":assignment.attempt_id}));
+                        // Dropping execution kills its owned process group (or
+                        // closes the OCI supervisor lifeline). Never fabricate
+                        // completion after an uncertain external effect.
+                        return Ok(());
+                    }
+                }
+            }
+        };
+        if result.is_err() {
+            crate::ops::log(
+                "attempt_stopped",
+                json!({"attempt_id":assignment.attempt_id}),
+            );
         }
         if once {
             return Ok(());
@@ -312,7 +383,16 @@ pub async fn execute(client: &Client, assignment: &Assignment, root: &Path) -> R
                                 category: "infrastructure_failure".into(),
                                 code: "worker_execution_error".into(),
                                 message: error.to_string(),
-                                side_effect_status: "none".into(),
+                                side_effect_status: if assignment.plan.definition.steps
+                                    [&assignment.step]
+                                    .uses
+                                    == "agent.run"
+                                {
+                                    "unknown"
+                                } else {
+                                    "none"
+                                }
+                                .into(),
                             }),
                         },
                     )
@@ -395,6 +475,14 @@ async fn perform(
     .await?;
     if a.plan.definition.steps[&a.step].uses == "container.run" {
         return crate::container::perform(client, a, &directory, &home).await;
+    }
+    if a.plan.definition.steps[&a.step].uses == "agent.run" {
+        return client
+            .command_agent
+            .as_ref()
+            .context("agent runtime missing")?
+            .perform(client, a, &directory, &home)
+            .await;
     }
     let base = &a.plan.definition.inputs.base_revision;
     checked(
@@ -551,7 +639,7 @@ async fn command(
     home: &Path,
     a: &Assignment,
 ) -> Result<(Option<i32>, Vec<u8>, Vec<u8>, bool)> {
-    command_inner(spec, workspace, home, a, false).await
+    command_inner(spec, workspace, home, a, false, &Default::default()).await
 }
 pub(crate) async fn supervised_command(
     spec: &CommandSpec,
@@ -559,7 +647,16 @@ pub(crate) async fn supervised_command(
     home: &Path,
     a: &Assignment,
 ) -> Result<(Option<i32>, Vec<u8>, Vec<u8>, bool)> {
-    command_inner(spec, workspace, home, a, true).await
+    command_inner(spec, workspace, home, a, true, &Default::default()).await
+}
+pub(crate) async fn agent_command(
+    spec: &CommandSpec,
+    workspace: &Path,
+    home: &Path,
+    a: &Assignment,
+    environment: &std::collections::BTreeMap<String, String>,
+) -> Result<(Option<i32>, Vec<u8>, Vec<u8>, bool)> {
+    command_inner(spec, workspace, home, a, false, environment).await
 }
 async fn command_inner(
     spec: &CommandSpec,
@@ -567,6 +664,7 @@ async fn command_inner(
     home: &Path,
     a: &Assignment,
     supervised: bool,
+    environment: &std::collections::BTreeMap<String, String>,
 ) -> Result<(Option<i32>, Vec<u8>, Vec<u8>, bool)> {
     spec.validate()?;
     let cwd = workspace.join(&spec.cwd).canonicalize()?;
@@ -578,6 +676,7 @@ async fn command_inner(
     cmd.args(&spec.argv[1..])
         .current_dir(cwd)
         .env_clear()
+        .envs(environment)
         .env(
             "PATH",
             std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),

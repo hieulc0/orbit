@@ -203,6 +203,8 @@ pub const ACTIONS: &[&str] = &[
     "run.approve",
     "artifact.read",
     "worker.read",
+    "worker.write",
+    "system.read",
     "queue.read",
     "limits.read",
     "limits.write",

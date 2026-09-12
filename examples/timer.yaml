@@ -1,0 +1,14 @@
+apiVersion: orbit/v1
+kind: Definition
+metadata:
+  name: first-durable-timer
+inputs:
+  task: Wait durably, without a worker or repository.
+steps:
+  pause:
+    uses: engine.timer
+    delay_seconds: 1
+    timeout_seconds: 60
+    max_attempts: 1
+    retry_backoff_seconds: 0
+    recovery_policy: restart_from_inputs

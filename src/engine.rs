@@ -42,6 +42,9 @@ impl Engine {
         sqlx::raw_sql(include_str!("../migrations/0005_registry.sql"))
             .execute(&mut *migration)
             .await?;
+        sqlx::raw_sql(include_str!("../migrations/0006_operations.sql"))
+            .execute(&mut *migration)
+            .await?;
         migration.commit().await?;
         Ok(Self {
             pool,
@@ -280,6 +283,15 @@ impl Engine {
         }
         if let Some(value) = request(&mut tx, &actor, &claim.request_id, &payload).await? {
             return Ok(value);
+        }
+        let draining: Option<bool> =
+            sqlx::query_scalar("SELECT draining FROM orbit_workers WHERE id=$1")
+                .bind(worker)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if draining == Some(true) {
+            tx.commit().await?;
+            return Ok(json!({"status":"no_work","draining":true}));
         }
         // Each run is an aggregate. Locking it fences state, dependencies and history together.
         let rows = sqlx::query("SELECT document FROM orbit_runs WHERE state IN ('ACCEPTED','RUNNING','NEEDS_INTERVENTION','CANCEL_REQUESTED') ORDER BY created_at,id").fetch_all(&mut *tx).await?;
@@ -911,9 +923,21 @@ impl Engine {
         tx.commit().await?;
         Ok(())
     }
+    pub async fn set_worker_draining(&self, worker: &str, draining: bool) -> Result<Value> {
+        let mut tx = self.pool.begin().await?;
+        coordinate(&mut tx).await?;
+        let updated = sqlx::query("UPDATE orbit_workers SET draining=$2 WHERE id=$1")
+            .bind(worker)
+            .bind(draining)
+            .execute(&mut *tx)
+            .await?;
+        ensure!(updated.rows_affected() == 1, "worker not registered");
+        tx.commit().await?;
+        Ok(json!({"status":"accepted","worker_id":worker,"draining":draining}))
+    }
     pub async fn workers(&self) -> Result<Value> {
-        let rows = sqlx::query("SELECT w.id,w.profile,w.last_seen::text AS last_seen, extract(epoch FROM clock_timestamp()-w.last_seen)::bigint AS idle_seconds, COALESCE((SELECT jsonb_agg(jsonb_build_object('run_id',r.id,'task_id',t->>'id','step',t->>'step','attempt_id',a->>'id','generation',a->'generation','state',a->>'state','lease_expires_at',a->'lease_expires_at','resources',r.document->'plan'->'definition'->'steps'->(t->>'step')->'resources')) FROM orbit_runs r CROSS JOIN LATERAL jsonb_array_elements(r.document->'tasks') t CROSS JOIN LATERAL jsonb_array_elements(t->'attempts') a WHERE a->>'worker_id'=w.id AND a->>'state' IN ('CLAIMED','RUNNING') AND (a->>'lease_expires_at')::bigint > extract(epoch FROM clock_timestamp())*1000),'[]'::jsonb) AS active_attempts FROM orbit_workers w ORDER BY w.id").fetch_all(&self.pool).await?;
-        Ok(json!(rows.into_iter().map(|r| json!({"id":r.get::<String,_>("id"), "profile":r.get::<Value,_>("profile"), "last_seen":r.get::<String,_>("last_seen"), "idle_seconds":r.get::<i64,_>("idle_seconds"), "active_attempts":r.get::<Value,_>("active_attempts")})).collect::<Vec<_>>()))
+        let rows = sqlx::query("SELECT w.id,w.profile,w.draining,w.last_seen::text AS last_seen, extract(epoch FROM clock_timestamp()-w.last_seen)::bigint AS idle_seconds, COALESCE((SELECT jsonb_agg(jsonb_build_object('run_id',r.id,'task_id',t->>'id','step',t->>'step','attempt_id',a->>'id','generation',a->'generation','state',a->>'state','lease_expires_at',a->'lease_expires_at','resources',r.document->'plan'->'definition'->'steps'->(t->>'step')->'resources')) FROM orbit_runs r CROSS JOIN LATERAL jsonb_array_elements(r.document->'tasks') t CROSS JOIN LATERAL jsonb_array_elements(t->'attempts') a WHERE a->>'worker_id'=w.id AND a->>'state' IN ('CLAIMED','RUNNING') AND (a->>'lease_expires_at')::bigint > extract(epoch FROM clock_timestamp())*1000),'[]'::jsonb) AS active_attempts FROM orbit_workers w ORDER BY w.id").fetch_all(&self.pool).await?;
+        Ok(json!(rows.into_iter().map(|r| json!({"id":r.get::<String,_>("id"), "profile":r.get::<Value,_>("profile"), "draining":r.get::<bool,_>("draining"), "last_seen":r.get::<String,_>("last_seen"), "idle_seconds":r.get::<i64,_>("idle_seconds"), "active_attempts":r.get::<Value,_>("active_attempts")})).collect::<Vec<_>>()))
     }
     pub async fn queues(&self) -> Result<Value> {
         let documents: Vec<Value> = sqlx::query_scalar("SELECT document FROM orbit_runs WHERE state IN ('ACCEPTED','RUNNING','NEEDS_INTERVENTION','CANCEL_REQUESTED')").fetch_all(&self.pool).await?;

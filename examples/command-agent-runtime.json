@@ -1,0 +1,19 @@
+{
+  "binding_name": "command-demo",
+  "binding": {
+    "model": "offline-demo/revision-1",
+    "runtime": "agent.command-demo-v1",
+    "tools": {},
+    "permissions": [],
+    "max_budget": {"tokens": 1000, "cost_microusd": 0, "calls": 2},
+    "max_delegations": 0
+  },
+  "command": {
+    "argv": ["/usr/bin/python3", "/absolute/path/to/orbit/examples/command-agent.py"],
+    "cwd": ".",
+    "timeout_seconds": 30
+  },
+  "tokens_per_call": 500,
+  "cost_microusd_per_call": 0,
+  "environment": {}
+}
