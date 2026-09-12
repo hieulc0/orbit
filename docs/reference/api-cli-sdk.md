@@ -9,6 +9,11 @@ metadata. The [private registry](packages.md) now supports signed
 capability descriptors and packaged definitions; worker provisioning remains
 external to the server.
 
+The [remote coding adapter](../guides/remote-coding.md) adds worker
+`--execution-config`, optional repository-step execution requirements, pinned
+operator profiles, remote repository bindings and tracked invocation receipts.
+It uses the same HTTP/lease boundary, not a second dispatch API.
+
 ## Compatibility
 
 Existing request fields, enum spellings and successful response shapes are retained.

@@ -54,6 +54,9 @@ accounts reservations, not actual provider billing. A subprocess is trusted code
 not a network/security sandbox: it can violate the contract or leak credentials.
 This single-call adapter rejects tools. Multi-call/tool-loop runtimes should use
 the [SDK reservation protocol](../reference/agents.md), reserving each call.
+For a built-in multi-turn repository workflow with isolated tools, use the
+[remote coding adapter](remote-coding.md); this legacy single-call command contract
+is unchanged.
 
 Before real use, explicitly choose a provider/account and qualify its budget,
 timeout/idempotency, secret-handling and uncertain-dispatch behavior. Offline

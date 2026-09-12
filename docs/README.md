@@ -10,6 +10,7 @@ not the source of current setup instructions.
 - [Container execution and artifact providers](reference/compute-artifacts.md)
 - [Agents, budgets, delegation and approval](reference/agents.md)
 - [Command agent runtime](guides/command-agent.md)
+- [Remote coding worker and OCI tools](guides/remote-coding.md)
 - [Operations console and definition studio](guides/console.md)
 - [Timers and signals](reference/timers-signals.md)
 - [Child runs, fan-out and limits](reference/children-limits.md)
@@ -30,4 +31,5 @@ not the source of current setup instructions.
 - [Testing and CI](development/testing.md), [dogfooding](development/dogfooding.md)
 - [Agent onboarding and repository skills](development/agents.md)
 - [Current roadmap](ROADMAP.md), [alpha qualification](operations/qualification.md)
+- [Remote coding qualification](operations/remote-coding-qualification.md)
 - [Historical records](archive/README.md)

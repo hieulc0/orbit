@@ -1,0 +1,47 @@
+{
+  "profiles": [
+    {
+      "backend": "rootless_podman",
+      "image": "docker.io/library/alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b"
+    }
+  ],
+  "repository_ids": ["approved-repository"],
+  "credentials": {
+    "repository-read": {
+      "secret": {"provider": "file", "path": "/absolute/private/git-token"},
+      "purpose": "repository",
+      "binding": "approved-repository",
+      "audience": "https://git.example.invalid/owner/repository.git"
+    },
+    "model-api": {
+      "secret": {"provider": "file", "path": "/absolute/private/model-token"},
+      "purpose": "model",
+      "binding": "coding-v1",
+      "audience": "https://api.openai.com/v1/responses"
+    }
+  },
+  "coding_agent": {
+    "binding_name": "coding-v1",
+    "binding": {
+      "model": "REPLACE_WITH_PINNED_MODEL_REVISION",
+      "runtime": "agent.coding-responses-v1",
+      "tools": {
+        "read_file": "orbit.workspace.read_file/v1",
+        "write_file": "orbit.workspace.write_file/v1",
+        "shell": "orbit.workspace.shell/v1"
+      },
+      "permissions": ["workspace.read", "workspace.write", "shell.execute"],
+      "max_budget": {"tokens": 1200000, "cost_microusd": 16000000, "calls": 32},
+      "max_delegations": 0
+    },
+    "endpoint": "https://api.openai.com/v1/responses",
+    "credential": "model-api",
+    "max_turns": 16,
+    "max_input_bytes": 65536,
+    "max_output_tokens": 4096,
+    "tokens_per_call": 73728,
+    "cost_microusd_per_call": 1000000,
+    "call_timeout_seconds": 60,
+    "tool_timeout_seconds": 120
+  }
+}

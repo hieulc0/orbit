@@ -15,6 +15,7 @@ fn strict_definition_and_immutable_plan() {
     let definition = definition();
     definition.validate().unwrap();
     let repository = RepositoryBinding {
+        remote: None,
         path: "/tmp/fixture".into(),
         coding_command: CommandSpec {
             argv: vec!["agent".into()],
@@ -90,6 +91,7 @@ fn graph_validation_and_binding_permissions() {
     graph.steps.insert("0-join".into(), join);
     graph.validate().unwrap();
     let repository = RepositoryBinding {
+        remote: None,
         path: "/tmp/fixture".into(),
         coding_command: CommandSpec {
             argv: vec!["agent".into()],
@@ -193,6 +195,7 @@ fn child_templates_and_execution_tree_bounds_are_validated() {
     parent.max_concurrency = Some(2);
     parent.validate().unwrap();
     let repository = RepositoryBinding {
+        remote: None,
         path: "/tmp/fixture".into(),
         coding_command: CommandSpec {
             argv: vec!["agent".into()],

@@ -62,6 +62,7 @@ fn budget_reservations_are_bounded_and_replay_safe() {
     let spec = def.steps["planner"].agent.as_ref().unwrap();
     let mut usage = Usage::default();
     let mut call = CallReservation {
+        request_digest: None,
         call_id: "call-1".into(),
         tokens: 600,
         cost_microusd: 5000,

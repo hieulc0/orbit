@@ -235,6 +235,15 @@ pub async fn supervise(assignment_path: &Path) -> Result<i32> {
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
+    run_supervised(command, &runtime, &name, step.timeout_seconds).await
+}
+
+pub(crate) async fn run_supervised(
+    mut command: Command,
+    runtime: &str,
+    name: &str,
+    timeout: u64,
+) -> Result<i32> {
     let mut child = command
         .spawn()
         .context("cannot start container runtime; provision runtime and pinned image")?;
@@ -250,17 +259,21 @@ pub async fn supervise(assignment_path: &Path) -> Result<i32> {
     let result = tokio::select! {
         result = child.wait() => result.map(|s| s.code().unwrap_or(1)),
         result = disconnected => result.map(|_| 125),
-        _ = tokio::time::sleep(Duration::from_secs(step.timeout_seconds)) => Ok(124),
+        _ = tokio::time::sleep(Duration::from_secs(timeout)) => Ok(124),
     };
     let _ = child.kill().await;
     // Docker may finish a create after its CLI has disconnected. Retry cleanup
     // for a bounded grace period; report daemon errors without claiming a stop.
     let mut stopped = false;
     for _ in 0..10 {
+        let mut cleanup = Command::new(runtime);
+        if runtime == "podman" {
+            cleanup.args(["--remote=false", "--cgroup-manager=cgroupfs"]);
+        }
         let removed = tokio::time::timeout(
             Duration::from_secs(5),
-            Command::new(&runtime)
-                .args(["rm", "--force", &name])
+            cleanup
+                .args(["rm", "--force", name])
                 .stdin(Stdio::null())
                 .kill_on_drop(true)
                 .output(),

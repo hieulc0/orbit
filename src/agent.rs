@@ -191,15 +191,32 @@ pub struct CallReservation {
     /// None is a model invocation. Tool calls must name an allowed bound tool.
     pub tool: Option<String>,
     pub permissions: Vec<String>,
+    /// Tracked dispatch intent for the coding runtime; absent in legacy reservations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_digest: Option<String>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CallReceipt {
+    pub call_id: String,
+    pub attempt_id: String,
+    pub result_digest: String,
+    pub external_id: Option<String>,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Usage {
     pub tokens: u64,
     pub cost_microusd: u64,
     pub reservations: BTreeMap<String, CallReservation>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub receipts: BTreeMap<String, CallReceipt>,
 }
 impl Usage {
     pub fn reserve(&mut self, spec: &AgentSpec, call: &CallReservation) -> Result<bool> {
+        ensure!(
+            call.request_digest.as_deref().is_none_or(valid_digest),
+            "invalid invocation request digest"
+        );
         ensure!(
             valid_name(&call.call_id) && names(&call.permissions),
             "invalid call reservation"
@@ -238,6 +255,54 @@ impl Usage {
         self.reservations.insert(call.call_id.clone(), call.clone());
         Ok(true)
     }
+    pub fn finish(&mut self, receipt: &CallReceipt) -> Result<bool> {
+        ensure!(
+            self.reservations
+                .get(&receipt.call_id)
+                .is_some_and(|r| r.request_digest.is_some()),
+            "tracked invocation reservation missing"
+        );
+        ensure!(
+            receipt
+                .call_id
+                .starts_with(&format!("{}-", receipt.attempt_id))
+                && valid_digest(&receipt.result_digest)
+                && receipt
+                    .external_id
+                    .as_deref()
+                    .is_none_or(|id| !id.is_empty()
+                        && id.len() <= 256
+                        && id
+                            .bytes()
+                            .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))),
+            "invalid invocation receipt"
+        );
+        if let Some(previous) = self.receipts.get(&receipt.call_id) {
+            ensure!(previous == receipt, "conflict: invocation receipt changed");
+            return Ok(false);
+        }
+        self.receipts
+            .insert(receipt.call_id.clone(), receipt.clone());
+        Ok(true)
+    }
+    pub fn pending_model_call(&self) -> bool {
+        self.reservations.values().any(|r| {
+            r.request_digest.is_some()
+                && r.tool.is_none()
+                && !self.receipts.contains_key(&r.call_id)
+        })
+    }
+    pub fn pending_attempt_call(&self, attempt_id: &str) -> bool {
+        self.reservations.values().any(|r| {
+            r.request_digest.is_some()
+                && r.call_id.starts_with(&format!("{attempt_id}-"))
+                && !self.receipts.contains_key(&r.call_id)
+        })
+    }
+}
+
+fn valid_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|c| c.is_ascii_hexdigit())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -629,9 +629,6 @@ signals
 workers
 worker_leases
 
-projects
-environments
-
 artifact_metadata
 ```
 
@@ -650,6 +647,9 @@ PostgreSQL
 
 Object storage becomes required only when the chosen workload needs
 external artifact storage.
+
+Project/environment storage is optional and follows a concrete product requirement;
+it is not a prerequisite for run ownership or worker authorization.
 
 ------------------------------------------------------------------------
 
@@ -944,6 +944,12 @@ Workers register capabilities:
 
 The scheduler routes work based on capabilities and policy.
 
+Execution requirements also describe network policy, filesystem policy, credential
+requirements and a logical isolation class. Operator policy selects an eligible
+backend that satisfies every requirement. Definitions do not select gVisor,
+Firecracker or another infrastructure implementation. An unsupported requirement
+must fail closed; it cannot silently fall back to weaker execution.
+
 Potential worker types:
 
 ``` text
@@ -1014,6 +1020,12 @@ Orbit provides durability around the agents.
 
 An agent runtime remains responsible for reasoning, model interaction,
 tool loops, and agent-specific execution.
+
+The first live coding runtime keeps model interaction in a trusted worker and
+repository tools in a disposable OCI workspace. Repository fetching and model
+calls have separately authorized network/credential access. Networkless tools
+receive neither provider keys nor Orbit lease credentials. Independent tests
+apply accepted patch artifacts to a fresh base workspace before human review.
 
 ------------------------------------------------------------------------
 
@@ -1104,6 +1116,14 @@ compute backend.
 The Definition should express execution requirements rather than
 hard-code infrastructure where possible.
 
+Isolation is a first-class execution requirement, separate from authorization.
+The first supported profile targets trusted workloads with rootless Podman/OCI.
+An operator may later qualify gVisor/runsc for a `sandboxed` class or Firecracker
+microVMs for an `untrusted` class. These are candidate policy mappings, not
+universal security guarantees or an obligation to implement all backends.
+Each class needs a defined threat model and evidence. The backend must enforce
+network, filesystem and resource restrictions as well as the isolation class.
+
 ------------------------------------------------------------------------
 
 # 24. Artifacts
@@ -1118,7 +1138,7 @@ Conceptually:
 ``` text
 Artifact
 ├── id
-├── project_id
+├── optional scope association
 ├── run_id
 ├── producing_step
 ├── provider
@@ -1437,37 +1457,29 @@ store.
 A provider/binding abstraction can be introduced once the basic engine
 is proven.
 
+Authorization determines which tools, credentials, artifacts, budgets and
+delegation a task may use. Containment limits what its processes can physically
+access or affect. Orbit checks authorization at admission and dispatch; execution
+backends enforce filesystem, network, process and resource restrictions. Shell or
+filesystem permissions do not constitute containment. Execution isolation and
+tenant identity management are separate concerns with separate acceptance gates.
+
 ------------------------------------------------------------------------
 
-# 33. Multi-Tenancy and Projects
+# 33. Scoping and Ownership
 
-Do not overbuild tenancy before the execution engine is correct.
+Orbit preserves authenticated run attribution, worker admission, credential-use
+authorization and artifact access boundaries. These contracts remain compatible
+with future namespace or project scoping without requiring a tenant hierarchy.
 
-A reasonable resource model later is:
+Full tenancy, organization management, RBAC administration, SSO and hostile
+multi-tenant identity management are not current kernel requirements. Introduce
+them only for a concrete product requirement.
 
-``` text
-Organization
-  └── Project
-       ├── Definitions
-       ├── Runs
-       ├── Environments
-       ├── Artifacts
-       ├── Bindings
-       └── Policies
-```
-
-The core engine should carry an immutable execution scope such as:
-
-``` text
-organization_id
-project_id
-environment_id
-run_id
-principal_id
-```
-
-Workers must not be allowed to redefine that scope through arbitrary
-Step parameters.
+Existing optional organization/project/environment scopes and authorization
+contracts remain supported. Deferring further tenancy work does not remove
+enforcement or change accepted plans. Workers cannot redefine accepted scope
+through arbitrary Step parameters. Attribution alone is not an access grant.
 
 ------------------------------------------------------------------------
 
@@ -1802,6 +1814,10 @@ Orbit is a new project.
 
 # 43. Development Roadmap
 
+The phases below describe the original development sequence. Active priorities,
+implemented support and remaining acceptance gates are in [the current roadmap](../ROADMAP.md).
+Historical phase records do not make future tenancy or infrastructure mandatory.
+
 ## Phase 0 --- Semantics Before Code
 
 Define formally:
@@ -1933,17 +1949,19 @@ Only now implement:
 
 The graph editor edits the canonical Definition.
 
-## Phase 8 --- Governance
+## Phase 8 --- Ownership and Authorization
 
 Implement:
 
--   organizations/projects;
--   environments;
--   RBAC;
+-   authenticated run attribution;
+-   worker and artifact authorization;
 -   service accounts;
 -   secret/binding providers;
 -   policies;
 -   audit controls.
+
+Existing optional scoped governance is retained for compatibility. Further tenant
+hierarchy, RBAC administration and SSO require a concrete product requirement.
 
 ## Phase 9 --- Ecosystem
 
@@ -2030,6 +2048,12 @@ If yes, integrate rather than recreate.
 
 Prefer capability/resource requirements over infrastructure-specific
 details.
+
+### Does this require a new abstraction?
+
+Prefer the current execution contract when it can satisfy the selected workload.
+Add isolation backends, credential providers and tenant models only for a defined
+requirement; do not build a universal policy or plugin framework preemptively.
 
 ### Does this require arbitrary workflow code?
 

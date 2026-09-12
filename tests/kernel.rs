@@ -27,6 +27,8 @@ mod phase4;
 mod phase5;
 #[path = "kernel/registry.rs"]
 mod registry;
+#[path = "kernel/remote_coding.rs"]
+mod remote_coding;
 #[path = "kernel/web.rs"]
 mod web;
 
@@ -98,6 +100,7 @@ impl Fixture {
         std::fs::write(&definition_path, serde_yaml::to_string(&definition)?)?;
         let definition = Definition::parse(&std::fs::read_to_string(definition_path)?)?;
         let binding = RepositoryBinding {
+            remote: None,
             path: repo.to_string_lossy().into(),
             coding_command: CommandSpec {
                 argv: vec![

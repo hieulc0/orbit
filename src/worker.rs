@@ -21,6 +21,7 @@ pub struct Client {
     http: reqwest::Client,
     local_artifacts: Option<PathBuf>,
     pub command_agent: Option<std::sync::Arc<crate::command_agent::CommandAgent>>,
+    pub execution_config: Option<std::sync::Arc<crate::execution::WorkerConfig>>,
 }
 impl Client {
     pub fn new(url: String, token: String) -> Result<Self> {
@@ -43,6 +44,7 @@ impl Client {
                 .build()?,
             local_artifacts: None,
             command_agent: None,
+            execution_config: None,
         })
     }
     pub async fn post<T: Serialize + ?Sized>(&self, path: &str, body: &T) -> Result<Value> {
@@ -259,6 +261,15 @@ pub async fn run_until(
     tokio::fs::create_dir_all(&root).await?;
     let root = root.canonicalize()?;
     let mut capabilities = vec![capability.clone()];
+    if let Some(config) = &client.execution_config {
+        config.validate()?;
+        capabilities.push(crate::execution::CAPABILITY.into());
+        if capability == "repository.code"
+            && let Some(agent) = &config.coding_agent
+        {
+            capabilities.push(agent.binding.runtime.clone());
+        }
+    }
     if capability == "agent.run" {
         let runtime = client
             .command_agent
@@ -457,6 +468,10 @@ async fn perform(
     tokio::fs::create_dir(&directory)
         .await
         .context("attempt workspace already exists or cannot be created")?;
+    if a.plan.definition.steps[&a.step].execution.is_some() {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).await?;
+    }
     let repo = directory.join("repository");
     let home = directory.join("home");
     tokio::fs::create_dir(&home).await?;
@@ -473,6 +488,9 @@ async fn perform(
         serde_json::to_vec_pretty(&saved)?,
     )
     .await?;
+    if a.plan.definition.steps[&a.step].execution.is_some() {
+        return crate::workspace::perform(client, a, &directory, &home).await;
+    }
     if a.plan.definition.steps[&a.step].uses == "container.run" {
         return crate::container::perform(client, a, &directory, &home).await;
     }
@@ -623,7 +641,7 @@ async fn checked(args: &[&str], cwd: &Path, home: &Path, a: &Assignment) -> Resu
     );
     Ok(out)
 }
-struct ProcessGroup(u32);
+pub(crate) struct ProcessGroup(pub(crate) u32);
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
         // Only the process group created for this child, never the worker's own group.
@@ -699,7 +717,15 @@ async fn command_inner(
         })
         .kill_on_drop(!supervised);
     if supervised {
-        let runtime = crate::container::runtime()?;
+        let runtime = if spec
+            .argv
+            .get(1)
+            .is_some_and(|arg| arg == "workspace-supervisor")
+        {
+            "podman".to_string()
+        } else {
+            crate::container::runtime()?
+        };
         cmd.env("ORBIT_CONTAINER_RUNTIME", &runtime);
         if runtime == "podman" {
             // Only the trusted runtime supervisor needs the operator's rootless

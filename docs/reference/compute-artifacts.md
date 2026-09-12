@@ -5,6 +5,31 @@ Definitions containing only compute or engine steps need only `inputs.task`;
 repository steps still require a repository binding and a full Git revision.
 Existing v0 definitions retain their validation and serialized plan digests.
 
+## Repository execution requirements
+
+`repository.code` and `repository.test` may opt into `execution` requirements:
+`isolation: trusted`, `network: none`, `filesystem: workspace`, with positive
+CPU/memory in the existing `resources` fields and no GPU. Private remote bindings
+and coding-agent steps require this containment. The server's `execution_profiles`
+maps the logical class to a digest-pinned `rootless_podman` image; the selected
+profile enters the plan digest. The worker checks its own exact profile and
+repository allowlists. Missing profiles and unsupported `sandboxed`/`untrusted`
+classes fail closed, without fallback. Structural definition validation alone
+does not establish operator profile availability; submission compiles the binding.
+
+The first implementation runs tools in disposable OCI containers on the host's
+rootless Podman, not Docker-in-Docker. The trusted worker handles Git/model network
+access outside the tool container. It publishes an attempt/plan/profile/resource
+bound `execution_report`; successful completion checks its provenance. See the
+[remote coding guide](../guides/remote-coding.md) for setup, credential authority,
+mounts, threat model and recovery. This field is deliberately limited to repository
+execution, not a new general runtime plugin API. Existing `container.run` semantics
+below and legacy repository commands without this field remain unchanged.
+
+Future operator mappings may use gVisor/runsc for `sandboxed` and Firecracker for
+`untrusted`, only after their required threat model is defined and qualified. These
+are conditional isolation integrations, separate from tenant identity management.
+
 ## Compute contract
 
 See [the executable container definition](../../examples/container.yaml). Each

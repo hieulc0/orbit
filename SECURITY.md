@@ -6,6 +6,24 @@ container restrictions and permission declarations do not constitute a complete
 sandbox. Agent budgets are conservative reservations, not provider-side billing
 enforcement. Signed packages establish publisher provenance, not code safety.
 
+Authorization and process containment are separate controls. Allowing a shell or
+filesystem operation does not constrain its subprocess by itself. The execution
+backend must enforce the applicable filesystem, network, process and resource
+restrictions. Logical isolation requirements cannot silently downgrade to an
+available weaker backend.
+
+The remote coding milestone targets trusted operators, provisioned workers and
+approved repositories. Rootless OCI provides bounded restrictions within this
+boundary; it does not establish hostile-code isolation. Stronger execution
+isolation and tenant identity management have separate qualification requirements.
+Existing optional scoped governance remains supported, with no new tenant hierarchy
+or identity administration required for this milestone.
+
+Stopping dispatch after lease loss cannot revoke a static credential already
+copied into a process. Keep Git/model credentials in trusted materialization and
+provider adapters, outside repository tool environments. Provider data access is
+an explicit authorization decision even when repository tools have no network.
+
 Use dedicated worker users/hosts. Never expose a container runtime socket to the
 API server, UI, or task workloads. Keep the API on loopback until a trusted TLS
 gateway is configured. The bundled Compose configuration uses private networking

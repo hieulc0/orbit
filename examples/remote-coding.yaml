@@ -1,0 +1,49 @@
+apiVersion: orbit/v1
+kind: Definition
+metadata:
+  name: remote-coding-review
+inputs:
+  repository_id: approved-repository
+  base_revision: REPLACE_WITH_FULL_COMMIT_ID
+  task: Fix the bounded issue described here and preserve the existing tests.
+steps:
+  code:
+    uses: repository.code
+    recovery_policy: restart_from_inputs
+    max_attempts: 3
+    timeout_seconds: 1800
+    retry_backoff_seconds: 5
+    resources: {cpu_millis: 1000, memory_mib: 512}
+    execution: {isolation: trusted, network: none, filesystem: workspace}
+    agent:
+      identity: coding-agent
+      binding: coding-v1
+      tools: [read_file, write_file, shell]
+      permissions: [workspace.read, workspace.write, shell.execute]
+      budget: {tokens: 1200000, cost_microusd: 16000000, calls: 32}
+      max_delegations: 0
+      context: {}
+      output: object
+  test:
+    uses: repository.test
+    needs: [code]
+    recovery_policy: restart_from_inputs
+    max_attempts: 2
+    timeout_seconds: 600
+    retry_backoff_seconds: 5
+    resources: {cpu_millis: 1000, memory_mib: 512}
+    execution: {isolation: trusted, network: none, filesystem: workspace}
+    commands:
+      - argv: [sh, test.sh]
+        cwd: .
+        timeout_seconds: 120
+  review:
+    uses: human.approval
+    needs: [test]
+    recovery_policy: restart_from_inputs
+    max_attempts: 1
+    timeout_seconds: 86400
+    retry_backoff_seconds: 0
+    approval:
+      assignees: [operator]
+      prompt: Review the accepted patch and independent test artifacts.

@@ -104,6 +104,11 @@ enum Commands {
         #[arg(long)]
         assignment: PathBuf,
     },
+    #[command(hide = true)]
+    WorkspaceSupervisor {
+        #[arg(long)]
+        request: PathBuf,
+    },
     /// Export qualification evidence for operator review, excluding runtime fixtures.
     ExportEvidence {
         #[arg(long)]
@@ -209,6 +214,8 @@ enum Commands {
         shutdown_grace_seconds: u64,
         #[arg(long)]
         agent_runtime: Option<PathBuf>,
+        #[arg(long)]
+        execution_config: Option<PathBuf>,
     },
     /// Recover a retained artifact through the operator API.
     Artifact {
@@ -352,6 +359,16 @@ async fn main() -> Result<()> {
                 Ok(code) => code,
                 Err(error) => {
                     eprintln!("container supervisor: {error}");
+                    125
+                }
+            };
+            std::process::exit(code);
+        }
+        Commands::WorkspaceSupervisor { request } => {
+            let code = match orbit::workspace::supervise(&request).await {
+                Ok(code) => code,
+                Err(error) => {
+                    eprintln!("workspace supervisor: {error}");
                     125
                 }
             };
@@ -560,8 +577,19 @@ async fn main() -> Result<()> {
             once,
             shutdown_grace_seconds,
             agent_runtime,
+            execution_config,
         } => {
             let mut client = client;
+            if let Some(path) = execution_config {
+                anyhow::ensure!(
+                    ["repository.code", "repository.test"].contains(&capability.as_str()),
+                    "--execution-config requires a repository worker"
+                );
+                let config: orbit::execution::WorkerConfig =
+                    serde_json::from_slice(&tokio::fs::read(path).await?)?;
+                config.validate()?;
+                client.execution_config = Some(std::sync::Arc::new(config));
+            }
             if let Some(path) = agent_runtime {
                 anyhow::ensure!(
                     capability == "agent.run",

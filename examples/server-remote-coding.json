@@ -1,0 +1,45 @@
+{
+  "operator_credential": {"provider": "file", "path": "/absolute/private/operator-token"},
+  "repositories": {
+    "approved-repository": {
+      "remote": {
+        "url": "https://git.example.invalid/owner/repository.git",
+        "credential": "repository-read"
+      },
+      "coding_command": {"argv": ["true"], "cwd": ".", "timeout_seconds": 30},
+      "allowed_test_executables": ["sh"]
+    }
+  },
+  "execution_profiles": {
+    "trusted": {
+      "backend": "rootless_podman",
+      "image": "docker.io/library/alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b"
+    }
+  },
+  "agent_bindings": {
+    "coding-v1": {
+      "model": "REPLACE_WITH_PINNED_MODEL_REVISION",
+      "runtime": "agent.coding-responses-v1",
+      "tools": {
+        "read_file": "orbit.workspace.read_file/v1",
+        "write_file": "orbit.workspace.write_file/v1",
+        "shell": "orbit.workspace.shell/v1"
+      },
+      "permissions": ["workspace.read", "workspace.write", "shell.execute"],
+      "max_budget": {"tokens": 1200000, "cost_microusd": 16000000, "calls": 32},
+      "max_delegations": 0
+    }
+  },
+  "workers": {
+    "remote-coder": {
+      "credential": {"provider": "file", "path": "/absolute/private/coder-token"},
+      "capabilities": ["repository.code", "execution.podman-v1", "agent.coding-responses-v1"],
+      "capacity": {"pool": "coding", "resources": {"cpu_millis": 2000, "memory_mib": 1024}}
+    },
+    "remote-tester": {
+      "credential": {"provider": "file", "path": "/absolute/private/tester-token"},
+      "capabilities": ["repository.test", "execution.podman-v1"],
+      "capacity": {"pool": "verification", "resources": {"cpu_millis": 2000, "memory_mib": 1024}}
+    }
+  }
+}

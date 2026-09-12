@@ -1,5 +1,9 @@
 # Deployable alpha qualification
 
+For the later remote coding increment, see
+[remote coding qualification](remote-coding-qualification.md). The alpha evidence
+and backend gaps below are preserved, not replaced by that increment.
+
 This is the current implementation record for 2026-09-12, following the committed
 Phase 1–9 baseline `9b9e3d252615589104067d2d272124fc795b3f2b`. Historical counts and
 owner decisions remain in [the archive](../archive/README.md). This increment does

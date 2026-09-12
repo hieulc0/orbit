@@ -52,13 +52,27 @@ jobs:
           docker compose --profile compute exec -T minio mc alias set qualification http://127.0.0.1:9000 orbit-local-test orbit-local-test-secret
           docker compose --profile compute exec -T minio mc mb --ignore-existing qualification/orbit-qualification
           docker pull docker.io/library/alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
+      - name: Rootless workspace prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends podman crun uidmap
+          test "$(stat -fc %T /sys/fs/cgroup)" = cgroup2fs
+          sudo loginctl enable-linger "$(id -un)"
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+          systemctl --user is-system-running --wait || systemctl --user show-environment >/dev/null
+          podman --remote=false pull docker.io/library/alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
       - name: Full kernel qualification
         env:
           ORBIT_CONTAINER_RUNTIME: docker
           ORBIT_TEST_DATABASE_URL: postgres://orbit:orbit-local-test@127.0.0.1:55439/orbit
           ORBIT_TEST_S3_ACCESS_KEY: orbit-local-test
           ORBIT_TEST_S3_SECRET_KEY: orbit-local-test-secret
-        run: bash scripts/qualify.sh
+        run: |
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+          systemd-run --user --scope --property=Delegate=yes bash scripts/qualify.sh --skip dogfood
+          systemd-run --user --scope --property=Delegate=yes bash scripts/qualify.sh dogfood
       - name: Stop only this runner's disposable services
         if: always()
         run: docker compose --profile compute down

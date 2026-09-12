@@ -54,6 +54,8 @@ durably deduplicated for at least the lifetime of retained run history.
 | --- | --- | --- |
 | `start` | Assignment identity | Attempt/task become running |
 | `heartbeat` | Assignment identity | Lease renewed within the task deadline |
+| `reserve_agent_call` | Bounded reservation; optional request digest | Task-wide budget reserved before dispatch |
+| `finish_agent_call` | Attempt-bound receipt and result digest | Tracked invocation result durably recorded |
 | `prepare_artifact` | Kind, expected checksum and size | Attempt-scoped upload identity created |
 | `publish_checkpoint` | Uploaded artifact ID, format/version, input digest | Compatible immutable checkpoint recorded |
 | `complete` | Outcome, accepted output IDs, structured failure if any | Attempt/task outcome and dependencies committed |
@@ -106,6 +108,23 @@ The coding worker may use an agent runtime, but the engine does not interpret it
 conversation or tool loop. A restart begins from the immutable task inputs; a
 checkpoint resume requires an explicitly advertised runtime format. Persisted
 logs are not automatically a resumable checkpoint.
+
+Explicit repository `execution` requirements add pinned `plan.execution_profiles`
+and require server-authorized `execution.podman-v1` capability. Private remote Git
+bindings carry only an approved URL and logical credential reference; the worker
+resolves a local purpose/binding/audience grant. Workspaces and tool containers are
+attempt-owned; credentials and host Git metadata are never mounted. See the
+[remote coding guide](../guides/remote-coding.md). A successful isolated repository
+attempt additionally requires `execution_report` provenance matching its plan,
+requirements, selected profile and resources. Existing fields and old plans retain
+their semantics and serialized digests.
+
+Isolated coding reservations carry attempt-prefixed call IDs and `request_digest`.
+The result is acknowledged separately through `finish_agent_call`. Unresolved
+model dispatch prevents automatic retry; terminal deadline/cancellation retains
+uncertainty. See [agent accounting](agents.md#tracked-coding-invocations) for replay,
+receipt and fresh-workspace recovery rules. Neither an accepted reservation nor a
+replayed receipt authorizes repeating the provider effect.
 
 ## Artifact publication
 

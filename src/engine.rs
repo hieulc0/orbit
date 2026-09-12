@@ -64,10 +64,11 @@ impl Engine {
         parent: Option<String>,
         actor: &str,
     ) -> Result<Value> {
-        let compiled = Plan::compile_with_agents(
+        let compiled = Plan::compile_with_execution(
             plan.definition.clone(),
             plan.repository.clone(),
             &plan.agent_bindings,
+            &plan.execution_profiles,
         )?
         .in_scope(plan.scope.clone())?;
         ensure!(
@@ -351,6 +352,8 @@ impl Engine {
                 let step = &run.plan.definition.steps[&t.step];
                 t.state == State::Ready
                     && step.uses == claim.capability
+                    && (step.execution.is_none()
+                        || capabilities.contains(&crate::execution::CAPABILITY.to_string()))
                     && step.agent.as_ref().is_none_or(|agent| {
                         capabilities.contains(&run.plan.agent_bindings[&agent.binding].runtime)
                     })
@@ -529,7 +532,11 @@ impl Engine {
         }
         if response["status"] == "accepted" {
             if let Action::ReserveAgentCall { reservation } = &op.action {
-                event(&mut tx, &mut run, json!({"type":"AGENT_CALL_RESERVED","actor":worker,"attempt_id":op.attempt_id,"call_id":reservation.call_id,"tokens":reservation.tokens,"cost_microusd":reservation.cost_microusd,"tool":reservation.tool,"permissions":reservation.permissions,"replayed":response["replayed"]})).await?;
+                event(&mut tx, &mut run, json!({"type":"AGENT_CALL_RESERVED","actor":worker,"attempt_id":op.attempt_id,"call_id":reservation.call_id,"tokens":reservation.tokens,"cost_microusd":reservation.cost_microusd,"tool":reservation.tool,"permissions":reservation.permissions,"request_digest":reservation.request_digest,"replayed":response["replayed"]})).await?;
+            }
+            if let Action::FinishAgentCall { receipt } = &op.action {
+                event(&mut tx, &mut run, json!({"type":"AGENT_CALL_FINISHED","actor":worker,"attempt_id":op.attempt_id,
+                    "call_id":receipt.call_id,"result_digest":receipt.result_digest,"external_id":receipt.external_id})).await?;
             }
             sqlx::query("UPDATE orbit_workers SET last_seen=clock_timestamp() WHERE id=$1")
                 .bind(worker)
@@ -594,7 +601,24 @@ impl Engine {
                 let spec = run.plan.definition.steps[&run.tasks[ti].step]
                     .agent
                     .as_ref()
-                    .context("agent call requires agent.run")?;
+                    .context("agent call requires a pinned agent step")?;
+                if run.plan.definition.steps[&run.tasks[ti].step]
+                    .execution
+                    .is_some()
+                {
+                    ensure!(
+                        reservation.request_digest.is_some(),
+                        "coding invocation requires attempt-bound dispatch intent"
+                    );
+                }
+                if reservation.request_digest.is_some() {
+                    ensure!(
+                        reservation
+                            .call_id
+                            .starts_with(&format!("{}-", op.attempt_id)),
+                        "tracked invocation requires attempt-bound call ID"
+                    );
+                }
                 let usage = run.tasks[ti]
                     .agent_usage
                     .get_or_insert_with(Default::default);
@@ -602,6 +626,18 @@ impl Engine {
                 return Ok(
                     json!({"status":"accepted","replayed":!fresh,"tokens_reserved":usage.tokens,"cost_microusd_reserved":usage.cost_microusd,"calls_reserved":usage.reservations.len()}),
                 );
+            }
+            Action::FinishAgentCall { receipt } => {
+                ensure!(
+                    run.tasks[ti].state == State::Running && receipt.attempt_id == op.attempt_id,
+                    "invocation receipt requires running owner"
+                );
+                let usage = run.tasks[ti]
+                    .agent_usage
+                    .as_mut()
+                    .context("agent usage missing")?;
+                let fresh = usage.finish(receipt)?;
+                return Ok(json!({"status":"accepted","replayed":!fresh}));
             }
             Action::PrepareArtifact {
                 kind,
@@ -616,7 +652,8 @@ impl Engine {
                         "logs",
                         "container_report",
                         "agent_report",
-                        "data"
+                        "data",
+                        "execution_report"
                     ]
                     .contains(&kind.as_str()),
                     "unsupported artifact kind"
@@ -758,7 +795,11 @@ impl Engine {
                         "container report provenance mismatch"
                     );
                 }
-                if *success && capability == "agent.run" {
+                if *success
+                    && run.plan.definition.steps[&run.tasks[ti].step]
+                        .agent
+                        .is_some()
+                {
                     ensure!(
                         kinds.contains("agent_report") && kinds.contains("logs"),
                         "agent output requires report and logs"
@@ -780,6 +821,42 @@ impl Engine {
                         &run.plan.agent_bindings[&spec.binding],
                     )?;
                     run.tasks[ti].expansion = Some(report.delegation_inputs);
+                }
+                if *success
+                    && run.plan.definition.steps[&run.tasks[ti].step]
+                        .execution
+                        .is_some()
+                {
+                    ensure!(
+                        kinds.contains("execution_report"),
+                        "workspace execution requires provenance report"
+                    );
+                    ensure!(
+                        !run.tasks[ti]
+                            .agent_usage
+                            .as_ref()
+                            .is_some_and(|usage| usage.pending_model_call()
+                                || usage.pending_attempt_call(&op.attempt_id)),
+                        "invocation outcome unresolved"
+                    );
+                    let config = &run.plan.definition.steps[&run.tasks[ti].step];
+                    let profile =
+                        &run.plan.execution_profiles[&config.execution.as_ref().unwrap().isolation];
+                    let artifact = run
+                        .artifacts
+                        .iter()
+                        .find(|a| outputs.contains(&a.id) && a.kind == "execution_report")
+                        .unwrap();
+                    let report: Value =
+                        serde_json::from_slice(verified_bytes(verified, artifact)?)?;
+                    ensure!(
+                        report["attempt_id"] == op.attempt_id
+                            && report["plan_digest"] == run.plan.digest
+                            && report["profile"] == json!(profile)
+                            && report["requirements"] == json!(config.execution)
+                            && report["resources"] == json!(config.resources),
+                        "execution report provenance mismatch"
+                    );
                 }
                 run.tasks[ti].attempts[ai].outputs = outputs.clone();
                 if *success {
@@ -1118,8 +1195,10 @@ impl Engine {
                 for task in &mut run.tasks {
                     if !task.state.terminal() {
                         task.state = State::Cancelled;
-                        task.reason =
-                            Some("cancelled; external process stopping unconfirmed".into());
+                        task.reason = Some(with_model_uncertainty(
+                            task,
+                            "cancelled; external process stopping unconfirmed",
+                        ));
                         if let Some(attempt) =
                             task.attempts.last_mut().filter(|a| !a.state.terminal())
                         {
@@ -1302,10 +1381,11 @@ async fn drive_children(tx: &mut Tx<'_>, run: &mut Run, now: i64) -> Result<()> 
             let index = run.tasks[ti].child_run_ids.len();
             let mut definition = *config.definition.clone().unwrap();
             definition.inputs.task = run.tasks[ti].expansion.as_ref().unwrap()[index].clone();
-            let plan = Plan::compile_with_agents(
+            let plan = Plan::compile_with_execution(
                 definition,
                 run.plan.repository.clone(),
                 &run.plan.agent_bindings,
+                &run.plan.execution_profiles,
             )?
             .in_scope(run.plan.scope.clone())?;
             let mut child = Run::new(plan, Some(run.id.clone()));
@@ -1418,6 +1498,17 @@ async fn propagate(tx: &mut Tx<'_>, run: &Run) -> Result<()> {
 }
 
 fn recover(run: &mut Run, ti: usize, now: i64, failure: &Failure) {
+    let mut failure = failure.clone();
+    if run.tasks[ti]
+        .agent_usage
+        .as_ref()
+        .is_some_and(|usage| usage.pending_model_call())
+    {
+        failure.side_effect_status = "unknown".into();
+        failure
+            .message
+            .push_str("; model dispatch outcome unresolved");
+    }
     let config = &run.plan.definition.steps[&run.tasks[ti].step];
     let reason = format!(
         "{}: {}; side_effect_status={}",
@@ -1448,15 +1539,16 @@ fn recover(run: &mut Run, ti: usize, now: i64, failure: &Failure) {
     }
 }
 fn fail_task(run: &mut Run, ti: usize, reason: &str) {
+    let reason = with_model_uncertainty(&run.tasks[ti], reason);
     run.tasks[ti].state = State::Failed;
-    run.tasks[ti].reason = Some(reason.into());
+    run.tasks[ti].reason = Some(reason.clone());
     if let Some(attempt) = run.tasks[ti]
         .attempts
         .last_mut()
         .filter(|a| !a.state.terminal())
     {
         attempt.state = State::Failed;
-        attempt.reason = Some(reason.into());
+        attempt.reason = Some(reason);
     }
     // Fail fast: no sibling attempt may keep an authoritative lease after the run fails.
     for task in &mut run.tasks {
@@ -1466,7 +1558,10 @@ fn fail_task(run: &mut Run, ti: usize, reason: &str) {
             } else {
                 State::Skipped
             };
-            task.reason = Some("run failed; external process stopping unconfirmed".into());
+            task.reason = Some(with_model_uncertainty(
+                task,
+                "run failed; external process stopping unconfirmed",
+            ));
             if let Some(attempt) = task.attempts.last_mut().filter(|a| !a.state.terminal()) {
                 attempt.state = State::Cancelled;
                 attempt.reason = task.reason.clone();
@@ -1474,6 +1569,19 @@ fn fail_task(run: &mut Run, ti: usize, reason: &str) {
         }
     }
     run.state = State::Failed;
+}
+
+fn with_model_uncertainty(task: &Task, reason: &str) -> String {
+    if task
+        .agent_usage
+        .as_ref()
+        .is_some_and(|usage| usage.pending_model_call())
+        && !reason.contains("model dispatch outcome unresolved")
+    {
+        format!("{reason}; model dispatch outcome unresolved; side_effect_status=unknown")
+    } else {
+        reason.into()
+    }
 }
 
 /// Advance engine-owned work and dependencies using database time in the current transaction.

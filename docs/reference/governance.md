@@ -1,5 +1,22 @@
 # Governance
 
+This document describes implemented, optional governance capabilities. Existing
+scopes, roles, principal types, policies and checks remain supported. Expanding
+tenant hierarchy, identity administration or SSO is outside the current remote
+coding milestone, which must also work with governance disabled.
+
+## Ownership and credential scope
+
+Run attribution comes from authenticated submission. Execution authority comes
+from server-authorized worker admission and the current attempt lease. Artifact
+access follows resource and dependency authorization. Attribution alone is not
+an access grant.
+
+An attempt-scoped credential means authorized use of a logical credential binding
+for a particular task or attempt; it does not require a tenant hierarchy. Existing
+configured scope restrictions continue to apply. File/environment references are
+credential sources, not a general lease/revocation service.
+
 Governance is an opt-in, server-configured authorization boundary. It models
 organizations, projects, environments, roles, users, service accounts, agent
 identities and integrations. This bounded release uses deployment configuration,
@@ -77,6 +94,14 @@ for the same identity. Duplicate credentials/identities are rejected.
 File parent directories and server configuration must be trusted and protected.
 There is no cloud vault, OAuth rotation or per-task secret delivery service here.
 S3 credentials continue to use the artifact provider's environment references.
+
+The [remote coding worker](../guides/remote-coding.md) reuses SecretRef for its local
+credential grants. These are resolved at use, outside scheduler transactions, and
+restricted by purpose, repository/agent binding, exact URL audience and optional
+existing scopes. Empty scope lists allow only unscoped attempts. Only logical Git
+references enter plans; model credentials belong to the provisioned adapter.
+Tool processes receive neither. This is worker-local authorized use, not a new
+tenant hierarchy, a server-side credential broker or provider-key revocation.
 
 ## Audit controls
 

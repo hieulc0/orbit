@@ -15,13 +15,22 @@ CLI / MCP / React UI / SDK
        artifact providers      scoped claims / leases
                                     |
                        trusted workers on dedicated hosts
-                       repository / OCI / command agent
+                       repository / OCI / command or coding agent
 ```
 
 The server image contains the API, reconciler and static UI. It requires no
 container runtime socket. Host workers own their runtime access and disposable
 workspaces. The deployment is single-host first; PostgreSQL is not replaced by
 an in-memory broker or a second execution authority.
+
+The [remote coding worker](../guides/remote-coding.md) materializes private HTTPS
+Git repositories and performs a bounded model loop on the trusted worker. Each
+repository tool runs in a disposable host-managed rootless Podman container,
+without Git metadata, credentials or network. Tasks request a logical isolation
+class; the operator pins its execution profile. Only `trusted` workspace execution
+is implemented. Optional governance stays compatible, but adding a tenant
+hierarchy is not part of this milestone. Authorization and containment are
+independent boundaries, not interchangeable permission strings.
 
 ## Code map
 
@@ -31,7 +40,9 @@ an in-memory broker or a second execution authority.
 | `src/engine.rs`, `migrations/` | PostgreSQL transitions, coordination, deduplication, reconciliation |
 | `src/api.rs`, `src/governance.rs` | Authentication, scoped authorization, admission policy |
 | `src/worker.rs`, `src/container.rs` | Lease-bound execution, workspaces, process supervision |
+| `src/execution.rs`, `src/workspace.rs`, `src/repository.rs` | Logical requirements, pinned OCI profiles, isolated tools and private Git materialization |
 | `src/agent.rs`, `src/command_agent.rs` | Agent contracts and trusted command-runtime adapter |
+| `src/coding_agent.rs` | Bounded Responses loop, per-call dispatch intent/receipts and tool authorization |
 | `src/artifacts.rs` | Local/S3 immutable publication and verified reads |
 | `src/registry.rs` | Signed immutable package metadata; no code loading |
 | `src/ops.rs`, `src/main.rs` | Lifecycle, probes, metrics, executable commands |
@@ -45,7 +56,8 @@ A shared control-row lock serializes cross-run mutations; this favors auditable
 correctness over high-throughput scheduling. Storage I/O must not hold that lock.
 Recheck lease/generation/cancellation and request identity after external I/O.
 
-Plans pin definitions, repository/model/tool bindings and execution scope. Preserve
+Plans pin definitions, repository/model/tool bindings, referenced execution profiles
+and optional existing execution scope. Preserve
 legacy serialized digests. Worker protocol success requires an accepted receipt,
 not merely HTTP 200. At-least-once execution never proves exactly-once external
 effects. Draining does not cancel existing leases; stopping is not proof that an

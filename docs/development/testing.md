@@ -47,6 +47,21 @@ silently skip prerequisites. Test schemas and `target/qualification-alpha` are
 retained. Use a targeted `cargo test --locked --test kernel NAME -- --ignored`
 for a database-only case; pass `fault-injection` for transaction-barrier tests.
 
+The `remote_coding` cases require local Git/Python and rootless Podman with the
+pinned Alpine image even if legacy `ORBIT_CONTAINER_RUNTIME=docker` is selected.
+They run authenticated loopback Git and deterministic Responses fixtures, never
+a paid provider, private production repository or remote deployment:
+
+```sh
+ORBIT_TEST_DATABASE_URL=postgres://orbit:orbit-local-test@127.0.0.1:55439/orbit \
+ORBIT_EVIDENCE_DIR="$PWD/target/qualification-remote-coding" \
+cargo test --locked --features fault-injection --test kernel remote_coding -- --ignored
+```
+
+Regular `tests/execution.rs` and the repository-helper unit test need no database,
+container or credential account. Shared engine changes still require the full
+qualification suite, including legacy agent, artifact, governance and digest cases.
+
 ## CI and evidence
 
 CI runs regular checks, mocked Chromium, the full disposable suite and image

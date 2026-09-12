@@ -25,6 +25,16 @@ has been published externally as part of this implementation.
 - Agent reservations precede external calls, are shared across attempts, and are
   never refunded. `reserve_agent_call` / `CallReservation` and `agent_report` /
   `AgentReport` describe this protocol, not an LLM implementation.
+- Isolated coding adds optional `request_digest` to reservations and
+  `finish_agent_call` / `CallReceipt` for attempt-bound outcome hashes. Old
+  reservations remain valid. Replayed dispatch intent never authorizes repeating
+  an effect; unresolved model calls prevent automatic retry. Generic operation
+  transports can carry the additive receipt without a new wire version.
+- Repository `execution` requirements pin operator `execution_profiles` and require
+  server-authorized `execution.podman-v1`. Legacy workers cannot claim those steps.
+  Private Git bindings use logical credential names, not embedded secrets. Legacy
+  plans without the new fields keep their serialized digests. See the
+  [remote coding guide](../docs/guides/remote-coding.md) for the narrow first backend.
 - Treat model/provider credentials as runtime configuration. Assignments contain
   scoped contracts and lease tokens, not provider credentials. Never log/export
   lease tokens or include them in agent/container environment payloads.

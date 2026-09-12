@@ -30,6 +30,8 @@ pub struct Config {
     pub artifact_provider: Option<String>,
     #[serde(default)]
     pub agent_bindings: BTreeMap<String, crate::agent::Binding>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub execution_profiles: BTreeMap<crate::execution::Isolation, crate::execution::Profile>,
     /// Named approval-only bearer identities; these do not grant operator access.
     #[serde(default)]
     pub approvers: BTreeMap<String, String>,
@@ -122,6 +124,9 @@ impl App {
         for (name, binding) in &config.agent_bindings {
             ensure!(crate::agent::valid_name(name), "invalid agent binding name");
             binding.validate()?;
+        }
+        for (isolation, profile) in &config.execution_profiles {
+            profile.validate(isolation)?;
         }
         for worker in config.workers.values() {
             for scope in &worker.scopes {
@@ -475,8 +480,13 @@ async fn submit(
             .map_err(ApiError)?
             .clone()
     };
-    let plan = Plan::compile_with_agents(body.definition, binding, &app.config.agent_bindings)?
-        .in_scope(scope)?;
+    let plan = Plan::compile_with_execution(
+        body.definition,
+        binding,
+        &app.config.agent_bindings,
+        &app.config.execution_profiles,
+    )?
+    .in_scope(scope)?;
     Ok(Json(
         app.engine
             .submit_as(&body.request_id, plan, body.parent_run_id, &actor)

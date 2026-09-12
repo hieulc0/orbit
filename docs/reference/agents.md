@@ -3,6 +3,9 @@
 The built-in provider-neutral single-call worker is described in the
 [command-agent guide](../guides/command-agent.md). The contracts below also serve
 external runtimes that reserve each call through the SDK.
+The [remote coding guide](../guides/remote-coding.md) covers the built-in multi-turn
+Responses adapter: an `agent` on an explicitly isolated `repository.code` step.
+It uses private Git, OCI tools, independent testing and existing human approval.
 
 `orbit/v1` supports `agent.run` and `human.approval`. See
 [the executable definition](../../examples/agent.yaml) and
@@ -20,8 +23,9 @@ of tools/permissions, budget, context (16 KiB maximum) and output type (`json`,
 Only referenced bindings, including nested child bindings, enter the immutable
 plan digest. Existing plans without agent bindings keep their original digests.
 
-A worker must be authorized for both `agent.run` and the binding's runtime
-capability. Model/tool revision strings are operator assertions: the trusted
+A worker must be authorized for the step capability (`agent.run` or isolated
+`repository.code`) and the binding's runtime capability. Isolated repository
+steps additionally require `execution.podman-v1`. Model/tool revision strings are operator assertions: the trusted
 runtime must resolve and verify the actual implementation. No provider keys are
 embedded in bindings, assignments, reports or the engine database. Provision
 provider credentials separately at the trusted runtime. Permissions are a
@@ -51,6 +55,33 @@ dispatch/result record and use provider idempotency where available. Orbit
 cannot make a provider effect exactly-once or police a runtime that bypasses the
 reservation endpoint. Stop before the last confirmed lease/deadline expires.
 The attempt inspection endpoint includes `agent_usage` for recovery.
+
+### Tracked coding invocations
+
+Isolated coding calls require `request_digest` (SHA-256) in the reservation and a
+call ID prefixed with `<attempt-id>-`. After a response, the owner submits
+`finish_agent_call` with `receipt: {call_id, attempt_id, result_digest, external_id}`;
+`external_id` is optional. Receipts are immutable and durably deduplicated, with
+the same lease/generation checks as other operations. Reservations and result
+hashes are journaled; no prompt, secret or raw reasoning is stored there.
+The new fields/operation are additive: old untracked reservations and their
+serialized records remain valid and do not retroactively imply pending dispatch.
+Any external runtime opting into `request_digest` must use the same attempt-bound
+call ID format, even on a legacy `agent.run` step.
+
+A pending tracked model call marks failure/recovery as an unknown external
+outcome, prohibiting automatic redispatch. Deadlines, cancellation and exhausted
+attempts still terminate logically while retaining uncertainty in their reasons.
+Successful coding completion requires no unresolved model calls and no pending
+calls in the completing attempt. Prior interrupted tool-only work can be discarded
+on a fresh attempt, without resetting reservations. Receipts are not conversation
+checkpoints and cannot make provider calls exactly-once.
+
+The built-in coding runtime authorizes the exact tool revision and fixed permission
+set before dispatch and uses OCI containment for every tool subprocess. The worker
+retains model/Git credentials; tool processes receive neither. Authorization says
+which action is allowed; the container enforces what a process can physically
+access. Enabling `shell.execute` alone is not a filesystem or network sandbox.
 
 Success requires finalized `logs` and `agent_report` artifacts. Reports carry
 `attempt_id`, assignment `agent_binding_digest`, typed `output` (64 KiB maximum)

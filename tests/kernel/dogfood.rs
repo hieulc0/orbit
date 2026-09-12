@@ -67,6 +67,7 @@ async fn pinned_orbit_runs_a_reviewable_patch_and_independent_tests_on_itself() 
     let binary_digest = digest(&std::fs::read(&binary)?);
     let marker = "\n## Reproducibility check (dogfood fixture)\n\nRun `cargo fmt --all -- --check` and `cargo test --locked` before handing off a change.\n";
     f.plan.repository = RepositoryBinding {
+        remote: None,
         path: repo.to_string_lossy().into(),
         coding_command: CommandSpec {
             argv: vec![

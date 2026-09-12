@@ -122,6 +122,7 @@ impl CommandAgent {
                         cost_microusd: self.cost_microusd_per_call,
                         tool: None,
                         permissions: spec.permissions.clone(),
+                        request_digest: None,
                     },
                 },
             )

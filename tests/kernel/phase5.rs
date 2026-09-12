@@ -91,6 +91,7 @@ async fn agent_budgets_permissions_and_retries_are_transactional() -> Result<()>
     f.start("agent", &a).await?;
     let reservation = |key: &str, tokens| Action::ReserveAgentCall {
         reservation: CallReservation {
+            request_digest: None,
             call_id: key.into(),
             tokens,
             cost_microusd: 1,
@@ -115,6 +116,7 @@ async fn agent_budgets_permissions_and_retries_are_transactional() -> Result<()>
         &a,
         Action::ReserveAgentCall {
             reservation: CallReservation {
+                request_digest: None,
                 call_id: "forbidden".into(),
                 tokens: 1,
                 cost_microusd: 0,

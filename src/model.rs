@@ -72,6 +72,8 @@ pub struct Step {
     pub agent: Option<crate::agent::AgentSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval: Option<crate::agent::ApprovalSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<crate::execution::Requirements>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -238,7 +240,8 @@ impl Definition {
                         && step.placement.is_none()
                         && step.container.is_none()
                         && step.agent.is_none()
-                        && step.approval.is_none()),
+                        && step.approval.is_none()
+                        && step.execution.is_none()),
                 "compute fields require v1"
             );
             if let Some(resources) = &step.resources {
@@ -247,16 +250,37 @@ impl Definition {
             if let Some(placement) = &step.placement {
                 placement.validate()?;
             }
+            if step.execution.is_some() {
+                ensure!(
+                    ["repository.code", "repository.test"].contains(&step.uses.as_str()),
+                    "workspace execution currently requires a repository step"
+                );
+                let resources = step
+                    .resources
+                    .as_ref()
+                    .context("workspace execution requires resource limits")?;
+                ensure!(
+                    resources.cpu_millis > 0 && resources.memory_mib >= 16 && resources.gpu == 0,
+                    "workspace execution requires CPU/memory and currently supports no GPU"
+                );
+            }
             ensure!(
                 !(step.uses.starts_with("engine.") || step.uses == "human.approval")
                     || (step.resources.is_none() && step.placement.is_none()),
                 "engine steps cannot reserve worker resources"
             );
-            if step.uses == "agent.run" {
+            if step.uses == "agent.run" || (step.uses == "repository.code" && step.agent.is_some())
+            {
                 step.agent
                     .as_ref()
                     .context("agent configuration required")?
                     .validate()?;
+                if step.uses == "repository.code" {
+                    ensure!(
+                        step.execution.is_some(),
+                        "coding agents require explicit workspace execution"
+                    );
+                }
             } else {
                 ensure!(
                     step.agent.is_none(),
@@ -483,9 +507,12 @@ impl CommandSpec {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RepositoryBinding {
+    #[serde(default)]
     pub path: String,
     pub coding_command: CommandSpec,
     pub allowed_test_executables: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<crate::repository::Remote>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Plan {
@@ -496,6 +523,8 @@ pub struct Plan {
     pub agent_bindings: BTreeMap<String, crate::agent::Binding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<crate::governance::Scope>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub execution_profiles: BTreeMap<crate::execution::Isolation, crate::execution::Profile>,
 }
 impl Plan {
     pub fn compile(definition: Definition, repository: RepositoryBinding) -> Result<Self> {
@@ -506,18 +535,48 @@ impl Plan {
         repository: RepositoryBinding,
         bindings: &BTreeMap<String, crate::agent::Binding>,
     ) -> Result<Self> {
+        Self::compile_with_execution(definition, repository, bindings, &BTreeMap::new())
+    }
+    pub fn compile_with_execution(
+        definition: Definition,
+        repository: RepositoryBinding,
+        bindings: &BTreeMap<String, crate::agent::Binding>,
+        profiles: &BTreeMap<crate::execution::Isolation, crate::execution::Profile>,
+    ) -> Result<Self> {
         definition.validate()?;
         if !definition.inputs.repository_id.is_empty() {
             repository.coding_command.validate()?;
-            ensure!(
-                Path::new(&repository.path).is_absolute(),
-                "repository binding must be absolute"
-            );
+            if let Some(remote) = &repository.remote {
+                ensure!(
+                    repository.path.is_empty(),
+                    "choose local path or remote repository"
+                );
+                remote.validate()?;
+            } else {
+                ensure!(
+                    Path::new(&repository.path).is_absolute(),
+                    "repository binding must be absolute"
+                );
+            }
         }
         let mut agent_bindings = BTreeMap::new();
+        let mut execution_profiles = BTreeMap::new();
         let mut definitions = vec![&definition];
         while let Some(definition) = definitions.pop() {
             for step in definition.steps.values() {
+                if repository.remote.is_some() && step.uses.starts_with("repository.") {
+                    ensure!(
+                        step.execution.is_some(),
+                        "remote repository execution requires containment"
+                    );
+                }
+                if let Some(requirements) = &step.execution {
+                    let profile = profiles
+                        .get(&requirements.isolation)
+                        .context("execution isolation class unavailable")?;
+                    profile.validate(&requirements.isolation)?;
+                    execution_profiles.insert(requirements.isolation.clone(), profile.clone());
+                }
                 if let Some(agent) = &step.agent {
                     let binding = bindings
                         .get(&agent.binding)
@@ -538,7 +597,7 @@ impl Plan {
                 }
             }
         }
-        let digest = if agent_bindings.is_empty() {
+        let mut plan_digest = if agent_bindings.is_empty() {
             digest(&serde_json::to_vec(&(&definition, &repository))?)
         } else {
             digest(&serde_json::to_vec(&(
@@ -547,17 +606,25 @@ impl Plan {
                 &agent_bindings,
             ))?)
         };
+        if !execution_profiles.is_empty() {
+            plan_digest = digest(&serde_json::to_vec(&(&plan_digest, &execution_profiles))?);
+        }
         Ok(Self {
             definition,
             repository,
-            digest,
+            digest: plan_digest,
             agent_bindings,
             scope: None,
+            execution_profiles,
         })
     }
     pub fn in_scope(self, scope: Option<crate::governance::Scope>) -> Result<Self> {
-        let mut plan =
-            Self::compile_with_agents(self.definition, self.repository, &self.agent_bindings)?;
+        let mut plan = Self::compile_with_execution(
+            self.definition,
+            self.repository,
+            &self.agent_bindings,
+            &self.execution_profiles,
+        )?;
         if let Some(scope) = scope {
             scope.validate()?;
             plan.digest = digest(&serde_json::to_vec(&(&plan.digest, &scope))?);
@@ -577,6 +644,7 @@ impl RepositoryBinding {
                 timeout_seconds: 0,
             },
             allowed_test_executables: vec![],
+            remote: None,
         }
     }
 }
@@ -791,6 +859,9 @@ pub struct Operation {
 pub enum Action {
     Start,
     Heartbeat,
+    FinishAgentCall {
+        receipt: crate::agent::CallReceipt,
+    },
     ReserveAgentCall {
         reservation: crate::agent::CallReservation,
     },
