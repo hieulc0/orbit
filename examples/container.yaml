@@ -1,0 +1,22 @@
+apiVersion: orbit/v1
+kind: Definition
+metadata:
+  name: portable-compute
+inputs:
+  task: Produce a result without a repository checkout.
+steps:
+  compute:
+    uses: container.run
+    recovery_policy: restart_from_inputs
+    max_attempts: 3
+    timeout_seconds: 120
+    retry_backoff_seconds: 1
+    resources:
+      cpu_millis: 500
+      memory_mib: 64
+      gpu: 0
+    placement:
+      pool: local-compute
+    container:
+      image: docker.io/library/alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
+      command: [sh, -c, 'printf "durable compute\n" > /orbit/outputs/result']

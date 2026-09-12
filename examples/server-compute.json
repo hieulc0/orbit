@@ -1,0 +1,14 @@
+{
+  "operator_token": "replace-with-unique-operator-token",
+  "repositories": {},
+  "workers": {
+    "compute": {
+      "token": "replace-with-unique-compute-worker-token",
+      "capabilities": ["container.run"],
+      "capacity": {
+        "pool": "local-compute",
+        "resources": {"cpu_millis": 2000, "memory_mib": 256, "gpu": 0}
+      }
+    }
+  }
+}
