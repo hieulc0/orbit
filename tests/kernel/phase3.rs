@@ -311,9 +311,11 @@ async fn journal_stream_replay_and_sdk_contract() -> Result<()> {
             WorkerIdentity {
                 token: token.into(),
                 capabilities: vec!["repository.code".into()],
+                ..Default::default()
             },
         )]),
         repositories: BTreeMap::new(),
+        ..Default::default()
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let url = format!("http://{}", listener.local_addr()?);

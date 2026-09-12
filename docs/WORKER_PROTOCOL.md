@@ -4,6 +4,12 @@ Status: implementation specification. This document defines transport-independen
 operation contracts; the first implementation may expose them through HTTP.
 See [engine semantics](ENGINE_SEMANTICS.md) and [state machines](STATE_MACHINES.md).
 
+Phase 4 retains the v0 wire protocol and adds `container.run`, optional
+`gpu_devices` in assignments, provider/object-key metadata on artifacts, and
+`data`/`container_report` artifact kinds. Server-authorized capacity and pool
+membership constrain claims; clients cannot supply capacity overrides. See
+[compute and artifacts](COMPUTE_AND_ARTIFACTS.md) for the additional contract.
+
 ## Registration and claim
 
 A worker registers an authenticated worker identity, protocol version, supported
@@ -124,6 +130,11 @@ unfinalized object, but cannot finalize it or attach it to task outputs. Concurr
 retransmissions verify identical bytes and sync the directory before acknowledging
 publication, including when another writer has already created the object.
 
+For S3, publication uses conditional creation and reconciles uncertain responses
+by reading and checking the expected object. All provider reads needed for
+finalization and completion also happen outside coordination locks. The commit
+transaction rechecks authority and immutable metadata after those reads.
+
 ## Failure contract
 
 A failure contains `category`, machine-readable `code`, readable `message`,
@@ -159,3 +170,12 @@ diagnostic acknowledgement. Cancellation can finalize logical state before this
 acknowledgement arrives. Such acknowledgement MUST NOT reopen an attempt or
 replace its terminal result. If process termination is unconfirmed, inspection
 must say so explicitly.
+## Agent and scoped execution additions
+
+Agent assignments add `agent_binding_digest` and pinned `plan.agent_bindings`.
+`reserve_agent_call` reserves tokens, cost and call count per task across attempts;
+success publishes `agent_report` plus logs. See [agent execution](AGENT_EXECUTION.md).
+Scoped plans carry immutable `plan.scope`; worker scope permissions come only from
+server configuration and are checked at claim, operation, upload and read. Scope
+cannot be supplied in worker operations. See [governance](GOVERNANCE.md) and the
+[SDK compatibility contract](../sdk/PROTOCOL_COMPATIBILITY.md).

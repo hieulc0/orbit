@@ -9,10 +9,20 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use std::{collections::BTreeMap, path::Path, time::Duration};
 
+#[path = "kernel/governance.rs"]
+mod governance;
 #[path = "kernel/phase2.rs"]
 mod phase2;
 #[path = "kernel/phase3.rs"]
 mod phase3;
+#[path = "kernel/phase4.rs"]
+mod phase4;
+#[path = "kernel/phase5.rs"]
+mod phase5;
+#[path = "kernel/registry.rs"]
+mod registry;
+#[path = "kernel/web.rs"]
+mod web;
 
 struct Fixture {
     engine: Engine,
@@ -252,8 +262,32 @@ impl Fixture {
                 let path = self.engine.artifact_path(id)?;
                 if path.exists() {
                     std::fs::copy(path, directory.join("artifacts").join(id))?;
+                } else if artifact["finalized"] == true
+                    && artifact["location"]["provider"]
+                        .as_str()
+                        .is_some_and(|provider| provider != "local")
+                {
+                    std::fs::write(
+                        directory.join("artifacts").join(id),
+                        self.engine.read_artifact(run_id, id, None).await?,
+                    )?;
                 }
             }
+        }
+        Ok(())
+    }
+    fn control_evidence(&self, scenario: &str, data: Value) -> Result<()> {
+        if let Ok(destination) = std::env::var("ORBIT_EVIDENCE_DIR") {
+            let directory = std::path::PathBuf::from(destination)
+                .join(scenario)
+                .join(id());
+            std::fs::create_dir_all(&directory)?;
+            std::fs::write(
+                directory.join("record.json"),
+                serde_json::to_vec_pretty(
+                    &json!({"format":"orbit-control-evidence/v1","scenario":scenario,"result":"passed","data":data}),
+                )?,
+            )?;
         }
         Ok(())
     }
@@ -290,6 +324,7 @@ impl Fixture {
                             !run.plan.definition.steps[&task.step]
                                 .uses
                                 .starts_with("engine.")
+                                && run.plan.definition.steps[&task.step].uses != "human.approval"
                         )
                     );
                     for output in &task.accepted_outputs {
@@ -403,6 +438,7 @@ fn process_config(f: &Fixture) -> Result<std::path::PathBuf> {
                 WorkerIdentity {
                     token: CODER.into(),
                     capabilities: vec!["repository.code".into()],
+                    ..Default::default()
                 },
             ),
             (
@@ -410,10 +446,12 @@ fn process_config(f: &Fixture) -> Result<std::path::PathBuf> {
                 WorkerIdentity {
                     token: TESTER.into(),
                     capabilities: vec!["repository.test".into()],
+                    ..Default::default()
                 },
             ),
         ]),
         repositories: BTreeMap::from([("fixture".into(), f.plan.repository.clone())]),
+        ..Default::default()
     };
     let path = f.root.path().join("server.json");
     std::fs::write(&path, serde_json::to_vec(&config)?)?;
@@ -421,6 +459,14 @@ fn process_config(f: &Fixture) -> Result<std::path::PathBuf> {
 }
 async fn server_process(f: &Fixture, address: &str, fault: Option<&str>) -> Result<ChildGuard> {
     let config = process_config(f)?;
+    server_process_configured(f, address, fault, config).await
+}
+async fn server_process_configured(
+    f: &Fixture,
+    address: &str,
+    fault: Option<&str>,
+    config: std::path::PathBuf,
+) -> Result<ChildGuard> {
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_orbit"));
     command
         .arg("server")
@@ -1190,6 +1236,7 @@ async fn repository_change(graph: bool) -> Result<()> {
                 WorkerIdentity {
                     token: code_token.into(),
                     capabilities: vec!["repository.code".into()],
+                    ..Default::default()
                 },
             ),
             (
@@ -1197,10 +1244,12 @@ async fn repository_change(graph: bool) -> Result<()> {
                 WorkerIdentity {
                     token: test_token.into(),
                     capabilities: vec!["repository.test".into()],
+                    ..Default::default()
                 },
             ),
         ]),
         repositories: BTreeMap::from([("fixture".into(), f.plan.repository.clone())]),
+        ..Default::default()
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let url = format!("http://{}", listener.local_addr()?);
@@ -1216,6 +1265,7 @@ async fn repository_change(graph: bool) -> Result<()> {
         .post(
             "/runs",
             &orbit::api::Submit {
+                scope: None,
                 request_id: id(),
                 definition: f.plan.definition.clone(),
                 parent_run_id: None,

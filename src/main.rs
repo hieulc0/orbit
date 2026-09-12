@@ -28,8 +28,69 @@ enum Output {
     Json,
     Jsonl,
 }
+fn scope_query(scope: Option<&str>) -> Result<String> {
+    if let Some(value) = scope {
+        orbit::governance::Scope::parse(value)?;
+        Ok(format!("?scope={value}"))
+    } else {
+        Ok(String::new())
+    }
+}
 #[derive(Subcommand)]
 enum Commands {
+    /// Print canonical package digest and domain-separated bytes for external signing.
+    PackageDigest {
+        manifest: PathBuf,
+    },
+    /// Publish an already signed package to the configured private registry.
+    PublishPackage {
+        package: PathBuf,
+        #[arg(long)]
+        scope: Option<String>,
+    },
+    Packages {
+        #[arg(long)]
+        scope: Option<String>,
+    },
+    Package {
+        digest: String,
+        #[arg(long)]
+        scope: Option<String>,
+    },
+    Identity,
+    Projects,
+    Protocol,
+    /// Submit a named definition from a currently trusted, digest-pinned package.
+    RunPackage {
+        digest: String,
+        definition: String,
+        #[arg(long)]
+        scope: Option<String>,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    Audit {
+        #[arg(long, default_value_t = 0)]
+        after: u64,
+    },
+    /// Serve the MCP 2025-11-25 stdio adapter. Credentials come from ORBIT_TOKEN.
+    Mcp,
+    /// Record an assigned human approval decision (denial fails the run).
+    Approve {
+        run_id: String,
+        step: String,
+        #[arg(long)]
+        deny: bool,
+        #[arg(long, default_value = "")]
+        comment: String,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    #[command(hide = true)]
+    ContainerSupervisor {
+        #[arg(long)]
+        assignment: PathBuf,
+    },
     /// Export qualification evidence for operator review, excluding runtime fixtures.
     ExportEvidence {
         #[arg(long)]
@@ -64,6 +125,8 @@ enum Commands {
     Run {
         definition: PathBuf,
         #[arg(long)]
+        scope: Option<String>,
+        #[arg(long)]
         request_id: Option<String>,
         #[arg(long)]
         parent_run_id: Option<String>,
@@ -74,6 +137,8 @@ enum Commands {
     },
     /// Inspect the shared database scheduler limits.
     Limits,
+    Workers,
+    Queues,
     /// Replace scheduler limits across all servers using this database.
     SetLimits {
         #[arg(long)]
@@ -132,6 +197,114 @@ async fn main() -> Result<()> {
     let mut output_format = cli.output_format;
     let client = Client::new(cli.url, cli.token)?;
     let value = match cli.command {
+        Commands::PackageDigest { manifest } => {
+            let manifest: orbit::registry::Manifest =
+                serde_json::from_slice(&tokio::fs::read(manifest).await?)?;
+            manifest.validate()?;
+            serde_json::json!({"digest":manifest.digest()?,"signing_message_hex":hex::encode(manifest.signing_message()?)})
+        }
+        Commands::PublishPackage { package, scope } => {
+            let package: orbit::registry::Package =
+                serde_json::from_slice(&tokio::fs::read(package).await?)?;
+            let scope = scope
+                .as_deref()
+                .map(orbit::governance::Scope::parse)
+                .transpose()?;
+            client
+                .post(
+                    "/packages",
+                    &serde_json::json!({"package":package,"scope":scope}),
+                )
+                .await?
+        }
+        Commands::Packages { scope } => {
+            let suffix = scope_query(scope.as_deref())?;
+            client.get(&format!("/packages{suffix}")).await?
+        }
+        Commands::Package { digest, scope } => {
+            anyhow::ensure!(
+                digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()),
+                "invalid package digest"
+            );
+            let suffix = scope_query(scope.as_deref())?;
+            client.get(&format!("/packages/{digest}{suffix}")).await?
+        }
+        Commands::Identity => client.get("/identity").await?,
+        Commands::Projects => client.get("/projects").await?,
+        Commands::Protocol => client.get("/protocol").await?,
+        Commands::RunPackage {
+            digest,
+            definition,
+            scope,
+            request_id,
+        } => {
+            anyhow::ensure!(
+                digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()),
+                "invalid package digest"
+            );
+            let suffix = scope_query(scope.as_deref())?;
+            let package = client.get(&format!("/packages/{digest}{suffix}")).await?;
+            anyhow::ensure!(
+                package["verified"] == true && package["package"]["digest"] == digest,
+                "package verification unavailable"
+            );
+            let definition: Definition = serde_json::from_value(
+                package["package"]["manifest"]["definitions"]
+                    .get(&definition)
+                    .ok_or_else(|| anyhow::anyhow!("packaged definition not found"))?
+                    .clone(),
+            )?;
+            let request_id = request_id.unwrap_or_else(id);
+            eprintln!("submission request_id={request_id} package_digest={digest}");
+            client
+                .post(
+                    "/runs",
+                    &Submit {
+                        request_id,
+                        definition,
+                        scope: scope
+                            .as_deref()
+                            .map(orbit::governance::Scope::parse)
+                            .transpose()?,
+                        parent_run_id: None,
+                    },
+                )
+                .await?
+        }
+        Commands::Audit { after } => client.get(&format!("/audit?after={after}")).await?,
+        Commands::Mcp => return orbit::mcp::serve(client).await,
+        Commands::Approve {
+            run_id,
+            step,
+            deny,
+            comment,
+            request_id,
+        } => {
+            let request_id = request_id.unwrap_or_else(id);
+            eprintln!("approval request_id={request_id}");
+            client
+                .post(
+                    &format!("/runs/{run_id}/approvals"),
+                    &orbit::agent::Approval {
+                        request_id,
+                        step,
+                        approved: !deny,
+                        comment,
+                    },
+                )
+                .await?
+        }
+        Commands::ContainerSupervisor { assignment } => {
+            let result = orbit::container::supervise(&assignment).await;
+            let code = match result {
+                Ok(code) => code,
+                Err(error) => {
+                    eprintln!("container supervisor: {error}");
+                    125
+                }
+            };
+            std::process::exit(code);
+        }
         Commands::ExportEvidence { source, output } => orbit::evidence::export(&source, &output)?,
         Commands::ExecuteLocal {
             assignment,
@@ -184,6 +357,7 @@ async fn main() -> Result<()> {
         }
         Commands::Run {
             definition,
+            scope,
             request_id,
             parent_run_id,
         } => {
@@ -194,6 +368,10 @@ async fn main() -> Result<()> {
                 .post(
                     "/runs",
                     &Submit {
+                        scope: scope
+                            .as_deref()
+                            .map(orbit::governance::Scope::parse)
+                            .transpose()?,
                         request_id,
                         definition,
                         parent_run_id,
@@ -206,6 +384,8 @@ async fn main() -> Result<()> {
             client.get("/runs").await?
         }
         Commands::Limits => client.get("/limits").await?,
+        Commands::Workers => client.get("/workers").await?,
+        Commands::Queues => client.get("/queues").await?,
         Commands::SetLimits {
             max_active_roots,
             max_running_attempts,

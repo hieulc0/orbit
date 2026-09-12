@@ -10,6 +10,14 @@ fn export_excludes_runtime_secrets_and_preserves_artifacts() -> anyhow::Result<(
     fs::create_dir_all(run.join("artifacts"))?;
     fs::create_dir_all(source.join("fixtures"))?;
     fs::write(source.join("fixtures/server.json"), "private-runtime-token")?;
+    let control = source.join("registry/control");
+    fs::create_dir_all(&control)?;
+    fs::write(
+        control.join("record.json"),
+        serde_json::to_vec(
+            &json!({"format":"orbit-control-evidence/v1","data":{"verified":true,"private_key":"do-not-export"}}),
+        )?,
+    )?;
     let id = uuid::Uuid::new_v4().to_string();
     let patch = b"a reviewable patch";
     fs::write(run.join("artifacts").join(&id), patch)?;
@@ -26,6 +34,10 @@ fn export_excludes_runtime_secrets_and_preserves_artifacts() -> anyhow::Result<(
     let destination = root.path().join("export");
     let manifest = export(&source, &destination)?;
     assert!(!destination.join("fixtures").exists());
+    assert!(
+        !fs::read_to_string(destination.join("registry/control/record.json"))?
+            .contains("do-not-export")
+    );
     assert!(
         !fs::read_to_string(destination.join("baseline/run/run.json"))?
             .contains("private-lease-token")

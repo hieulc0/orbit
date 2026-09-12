@@ -1,6 +1,7 @@
 //! Rust worker SDK for the orbit/v0 wire protocol.
 //! Persist claim and operation request IDs across uncertain responses. Execution,
 //! heartbeat scheduling and stopping work on lease loss belong to the runtime.
+pub use crate::agent::{AgentReport, CallReservation};
 pub use crate::api::{Registration, Upload};
 pub use crate::model::{Action, Artifact, Assignment, Claim, Failure, Operation, Recovery};
 pub use crate::worker::{Client, operation};
@@ -8,6 +9,10 @@ use anyhow::Result;
 use serde_json::Value;
 
 impl Client {
+    /// Discover additive protocol support before registration; this does not grant authority.
+    pub async fn protocol(&self) -> Result<Value> {
+        self.get("/protocol").await
+    }
     pub async fn register(
         &self,
         capabilities: Vec<String>,

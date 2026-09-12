@@ -23,10 +23,21 @@ pub struct Client {
 }
 impl Client {
     pub fn new(url: String, token: String) -> Result<Self> {
+        let parsed = reqwest::Url::parse(&url)?;
+        ensure!(
+            ["http", "https"].contains(&parsed.scheme())
+                && parsed.host_str().is_some()
+                && parsed.username().is_empty()
+                && parsed.password().is_none()
+                && parsed.query().is_none()
+                && parsed.fragment().is_none(),
+            "expected HTTP(S) server URL without credentials/query/fragment"
+        );
         Ok(Self {
             url: url.trim_end_matches('/').into(),
             token,
             http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
                 .timeout(Duration::from_secs(30))
                 .build()?,
             local_artifacts: None,
@@ -120,6 +131,7 @@ impl Client {
                 checksum: digest(&bytes),
                 size: bytes.len() as u64,
                 finalized: true,
+                location: None,
             };
             let mut file = tokio::fs::OpenOptions::new()
                 .create_new(true)
@@ -185,7 +197,8 @@ pub async fn execute_local(
             .steps
             .get(&assignment.step)
             .is_some_and(
-                |step| ["repository.code", "repository.test"].contains(&step.uses.as_str())
+                |step| ["repository.code", "repository.test", "container.run"]
+                    .contains(&step.uses.as_str())
             ),
         "invalid step"
     );
@@ -211,6 +224,10 @@ pub async fn execute_local(
 }
 
 pub async fn run(client: Client, capability: String, root: PathBuf, once: bool) -> Result<()> {
+    ensure!(
+        ["repository.code", "repository.test", "container.run"].contains(&capability.as_str()),
+        "unsupported built-in worker capability"
+    );
     tokio::fs::create_dir_all(&root).await?;
     let root = root.canonicalize()?;
     client
@@ -376,6 +393,9 @@ async fn perform(
         serde_json::to_vec_pretty(&saved)?,
     )
     .await?;
+    if a.plan.definition.steps[&a.step].uses == "container.run" {
+        return crate::container::perform(client, a, &directory, &home).await;
+    }
     let base = &a.plan.definition.inputs.base_revision;
     checked(
         &[
@@ -531,6 +551,23 @@ async fn command(
     home: &Path,
     a: &Assignment,
 ) -> Result<(Option<i32>, Vec<u8>, Vec<u8>, bool)> {
+    command_inner(spec, workspace, home, a, false).await
+}
+pub(crate) async fn supervised_command(
+    spec: &CommandSpec,
+    workspace: &Path,
+    home: &Path,
+    a: &Assignment,
+) -> Result<(Option<i32>, Vec<u8>, Vec<u8>, bool)> {
+    command_inner(spec, workspace, home, a, true).await
+}
+async fn command_inner(
+    spec: &CommandSpec,
+    workspace: &Path,
+    home: &Path,
+    a: &Assignment,
+    supervised: bool,
+) -> Result<(Option<i32>, Vec<u8>, Vec<u8>, bool)> {
     spec.validate()?;
     let cwd = workspace.join(&spec.cwd).canonicalize()?;
     ensure!(
@@ -556,11 +593,39 @@ async fn command(
         )
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
+        .stdin(if supervised {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
+        .kill_on_drop(!supervised);
+    if supervised {
+        let runtime = crate::container::runtime()?;
+        cmd.env("ORBIT_CONTAINER_RUNTIME", &runtime);
+        if runtime == "podman" {
+            // Only the trusted runtime supervisor needs the operator's rootless
+            // image store and runtime directory. These never enter the container.
+            if let Some(runtime_home) = std::env::var_os("HOME") {
+                cmd.env("HOME", runtime_home);
+            }
+            if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+                cmd.env("XDG_RUNTIME_DIR", runtime_dir);
+            }
+        }
+        // Runtime endpoints are operator configuration, never Definition fields.
+        if let Some(host) = std::env::var_os("DOCKER_HOST") {
+            cmd.env("DOCKER_HOST", host);
+        }
+    }
     #[cfg(unix)]
     cmd.process_group(0);
     let mut child = cmd.spawn().context("cannot start command")?;
-    let group = ProcessGroup(child.id().context("child has no process ID")?);
+    let group = if supervised {
+        None
+    } else {
+        Some(ProcessGroup(child.id().context("child has no process ID")?))
+    };
+    let _lifeline = child.stdin.take();
     let log_id = id();
     let log_root = home.parent().context("attempt log directory missing")?;
     let stdout = child.stdout.take().context("stdout pipe missing")?;

@@ -187,6 +187,7 @@ fn child_templates_and_execution_tree_bounds_are_validated() {
         max_parallel: 2,
         items: Some(vec!["first".into(), "second".into()]),
         signal_from: None,
+        agent_from: None,
     });
     parent.steps.insert("dispatch".into(), step);
     parent.max_concurrency = Some(2);

@@ -3,10 +3,22 @@ import json
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from orbit_worker import Client, OrbitError, operation
+from orbit_worker import Client, OrbitError, operation, reserve_agent_call, agent_report
 
 
 class ProtocolTest(unittest.TestCase):
+    def test_agent_contract_helpers(self):
+        assignment = dict(run_id="run", attempt_id="attempt", generation=2,
+                          lease_token="local-fixture", agent_binding_digest="a" * 64)
+        request = reserve_agent_call(assignment, call_id="call", tokens=25,
+                                     cost_microusd=1, request_id="stable")
+        self.assertEqual(request["request_id"], "stable")
+        self.assertEqual(request["operation"], "reserve_agent_call")
+        self.assertEqual(request["reservation"]["tokens"], 25)
+        report = agent_report(assignment, {"answer": True}, ["work"])
+        self.assertEqual(report["binding_digest"], "a" * 64)
+        self.assertNotIn("lease_token", report)
+
     def test_transport_and_retransmission(self):
         calls = []
 

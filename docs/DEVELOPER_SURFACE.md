@@ -3,8 +3,11 @@
 Phase 3 adds journal streaming, JSONL and reusable worker transports. It preserves
 the existing unprefixed HTTP routes, `orbit/v0` worker protocol and both definition
 versions. YAML and JSON definitions use the same parser and validation rules.
-These SDKs target the existing repository capabilities; adding arbitrary compute
-capabilities and execution runtimes remains subsequent roadmap work.
+Phase 4 also supports `container.run` through the same transports. See the
+[compute contract](COMPUTE_AND_ARTIFACTS.md) for resources, pools and provider
+metadata. The [private registry](PACKAGE_REGISTRY.md) now supports signed
+capability descriptors and packaged definitions; worker provisioning remains
+external to the server.
 
 ## Compatibility
 
@@ -15,10 +18,13 @@ require a new explicit protocol version, not reinterpretation of `orbit/v0`.
 The crate is pre-1.0; this wire compatibility commitment does not promise Rust ABI
 stability or rolling mixed-version database upgrades.
 
-All HTTP routes require bearer authentication. Operator and worker credentials are
-distinct. Operator routes are `/runs` (GET/POST), `/runs/{id}` (GET),
+All data and action routes require bearer authentication; `/protocol` discovery
+and the optional static `/console/` assets are public. Operator and worker
+credentials are distinct. Operator routes are `/runs` (GET/POST), `/runs/{id}` (GET),
 `/runs/{id}/events` (GET), `/runs/{id}/events/stream` (GET),
 `/runs/{id}/cancel` (POST), `/runs/{id}/signals` (POST), and `/limits` (GET/POST).
+Phase 4 adds operator `GET /workers` and `GET /queues` with corresponding CLI
+commands. Worker capacity and pool membership come from server configuration.
 Worker routes are `/worker/register`, `/worker/claim`, `/worker/operate`,
 `/worker/upload` (POST) and `/worker/runs/{run}/attempts/{attempt}` (GET).
 `/runs/{run}/artifacts/{artifact}` returns binary bytes to operators or authorized
@@ -93,7 +99,7 @@ Use the local `orbit` crate's `orbit::sdk` module. It exports `Client`, `Assignm
 creates a new request; retain the result when retransmitting. `send_operation`
 retries that identical request up to three times and rejects non-accepted receipts.
 `artifact` checks size and checksum. The built-in `worker::execute` runtime handles
-repository work and independent heartbeats; SDK consumers own their execution loop.
+repository/container work and independent heartbeats; SDK consumers own their execution loop.
 For an executable registration example, run `cargo run --example sdk_register`
 with `ORBIT_URL` and a configured `ORBIT_TOKEN` worker credential.
 
@@ -155,3 +161,9 @@ verified evidence export and final concurrent/serial results are recorded in
 [Phase 3 qualification](PHASE_3_QUALIFICATION.md). The built-in Rust runtime uses
 the server's remaining-lease duration receipts as described in the
 [worker protocol](WORKER_PROTOCOL.md).
+
+[Agent execution](AGENT_EXECUTION.md) adds `agent.run`, budget reservations and
+human approval. [Governance](GOVERNANCE.md) adds scoped submission and resource
+actions; [registry](PACKAGE_REGISTRY.md) adds private package APIs. The
+[SDK compatibility contract](../sdk/PROTOCOL_COMPATIBILITY.md) describes the
+additive wire guarantees; `GET /protocol` exposes supported versions.

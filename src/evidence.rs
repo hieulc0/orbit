@@ -24,7 +24,15 @@ fn redact(value: &mut Value) {
             fields.retain(|key, _| {
                 !matches!(
                     key.to_ascii_lowercase().as_str(),
-                    "token" | "lease_token" | "operator_token" | "password" | "authorization"
+                    "token"
+                        | "lease_token"
+                        | "operator_token"
+                        | "password"
+                        | "authorization"
+                        | "api_key"
+                        | "secret_access_key"
+                        | "access_key_id"
+                        | "private_key"
                 )
             });
             fields.values_mut().for_each(redact);
@@ -53,6 +61,21 @@ pub fn export(source: &Path, destination: &Path) -> Result<Value> {
         for run in runs {
             regular(&run.path(), true)?;
             let relative = std::path::PathBuf::from(scenario.file_name()).join(run.file_name());
+            let control = run.path().join("record.json");
+            if control.try_exists()? {
+                regular(&control, false)?;
+                let mut value: Value = serde_json::from_slice(&fs::read(&control)?)?;
+                ensure!(
+                    value["format"] == "orbit-control-evidence/v1",
+                    "unsupported control evidence format"
+                );
+                redact(&mut value);
+                files.push((
+                    relative.join("record.json"),
+                    serde_json::to_vec_pretty(&value)?,
+                ));
+                continue;
+            }
             let mut snapshot = Value::Null;
             for name in ["run.json", "events.json", "qualification.json"] {
                 let path = run.path().join(name);

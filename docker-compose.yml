@@ -1,6 +1,17 @@
 # Local PostgreSQL for kernel tests and the local runbook.
 # Not a production or deployment definition.
 services:
+  minio:
+    profiles: [compute]
+    image: minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    command: [server, /data]
+    ports:
+      - "127.0.0.1:55440:9000"
+    environment:
+      MINIO_ROOT_USER: orbit-local-test
+      MINIO_ROOT_PASSWORD: orbit-local-test-secret
+    volumes:
+      - orbit-minio:/data
   postgres:
     image: postgres:17-alpine
     container_name: orbit-postgres
@@ -20,3 +31,4 @@ services:
 
 volumes:
   orbit-postgres:
+  orbit-minio:

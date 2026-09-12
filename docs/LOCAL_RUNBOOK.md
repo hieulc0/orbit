@@ -207,5 +207,16 @@ At capacity, root submissions return HTTP 429 and can be retried using the same
 request ID. See [Phase 2 execution](PHASE_2_EXECUTION.md) for exact semantics.
 
 Stop old server/worker binaries before starting this version. Startup applies
-`0002_coordination.sql` additively and preserves existing limits. Mixed-version
-rolling operation is not supported because old binaries bypass the shared lock.
+`0002_coordination.sql` through `0005_registry.sql` additively and preserves
+existing limits. Mixed-version rolling operation is not supported: older binaries
+can bypass coordination, scope and policy checks. Use a coordinated restart with
+the same trusted configuration across replicas.
+
+## Later runtime surfaces
+
+For repository-free workloads see [compute and artifacts](COMPUTE_AND_ARTIFACTS.md).
+For agent runtimes and durable human decisions see [agent execution](AGENT_EXECUTION.md).
+The [React console/studio](WEB_CONSOLE.md), [scoped governance](GOVERNANCE.md),
+and [private package registry](PACKAGE_REGISTRY.md) are opt-in additions over the
+same server. See [release qualification](RELEASE_QUALIFICATION.md) before treating
+local test success as an acceptance or deployment decision.

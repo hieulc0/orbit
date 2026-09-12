@@ -9,6 +9,7 @@ pub struct Engine {
     pub pool: PgPool,
     pub artifact_root: PathBuf,
     pub lease_seconds: i64,
+    pub artifact_stores: crate::artifacts::ArtifactStores,
 }
 type Tx<'a> = Transaction<'a, Postgres>;
 
@@ -32,24 +33,53 @@ impl Engine {
         sqlx::raw_sql(include_str!("../migrations/0002_coordination.sql"))
             .execute(&mut *migration)
             .await?;
+        sqlx::raw_sql(include_str!("../migrations/0003_workers.sql"))
+            .execute(&mut *migration)
+            .await?;
+        sqlx::raw_sql(include_str!("../migrations/0004_governance.sql"))
+            .execute(&mut *migration)
+            .await?;
+        sqlx::raw_sql(include_str!("../migrations/0005_registry.sql"))
+            .execute(&mut *migration)
+            .await?;
         migration.commit().await?;
         Ok(Self {
             pool,
+            artifact_stores: crate::artifacts::ArtifactStores::local(artifact_root.canonicalize()?),
             artifact_root: artifact_root.canonicalize()?,
             lease_seconds,
         })
     }
 
     pub async fn submit(&self, key: &str, plan: Plan, parent: Option<String>) -> Result<Value> {
-        let compiled = Plan::compile(plan.definition.clone(), plan.repository.clone())?;
+        self.submit_as(key, plan, parent, "operator").await
+    }
+    pub async fn submit_as(
+        &self,
+        key: &str,
+        plan: Plan,
+        parent: Option<String>,
+        actor: &str,
+    ) -> Result<Value> {
+        let compiled = Plan::compile_with_agents(
+            plan.definition.clone(),
+            plan.repository.clone(),
+            &plan.agent_bindings,
+        )?
+        .in_scope(plan.scope.clone())?;
         ensure!(
             compiled.digest == plan.digest,
             "plan digest does not match immutable inputs"
         );
+        let plan = compiled;
         let mut tx = self.pool.begin().await?;
         let limits = coordinate(&mut tx).await?;
-        let payload = json!({"definition":plan.definition,"parent":parent});
-        if let Some(value) = request(&mut tx, "operator:submit", key, &payload).await? {
+        let mut payload = json!({"definition":plan.definition,"parent":parent});
+        if plan.scope.is_some() {
+            payload["scope"] = json!(plan.scope);
+        }
+        let request_actor = format!("{actor}:submit");
+        if let Some(value) = request(&mut tx, &request_actor, key, &payload).await? {
             return Ok(value);
         }
         let roots: i64 = sqlx::query_scalar("SELECT count(*) FROM orbit_runs r WHERE r.document->>'parent_task_id' IS NULL AND (r.state IN ('ACCEPTED','RUNNING','NEEDS_INTERVENTION','CANCEL_REQUESTED') OR EXISTS (SELECT 1 FROM orbit_runs c WHERE c.document->>'root_run_id'=r.id AND c.state IN ('ACCEPTED','RUNNING','NEEDS_INTERVENTION','CANCEL_REQUESTED')))")
@@ -65,8 +95,14 @@ impl Engine {
                     .fetch_one(&mut *tx)
                     .await?;
             ensure!(exists, "parent run does not exist");
+            let parent_run = locked(&mut tx, parent).await?;
+            ensure!(
+                parent_run.plan.scope == plan.scope,
+                "parent execution scope mismatch"
+            );
         }
         let mut run = Run::new(plan, parent);
+        run.submitted_by = actor.into();
         sqlx::query("INSERT INTO orbit_runs(id,state,document) VALUES($1,'ACCEPTED',$2)")
             .bind(&run.id)
             .bind(serde_json::to_value(&run)?)
@@ -75,12 +111,12 @@ impl Engine {
         event(
             &mut tx,
             &mut run,
-            json!({"type":"RUN_ACCEPTED","actor":"operator"}),
+            json!({"type":"RUN_ACCEPTED","actor":actor}),
         )
         .await?;
         save(&mut tx, &run).await?;
         let response = json!({"status":"accepted","run_id":run.id});
-        remember(&mut tx, "operator:submit", key, &payload, &response).await?;
+        remember(&mut tx, &request_actor, key, &payload, &response).await?;
         tx.commit().await?;
         Ok(response)
     }
@@ -105,8 +141,54 @@ impl Engine {
         Ok(rows.into_iter().map(|row| json!({"sequence":row.get::<i64,_>("sequence"),"at":row.get::<String,_>("at"),"event":row.get::<Value,_>("event")})).collect())
     }
     pub async fn list(&self) -> Result<Value> {
-        let rows = sqlx::query("SELECT id,state,created_at::text AS created_at FROM orbit_runs ORDER BY created_at DESC LIMIT 100").fetch_all(&self.pool).await?;
+        self.list_in_scopes(None).await
+    }
+    pub async fn list_in_scopes(
+        &self,
+        scopes: Option<&[crate::governance::Scope]>,
+    ) -> Result<Value> {
+        let rows = sqlx::query("SELECT id,state,created_at::text AS created_at FROM orbit_runs WHERE $1::jsonb IS NULL OR document->'plan'->'scope' IN (SELECT value FROM jsonb_array_elements($1)) ORDER BY created_at DESC LIMIT 100").bind(scopes.map(|s| json!(s))).fetch_all(&self.pool).await?;
         Ok(Value::Array(rows.into_iter().map(|r| json!({"id":r.get::<String,_>("id"),"state":r.get::<String,_>("state"),"created_at":r.get::<String,_>("created_at")})).collect()))
+    }
+    pub async fn scope(&self, run_id: &str) -> Result<Option<crate::governance::Scope>> {
+        let value: Option<Value> =
+            sqlx::query_scalar("SELECT document->'plan'->'scope' FROM orbit_runs WHERE id=$1")
+                .bind(run_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .context("run not found")?;
+        Ok(value.map(serde_json::from_value).transpose()?)
+    }
+    pub async fn audit_access(
+        &self,
+        actor: &str,
+        action: &str,
+        scope: Option<&crate::governance::Scope>,
+        allowed: bool,
+        resource: Option<&str>,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        coordinate(&mut tx).await?;
+        let previous: String =
+            sqlx::query_scalar("SELECT hash FROM orbit_audit ORDER BY sequence DESC LIMIT 1")
+                .fetch_optional(&mut *tx)
+                .await?
+                .unwrap_or_default();
+        let event = json!({"actor":actor,"action":action,"scope":scope,"resource_id":resource,"authorized":allowed,"at_ms":now(&mut tx).await?});
+        let hash = digest(&serde_json::to_vec(&(&previous, &event))?);
+        sqlx::query("INSERT INTO orbit_audit(event,previous_hash,hash) VALUES($1,$2,$3)")
+            .bind(event)
+            .bind(previous)
+            .bind(hash)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+    pub async fn audit(&self, after: i64) -> Result<Value> {
+        ensure!(after >= 0, "audit cursor must be nonnegative");
+        let rows = sqlx::query("SELECT sequence,event,previous_hash,hash FROM orbit_audit WHERE sequence>$1 ORDER BY sequence LIMIT 256").bind(after).fetch_all(&self.pool).await?;
+        Ok(json!(rows.into_iter().map(|r| json!({"sequence":r.get::<i64,_>("sequence"),"event":r.get::<Value,_>("event"),"previous_hash":r.get::<String,_>("previous_hash"),"hash":r.get::<String,_>("hash")})).collect::<Vec<_>>()))
     }
 
     pub async fn limits(&self) -> Result<Limits> {
@@ -116,6 +198,9 @@ impl Engine {
         Ok(serde_json::from_value(value)?)
     }
     pub async fn set_limits(&self, limits: &Limits) -> Result<Value> {
+        self.set_limits_as(limits, "operator").await
+    }
+    pub async fn set_limits_as(&self, limits: &Limits, actor: &str) -> Result<Value> {
         limits.validate()?;
         let mut tx = self.pool.begin().await?;
         let before = coordinate(&mut tx).await?;
@@ -125,21 +210,74 @@ impl Engine {
             .await?;
         if &before != limits {
             sqlx::query("INSERT INTO orbit_control_events(event) VALUES($1)")
-                .bind(json!({"type":"LIMITS_CHANGED","actor":"operator","before":before,"after":limits})).execute(&mut *tx).await?;
+                .bind(json!({"type":"LIMITS_CHANGED","actor":actor,"before":before,"after":limits}))
+                .execute(&mut *tx)
+                .await?;
         }
         tx.commit().await?;
         Ok(json!({"status":"accepted","limits":limits}))
     }
 
     pub async fn claim(&self, worker: &str, claim: &Claim) -> Result<Value> {
+        self.claim_inner(
+            worker,
+            claim,
+            std::slice::from_ref(&claim.capability),
+            &crate::compute::WorkerCapacity::default(),
+            &[],
+            false,
+        )
+        .await
+    }
+
+    pub async fn claim_with_capacity(
+        &self,
+        worker: &str,
+        claim: &Claim,
+        capabilities: &[String],
+        capacity: &crate::compute::WorkerCapacity,
+    ) -> Result<Value> {
+        self.claim_inner(worker, claim, capabilities, capacity, &[], true)
+            .await
+    }
+    pub async fn claim_in_scopes(
+        &self,
+        worker: &str,
+        claim: &Claim,
+        capabilities: &[String],
+        capacity: &crate::compute::WorkerCapacity,
+        scopes: &[crate::governance::Scope],
+    ) -> Result<Value> {
+        self.claim_inner(worker, claim, capabilities, capacity, scopes, true)
+            .await
+    }
+    async fn claim_inner(
+        &self,
+        worker: &str,
+        claim: &Claim,
+        capabilities: &[String],
+        capacity: &crate::compute::WorkerCapacity,
+        scopes: &[crate::governance::Scope],
+        persist: bool,
+    ) -> Result<Value> {
         ensure!(
-            ["repository.code", "repository.test"].contains(&claim.capability.as_str()),
+            [
+                "repository.code",
+                "repository.test",
+                "container.run",
+                "agent.run"
+            ]
+            .contains(&claim.capability.as_str())
+                && capabilities.contains(&claim.capability),
             "unsupported capability"
         );
         let actor = format!("worker:{worker}");
         let payload = json!({"claim":claim});
         let mut tx = self.pool.begin().await?;
         let limits = coordinate(&mut tx).await?;
+        if persist {
+            worker_profile(&mut tx, worker, capabilities, capacity, scopes).await?;
+        }
         if let Some(value) = request(&mut tx, &actor, &claim.request_id, &payload).await? {
             return Ok(value);
         }
@@ -159,6 +297,20 @@ impl Engine {
         let throttled = live.len() >= limits.max_running_attempts as usize
             || live.iter().filter(|a| a.worker_id == worker).count()
                 >= limits.max_attempts_per_worker as usize;
+        let mut used = crate::compute::Resources::default();
+        let mut used_gpu_devices = std::collections::BTreeSet::new();
+        for run in &runs {
+            for task in &run.tasks {
+                for attempt in task.attempts.iter().filter(|a| {
+                    a.worker_id == worker && !a.state.terminal() && a.lease_expires_at > now
+                }) {
+                    used_gpu_devices.extend(attempt.gpu_devices.iter().copied());
+                    if let Some(resources) = &run.plan.definition.steps[&task.step].resources {
+                        used.reserve(resources);
+                    }
+                }
+            }
+        }
         let mut response = json!({"status":"no_work","poll_after_ms":500});
         if throttled {
             response["reason"] = json!("concurrency_limit");
@@ -168,6 +320,10 @@ impl Engine {
                 break;
             }
             if run.state != State::Running
+                || match &run.plan.scope {
+                    Some(scope) => !scopes.contains(scope),
+                    None => !scopes.is_empty(),
+                }
                 || !tree_running(&mut tx, &run).await?
                 || run
                     .tasks
@@ -180,8 +336,22 @@ impl Engine {
                 continue;
             }
             if let Some(index) = run.tasks.iter().position(|t| {
+                let step = &run.plan.definition.steps[&t.step];
                 t.state == State::Ready
-                    && run.plan.definition.steps[&t.step].uses == claim.capability
+                    && step.uses == claim.capability
+                    && step.agent.as_ref().is_none_or(|agent| {
+                        capabilities.contains(&run.plan.agent_bindings[&agent.binding].runtime)
+                    })
+                    && step
+                        .resources
+                        .as_ref()
+                        .is_none_or(|r| r.fits(&used, &capacity.resources))
+                    && step.placement.as_ref().is_none_or(|p| {
+                        p.pool
+                            .as_ref()
+                            .is_none_or(|pool| Some(pool) == capacity.pool.as_ref())
+                            && p.capabilities.iter().all(|c| capabilities.contains(c))
+                    })
                     && t.deadline_at.is_none_or(|deadline| now < deadline)
             }) {
                 let before = run.clone();
@@ -204,6 +374,10 @@ impl Engine {
                     lease_expires_at: (now + self.lease_seconds * 1000).min(deadline),
                     reason: None,
                     outputs: vec![],
+                    gpu_devices: (0..capacity.resources.gpu)
+                        .filter(|device| !used_gpu_devices.contains(device))
+                        .take(config.resources.as_ref().map_or(0, |r| r.gpu) as usize)
+                        .collect(),
                 };
                 let assignment = Assignment {
                     run_id: run.id.clone(),
@@ -219,6 +393,15 @@ impl Engine {
                     step: task.step.clone(),
                     input_artifacts,
                     idempotency_key: task.id.clone(),
+                    gpu_devices: attempt.gpu_devices.clone(),
+                    agent_binding_digest: config
+                        .agent
+                        .as_ref()
+                        .map(|a| {
+                            serde_json::to_vec(&run.plan.agent_bindings[&a.binding])
+                                .map(|bytes| digest(&bytes))
+                        })
+                        .transpose()?,
                 };
                 run.tasks[index].attempts.push(attempt);
                 run.tasks[index].state = State::Claimed;
@@ -262,6 +445,49 @@ impl Engine {
             Err(error) => return Err(error),
         }
         let mut run = locked(&mut tx, &op.run_id).await?;
+        let mut verified = std::collections::BTreeMap::new();
+        if matches!(
+            op.action,
+            Action::FinalizeArtifact { .. } | Action::Complete { .. }
+        ) {
+            // Only authorized owners can initiate storage reads. Recheck ownership
+            // and request identity after I/O, under the transaction that commits.
+            let now = now(&mut tx).await?;
+            if locate(&run, &op.attempt_id).is_some_and(|(ti, ai)| {
+                let a = &run.tasks[ti].attempts[ai];
+                a.worker_id == worker
+                    && a.token == op.lease_token
+                    && a.generation == op.generation
+                    && !a.state.terminal()
+                    && a.lease_expires_at > now
+                    && run.state == State::Running
+            }) {
+                tx.commit().await?;
+                let outputs = match &op.action {
+                    Action::FinalizeArtifact { artifact_id } => vec![artifact_id.clone()],
+                    Action::Complete { outputs, .. } => outputs.clone(),
+                    _ => unreachable!(),
+                };
+                ensure!(outputs.len() <= 6, "too many output artifacts");
+                for output in outputs {
+                    let artifact = run
+                        .artifacts
+                        .iter()
+                        .find(|a| a.id == output && a.attempt_id == op.attempt_id)
+                        .context("artifact not owned by attempt")?;
+                    verified.insert(
+                        output,
+                        (artifact.clone(), self.artifact_stores.read(artifact).await?),
+                    );
+                }
+                tx = self.pool.begin().await?;
+                coordinate(&mut tx).await?;
+                if let Some(value) = request(&mut tx, &actor, &op.request_id, &payload).await? {
+                    return Ok(value);
+                }
+                run = locked(&mut tx, &op.run_id).await?;
+            }
+        }
         let now = now(&mut tx).await?;
         let before = run.clone();
         let location = locate(&run, &op.attempt_id);
@@ -281,13 +507,22 @@ impl Engine {
             } else if task.deadline_at.is_some_and(|deadline| now >= deadline) {
                 json!({"status":"deadline_exceeded"})
             } else {
-                self.apply_operation(&mut run, ti, ai, op, now).await?
+                self.apply_operation(&mut run, ti, ai, op, now, &verified)?
             }
         } else {
             json!({"status":"ownership_lost"})
         };
         if response["status"] != "accepted" {
             event(&mut tx, &mut run, json!({"type":"MESSAGE_REJECTED","actor":worker,"attempt_id":op.attempt_id,"reason":response["status"]})).await?;
+        }
+        if response["status"] == "accepted" {
+            if let Action::ReserveAgentCall { reservation } = &op.action {
+                event(&mut tx, &mut run, json!({"type":"AGENT_CALL_RESERVED","actor":worker,"attempt_id":op.attempt_id,"call_id":reservation.call_id,"tokens":reservation.tokens,"cost_microusd":reservation.cost_microusd,"tool":reservation.tool,"permissions":reservation.permissions,"replayed":response["replayed"]})).await?;
+            }
+            sqlx::query("UPDATE orbit_workers SET last_seen=clock_timestamp() WHERE id=$1")
+                .bind(worker)
+                .execute(&mut *tx)
+                .await?;
         }
         transitions(&mut tx, &before, &mut run, worker, "worker operation").await?;
         save(&mut tx, &run).await?;
@@ -309,13 +544,14 @@ impl Engine {
         Ok(response)
     }
 
-    async fn apply_operation(
+    fn apply_operation(
         &self,
         run: &mut Run,
         ti: usize,
         ai: usize,
         op: &Operation,
         now: i64,
+        verified: &std::collections::BTreeMap<String, (Artifact, Vec<u8>)>,
     ) -> Result<Value> {
         match &op.action {
             Action::Start => {
@@ -338,13 +574,39 @@ impl Engine {
                     json!({"status":"accepted","lease_expires_at":expires,"lease_remaining_ms":expires-now}),
                 );
             }
+            Action::ReserveAgentCall { reservation } => {
+                ensure!(
+                    run.tasks[ti].state == State::Running,
+                    "agent calls require running task"
+                );
+                let spec = run.plan.definition.steps[&run.tasks[ti].step]
+                    .agent
+                    .as_ref()
+                    .context("agent call requires agent.run")?;
+                let usage = run.tasks[ti]
+                    .agent_usage
+                    .get_or_insert_with(Default::default);
+                let fresh = usage.reserve(spec, reservation)?;
+                return Ok(
+                    json!({"status":"accepted","replayed":!fresh,"tokens_reserved":usage.tokens,"cost_microusd_reserved":usage.cost_microusd,"calls_reserved":usage.reservations.len()}),
+                );
+            }
             Action::PrepareArtifact {
                 kind,
                 checksum,
                 size,
             } => {
                 ensure!(
-                    ["patch", "manifest", "test_report", "logs"].contains(&kind.as_str()),
+                    [
+                        "patch",
+                        "manifest",
+                        "test_report",
+                        "logs",
+                        "container_report",
+                        "agent_report",
+                        "data"
+                    ]
+                    .contains(&kind.as_str()),
                     "unsupported artifact kind"
                 );
                 ensure!(
@@ -353,8 +615,10 @@ impl Engine {
                         && checksum.bytes().all(|b| b.is_ascii_hexdigit()),
                     "invalid artifact metadata or size above 32 MiB"
                 );
+                let artifact_id = id();
                 let artifact = Artifact {
-                    id: id(),
+                    location: Some(self.artifact_stores.location(&artifact_id, kind)),
+                    id: artifact_id,
                     attempt_id: op.attempt_id.clone(),
                     kind: kind.clone(),
                     checksum: checksum.clone(),
@@ -370,11 +634,9 @@ impl Engine {
                     .iter_mut()
                     .find(|a| &a.id == artifact_id && a.attempt_id == op.attempt_id)
                     .context("artifact not owned by attempt")?;
-                let bytes = tokio::fs::read(self.artifact_path(&artifact.id)?)
-                    .await
-                    .context("artifact bytes missing")?;
+                let bytes = verified_bytes(verified, artifact)?;
                 ensure!(
-                    bytes.len() as u64 == artifact.size && digest(&bytes) == artifact.checksum,
+                    bytes.len() as u64 == artifact.size && digest(bytes) == artifact.checksum,
                     "artifact checksum mismatch"
                 );
                 artifact.finalized = true;
@@ -403,11 +665,9 @@ impl Engine {
                         kinds.insert(artifact.kind.as_str()),
                         "duplicate artifact kind"
                     );
-                    let bytes = tokio::fs::read(self.artifact_path(output)?)
-                        .await
-                        .context("output artifact missing")?;
+                    let bytes = verified_bytes(verified, artifact)?;
                     ensure!(
-                        digest(&bytes) == artifact.checksum && bytes.len() as u64 == artifact.size,
+                        digest(bytes) == artifact.checksum && bytes.len() as u64 == artifact.size,
                         "output artifact corrupt"
                     );
                 }
@@ -427,9 +687,8 @@ impl Engine {
                         .iter()
                         .find(|a| outputs.contains(&a.id) && a.kind == "manifest")
                         .unwrap();
-                    let manifest: Value = serde_json::from_slice(
-                        &tokio::fs::read(self.artifact_path(&manifest.id)?).await?,
-                    )?;
+                    let manifest: Value =
+                        serde_json::from_slice(verified_bytes(verified, manifest)?)?;
                     ensure!(
                         manifest["base_revision"] == run.plan.definition.inputs.base_revision
                             && manifest["attempt_id"] == op.attempt_id
@@ -459,6 +718,57 @@ impl Engine {
                         "testing output requires report and logs"
                     );
                 }
+                if capability == "container.run"
+                    && (*success
+                        || failure
+                            .as_ref()
+                            .is_some_and(|f| f.category == "task_failure"))
+                {
+                    ensure!(
+                        kinds.contains("container_report") && kinds.contains("logs"),
+                        "container output requires report and logs"
+                    );
+                    let report = run
+                        .artifacts
+                        .iter()
+                        .find(|a| outputs.contains(&a.id) && a.kind == "container_report")
+                        .unwrap();
+                    let report: Value = serde_json::from_slice(verified_bytes(verified, report)?)?;
+                    ensure!(
+                        report["attempt_id"] == op.attempt_id
+                            && report["image"]
+                                == run.plan.definition.steps[&run.tasks[ti].step]
+                                    .container
+                                    .as_ref()
+                                    .unwrap()
+                                    .image
+                            && report["success"] == *success,
+                        "container report provenance mismatch"
+                    );
+                }
+                if *success && capability == "agent.run" {
+                    ensure!(
+                        kinds.contains("agent_report") && kinds.contains("logs"),
+                        "agent output requires report and logs"
+                    );
+                    let report = run
+                        .artifacts
+                        .iter()
+                        .find(|a| outputs.contains(&a.id) && a.kind == "agent_report")
+                        .unwrap();
+                    let report: crate::agent::AgentReport =
+                        serde_json::from_slice(verified_bytes(verified, report)?)?;
+                    let spec = run.plan.definition.steps[&run.tasks[ti].step]
+                        .agent
+                        .as_ref()
+                        .unwrap();
+                    spec.validate_report(
+                        &report,
+                        &op.attempt_id,
+                        &run.plan.agent_bindings[&spec.binding],
+                    )?;
+                    run.tasks[ti].expansion = Some(report.delegation_inputs);
+                }
                 run.tasks[ti].attempts[ai].outputs = outputs.clone();
                 if *success {
                     run.tasks[ti].attempts[ai].state = State::Succeeded;
@@ -476,8 +786,7 @@ impl Engine {
     }
 
     pub fn artifact_path(&self, artifact_id: &str) -> Result<PathBuf> {
-        uuid::Uuid::parse_str(artifact_id)?;
-        Ok(self.artifact_root.join(artifact_id))
+        self.artifact_stores.local_path(artifact_id)
     }
 
     pub async fn upload(&self, worker: &str, op: &Operation, bytes: &[u8]) -> Result<Value> {
@@ -520,14 +829,13 @@ impl Engine {
             digest(bytes) == artifact.checksum && bytes.len() as u64 == artifact.size,
             "artifact content mismatch"
         );
-        let path = self.artifact_path(artifact_id)?;
+        let artifact = artifact.clone();
         // Publication can wait on storage. Do not hold coordination/run locks or
         // block an async executor while syncing bytes: heartbeats and cancellation
         // must remain available. Only the final operation grants durable ownership.
         tx.commit().await?;
         fault("upload_before_publish").await;
-        let bytes = bytes.to_vec();
-        tokio::task::spawn_blocking(move || publish(&path, &bytes)).await??;
+        self.artifact_stores.publish(&artifact, bytes).await?;
         self.operate(worker, op).await
     }
 
@@ -560,12 +868,8 @@ impl Engine {
             });
             ensure!(authorized, "artifact access denied");
         }
-        let bytes = tokio::fs::read(self.artifact_path(artifact_id)?).await?;
-        ensure!(
-            digest(&bytes) == artifact.checksum,
-            "artifact checksum mismatch"
-        );
-        Ok(bytes)
+        ensure!(artifact.finalized, "artifact not finalized");
+        self.artifact_stores.read(artifact).await
     }
 
     pub async fn get_attempt(&self, worker: &str, run_id: &str, attempt_id: &str) -> Result<Value> {
@@ -581,11 +885,63 @@ impl Engine {
         );
         let inspected = run.inspect();
         Ok(
-            json!({"run_state":run.state,"task_state":run.tasks[ti].state,"attempt":inspected["tasks"][ti]["attempts"][ai],"accepted_outputs":run.tasks[ti].accepted_outputs}),
+            json!({"run_state":run.state,"task_state":run.tasks[ti].state,"attempt":inspected["tasks"][ti]["attempts"][ai],"accepted_outputs":run.tasks[ti].accepted_outputs,"agent_usage":run.tasks[ti].agent_usage}),
         )
     }
 
+    pub async fn register_worker(
+        &self,
+        worker: &str,
+        capabilities: &[String],
+        capacity: &crate::compute::WorkerCapacity,
+    ) -> Result<()> {
+        self.register_worker_in_scopes(worker, capabilities, capacity, &[])
+            .await
+    }
+    pub async fn register_worker_in_scopes(
+        &self,
+        worker: &str,
+        capabilities: &[String],
+        capacity: &crate::compute::WorkerCapacity,
+        scopes: &[crate::governance::Scope],
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        coordinate(&mut tx).await?;
+        worker_profile(&mut tx, worker, capabilities, capacity, scopes).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+    pub async fn workers(&self) -> Result<Value> {
+        let rows = sqlx::query("SELECT w.id,w.profile,w.last_seen::text AS last_seen, extract(epoch FROM clock_timestamp()-w.last_seen)::bigint AS idle_seconds, COALESCE((SELECT jsonb_agg(jsonb_build_object('run_id',r.id,'task_id',t->>'id','step',t->>'step','attempt_id',a->>'id','generation',a->'generation','state',a->>'state','lease_expires_at',a->'lease_expires_at','resources',r.document->'plan'->'definition'->'steps'->(t->>'step')->'resources')) FROM orbit_runs r CROSS JOIN LATERAL jsonb_array_elements(r.document->'tasks') t CROSS JOIN LATERAL jsonb_array_elements(t->'attempts') a WHERE a->>'worker_id'=w.id AND a->>'state' IN ('CLAIMED','RUNNING') AND (a->>'lease_expires_at')::bigint > extract(epoch FROM clock_timestamp())*1000),'[]'::jsonb) AS active_attempts FROM orbit_workers w ORDER BY w.id").fetch_all(&self.pool).await?;
+        Ok(json!(rows.into_iter().map(|r| json!({"id":r.get::<String,_>("id"), "profile":r.get::<Value,_>("profile"), "last_seen":r.get::<String,_>("last_seen"), "idle_seconds":r.get::<i64,_>("idle_seconds"), "active_attempts":r.get::<Value,_>("active_attempts")})).collect::<Vec<_>>()))
+    }
+    pub async fn queues(&self) -> Result<Value> {
+        let documents: Vec<Value> = sqlx::query_scalar("SELECT document FROM orbit_runs WHERE state IN ('ACCEPTED','RUNNING','NEEDS_INTERVENTION','CANCEL_REQUESTED')").fetch_all(&self.pool).await?;
+        let mut queues = std::collections::BTreeMap::<(String, Option<String>), (u64, u64)>::new();
+        for document in documents {
+            let run: Run = serde_json::from_value(document)?;
+            for task in &run.tasks {
+                let step = &run.plan.definition.steps[&task.step];
+                if step.uses.starts_with("engine.") || step.uses == "human.approval" {
+                    continue;
+                }
+                let count = queues
+                    .entry((
+                        step.uses.clone(),
+                        step.placement.as_ref().and_then(|p| p.pool.clone()),
+                    ))
+                    .or_default();
+                count.0 += u64::from(task.state == State::Ready);
+                count.1 += u64::from(matches!(task.state, State::Running | State::Claimed));
+            }
+        }
+        Ok(json!(queues.into_iter().map(|((capability, pool), (ready, active))| json!({"capability":capability,"pool":pool,"ready":ready,"active":active})).collect::<Vec<_>>()))
+    }
+
     pub async fn cancel(&self, run_id: &str) -> Result<Value> {
+        self.cancel_as(run_id, "operator").await
+    }
+    pub async fn cancel_as(&self, run_id: &str, actor: &str) -> Result<Value> {
         let mut tx = self.pool.begin().await?;
         coordinate(&mut tx).await?;
         let mut run = locked(&mut tx, run_id).await?;
@@ -596,7 +952,7 @@ impl Engine {
                 &mut tx,
                 &before,
                 &mut run,
-                "operator",
+                actor,
                 "cancellation intent persisted; process stopping unconfirmed",
             )
             .await?;
@@ -609,15 +965,50 @@ impl Engine {
 
     /// Accept one signal for an explicitly named wait, even before its dependencies finish.
     pub async fn signal(&self, run_id: &str, signal: &Signal) -> Result<Value> {
+        self.signal_as(run_id, signal, "operator", false).await
+    }
+    pub async fn signal_by(&self, run_id: &str, signal: &Signal, actor: &str) -> Result<Value> {
+        self.signal_as(run_id, signal, actor, false).await
+    }
+
+    /// The adapter supplies the authenticated identity; it never comes from the body.
+    pub async fn approve(
+        &self,
+        run_id: &str,
+        approval: &crate::agent::Approval,
+        actor: &str,
+    ) -> Result<Value> {
+        ensure!(
+            crate::agent::valid_name(actor) && approval.comment.len() <= 4096,
+            "invalid approval identity/comment"
+        );
+        self.signal_as(run_id, &Signal {
+            request_id: approval.request_id.clone(), step: approval.step.clone(),
+            payload: json!({"approved":approval.approved,"comment":approval.comment,"actor":actor}),
+        }, actor, true).await
+    }
+
+    async fn signal_as(
+        &self,
+        run_id: &str,
+        signal: &Signal,
+        actor: &str,
+        approval: bool,
+    ) -> Result<Value> {
         ensure!(
             serde_json::to_vec(&signal.payload)?.len() <= 16384,
             "signal payload exceeds 16384 bytes"
         );
         let payload = json!({"run_id":run_id,"signal":signal});
+        let request_actor = if approval {
+            format!("approver:{actor}")
+        } else {
+            format!("{actor}:signal")
+        };
         let mut tx = self.pool.begin().await?;
         coordinate(&mut tx).await?;
         if let Some(response) =
-            request(&mut tx, "operator:signal", &signal.request_id, &payload).await?
+            request(&mut tx, &request_actor, &signal.request_id, &payload).await?
         {
             return Ok(response);
         }
@@ -636,10 +1027,22 @@ impl Engine {
             .iter()
             .position(|task| task.step == signal.step)
             .context("signal step not found")?;
-        ensure!(
-            run.plan.definition.steps[&signal.step].uses == "engine.wait",
-            "signal target must be engine.wait"
-        );
+        let step = &run.plan.definition.steps[&signal.step];
+        if approval {
+            ensure!(
+                step.uses == "human.approval"
+                    && step
+                        .approval
+                        .as_ref()
+                        .is_some_and(|a| a.assignees.iter().any(|name| name == actor)),
+                "unauthorized approval assignee"
+            );
+        } else {
+            ensure!(
+                step.uses == "engine.wait",
+                "signal target must be engine.wait"
+            );
+        }
         let task = &run.tasks[ti];
         ensure!(
             matches!(task.state, State::Pending | State::Waiting) && task.signal.is_none(),
@@ -655,15 +1058,15 @@ impl Engine {
             accepted_at: now,
             payload: signal.payload.clone(),
         });
-        event(&mut tx, &mut run, json!({"type":"SIGNAL_RECEIVED","actor":"operator","step":signal.step,"request_id":signal.request_id,"accepted_at":now,"payload_digest":digest(&serde_json::to_vec(&signal.payload)?)})).await?;
+        event(&mut tx, &mut run, json!({"type":if approval { "APPROVAL_RECEIVED" } else { "SIGNAL_RECEIVED" },"actor":actor,"step":signal.step,"request_id":signal.request_id,"accepted_at":now,"payload_digest":digest(&serde_json::to_vec(&signal.payload)?)})).await?;
         advance(&mut run, now);
-        transitions(&mut tx, &before, &mut run, "operator", "signal received").await?;
+        transitions(&mut tx, &before, &mut run, actor, "signal received").await?;
         save(&mut tx, &run).await?;
         propagate(&mut tx, &run).await?;
         let response = json!({"status":"accepted","run_id":run_id,"step":signal.step,"request_id":signal.request_id,"accepted_at":now});
         remember(
             &mut tx,
-            "operator:signal",
+            &request_actor,
             &signal.request_id,
             &payload,
             &response,
@@ -803,6 +1206,12 @@ async fn drive_children(tx: &mut Tx<'_>, run: &mut Run, now: i64) -> Result<()> 
             let items: Result<Vec<String>> = if let Some(fan) = &config.fan_out {
                 let items = if let Some(items) = &fan.items {
                     Ok(items.clone())
+                } else if let Some(source) = &fan.agent_from {
+                    run.tasks
+                        .iter()
+                        .find(|task| &task.step == source)
+                        .and_then(|task| task.expansion.clone())
+                        .context("agent delegation report missing")
                 } else {
                     let source = run
                         .tasks
@@ -869,8 +1278,14 @@ async fn drive_children(tx: &mut Tx<'_>, run: &mut Run, now: i64) -> Result<()> 
             let index = run.tasks[ti].child_run_ids.len();
             let mut definition = *config.definition.clone().unwrap();
             definition.inputs.task = run.tasks[ti].expansion.as_ref().unwrap()[index].clone();
-            let plan = Plan::compile(definition, run.plan.repository.clone())?;
+            let plan = Plan::compile_with_agents(
+                definition,
+                run.plan.repository.clone(),
+                &run.plan.agent_bindings,
+            )?
+            .in_scope(run.plan.scope.clone())?;
             let mut child = Run::new(plan, Some(run.id.clone()));
+            child.submitted_by = run.submitted_by.clone();
             child.parent_task_id = Some(run.tasks[ti].id.clone());
             child.root_run_id = Some(run.root_run_id.as_ref().unwrap_or(&run.id).clone());
             sqlx::query("INSERT INTO orbit_runs(id,state,document) VALUES($1,'ACCEPTED',$2)")
@@ -1067,7 +1482,7 @@ fn advance(run: &mut Run, now: i64) {
                         run.tasks[ti].next_eligible_at =
                             Some(now + config.delay_seconds.unwrap() as i64 * 1000);
                     }
-                    "engine.wait" | "engine.child" | "engine.fan_out" => {
+                    "engine.wait" | "engine.child" | "engine.fan_out" | "human.approval" => {
                         run.tasks[ti].state = State::Waiting;
                         run.tasks[ti].deadline_at =
                             Some(now + config.timeout_seconds as i64 * 1000);
@@ -1083,6 +1498,15 @@ fn advance(run: &mut Run, now: i64) {
                     return;
                 }
                 if task.signal.is_some() || task.next_eligible_at.is_some_and(|due| now >= due) {
+                    if config.uses == "human.approval"
+                        && task
+                            .signal
+                            .as_ref()
+                            .is_some_and(|s| s.payload["approved"] == false)
+                    {
+                        fail_task(run, ti, "human approval denied");
+                        return;
+                    }
                     run.tasks[ti].state = State::Succeeded;
                     run.tasks[ti].reason = Some(
                         if run.tasks[ti].signal.is_some() {
@@ -1229,32 +1653,51 @@ async fn remember(
     Ok(())
 }
 
-fn publish(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::io::Write;
-    if path.exists() {
-        ensure!(std::fs::read(path)? == bytes, "immutable artifact conflict");
-        // A concurrent publisher may have linked the file but not yet synced the
-        // directory. This caller must establish durability before acknowledging.
-        std::fs::File::open(path)?.sync_all()?;
-        std::fs::File::open(path.parent().unwrap())?.sync_all()?;
-        return Ok(());
+fn verified_bytes<'a>(
+    verified: &'a std::collections::BTreeMap<String, (Artifact, Vec<u8>)>,
+    artifact: &Artifact,
+) -> Result<&'a [u8]> {
+    let (snapshot, bytes) = verified
+        .get(&artifact.id)
+        .context("artifact bytes not verified")?;
+    ensure!(
+        snapshot.checksum == artifact.checksum
+            && snapshot.size == artifact.size
+            && snapshot.location == artifact.location,
+        "artifact metadata changed during verification"
+    );
+    Ok(bytes)
+}
+
+async fn worker_profile(
+    tx: &mut Tx<'_>,
+    worker: &str,
+    capabilities: &[String],
+    capacity: &crate::compute::WorkerCapacity,
+    scopes: &[crate::governance::Scope],
+) -> Result<()> {
+    capacity.resources.validate()?;
+    let mut capabilities = capabilities.to_vec();
+    capabilities.sort();
+    capabilities.dedup();
+    let mut profile = json!({"capabilities":capabilities,"capacity":capacity});
+    if !scopes.is_empty() {
+        let mut scopes = scopes.to_vec();
+        scopes.sort();
+        scopes.dedup();
+        profile["scopes"] = json!(scopes);
     }
-    let tmp = path.with_extension(format!("{}.upload", id()));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    match std::fs::hard_link(&tmp, path) {
-        Ok(()) => (),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            ensure!(std::fs::read(path)? == bytes, "immutable artifact conflict")
-        }
-        Err(e) => return Err(e.into()),
-    }
-    std::fs::remove_file(&tmp)?;
-    std::fs::File::open(path.parent().unwrap())?.sync_all()?;
+    let existing: Option<Value> =
+        sqlx::query_scalar("SELECT profile FROM orbit_workers WHERE id=$1")
+            .bind(worker)
+            .fetch_optional(&mut **tx)
+            .await?;
+    ensure!(
+        existing.as_ref().is_none_or(|v| *v == profile),
+        "worker profile conflict: all servers must authorize identical capabilities and capacity; use a new worker identity for changed capacity"
+    );
+    sqlx::query("INSERT INTO orbit_workers(id,profile) VALUES($1,$2) ON CONFLICT(id) DO UPDATE SET last_seen=clock_timestamp()")
+        .bind(worker).bind(profile).execute(&mut **tx).await?;
     Ok(())
 }
 

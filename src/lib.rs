@@ -1,6 +1,13 @@
+pub mod agent;
 pub mod api;
+pub mod artifacts;
+pub mod compute;
+pub mod container;
 pub mod engine;
 pub mod evidence;
+pub mod governance;
+pub mod mcp;
 pub mod model;
+pub mod registry;
 pub mod sdk;
 pub mod worker;

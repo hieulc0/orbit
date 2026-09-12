@@ -74,7 +74,47 @@ renewal, and an unrelated-run cancellation wait. Lease lengths, retries and task
 deadlines were not relaxed. See [Phase 3 qualification](PHASE_3_QUALIFICATION.md)
 for the case-by-case mapping, earlier diagnostics, commands, evidence review and
 scope limits. The verified local export is `target/qualification-phase3-review`.
-No Phase 3 implementation or qualification item remains open; Phase 4 is next.
+No Phase 3 implementation or qualification item remains open.
+
+## Phase 4 bounded contract complete
+
+Compute definitions, supervised container execution, CPU/memory/GPU reservations,
+pool/capability placement, worker/queue inspection and local/S3-compatible
+artifact providers are implemented. Existing repository definition digests and
+the worker protocol remain compatible. Storage I/O and provenance verification
+no longer hold the database coordination lock; ownership is checked again at
+commit. See [the compute contract](COMPUTE_AND_ARTIFACTS.md).
+
+On 2026-09-12 all 33 PostgreSQL/process/S3/OCI cases passed together in 14.14
+seconds, including non-overlapping logical GPU assignments and actual rootless
+Podman recovery after combined server/worker termination. All 11 regular Rust
+tests, formatting, Clippy and the Python transport test passed. The local export
+contains 1,409 independently checksum-verified files with runtime fixtures and
+structured credentials excluded. This completes the bounded CPU/OCI and artifact
+contract. Physical GPU execution and live Docker behavior on the stalled host
+remain unqualified. Commands and evidence are in
+[Phase 4 qualification](PHASE_4_QUALIFICATION.md).
+
+## Phases 5–9 bounded implementation
+
+Agent bindings, persistent reservation budgets, permissions, MCP stdio, controlled
+delegation and human approval are implemented. The React operations console and
+canonical definition studio share the existing API and Rust validation. Scoped
+organizations/projects/environments, role grants, service accounts, environment/file
+credential providers, policies and audit controls are available as opt-in server
+configuration. The private registry verifies immutable signed manifests and supports
+running packaged definitions without loading package code into the server.
+
+On 2026-09-12 all 41 PostgreSQL/process/OCI/S3/browser cases passed together in
+18.17 seconds on the final rerun. All 22 regular Rust tests, five mocked browser
+cases and two Python SDK cases passed, as did formatting, Clippy and the strict
+UI build. The local release export has 930 independently checksum-verified files;
+artifact/command review and independent audit-chain/signature checks are recorded
+in the release qualification document. See
+[release qualification](RELEASE_QUALIFICATION.md), [agents](AGENT_EXECUTION.md),
+[console/studio](WEB_CONSOLE.md), [governance](GOVERNANCE.md) and
+[registry](PACKAGE_REGISTRY.md) for contracts, evidence and explicit limitations.
+No paid model, public marketplace publication or deployment was performed.
 
 ## Kernel capabilities
 
@@ -136,9 +176,11 @@ developers prefer Orbit for everyday development. Orbit-on-Orbit and Codex
 dogfooding remain to be demonstrated against a committed, known-good baseline.
 
 Checkpoint continuation is rejected, not simulated. The initial runner is trusted
-host execution, not an enforced untrusted-agent sandbox. There is no secret
-provider, remote repository adapter, web UI, business approval,
-deployment, or multi-tenant policy system in this increment.
+host execution, not an enforced untrusted-agent sandbox. Later increments add
+credential references, web UI, assigned approval and scoped policy; they do not
+establish hostile multi-tenant isolation. Remote repository adapters, deployment,
+cloud vault integrations, SSO and live policy distribution remain outside this
+bounded implementation.
 
 The checked-in evidence still lacks a complete case-by-case acceptance report, explicit
 before/after evidence and recovery measurements for every required matrix row,

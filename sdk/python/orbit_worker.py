@@ -35,6 +35,27 @@ def operation(assignment, action, *, request_id=None, **payload):
     }
 
 
+def reserve_agent_call(assignment, *, call_id, tokens, cost_microusd,
+                       tool=None, permissions=(), request_id=None):
+    """Persist this operation, send it before dispatch, and honor replayed=True.
+
+    Reservations are conservative upper bounds, never refunded across retries.
+    A replay is not permission to invoke the provider again. A new invocation
+    needs a new call_id and a fresh reservation, even after an uncertain result.
+    """
+    return operation(assignment, "reserve_agent_call", request_id=request_id,
+                     reservation={"call_id": call_id, "tokens": tokens,
+                                  "cost_microusd": cost_microusd, "tool": tool,
+                                  "permissions": list(permissions)})
+
+
+def agent_report(assignment, output, delegation_inputs=()):
+    """Build the report to upload as agent_report alongside logs."""
+    return {"attempt_id": assignment["attempt_id"],
+            "binding_digest": assignment["agent_binding_digest"],
+            "output": output, "delegation_inputs": list(delegation_inputs)}
+
+
 class Client:
     def __init__(self, url, token, timeout=30):
         parsed = urlsplit(url)
@@ -61,6 +82,9 @@ class Client:
         return self._request("/worker/register", {
             "protocol_version": "orbit/v0", "capabilities": list(capabilities),
             "recovery_policies": list(recovery_policies)})
+
+    def protocol(self):
+        return self._request("/protocol")
 
     def claim(self, capability, *, request_id):
         return self._request("/worker/claim", {"capability": capability, "request_id": request_id})

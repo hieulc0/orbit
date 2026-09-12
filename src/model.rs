@@ -16,6 +16,7 @@ pub fn digest(bytes: &[u8]) -> String {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
 pub struct Definition {
     #[serde(rename = "apiVersion")]
     pub api_version: String,
@@ -28,18 +29,23 @@ pub struct Definition {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
 pub struct Metadata {
     pub name: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
 pub struct Inputs {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub repository_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub base_revision: String,
     pub task: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
 pub struct Step {
     pub uses: String,
     #[serde(default)]
@@ -56,10 +62,21 @@ pub struct Step {
     pub definition: Option<Box<Definition>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fan_out: Option<FanOut>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<crate::compute::Resources>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<crate::compute::Placement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<crate::compute::ContainerSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<crate::agent::AgentSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<crate::agent::ApprovalSpec>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
 pub struct FanOut {
     pub max_items: u32,
     pub max_parallel: u32,
@@ -67,6 +84,8 @@ pub struct FanOut {
     pub items: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signal_from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_from: Option<String>,
 }
 
 impl FanOut {
@@ -114,6 +133,7 @@ impl Limits {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(schemars::JsonSchema)]
 pub enum Recovery {
     RestartFromInputs,
     ResumeFromCheckpoint,
@@ -121,6 +141,7 @@ pub enum Recovery {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(schemars::JsonSchema)]
 pub struct CommandSpec {
     pub argv: Vec<String>,
     pub cwd: String,
@@ -145,15 +166,23 @@ impl Definition {
             "unsupported definition version or kind"
         );
         ensure!(!self.metadata.name.trim().is_empty(), "empty name");
-        ensure!(
-            !self.inputs.repository_id.is_empty() && !self.inputs.task.trim().is_empty(),
-            "repository and task required"
-        );
+        ensure!(!self.inputs.task.trim().is_empty(), "task required");
         let rev = &self.inputs.base_revision;
-        ensure!(
-            [40, 64].contains(&rev.len()) && rev.bytes().all(|b| b.is_ascii_hexdigit()),
-            "full Git commit ID required"
-        );
+        if self.api_version == "orbit/v0"
+            || self
+                .steps
+                .values()
+                .any(|s| s.uses.starts_with("repository."))
+            || !self.inputs.repository_id.is_empty()
+        {
+            ensure!(!self.inputs.repository_id.is_empty(), "repository required");
+            ensure!(
+                [40, 64].contains(&rev.len()) && rev.bytes().all(|b| b.is_ascii_hexdigit()),
+                "full Git commit ID required"
+            );
+        } else {
+            ensure!(rev.is_empty(), "base_revision requires repository_id");
+        }
         if self.api_version == "orbit/v0" {
             ensure!(
                 self.max_concurrency.is_none(),
@@ -195,11 +224,75 @@ impl Definition {
                         "engine.wait",
                         "engine.child",
                         "engine.fan_out",
+                        "container.run",
+                        "agent.run",
+                        "human.approval",
                     ]
                     .contains(&step.uses.as_str())
                 },
                 "invalid capability"
             );
+            ensure!(
+                self.api_version != "orbit/v0"
+                    || (step.resources.is_none()
+                        && step.placement.is_none()
+                        && step.container.is_none()
+                        && step.agent.is_none()
+                        && step.approval.is_none()),
+                "compute fields require v1"
+            );
+            if let Some(resources) = &step.resources {
+                resources.validate()?;
+            }
+            if let Some(placement) = &step.placement {
+                placement.validate()?;
+            }
+            ensure!(
+                !(step.uses.starts_with("engine.") || step.uses == "human.approval")
+                    || (step.resources.is_none() && step.placement.is_none()),
+                "engine steps cannot reserve worker resources"
+            );
+            if step.uses == "agent.run" {
+                step.agent
+                    .as_ref()
+                    .context("agent configuration required")?
+                    .validate()?;
+            } else {
+                ensure!(
+                    step.agent.is_none(),
+                    "agent configuration requires agent.run"
+                );
+            }
+            if step.uses == "human.approval" {
+                step.approval
+                    .as_ref()
+                    .context("approval configuration required")?
+                    .validate()?;
+            } else {
+                ensure!(
+                    step.approval.is_none(),
+                    "approval configuration requires human.approval"
+                );
+            }
+            if step.uses == "container.run" {
+                step.container
+                    .as_ref()
+                    .context("container configuration required")?
+                    .validate()?;
+                let resources = step
+                    .resources
+                    .as_ref()
+                    .context("container resource limits required")?;
+                ensure!(
+                    resources.cpu_millis > 0 && resources.memory_mib >= 16,
+                    "container CPU and at least 16 MiB memory required"
+                );
+            } else {
+                ensure!(
+                    step.container.is_none(),
+                    "container configuration requires container.run"
+                );
+            }
             ensure!(
                 step.max_attempts > 0
                     && step.timeout_seconds > 0
@@ -243,8 +336,16 @@ impl Definition {
                     "invalid fan-out bounds"
                 );
                 ensure!(
-                    fan.items.is_some() != fan.signal_from.is_some(),
-                    "fan-out requires exactly one of items or signal_from"
+                    [
+                        fan.items.is_some(),
+                        fan.signal_from.is_some(),
+                        fan.agent_from.is_some()
+                    ]
+                    .into_iter()
+                    .filter(|v| *v)
+                    .count()
+                        == 1,
+                    "fan-out requires exactly one of items, signal_from or agent_from"
                 );
                 if let Some(items) = &fan.items {
                     fan.validate_items(items)?;
@@ -253,6 +354,20 @@ impl Definition {
                     ensure!(
                         needs.contains(source) && self.steps[source].uses == "engine.wait",
                         "signal_from must be a direct wait dependency"
+                    );
+                }
+                if let Some(source) = &fan.agent_from {
+                    let source_step = self
+                        .steps
+                        .get(source)
+                        .context("agent_from source missing")?;
+                    ensure!(
+                        needs.contains(source)
+                            && source_step.uses == "agent.run"
+                            && source_step.agent.as_ref().is_some_and(
+                                |a| a.max_delegations > 0 && a.max_delegations <= fan.max_items
+                            ),
+                        "agent_from must be a direct agent dependency with bounded delegation"
                     );
                 }
             } else {
@@ -377,18 +492,39 @@ pub struct Plan {
     pub definition: Definition,
     pub repository: RepositoryBinding,
     pub digest: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub agent_bindings: BTreeMap<String, crate::agent::Binding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<crate::governance::Scope>,
 }
 impl Plan {
     pub fn compile(definition: Definition, repository: RepositoryBinding) -> Result<Self> {
+        Self::compile_with_agents(definition, repository, &BTreeMap::new())
+    }
+    pub fn compile_with_agents(
+        definition: Definition,
+        repository: RepositoryBinding,
+        bindings: &BTreeMap<String, crate::agent::Binding>,
+    ) -> Result<Self> {
         definition.validate()?;
-        repository.coding_command.validate()?;
-        ensure!(
-            Path::new(&repository.path).is_absolute(),
-            "repository binding must be absolute"
-        );
+        if !definition.inputs.repository_id.is_empty() {
+            repository.coding_command.validate()?;
+            ensure!(
+                Path::new(&repository.path).is_absolute(),
+                "repository binding must be absolute"
+            );
+        }
+        let mut agent_bindings = BTreeMap::new();
         let mut definitions = vec![&definition];
         while let Some(definition) = definitions.pop() {
             for step in definition.steps.values() {
+                if let Some(agent) = &step.agent {
+                    let binding = bindings
+                        .get(&agent.binding)
+                        .context("agent binding not found")?;
+                    agent.authorize(binding)?;
+                    agent_bindings.insert(agent.binding.clone(), binding.clone());
+                }
                 if let Some(child) = &step.definition {
                     definitions.push(child);
                 }
@@ -402,12 +538,46 @@ impl Plan {
                 }
             }
         }
-        let digest = digest(&serde_json::to_vec(&(&definition, &repository))?);
+        let digest = if agent_bindings.is_empty() {
+            digest(&serde_json::to_vec(&(&definition, &repository))?)
+        } else {
+            digest(&serde_json::to_vec(&(
+                &definition,
+                &repository,
+                &agent_bindings,
+            ))?)
+        };
         Ok(Self {
             definition,
             repository,
             digest,
+            agent_bindings,
+            scope: None,
         })
+    }
+    pub fn in_scope(self, scope: Option<crate::governance::Scope>) -> Result<Self> {
+        let mut plan =
+            Self::compile_with_agents(self.definition, self.repository, &self.agent_bindings)?;
+        if let Some(scope) = scope {
+            scope.validate()?;
+            plan.digest = digest(&serde_json::to_vec(&(&plan.digest, &scope))?);
+            plan.scope = Some(scope);
+        }
+        Ok(plan)
+    }
+}
+impl RepositoryBinding {
+    /// Empty binding for definitions with no repository inputs or repository steps.
+    pub fn none() -> Self {
+        Self {
+            path: String::new(),
+            coding_command: CommandSpec {
+                argv: vec![],
+                cwd: String::new(),
+                timeout_seconds: 0,
+            },
+            allowed_test_executables: vec![],
+        }
     }
 }
 
@@ -449,6 +619,8 @@ pub struct Attempt {
     pub reason: Option<String>,
     #[serde(default)]
     pub outputs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gpu_devices: Vec<u32>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Task {
@@ -466,6 +638,8 @@ pub struct Task {
     pub child_run_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expansion: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_usage: Option<crate::agent::Usage>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -490,6 +664,8 @@ pub struct Artifact {
     pub checksum: String,
     pub size: u64,
     pub finalized: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<crate::artifacts::ArtifactLocation>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Run {
@@ -504,6 +680,11 @@ pub struct Run {
     pub parent_task_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_run_id: Option<String>,
+    #[serde(default = "operator_identity")]
+    pub submitted_by: String,
+}
+fn operator_identity() -> String {
+    "operator".into()
 }
 impl Run {
     pub fn new(plan: Plan, parent_run_id: Option<String>) -> Self {
@@ -514,6 +695,7 @@ impl Run {
             parent_run_id,
             parent_task_id: None,
             root_run_id: None,
+            submitted_by: operator_identity(),
             tasks: plan
                 .definition
                 .steps
@@ -530,6 +712,7 @@ impl Run {
                     signal: None,
                     child_run_ids: vec![],
                     expansion: None,
+                    agent_usage: None,
                 })
                 .collect(),
             plan,
@@ -539,7 +722,7 @@ impl Run {
     /// Only direct coding dependencies supply repository patches; joins do not merge artifacts.
     pub fn input_artifacts(&self, step: &str) -> Vec<Artifact> {
         let config = &self.plan.definition.steps[step];
-        if config.uses != "repository.test" {
+        if !["repository.test", "container.run", "agent.run"].contains(&config.uses.as_str()) {
             return vec![];
         }
         let needs = config.needs.as_deref().unwrap_or_default();
@@ -548,7 +731,8 @@ impl Run {
             .filter(|artifact| {
                 self.tasks.iter().any(|task| {
                     needs.contains(&task.step)
-                        && self.plan.definition.steps[&task.step].uses == "repository.code"
+                        && (config.uses != "repository.test"
+                            || self.plan.definition.steps[&task.step].uses == "repository.code")
                         && task.accepted_outputs.contains(&artifact.id)
                 })
             })
@@ -581,6 +765,10 @@ pub struct Assignment {
     pub step: String,
     pub input_artifacts: Vec<Artifact>,
     pub idempotency_key: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gpu_devices: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_binding_digest: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -603,6 +791,9 @@ pub struct Operation {
 pub enum Action {
     Start,
     Heartbeat,
+    ReserveAgentCall {
+        reservation: crate::agent::CallReservation,
+    },
     PrepareArtifact {
         kind: String,
         checksum: String,

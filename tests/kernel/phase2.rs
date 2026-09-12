@@ -43,6 +43,7 @@ fn literal_fan(items: &[&str], parallel: u32) -> FanOut {
         max_parallel: parallel,
         items: Some(items.iter().map(|s| s.to_string()).collect()),
         signal_from: None,
+        agent_from: None,
     }
 }
 
@@ -58,6 +59,7 @@ async fn dynamic_fan_out_runs_pinned_children_and_joins() -> Result<()> {
             max_parallel: 2,
             items: None,
             signal_from: Some("items".into()),
+            agent_from: None,
         }),
     )?;
     let root = f.submit().await?;
@@ -135,6 +137,7 @@ async fn fan_out_empty_and_invalid_inputs_are_bounded() -> Result<()> {
             max_parallel: 1,
             items: None,
             signal_from: Some("items".into()),
+            agent_from: None,
         }),
     )?;
     for (payload, expected) in [
@@ -543,6 +546,7 @@ async fn limits_cli_and_two_servers_enforce_backpressure() -> Result<()> {
         .post(format!("{second_url}/runs"))
         .bearer_auth(OPERATOR)
         .json(&orbit::api::Submit {
+            scope: None,
             request_id: request_id.clone(),
             definition: f.plan.definition.clone(),
             parent_run_id: None,
