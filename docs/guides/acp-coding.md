@@ -109,6 +109,11 @@ not supported. A denied callback fails the turn; it never authorizes native effe
 
 ## Accounting, evidence and recovery
 
+The [submit, inspect and review workflow](repository-review.md) applies to ACP too.
+`orbit export-run` collects accepted patch, transcript and test artifacts through
+the operator API. The export keeps unknown accounting values as `null` and does
+not copy worker auth stores or workspaces.
+
 Reserve one prompt before dispatch and every broker effect before execution.
 Calls, prompt count, broker count and worst-case terminal duration remain charged
 across retries. One ACP prompt may contain many provider exchanges. Token and

@@ -3,8 +3,6 @@ kind: Definition
 metadata:
   name: wait-and-resume
 inputs:
-  repository_id: fixture
-  base_revision: REPLACE_WITH_FULL_COMMIT_ID
   task: Demonstrate durable timer and signal coordination without workers.
 steps:
   delay:

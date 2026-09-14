@@ -11,6 +11,7 @@ not the source of current setup instructions.
 - [Agents, budgets, delegation and approval](reference/agents.md)
 - [Command agent runtime](guides/command-agent.md)
 - [Remote coding worker and OCI tools](guides/remote-coding.md)
+- [Submit, inspect and review a repository change](guides/repository-review.md)
 - [ACP coding worker and Codex bridge](guides/acp-coding.md) — experimental runtime,
   offline workflow evidence and live acceptance gaps
 - [ACP installation preflight](guides/acp-preflight.md) — credential-free probe,

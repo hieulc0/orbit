@@ -173,9 +173,9 @@ worktree, as the bootstrap baseline. See [dogfooding](../development/dogfooding.
 
 ## Durable timers and signals
 
-After configuring a repository binding and starting the server, use
-[wait-and-resume.yaml](../../examples/wait-and-resume.yaml) with a full fixture commit
-ID to run coordination without workers:
+With the server running, use
+[wait-and-resume.yaml](../../examples/wait-and-resume.yaml) unchanged to run
+coordination without a repository or workers:
 
 ```sh
 orbit validate examples/wait-and-resume.yaml

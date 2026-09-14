@@ -71,9 +71,30 @@ ORBIT_EVIDENCE_DIR="$PWD/target/qualification-remote-coding" \
 cargo test --locked --features fault-injection --test kernel remote_coding -- --ignored
 ```
 
+For just the repository review/export workflow, use the filter
+`remote_coding_private_git_oci_revision_independent_tests_and_review` in the same
+command. It invokes the actual `export-run` CLI while human review is waiting,
+checks the snapshot, journal and accepted patch/test artifacts against PostgreSQL,
+kills/restarts the server, then approves and exports the final state. Replaying the
+approval must produce one decision; the original candidate bundle must remain
+byte-identical. With `ORBIT_EVIDENCE_DIR` set, both bundles are retained under
+`fixtures/fixture-*/{candidate-review,final-review}`. These are private review
+bundles, not runtime configuration to share. `export-evidence` excludes the entire
+`fixtures` directory, so inspect these two bundles separately. See the
+[observed qualification](../operations/remote-coding-qualification.md#repository-review-export-qualification).
+Run inside a delegated user scope when the host requires it for rootless cgroups:
+`systemd-run --user --scope --property=Delegate=yes env ORBIT_TEST_DATABASE_URL=... ORBIT_EVIDENCE_DIR=... cargo test ...`.
+
 Regular `tests/execution.rs` and the repository-helper unit test need no database,
 container or credential account. Shared engine changes still require the full
 qualification suite, including legacy agent, artifact, governance and digest cases.
+
+`cargo test --locked --test run_export` exercises the actual export CLI against
+disposable authenticated loopback HTTP fixtures. It checks snapshot-bounded journal
+pagination, accepted-only downloads, private file permissions, hashes, authorization,
+corrupt/missing history and artifacts, size limits and refusal to overwrite paths.
+It needs local socket access, with no database, container, model account or remote
+service. It does not establish live workflow qualification.
 
 ACP has offline subprocess, confinement, auth, contract and bridge tests:
 

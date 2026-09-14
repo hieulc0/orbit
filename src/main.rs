@@ -134,6 +134,16 @@ enum Commands {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Save a run, its journal and verified accepted artifacts for private review.
+    ExportRun {
+        run_id: String,
+        /// New private directory; existing paths are never overwritten.
+        #[arg(long)]
+        output: PathBuf,
+        /// Maximum total export size, including metadata (default 256 MiB).
+        #[arg(long, default_value_t = orbit::run_export::DEFAULT_MAX_BYTES, value_parser = clap::value_parser!(u64).range(1..))]
+        max_bytes: u64,
+    },
     /// Run saved worker inputs locally, without updating any Orbit run.
     ExecuteLocal {
         #[arg(long)]
@@ -580,6 +590,11 @@ async fn main() -> Result<()> {
             client.post("/limits", &limits).await?
         }
         Commands::Inspect { run_id } => client.get(&format!("/runs/{run_id}")).await?,
+        Commands::ExportRun {
+            run_id,
+            output,
+            max_bytes,
+        } => orbit::run_export::export(&client, &run_id, &output, max_bytes).await?,
         Commands::Events {
             run_id,
             output,

@@ -50,6 +50,10 @@ The timer needs no worker or repository. For compute, agents, repository changes
 and approvals, follow the [workflow guides](docs/README.md#workflows). Keep the
 same request ID after an uncertain submission; use a new ID for independent work.
 
+For a repository change, follow [submit → inspect → review](docs/guides/repository-review.md).
+`orbit export-run RUN_ID --output /absolute/private/review` saves a private run
+snapshot, journal and verified accepted artifacts for human review.
+
 ## Execution contract
 
 Runs pin their definitions and bindings. Workers claim leased attempts and must

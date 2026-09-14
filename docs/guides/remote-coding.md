@@ -118,10 +118,10 @@ capabilities; the server must authorize them. Old workers cannot claim these new
 tasks. `ORBIT_CONTAINER_RUNTIME` does not override the pinned workspace profile.
 `execute-local` remains the legacy offline runner and does not load this configuration.
 
-With a separate operator session, submit your edited definition using `orbit run`,
-inspect the run and download its patch, manifest, logs, agent report, execution
-report and independent test report. Then use `orbit approve RUN_ID review --comment
-'Reviewed patch and independent tests'`. The gate does not merge or push. Separate
+With a separate operator session, follow the
+[submit, inspect and review workflow](repository-review.md). Use `orbit export-run`
+to collect the snapshot, journal, patch, manifests and independent reports into a
+private review directory. The approval gate does not merge or push. Separate
 testing verifies the accepted candidate, not that agent-modified tests are a trusted
 correctness oracle: the human must review test changes as well as implementation.
 

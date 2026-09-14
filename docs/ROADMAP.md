@@ -70,6 +70,19 @@ provider/model/account and a separately hosted worker, not more worker types.
 See [remote coding qualification](operations/remote-coding-qualification.md) for
 the passing local checks, reviewed artifacts and remaining live acceptance gates.
 
+The immediate product increment is a repeatable
+[submit, inspect and review workflow](guides/repository-review.md). `orbit export-run`
+collects a private, journal-bounded snapshot and verified accepted artifacts using
+existing read APIs. It supports human review without changing engine semantics or
+claiming live acceptance. The actual CLI now passes the local PostgreSQL/rootless
+Podman workflow across a pending-review server restart, with deduplicated approval
+and byte-identical candidate artifacts; see the
+[qualification record](operations/remote-coding-qualification.md#repository-review-export-qualification).
+Repeated real tasks should establish useful outcomes and
+expose onboarding/recovery friction before adding further adapters. A subsequent
+non-repository workload should exercise existing compute/artifact/wait contracts;
+extend the worker contract only when that workload demonstrates a specific gap.
+
 ## In progress: ACP agent integration
 
 Add a worker-side ACP adapter alongside the existing Responses and command
@@ -87,9 +100,11 @@ Delivery order is Codex, official Google Antigravity ACP, then Claude. The pinne
 Codex ACP adapter passes initialization but uses native tools. A version-specific
 Codex App Server bridge hands effects to Orbit before execution; see the
 [setup guide](guides/acp-coding.md) and [compatibility record](operations/acp-codex-compatibility.md).
-Next: resolve the specific terminal handoff gaps in
-[Antigravity/Claude](operations/acp-agent-compatibility.md), retaining Codex-first
-live account/host acceptance as a separately authorized gate.
+Prioritize Codex-first live account/host acceptance for the selected workflow.
+The specific terminal handoff gaps in
+[Antigravity/Claude](operations/acp-agent-compatibility.md) remain follow-up work
+when a selected workload requires those agents; they do not gate use of the
+implemented Codex path.
 A prompt may hide multiple model calls; unknown billing stays unknown.
 Unresolved prompts retain intervention semantics, with automatic session resume
 deferred. Agent and repository tools have distinct OCI resource/network policies;

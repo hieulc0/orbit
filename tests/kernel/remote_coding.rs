@@ -229,6 +229,125 @@ async fn terminal(f: &Fixture, run: &str, step: usize, expected: &str) -> Result
     .context("remote coding fixture deadline")?
 }
 
+async fn export_run_cli(client: &Client, run: &str, destination: &Path) -> Result<Value> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_orbit"))
+            .args(["--url", &client.url, "export-run", run, "--output"])
+            .arg(destination)
+            .env_remove("ORBIT_TOKEN_FILE")
+            .env("ORBIT_TOKEN", &client.token)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .context("run export CLI deadline")??;
+    anyhow::ensure!(
+        output.status.success(),
+        "run export failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+/// Independently check the CLI's files against PostgreSQL state and accepted outputs.
+fn verify_review_bundle(
+    directory: &Path,
+    manifest: &Value,
+    expected_run: &Value,
+    expected_events: &Value,
+) -> Result<BTreeMap<String, Vec<u8>>> {
+    use std::os::unix::fs::PermissionsExt;
+    let manifest_bytes = std::fs::read(directory.join("manifest.json"))?;
+    assert_eq!(serde_json::from_slice::<Value>(&manifest_bytes)?, *manifest);
+    assert_eq!(manifest["format"], "orbit-run-export/v1");
+    assert_eq!(manifest["run_id"], expected_run["id"]);
+    assert_eq!(manifest["state"], expected_run["state"]);
+    assert_eq!(manifest["plan_digest"], expected_run["plan"]["digest"]);
+    assert_eq!(manifest["journal_sequence"], expected_run["sequence"]);
+    assert_eq!(manifest["review_required"], true);
+    assert_eq!(
+        std::fs::metadata(directory)?.permissions().mode() & 0o077,
+        0
+    );
+    let mut files = BTreeMap::from([("manifest.json".into(), manifest_bytes)]);
+    for file in manifest["files"].as_array().unwrap() {
+        let path = file["path"].as_str().unwrap();
+        assert!(
+            Path::new(path)
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)))
+        );
+        let metadata = std::fs::symlink_metadata(directory.join(path))?;
+        assert!(metadata.is_file());
+        assert_eq!(metadata.permissions().mode() & 0o077, 0);
+        let bytes = std::fs::read(directory.join(path))?;
+        assert_eq!(file["sha256"], digest(&bytes));
+        assert_eq!(file["size"], bytes.len());
+        assert!(files.insert(path.into(), bytes).is_none());
+    }
+    let run: Value = serde_json::from_slice(&files["run.json"])?;
+    assert_eq!(run, *expected_run);
+    assert_eq!(
+        serde_yaml::from_slice::<Value>(&files["definition.yaml"])?,
+        expected_run["plan"]["definition"]
+    );
+    let events = std::str::from_utf8(&files["events.jsonl"])?
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    assert_eq!(json!(events), *expected_events);
+    assert_eq!(
+        events.len() as i64,
+        expected_run["sequence"].as_i64().unwrap()
+    );
+
+    let accepted = expected_run["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|task| {
+            task["accepted_outputs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(move |id| (id.as_str().unwrap(), task["step"].as_str().unwrap()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        manifest["artifacts"].as_array().unwrap().len(),
+        accepted.len()
+    );
+    for artifact in manifest["artifacts"].as_array().unwrap() {
+        let id = artifact["id"].as_str().unwrap();
+        assert_eq!(artifact["step"], accepted[id]);
+        assert_eq!(artifact["path"], format!("artifacts/{id}"));
+        let original = expected_run["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|metadata| metadata["id"] == id)
+            .unwrap();
+        assert_eq!(artifact["attempt_id"], original["attempt_id"]);
+        assert_eq!(artifact["kind"], original["kind"]);
+        let bytes = &files[artifact["path"].as_str().unwrap()];
+        assert_eq!(digest(bytes), original["checksum"]);
+        assert_eq!(bytes.len(), original["size"].as_u64().unwrap() as usize);
+    }
+    for bytes in files.values() {
+        for secret in [
+            OPERATOR,
+            CODER,
+            TESTER,
+            "fixture-git-token-private-00000000",
+            "fixture-model-token-private-00000000",
+        ] {
+            assert!(!String::from_utf8_lossy(bytes).contains(secret));
+        }
+    }
+    Ok(files)
+}
+
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL, rootless Podman and pinned Alpine image"]
 async fn remote_coding_private_git_oci_revision_independent_tests_and_review() -> Result<()> {
@@ -257,9 +376,9 @@ async fn remote_coding_private_git_oci_revision_independent_tests_and_review() -
     );
     drop(coder);
     drop(server);
-    let _server =
+    let server =
         server_process_configured(&f, &address, None, remote.server_config.clone()).await?;
-    let _tester = spawn_worker(&f, &remote, &address, "repository.test")?;
+    let tester = spawn_worker(&f, &remote, &address, "repository.test")?;
     let tested = terminal(&f, &run, 1, "WAITING").await?;
     assert_eq!(tested["tasks"][2]["state"], "SUCCEEDED");
     assert_ne!(
@@ -275,6 +394,47 @@ async fn remote_coding_private_git_oci_revision_independent_tests_and_review() -
     let patch_bytes = std::fs::read(f.engine.artifact_root.join(patch["id"].as_str().unwrap()))?;
     assert!(String::from_utf8_lossy(&patch_bytes).contains("$1 + $2"));
     assert!(git(Path::new(&f.plan.repository.path), &["diff", "HEAD"])?.is_empty());
+    let review_directory = f.root.path().join("candidate-review");
+    let review = export_run_cli(&operator, &run, &review_directory).await?;
+    let review_events = f.engine.events(&run).await?;
+    let review_files = verify_review_bundle(&review_directory, &review, &tested, &review_events)?;
+    assert_eq!(review["state"], "RUNNING");
+    assert_eq!(
+        review_files[&format!("artifacts/{}", patch["id"].as_str().unwrap())],
+        patch_bytes
+    );
+    let report = review["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["step"] == "test" && a["kind"] == "test_report")
+        .unwrap();
+    let report: Value = serde_json::from_slice(&review_files[report["path"].as_str().unwrap()])?;
+    assert_eq!(report["success"], true);
+    assert_eq!(report["patch_id"], patch["id"]);
+    assert_eq!(report["patch_checksum"], patch["checksum"]);
+    assert_eq!(
+        report["base_revision"],
+        f.plan.definition.inputs.base_revision
+    );
+    assert_eq!(
+        report["attempt_id"],
+        tested["tasks"][2]["attempts"][0]["id"]
+    );
+    assert_eq!(report["commands"][0]["success"], true);
+    assert_eq!(report["commands"][1]["argv"], json!(["sh", "test.sh"]));
+    assert_eq!(report["commands"][1]["exit_code"], 0);
+    assert_eq!(report["commands"][1]["timed_out"], false);
+    assert_eq!(operator.get(&format!("/runs/{run}")).await?, tested);
+
+    // Kill the real API process while human review is waiting. Recovery must
+    // retain exactly the candidate the reviewer exported, with no new attempts.
+    drop(tester);
+    drop(server);
+    let _server =
+        server_process_configured(&f, &address, None, remote.server_config.clone()).await?;
+    assert_eq!(operator.get(&format!("/runs/{run}")).await?, tested);
+    assert_eq!(f.engine.events(&run).await?, review_events);
     for artifact in tested["artifacts"].as_array().unwrap() {
         let bytes = std::fs::read(
             f.engine
@@ -305,18 +465,46 @@ async fn remote_coding_private_git_oci_revision_independent_tests_and_review() -
             .await
             .is_err()
     );
-    operator
-        .post(
-            &format!("/runs/{run}/approvals"),
-            &orbit::agent::Approval {
-                request_id: id(),
-                step: "review".into(),
-                approved: true,
-                comment: "fixture reviewer inspected independent artifacts".into(),
-            },
-        )
+    let decision = orbit::agent::Approval {
+        request_id: id(),
+        step: "review".into(),
+        approved: true,
+        comment: "fixture reviewer inspected independent artifacts".into(),
+    };
+    let receipt = operator
+        .post(&format!("/runs/{run}/approvals"), &decision)
         .await?;
-    terminal(&f, &run, 1, "SUCCEEDED").await?;
+    assert_eq!(
+        operator
+            .post(&format!("/runs/{run}/approvals"), &decision)
+            .await?,
+        receipt
+    );
+    let finished = terminal(&f, &run, 1, "SUCCEEDED").await?;
+    assert_eq!(finished["state"], "SUCCEEDED");
+    let final_directory = f.root.path().join("final-review");
+    let final_review = export_run_cli(&operator, &run, &final_directory).await?;
+    let final_events = f.engine.events(&run).await?;
+    verify_review_bundle(&final_directory, &final_review, &finished, &final_events)?;
+    assert_eq!(final_review["artifacts"], review["artifacts"]);
+    assert_eq!(final_review["plan_digest"], review["plan_digest"]);
+    let before = review_events.as_array().unwrap();
+    let after = final_events.as_array().unwrap();
+    assert!(after.len() > before.len());
+    assert_eq!(&after[..before.len()], before);
+    let approvals = after
+        .iter()
+        .filter(|event| event["event"]["type"] == "APPROVAL_RECEIVED")
+        .collect::<Vec<_>>();
+    assert_eq!(approvals.len(), 1);
+    assert_eq!(approvals[0]["event"]["request_id"], decision.request_id);
+    assert_eq!(approvals[0]["event"]["actor"], "operator");
+    assert_eq!(
+        verify_review_bundle(&review_directory, &review, &tested, &review_events)?,
+        review_files,
+        "the original review bundle must remain byte-identical after approval"
+    );
+    f.assert_invariants().await?;
     f.evidence("remote-coding-private-git-oci-review").await?;
     drop(remote.provider);
     Ok(())

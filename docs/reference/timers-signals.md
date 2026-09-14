@@ -3,8 +3,9 @@
 `orbit/v1` adds two engine-owned steps to the [graph contract](graphs.md).
 Both persist in the run aggregate with transactional journal entries. Neither
 claims a worker, starts a process, creates an attempt, or produces artifacts.
-Repository inputs and the server-controlled repository binding remain required
-by the current definition format, including for coordination-only graphs.
+Coordination-only `orbit/v1` graphs need only `inputs.task`; they require no
+repository binding or Git revision. Repository steps retain their existing input
+requirements. See [compute and artifacts](compute-artifacts.md).
 
 ## Timers
 
@@ -54,8 +55,10 @@ it does not promise eventual run success. Payloads are visible in operator run
 inspection and evidence; do not submit credentials or secrets. History records a
 payload digest rather than a second copy of the payload.
 
-Only the operator credential may send signals. This is a coordination primitive,
-not a business approval system with per-person permissions or approval policies.
+Legacy deployments use the operator credential to send signals. Governed
+deployments require `run.signal` on the run's scope. Human decisions use the
+separate `human.approval` contract and assignee checks; a signal cannot approve
+that step. See [governance](governance.md).
 
 ## Idempotency and races
 
@@ -79,11 +82,12 @@ completion and new signals, but does not reset existing signal wait deadlines.
 
 ## CLI and example
 
-Use [wait-and-resume.yaml](../../examples/wait-and-resume.yaml) with a configured
-fixture binding and a full base commit ID. This graph needs a server but no
-workers. Start it with `orbit run`, then deliver the signal:
+Use [wait-and-resume.yaml](../../examples/wait-and-resume.yaml) unchanged with a
+running server. This graph needs no repository or workers. Start it with
+`orbit run`, then deliver the signal:
 
 ```sh
+orbit run examples/wait-and-resume.yaml --request-id wait-release-1
 orbit signal RUN_ID resume --request-id resume-release-1
 orbit inspect RUN_ID
 orbit events RUN_ID

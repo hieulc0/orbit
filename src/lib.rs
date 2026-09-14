@@ -24,6 +24,7 @@ pub mod model;
 pub mod ops;
 pub mod registry;
 pub mod repository;
+pub mod run_export;
 pub mod sdk;
 pub mod worker;
 pub mod workspace;

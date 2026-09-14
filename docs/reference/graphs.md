@@ -12,8 +12,10 @@ workers assume fixed step names.
 A graph contains 1–256 statically declared steps. Step IDs contain 1–128 ASCII
 letters, digits, underscores, or hyphens. Dependencies must reference distinct
 existing steps; self dependencies and cycles are rejected. Definition inputs and
-repository bindings remain the repository-specific v0 contract. Unknown fields
-and capabilities are rejected. Plans remain immutable and digest-protected.
+repository bindings are required for repository steps; coordination and compute-only
+v1 graphs need only `inputs.task`. Unknown fields and capabilities are rejected.
+Plans remain immutable and digest-protected. Later compute, agent and approval
+capabilities are documented in [compute](compute-artifacts.md) and [agents](agents.md).
 
 Supported capabilities:
 

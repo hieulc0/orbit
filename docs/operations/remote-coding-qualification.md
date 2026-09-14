@@ -87,6 +87,56 @@ independent test report were inspected, as were the dogfood README-only patch,
 commands and test log. This is not a guarantee that every arbitrary legacy
 artifact is safe to publish; exports remain private pending owner review.
 
+## Repository review export qualification
+
+Record: 2026-09-15 (local time). The existing
+`remote_coding_private_git_oci_revision_independent_tests_and_review` case now
+invokes the actual `orbit export-run` CLI against the real API, not an HTTP mock.
+The targeted fault-enabled case passed in 4.59 seconds using disposable PostgreSQL
+17 and the cached pinned Alpine image in rootless Podman with delegated cgroup v2.
+Git and Responses endpoints remained authenticated loopback fixtures.
+
+The case verifies a pending-review export against PostgreSQL state and the complete
+snapshot-bounded journal; accepted patch bytes and independent test provenance;
+private file permissions, checksums and absence of known fixture credentials. It
+kills/restarts the server while review is waiting and checks unchanged state and
+history before a fixture operator approves. Replaying the approval returns the same
+receipt and records one decision. The final export contains the successful outcome
+and decision; every byte of the original candidate bundle remains unchanged.
+Worker approval remains denied, and the source repository is unchanged.
+
+Retained evidence:
+
+- Raw fixture and run records: `target/qualification-review-export.Bu43Gh`.
+- Under its `fixtures/fixture-77fVM2`, `candidate-review` has 11 manifest-listed
+  files (44,866 bytes), eight accepted artifacts and journal sequence 55;
+  `final-review` has 11 files (45,918 bytes), the same artifacts and sequence 58.
+  Counts exclude each bundle's `manifest.json`.
+- Separate `export-evidence` output: `target/qualification-review-export.Bu43Gh-review`;
+  12 manifest-listed files (53,067 bytes), one run and eight accepted artifacts.
+  Runtime fixtures and the two CLI bundles are deliberately excluded from this
+  separate export, so their manifests were reviewed independently.
+
+All three exports' file hashes/sizes and accepted artifact bytes were independently
+checked. The actual `calc.sh` addition patch, single changed-path manifest,
+inspect/fail/edit/retest tool log, resource/network provenance, independent
+`sh test.sh` result and approval actor/comment were inspected locally. Known
+fixture credentials were absent. All bundles retain `review_required: true`;
+local host paths remain in tool arguments and no bundle was published.
+
+`bash scripts/check.sh` passed: regular Rust tests, formatting, all-target/all-feature
+Clippy with warnings denied, Python tests, strict UI build, documentation links and
+diff whitespace. The normal binary was rebuilt without fault injection. This
+increment changes tests and documentation only; the full ignored qualification,
+ACP/live-account workflow, separate-host pilot and browser suites were not rerun.
+It does not replace their prior evidence or close their acceptance gaps.
+
+The newly provisioned Compose project `orbit-review-qualification` retains its
+`orbit-postgres` container on loopback port 55439, dedicated
+`orbit-review-qualification_orbit-postgres` volume and network, plus the raw
+fixture/schema and cached Podman image. No image was pulled or published and no
+live system was used. No Orbit task containers remained after the targeted case.
+
 ## Remaining acceptance work
 
 Select and explicitly authorize a real provider/account, exact model revision and

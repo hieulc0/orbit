@@ -111,6 +111,43 @@ see [bounds and setup](../guides/acp-preflight.md).
 its canonical SHA-256 without API credentials, login or process execution. It
 accepts at most 64 KiB. A full worker configuration is not a launch object.
 
+### Private run export
+
+`orbit export-run RUN_ID --output DIRECTORY [--max-bytes BYTES]` reads the existing
+run, journal and artifact endpoints with the caller's credentials. It performs no
+server mutations and grants no approval. The destination must be new, with an
+existing parent; existing files, directories and symlinks are rejected. On Unix,
+new directories are private (0700) and files are private (0600), subject to umask.
+
+The export contains `run.json`, `definition.yaml`, `events.jsonl`, accepted bytes
+under `artifacts/ID`, and `manifest.json`. The `orbit-run-export/v1` manifest maps
+each accepted artifact to its producing step, attempt, kind and path, and records
+the exported files' SHA-256 hashes and sizes. It preserves the server's original
+plan digest and the snapshot's state and journal sequence. The regenerated,
+redacted definition is for inspection; it is not a replacement executable plan.
+
+Journal pages must be contiguous from sequence 1 through the snapshot sequence.
+Events committed later are excluded, even if the run advances during download.
+Only outputs accepted in that snapshot are downloaded; obsolete attempts' uploads
+are not promoted to accepted outputs. Every download must match its accepted
+checksum and size. An authorization failure, journal gap, missing/corrupt artifact
+or size overrun fails the command. Exports of running or failed runs remain useful
+diagnostic snapshots; successful export does not imply successful execution.
+
+The default total output limit is 256 MiB, including metadata and the manifest.
+Artifacts are downloaded individually and journal pages are written incrementally.
+The manifest is published last, after all included files have been verified and
+written. Failure leaves private partial files for inspection; choose a new
+destination when retrying. No automatic overwrite, cleanup, history retention or
+recursive child-run export is provided. Each child has its own run and export.
+
+Structured credential fields are removed from JSON metadata. Artifact bytes remain
+unchanged and may contain private source, commands or secrets; review all contents
+before sharing. Every manifest retains `review_required: true`. Run/plan identity
+comes from the authenticated server; local hashes are integrity checks, not a
+signed attestation or an approval decision. See the
+[repository review guide](../guides/repository-review.md).
+
 ## Rust SDK
 
 Use the local `orbit` crate's `orbit::sdk` module. It exports `Client`, `Assignment`,

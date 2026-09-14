@@ -18,7 +18,7 @@ fn regular(path: &Path, directory: bool) -> Result<()> {
     Ok(())
 }
 
-fn redact(value: &mut Value) {
+pub(crate) fn redact(value: &mut Value) {
     match value {
         Value::Object(fields) => {
             fields.retain(|key, _| {
