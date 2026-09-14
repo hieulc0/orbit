@@ -236,7 +236,11 @@ impl Governance {
                 );
                 policy.max_resources.validate()?;
                 if let Some(budget) = &policy.max_agent_budget {
-                    budget.validate()?;
+                    if budget.tokens.is_none() && budget.cost_microusd.is_none() {
+                        budget.validate_execution_only()?;
+                    } else {
+                        budget.validate()?;
+                    }
                 }
             }
         }

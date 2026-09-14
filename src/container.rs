@@ -262,6 +262,11 @@ pub(crate) async fn run_supervised(
         _ = tokio::time::sleep(Duration::from_secs(timeout)) => Ok(124),
     };
     let _ = child.kill().await;
+    remove(runtime, name).await?;
+    Ok(result?)
+}
+
+pub(crate) async fn remove(runtime: &str, name: &str) -> Result<()> {
     // Docker may finish a create after its CLI has disconnected. Retry cleanup
     // for a bounded grace period; report daemon errors without claiming a stop.
     let mut stopped = false;
@@ -294,5 +299,5 @@ pub(crate) async fn run_supervised(
         stopped,
         "container cleanup unconfirmed; inspect attempt container {name}"
     );
-    Ok(result?)
+    Ok(())
 }

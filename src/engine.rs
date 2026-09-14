@@ -531,8 +531,21 @@ impl Engine {
             event(&mut tx, &mut run, json!({"type":"MESSAGE_REJECTED","actor":worker,"attempt_id":op.attempt_id,"reason":response["status"]})).await?;
         }
         if response["status"] == "accepted" {
+            if let Action::RecordAcpSession { batch } = &op.action {
+                event(
+                    &mut tx,
+                    &mut run,
+                    json!({"type":"ACP_SESSION_RECORDED","actor":worker,"attempt_id":op.attempt_id,
+                    "batch":batch,"replayed":response["replayed"]}),
+                )
+                .await?;
+            }
             if let Action::ReserveAgentCall { reservation } = &op.action {
-                event(&mut tx, &mut run, json!({"type":"AGENT_CALL_RESERVED","actor":worker,"attempt_id":op.attempt_id,"call_id":reservation.call_id,"tokens":reservation.tokens,"cost_microusd":reservation.cost_microusd,"tool":reservation.tool,"permissions":reservation.permissions,"request_digest":reservation.request_digest,"replayed":response["replayed"]})).await?;
+                let mut record = json!({"type":"AGENT_CALL_RESERVED","actor":worker,"attempt_id":op.attempt_id,"call_id":reservation.call_id,"tokens":reservation.tokens,"cost_microusd":reservation.cost_microusd,"tool":reservation.tool,"permissions":reservation.permissions,"request_digest":reservation.request_digest,"replayed":response["replayed"]});
+                if let Some(charge) = &reservation.acp_charge {
+                    record["acp_charge"] = serde_json::to_value(charge)?;
+                }
+                event(&mut tx, &mut run, record).await?;
             }
             if let Action::FinishAgentCall { receipt } = &op.action {
                 event(&mut tx, &mut run, json!({"type":"AGENT_CALL_FINISHED","actor":worker,"attempt_id":op.attempt_id,
@@ -573,6 +586,22 @@ impl Engine {
         verified: &std::collections::BTreeMap<String, (Artifact, Vec<u8>)>,
     ) -> Result<Value> {
         match &op.action {
+            Action::RecordAcpSession { batch } => {
+                ensure!(
+                    run.tasks[ti].state == State::Running && batch.attempt_id == op.attempt_id,
+                    "ACP records require running owner"
+                );
+                let limits = run.plan.definition.steps[&run.tasks[ti].step]
+                    .agent
+                    .as_ref()
+                    .and_then(|s| s.acp_limits.as_ref())
+                    .context("ACP records require ACP binding")?;
+                let usage = run.tasks[ti]
+                    .agent_usage
+                    .get_or_insert_with(Default::default);
+                let fresh = usage.record_acp(limits, batch)?;
+                return Ok(json!({"status":"accepted","replayed":!fresh}));
+            }
             Action::Start => {
                 ensure!(
                     run.tasks[ti].state == State::Claimed,
@@ -820,6 +849,48 @@ impl Engine {
                         &op.attempt_id,
                         &run.plan.agent_bindings[&spec.binding],
                     )?;
+                    if spec.acp_limits.is_some() {
+                        ensure!(
+                            run.tasks[ti].agent_usage.as_ref().is_some_and(|usage| usage
+                                .reservations
+                                .values()
+                                .any(|call| call
+                                    .call_id
+                                    .starts_with(&format!("{}-", op.attempt_id))
+                                    && call.acp_charge
+                                        == Some(crate::acp_contract::Charge::Prompt)
+                                    && usage.receipts.contains_key(&call.call_id))),
+                            "ACP completion requires an acknowledged prompt"
+                        );
+                        let session_id = report.output["acp"]["session_digest"]
+                            .as_str()
+                            .context("ACP session report missing")?;
+                        let session = run.tasks[ti]
+                            .agent_usage
+                            .as_ref()
+                            .and_then(|u| u.acp_sessions.get(session_id))
+                            .context("ACP session evidence missing")?;
+                        ensure!(
+                            session.attempt_id == op.attempt_id
+                                && session.completed
+                                && report.output["acp"]["cleanup_confirmed"] == true
+                                && report.output["acp"]["accounting"] == "execution_only"
+                                && report.output["acp"]["output_bytes"] == session.output_bytes
+                                && report.output["acp"]["reported_tool_calls"]
+                                    == session.reported_tool_calls,
+                            "ACP session evidence mismatch"
+                        );
+                        let logs = run
+                            .artifacts
+                            .iter()
+                            .find(|a| outputs.contains(&a.id) && a.kind == "logs")
+                            .context("ACP transcript missing")?;
+                        crate::acp_contract::verify_transcript(
+                            verified_bytes(verified, logs)?,
+                            session_id,
+                            session,
+                        )?;
+                    }
                     run.tasks[ti].expansion = Some(report.delegation_inputs);
                 }
                 if *success

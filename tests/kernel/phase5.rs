@@ -92,9 +92,10 @@ async fn agent_budgets_permissions_and_retries_are_transactional() -> Result<()>
     let reservation = |key: &str, tokens| Action::ReserveAgentCall {
         reservation: CallReservation {
             request_digest: None,
+            acp_charge: None,
             call_id: key.into(),
-            tokens,
-            cost_microusd: 1,
+            tokens: Some(tokens),
+            cost_microusd: Some(1),
             tool: None,
             permissions: vec![],
         },
@@ -117,9 +118,10 @@ async fn agent_budgets_permissions_and_retries_are_transactional() -> Result<()>
         Action::ReserveAgentCall {
             reservation: CallReservation {
                 request_digest: None,
+                acp_charge: None,
                 call_id: "forbidden".into(),
-                tokens: 1,
-                cost_microusd: 0,
+                tokens: Some(1),
+                cost_microusd: Some(0),
                 tool: Some("shell".into()),
                 permissions: vec![],
             },

@@ -418,11 +418,12 @@ async fn remote_coding_profile_admission_receipts_and_expired_dispatch_are_fence
     f.start("coder", &a).await?;
     let call = CallReservation {
         call_id: format!("{}-model-0", a.attempt_id),
-        tokens: 100,
-        cost_microusd: 1,
+        tokens: Some(100),
+        cost_microusd: Some(1),
         tool: None,
         permissions: vec![],
         request_digest: Some(digest(b"request")),
+        acp_charge: None,
     };
     let op = operation(
         &a,
@@ -581,11 +582,12 @@ async fn remote_coding_deadline_and_cancellation_retain_model_uncertainty() -> R
                     Action::ReserveAgentCall {
                         reservation: CallReservation {
                             call_id: format!("{}-model-0", a.attempt_id),
-                            tokens: 100,
-                            cost_microusd: 1,
+                            tokens: Some(100),
+                            cost_microusd: Some(1),
                             tool: None,
                             permissions: vec![],
                             request_digest: Some(digest(b"pending")),
+                            acp_charge: None,
                         },
                     },
                 ),
@@ -676,7 +678,7 @@ async fn remote_coding_denies_credentials_profiles_tools_and_budget_before_effec
                     .as_mut()
                     .unwrap()
                     .budget
-                    .tokens = 1
+                    .tokens = Some(1)
             }
             _ => {}
         }

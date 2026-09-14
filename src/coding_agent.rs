@@ -47,6 +47,10 @@ pub struct Session<'a> {
 impl Runtime {
     pub fn validate(&self) -> Result<()> {
         self.binding.validate()?;
+        ensure!(
+            self.binding.acp.is_none(),
+            "Responses runtime cannot execute ACP bindings"
+        );
         credential_name(&self.binding_name)?;
         credential_name(&self.credential)?;
         endpoint(&self.endpoint, self.allow_http_loopback)?;
@@ -66,8 +70,8 @@ impl Runtime {
         ensure!(
             self.tokens_per_call
                 >= u64::from(self.max_input_bytes) + u64::from(self.max_output_tokens) + 4096
-                && self.tokens_per_call <= self.binding.max_budget.tokens
-                && self.cost_microusd_per_call <= self.binding.max_budget.cost_microusd,
+                && Some(self.tokens_per_call) <= self.binding.max_budget.tokens
+                && Some(self.cost_microusd_per_call) <= self.binding.max_budget.cost_microusd,
             "coding runtime reservation does not cover configured bounds"
         );
         ensure!(
@@ -184,7 +188,8 @@ impl Runtime {
             }
             let value: Value = serde_json::from_slice(&raw).context("invalid model response")?;
             ensure!(
-                value["status"] == "completed" && value["model"] == self.binding.model,
+                value["status"] == "completed"
+                    && value["model"].as_str() == self.binding.model.as_deref(),
                 "model response incomplete or model revision mismatch"
             );
             let external = value["id"]
@@ -328,11 +333,12 @@ async fn reserve(
             Action::ReserveAgentCall {
                 reservation: CallReservation {
                     call_id: call_id.into(),
-                    tokens,
-                    cost_microusd: cost,
+                    tokens: Some(tokens),
+                    cost_microusd: Some(cost),
                     tool: tool.map(String::from),
                     permissions,
                     request_digest: Some(digest(bytes)),
+                    acp_charge: None,
                 },
             },
         )

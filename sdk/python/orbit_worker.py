@@ -35,18 +35,40 @@ def operation(assignment, action, *, request_id=None, **payload):
     }
 
 
-def reserve_agent_call(assignment, *, call_id, tokens, cost_microusd,
-                       tool=None, permissions=(), request_id=None):
+def reserve_agent_call(assignment, *, call_id, tokens=None, cost_microusd=None,
+                       tool=None, permissions=(), request_id=None,
+                       request_digest=None, acp_charge=None):
     """Persist this operation, send it before dispatch, and honor replayed=True.
 
     Reservations are conservative upper bounds, never refunded across retries.
     A replay is not permission to invoke the provider again. A new invocation
     needs a new call_id and a fresh reservation, even after an uncertain result.
     """
+    reservation = {"call_id": call_id, "tool": tool, "permissions": list(permissions)}
+    if acp_charge is None:
+        if tokens is None or cost_microusd is None:
+            raise ValueError("Legacy calls require token and cost reservations")
+        reservation.update(tokens=tokens, cost_microusd=cost_microusd)
+    else:
+        if tokens is not None or cost_microusd is not None or request_digest is None:
+            raise ValueError("ACP calls require execution-only accounting and dispatch intent")
+        reservation["acp_charge"] = acp_charge
+    if request_digest is not None:
+        reservation["request_digest"] = request_digest
     return operation(assignment, "reserve_agent_call", request_id=request_id,
-                     reservation={"call_id": call_id, "tokens": tokens,
-                                  "cost_microusd": cost_microusd, "tool": tool,
-                                  "permissions": list(permissions)})
+                     reservation=reservation)
+
+
+def record_acp_session(assignment, *, session_digest, sequence, records, request_id=None):
+    """Persist and send an ordered metadata-only batch through the fenced worker API.
+
+    A transport retry must reuse the entire returned operation unchanged.
+    Raw reasoning, credentials, and provider payloads do not belong in records.
+    """
+    return operation(assignment, "record_acp_session", request_id=request_id,
+                     batch={"attempt_id": assignment["attempt_id"],
+                            "session_digest": session_digest, "sequence": sequence,
+                            "records": list(records)})
 
 
 def agent_report(assignment, output, delegation_inputs=()):

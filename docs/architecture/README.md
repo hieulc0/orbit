@@ -5,6 +5,12 @@ performed by external workers; it does not run workflow code or an LLM loop in
 the scheduler. The [vision](vision.md) describes the long-term direction. The
 [roadmap](../ROADMAP.md) separates current capabilities from remaining gates.
 
+The [ACP integration design](acp-agent-integration.md) describes the experimental
+worker registry, supervised agent process, file/terminal broker and Codex bridge.
+Offline workflows and the final local fault regression have passed; live acceptance
+remains a separate gate. Existing Responses/command runtimes and trusted isolation
+stay intact.
+
 ```text
 CLI / MCP / React UI / SDK
             |
@@ -43,6 +49,10 @@ independent boundaries, not interchangeable permission strings.
 | `src/execution.rs`, `src/workspace.rs`, `src/repository.rs` | Logical requirements, pinned OCI profiles, isolated tools and private Git materialization |
 | `src/agent.rs`, `src/command_agent.rs` | Agent contracts and trusted command-runtime adapter |
 | `src/coding_agent.rs` | Bounded Responses loop, per-call dispatch intent/receipts and tool authorization |
+| `src/acp.rs`, `src/acp_contract.rs` | Credential-free ACP preflight, pinned policy, execution-only limits/charges |
+| `src/acp_runtime.rs`, `src/acp_process.rs`, `src/acp_wire.rs` | Pinned registry, auth quarantine, agent supervision and bounded protocol sessions |
+| `src/acp_broker.rs`, `src/acp_files.rs`, `src/acp_terminal.rs` | Lease-fenced client callbacks, confined files and asynchronous supervised terminals |
+| `src/codex_bridge.rs`, `src/codex_session.rs` | Version-specific Codex App Server bridge and dynamic-tool-to-ACP routing |
 | `src/artifacts.rs` | Local/S3 immutable publication and verified reads |
 | `src/registry.rs` | Signed immutable package metadata; no code loading |
 | `src/ops.rs`, `src/main.rs` | Lifecycle, probes, metrics, executable commands |

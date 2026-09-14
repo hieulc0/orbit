@@ -269,6 +269,14 @@ pub async fn run_until(
         {
             capabilities.push(agent.binding.runtime.clone());
         }
+        if capability == "repository.code" {
+            capabilities.extend(
+                config
+                    .acp_agents
+                    .iter()
+                    .map(|agent| agent.binding.runtime.clone()),
+            );
+        }
     }
     if capability == "agent.run" {
         let runtime = client

@@ -14,6 +14,11 @@ The [remote coding adapter](../guides/remote-coding.md) adds worker
 operator profiles, remote repository bindings and tracked invocation receipts.
 It uses the same HTTP/lease boundary, not a second dispatch API.
 
+The experimental [ACP contracts](agents.md#experimental-acp-contracts) add optional
+binding/definition fields and execution-only reservation charges through that
+same API. Token/cost ledger values may be `null` for ACP; clients must display
+unknown accounting honestly. See the experimental [ACP worker setup](../guides/acp-coding.md).
+
 ## Compatibility
 
 Existing request fields, enum spellings and successful response shapes are retained.
@@ -97,6 +102,15 @@ Without `--follow`, `--after` returns one bounded page. Existing commands retain
 their names and arguments. Clap usage errors exit 2; runtime errors exit nonzero;
 successful commands exit 0. Server and worker commands have no result document.
 
+`orbit acp-probe --config FILE --workspaces DIRECTORY` is a local, credential-free
+installed-agent initialization check. It never resolves Orbit tokens or calls
+the API. Its JSON/JSONL report does not qualify workflow execution or agent auth;
+see [bounds and setup](../guides/acp-preflight.md).
+
+`orbit acp-launch-digest --config FILE` validates a private launch policy and prints
+its canonical SHA-256 without API credentials, login or process execution. It
+accepts at most 64 KiB. A full worker configuration is not a launch object.
+
 ## Rust SDK
 
 Use the local `orbit` crate's `orbit::sdk` module. It exports `Client`, `Assignment`,
@@ -143,6 +157,16 @@ Download through `artifact(run_id, metadata)` to verify size and checksum.
 `OrbitError` exposes status/body without printing response contents automatically.
 Both SDKs require independent heartbeat scheduling and termination of work before
 unconfirmed lease expiry. Neither supplies an untrusted-code sandbox.
+
+Python `reserve_agent_call` retains required token/cost accounting for legacy
+calls. For ACP, omit both numbers and pass `request_digest` plus `acp_charge`;
+mixed or missing accounting raises `ValueError`. The server remains the authority
+for tools, permissions, cumulative limits and lease ownership.
+
+Python `record_acp_session(assignment, session_digest=..., sequence=..., records=...)`
+builds a fenced `record_acp_session` operation. Retain its complete request for
+transport replay. Record schemas, sequence/replay and accepted transcript rules
+are in the [agent reference](agents.md#experimental-acp-contracts).
 
 ## Verification
 

@@ -56,6 +56,7 @@ durably deduplicated for at least the lifetime of retained run history.
 | `heartbeat` | Assignment identity | Lease renewed within the task deadline |
 | `reserve_agent_call` | Bounded reservation; optional request digest | Task-wide budget reserved before dispatch |
 | `finish_agent_call` | Attempt-bound receipt and result digest | Tracked invocation result durably recorded |
+| `record_acp_session` | Attempt/session-bound ordered metadata batch | Accepted ACP transcript digests and cumulative output/tool counters |
 | `prepare_artifact` | Kind, expected checksum and size | Attempt-scoped upload identity created |
 | `publish_checkpoint` | Uploaded artifact ID, format/version, input digest | Compatible immutable checkpoint recorded |
 | `complete` | Outcome, accepted output IDs, structured failure if any | Attempt/task outcome and dependencies committed |
@@ -65,6 +66,12 @@ durably deduplicated for at least the lifetime of retained run history.
 may be reported from `CLAIMED`; success is accepted only from `RUNNING`.
 Heartbeats with a new request ID renew leases; retransmitting an old heartbeat
 returns its earlier result and does not extend ownership again.
+
+ACP session batches use this same boundary; no direct agent-to-engine connection
+is exposed. Ordered replay, nullable execution-only accounting and final accepted
+transcript/report validation are specified in the
+[agent reference](agents.md#experimental-acp-contracts). A pending ACP prompt is
+an uncertain external invocation, not permission to resume or redispatch it.
 
 Responses distinguish `accepted`, `duplicate`, `ownership_lost`, `cancelled`,
 `deadline_exceeded`, `invalid_payload`, and `conflict`. Network failure is not an

@@ -9,6 +9,11 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use std::{collections::BTreeMap, path::Path, time::Duration};
 
+#[path = "kernel/acp_accounting.rs"]
+mod acp_accounting;
+#[path = "kernel/acp_workflow.rs"]
+mod acp_workflow;
+
 #[path = "kernel/command_agent.rs"]
 mod command_agent;
 #[path = "kernel/dogfood.rs"]

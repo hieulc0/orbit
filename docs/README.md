@@ -11,6 +11,10 @@ not the source of current setup instructions.
 - [Agents, budgets, delegation and approval](reference/agents.md)
 - [Command agent runtime](guides/command-agent.md)
 - [Remote coding worker and OCI tools](guides/remote-coding.md)
+- [ACP coding worker and Codex bridge](guides/acp-coding.md) — experimental runtime,
+  offline workflow evidence and live acceptance gaps
+- [ACP installation preflight](guides/acp-preflight.md) — credential-free probe,
+  not workflow execution
 - [Operations console and definition studio](guides/console.md)
 - [Timers and signals](reference/timers-signals.md)
 - [Child runs, fan-out and limits](reference/children-limits.md)
@@ -19,6 +23,8 @@ not the source of current setup instructions.
 ## Architecture and reference
 
 - [Current architecture and code map](architecture/README.md)
+- [ACP agent integration](architecture/acp-agent-integration.md) — implemented
+  worker/broker boundaries and remaining qualification gates
 - [Long-term vision](architecture/vision.md) — aspirational, not a support promise
 - [Core semantics](reference/engine-semantics.md), [state machines](reference/state-machines.md), [graphs](reference/graphs.md)
 - [API/CLI/SDK contract](reference/api-cli-sdk.md), [worker protocol](reference/worker-protocol.md)
@@ -30,6 +36,9 @@ not the source of current setup instructions.
 - [Backup and restore](operations/backup-restore.md), [upgrades and rotation](operations/upgrades.md)
 - [Testing and CI](development/testing.md), [dogfooding](development/dogfooding.md)
 - [Agent onboarding and repository skills](development/agents.md)
+- [ACP implementation and acceptance plan](development/acp-implementation-plan.md)
+- [Codex ACP compatibility and implementation record](operations/acp-codex-compatibility.md)
+- [Antigravity and Claude compatibility](operations/acp-agent-compatibility.md)
 - [Current roadmap](ROADMAP.md), [alpha qualification](operations/qualification.md)
 - [Remote coding qualification](operations/remote-coding-qualification.md)
 - [Historical records](archive/README.md)

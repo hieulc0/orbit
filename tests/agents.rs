@@ -17,7 +17,7 @@ fn agents_pin_authorized_bindings_and_restrict_delegation() {
     let binding = bindings();
     let plan = Plan::compile_with_agents(def.clone(), RepositoryBinding::none(), &binding).unwrap();
     let mut changed = binding.clone();
-    changed.get_mut("local-agent").unwrap().model = "fixture-model/revision-2".into();
+    changed.get_mut("local-agent").unwrap().model = Some("fixture-model/revision-2".into());
     assert_ne!(
         plan.digest,
         Plan::compile_with_agents(def.clone(), RepositoryBinding::none(), &changed)
@@ -63,22 +63,23 @@ fn budget_reservations_are_bounded_and_replay_safe() {
     let mut usage = Usage::default();
     let mut call = CallReservation {
         request_digest: None,
+        acp_charge: None,
         call_id: "call-1".into(),
-        tokens: 600,
-        cost_microusd: 5000,
+        tokens: Some(600),
+        cost_microusd: Some(5000),
         tool: None,
         permissions: vec![],
     };
     assert!(usage.reserve(spec, &call).unwrap());
     assert!(!usage.reserve(spec, &call).unwrap());
-    call.tokens = 1;
+    call.tokens = Some(1);
     assert!(usage.reserve(spec, &call).is_err());
     call.call_id = "call-2".into();
-    call.tokens = 500;
+    call.tokens = Some(500);
     assert!(usage.reserve(spec, &call).is_err());
-    call.tokens = u64::MAX;
+    call.tokens = Some(u64::MAX);
     assert!(usage.reserve(spec, &call).is_err());
-    call.tokens = 1;
+    call.tokens = Some(1);
     call.tool = Some("shell".into());
     assert!(usage.reserve(spec, &call).is_err());
     call.tool = Some("summarize".into());
@@ -86,7 +87,7 @@ fn budget_reservations_are_bounded_and_replay_safe() {
     assert!(usage.reserve(spec, &call).is_err());
     call.permissions = vec!["context.read".into()];
     assert!(usage.reserve(spec, &call).unwrap());
-    assert_eq!(usage.tokens, 601);
+    assert_eq!(usage.tokens, Some(601));
 }
 #[test]
 fn agent_reports_enforce_output_provenance_and_bounds() {

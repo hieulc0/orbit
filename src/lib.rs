@@ -1,6 +1,16 @@
+pub mod acp;
+pub mod acp_broker;
+pub mod acp_contract;
+pub mod acp_files;
+pub mod acp_process;
+pub mod acp_runtime;
+pub mod acp_terminal;
+pub mod acp_wire;
 pub mod agent;
 pub mod api;
 pub mod artifacts;
+pub mod codex_bridge;
+pub mod codex_session;
 pub mod coding_agent;
 pub mod command_agent;
 pub mod compute;

@@ -88,6 +88,87 @@ Success requires finalized `logs` and `agent_report` artifacts. Reports carry
 and optional `delegation_inputs`. Provenance, output contract and delegation
 bounds are checked after storage verification and again under lease ownership.
 
+## Experimental ACP contracts
+
+The experimental [ACP worker](../guides/acp-coding.md) is implemented alongside
+Responses and command runtimes. The [preflight](../guides/acp-preflight.md),
+[implementation plan](../development/acp-implementation-plan.md) and
+[Codex compatibility record](../operations/acp-codex-compatibility.md) distinguish
+implemented behavior, observed offline workflows and remaining live/failure gates.
+
+An optional binding `acp` descriptor pins agent identity/revision, launch-policy
+SHA-256, wire version 1, logical auth source/owner/account class (`local_session`),
+trusted security profile, attempt-workspace files, workspace-supervisor terminals,
+model policy and maximum execution limits. No executable, argument, credential
+or auth-file path belongs in the Definition. Model policy is `exact` with a model
+revision, or `agent_configured` with `model` omitted. It does not identify a model
+from the adapter's version. ACP delegation is disallowed.
+
+ACP definitions require `acp_limits` and isolated `repository.code`; they cannot
+run as legacy `agent.run`. `budget` and `max_budget` contain required `calls` but
+omit both `tokens` and `cost_microusd`. Numeric zero is not an unknown-cost marker.
+Non-ACP bindings and definitions retain required model/token/cost validation.
+Legacy Responses/command worker configurations cannot select ACP bindings.
+Existing present fields and their ordering remain byte-compatible on serialization;
+new absent fields are omitted. Only referenced, including nested, ACP policies
+affect the plan digest.
+
+Execution limits are `prompt_turns` (1–64), `broker_calls` (0–1024),
+`reported_tool_calls` (0–4096), `turn_timeout_seconds` (1–600),
+`terminal_timeout_seconds` (1–300), `terminal_runtime_seconds` (0–86400), and
+`output_bytes` (4096–8388608). Every requested limit must fit the pinned binding.
+Current broker tool revisions are `orbit.acp.workspace.read_file/v1`,
+`orbit.acp.workspace.write_file/v1`, and `orbit.acp.workspace.shell/v1`; these name
+the ACP broker semantics, not the existing Responses helpers.
+Their permission sets are respectively `workspace.read`, `workspace.write`, and
+all of `workspace.read`, `workspace.write`, `shell.execute`.
+
+The existing `reserve_agent_call` operation accepts an ACP reservation such as:
+
+```json
+{"call_id":"ATTEMPT_ID-prompt-0","tool":null,"permissions":[],"request_digest":"REPLACE_WITH_SHA256","acp_charge":{"kind":"prompt"}}
+```
+
+All standard operation identity and lease/generation checks still apply. ACP
+requires `request_digest`, an attempt-prefixed call ID and no numeric token/cost
+fields. A broker reservation instead uses a permitted tool, its required
+permissions, and `acp_charge: {kind: "broker", terminal_runtime_seconds: N}`.
+Shell reserves its worst-case duration (1 through the task's terminal timeout);
+file calls use zero. Prompt, broker and cumulative terminal-time limits are
+checked transactionally across attempts, in addition to the total call budget.
+Accepted charges are not refunded on receipt, failure or retry. Replaying a call
+never grants another dispatch, and an unresolved prompt uses the existing
+unknown-model-dispatch intervention path. A prompt may contain multiple model
+exchanges; it is not a counted or priced model request.
+
+`agent_usage.tokens` and `agent_usage.cost_microusd` are explicitly `null` for
+ACP reservations. The same unknown values appear in reservation responses/events;
+they must not be rendered as zero. Reservation records and journal events retain
+`acp_charge`. Stable-v1 usage extensions are disabled; no observed context usage
+or subscription price is treated as measured billing.
+
+`record_acp_session` accepts `batch: {attempt_id, session_digest, sequence, records}`.
+Records contain `kind` (`started`, `update`, `broker_output`, `completed`), a SHA-256
+`digest`, `output_bytes` and `reported_tool_calls`. No raw provider payload belongs
+in a record. Batches contain 1–32 records, start at sequence 0, are limited to 4096
+per session, and bind one session to an attempt. Same-content replay is idempotent;
+conflicting replay, gaps, foreign attempts and writes after completion fail.
+Output/reported-tool charges are cumulative across attempts and checked against
+the task limits under existing lease/generation fencing.
+
+`agent_usage.acp_sessions` retains batch digests, attempt identity, totals and
+completion. Success requires an acknowledged prompt, no pending attempt calls,
+matching model/launch/accounting attribution and completed session state. The
+accepted `logs` transcript must reproduce every accepted batch digest in order;
+the `agent_report` must match session totals and confirm process cleanup. Existing
+artifact verification, patch/manifest, independent test and human approval gates
+remain authoritative. Legacy usage documents omit the new empty session map.
+
+For scoped deployments, `max_agent_budget: {calls: N}` explicitly admits
+execution-only budgets. A token/cost policy does not silently admit ACP calls,
+and an execution-only policy does not admit a measured legacy budget. Binding,
+repository, scope and capability restrictions continue to apply.
+
 ## Controlled delegation
 
 An agent may propose at most its configured number of nonempty work-item strings

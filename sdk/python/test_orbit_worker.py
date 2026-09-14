@@ -3,7 +3,7 @@ import json
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from orbit_worker import Client, OrbitError, operation, reserve_agent_call, agent_report
+from orbit_worker import Client, OrbitError, operation, reserve_agent_call, record_acp_session, agent_report
 
 
 class ProtocolTest(unittest.TestCase):
@@ -18,6 +18,22 @@ class ProtocolTest(unittest.TestCase):
         report = agent_report(assignment, {"answer": True}, ["work"])
         self.assertEqual(report["binding_digest"], "a" * 64)
         self.assertNotIn("lease_token", report)
+        acp = reserve_agent_call(assignment, call_id="attempt-prompt-0",
+                                 request_digest="b" * 64, acp_charge={"kind": "prompt"})
+        self.assertNotIn("tokens", acp["reservation"])
+        self.assertNotIn("cost_microusd", acp["reservation"])
+        self.assertEqual(acp["reservation"]["acp_charge"], {"kind": "prompt"})
+        batch = record_acp_session(assignment, session_digest="c" * 64, sequence=0,
+                                   records=[], request_id="record-once")
+        self.assertEqual(batch["operation"], "record_acp_session")
+        self.assertEqual(batch["batch"]["attempt_id"], "attempt")
+        self.assertEqual(batch["request_id"], "record-once")
+        self.assertNotIn("lease_token", batch["batch"])
+        with self.assertRaises(ValueError):
+            reserve_agent_call(assignment, call_id="missing-budget")
+        with self.assertRaises(ValueError):
+            reserve_agent_call(assignment, call_id="bad-acp", tokens=0,
+                               acp_charge={"kind": "prompt"}, request_digest="b" * 64)
 
     def test_transport_and_retransmission(self):
         calls = []

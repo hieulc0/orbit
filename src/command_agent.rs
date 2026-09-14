@@ -31,6 +31,10 @@ pub struct CommandOutput {
 impl CommandAgent {
     pub fn validate(&self) -> Result<()> {
         self.binding.validate()?;
+        ensure!(
+            self.binding.acp.is_none(),
+            "command runtime cannot execute ACP bindings"
+        );
         self.command.validate()?;
         ensure!(
             crate::agent::valid_name(&self.binding_name),
@@ -46,8 +50,8 @@ impl CommandAgent {
         );
         ensure!(
             self.tokens_per_call > 0
-                && self.tokens_per_call <= self.binding.max_budget.tokens
-                && self.cost_microusd_per_call <= self.binding.max_budget.cost_microusd,
+                && Some(self.tokens_per_call) <= self.binding.max_budget.tokens
+                && Some(self.cost_microusd_per_call) <= self.binding.max_budget.cost_microusd,
             "runtime reservation exceeds binding budget"
         );
         ensure!(
@@ -118,11 +122,12 @@ impl CommandAgent {
                 Action::ReserveAgentCall {
                     reservation: CallReservation {
                         call_id: a.attempt_id.clone(),
-                        tokens: self.tokens_per_call,
-                        cost_microusd: self.cost_microusd_per_call,
+                        tokens: Some(self.tokens_per_call),
+                        cost_microusd: Some(self.cost_microusd_per_call),
                         tool: None,
                         permissions: spec.permissions.clone(),
                         request_digest: None,
+                        acp_charge: None,
                     },
                 },
             )

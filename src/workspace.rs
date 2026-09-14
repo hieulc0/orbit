@@ -26,7 +26,15 @@ pub async fn perform(
         .context("configure --execution-config for workspace execution")?;
     let profile = config.authorize(a)?;
     let step = &a.plan.definition.steps[&a.step];
-    if step.agent.is_some() {
+    let acp_agent = step.agent.as_ref().and_then(|spec| {
+        config
+            .acp_agents
+            .iter()
+            .find(|agent| agent.binding_name == spec.binding)
+    });
+    if let Some(agent) = acp_agent {
+        agent.authorize(a)?;
+    } else if step.agent.is_some() {
         config
             .coding_agent
             .as_ref()
@@ -38,22 +46,26 @@ pub async fn perform(
     let mut logs = Vec::new();
     let success;
     if step.uses == "repository.code" {
-        if let Some(agent) = config
-            .coding_agent
-            .as_ref()
-            .filter(|_| step.agent.is_some())
-        {
-            let result = agent
-                .run(crate::coding_agent::Session {
-                    client,
-                    assignment: a,
-                    workspace: &workspace,
-                    directory,
-                    home,
-                    profile,
-                    credentials: &config.credentials,
-                })
-                .await;
+        if step.agent.is_some() {
+            let session = crate::coding_agent::Session {
+                client,
+                assignment: a,
+                workspace: &workspace,
+                directory,
+                home,
+                profile,
+                credentials: &config.credentials,
+            };
+            let result = if let Some(agent) = acp_agent {
+                agent.run(session).await
+            } else {
+                config
+                    .coding_agent
+                    .as_ref()
+                    .context("coding runtime unavailable")?
+                    .run(session)
+                    .await
+            };
             let (report, agent_logs) = match result {
                 Ok(result) => result,
                 Err(error) => {
@@ -193,6 +205,17 @@ pub async fn execute(
     profile: &Profile,
     command: &CommandSpec,
 ) -> Result<(Option<i32>, Vec<u8>, Vec<u8>, bool)> {
+    let spec = prepare_execution(a, workspace, directory, profile, command).await?;
+    crate::worker::supervised_command(&spec, directory, home, a).await
+}
+
+pub(crate) async fn prepare_execution(
+    a: &Assignment,
+    workspace: &Path,
+    directory: &Path,
+    profile: &Profile,
+    command: &CommandSpec,
+) -> Result<CommandSpec> {
     validate_tool_command(command)?;
     let invocation = id();
     let request_path = directory.join(format!("exec-{invocation}.json"));
@@ -216,7 +239,7 @@ pub async fn execute(
         cwd: ".".into(),
         timeout_seconds: (command.timeout_seconds + 60).min(604800),
     };
-    crate::worker::supervised_command(&spec, directory, home, a).await
+    Ok(spec)
 }
 
 pub async fn supervise(path: &Path) -> Result<i32> {
@@ -251,10 +274,25 @@ pub async fn supervise(path: &Path) -> Result<i32> {
     // Resolve cwd inside the container, so a task-controlled symlink is never
     // followed by the privileged supervisor on the host.
     let cwd = format!("/workspace/{}", request.command.cwd);
-    let resources = step
+    let mut resources = step
         .resources
         .as_ref()
-        .context("execution resources missing")?;
+        .context("execution resources missing")?
+        .clone();
+    if step
+        .agent
+        .as_ref()
+        .is_some_and(|agent| agent.acp_limits.is_some())
+    {
+        // The other half is reserved for the isolated agent process. Never
+        // overbook scheduler capacity with a second full-size tool container.
+        resources.cpu_millis /= 2;
+        resources.memory_mib /= 2;
+        ensure!(
+            resources.cpu_millis >= 100 && resources.memory_mib >= 64,
+            "ACP terminal resources too small"
+        );
+    }
     let name = format!("orbit-{}-{}", a.attempt_id, request.invocation_id);
     let mut cmd = Command::new("podman");
     cmd.args([
@@ -311,11 +349,13 @@ pub async fn supervise(path: &Path) -> Result<i32> {
     .stdout(Stdio::inherit())
     .stderr(Stdio::inherit())
     .kill_on_drop(true);
-    crate::container::run_supervised(
+    let code = crate::container::run_supervised(
         cmd,
         "podman",
         &name,
         request.command.timeout_seconds.min(step.timeout_seconds),
     )
-    .await
+    .await?;
+    crate::acp_process::write_cleanup(path, &a.attempt_id, code)?;
+    Ok(code)
 }

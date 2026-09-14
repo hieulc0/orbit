@@ -1,0 +1,46 @@
+{
+  "profiles": [{"backend":"rootless_podman","image":"docker.io/library/alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b"}],
+  "repository_ids": ["approved-repository"],
+  "acp_agents": [{
+    "binding_name":"codex-acp-v1",
+    "binding": {
+      "model":"REPLACE_WITH_EXACT_MODEL",
+      "runtime":"agent.acp-codex-v1",
+      "tools":{"read_file":"orbit.acp.workspace.read_file/v1","write_file":"orbit.acp.workspace.write_file/v1","shell":"orbit.acp.workspace.shell/v1"},
+      "permissions":["workspace.read","workspace.write","shell.execute"],
+      "max_budget":{"calls":33},
+      "max_delegations":0,
+      "acp": {
+        "agent_id":"codex",
+        "agent_revision":"orbit-codex-acp-bridge-v1",
+        "launch_digest":"REPLACE_WITH_ACP_LAUNCH_DIGEST",
+        "protocol_version":1,
+        "auth":{"source":"codex-local-session","owner":"approved-owner","account_class":"approved-account-class","mode":"local_session"},
+        "security_profile":"trusted",
+        "filesystem_policy":"attempt_workspace",
+        "terminal_policy":"workspace_supervisor",
+        "model_policy":"exact",
+        "accounting":"execution_only",
+        "max_limits":{"prompt_turns":1,"broker_calls":32,"reported_tool_calls":64,"turn_timeout_seconds":600,"terminal_timeout_seconds":30,"terminal_runtime_seconds":600,"output_bytes":1048576}
+      }
+    },
+    "launch": {
+      "adapter":"codex",
+      "image":"REPLACE_WITH_PINNED_AGENT_IMAGE",
+      "command":["/usr/local/bin/codex","app-server"],
+      "agent_name":"orbit-codex-acp",
+      "agent_version":"1",
+      "binary_revision":"0.153.4",
+      "cpu_millis":1000,
+      "memory_mib":512,
+      "network":"host"
+    },
+    "auth": {
+      "path":"/absolute/private/orbit-codex-auth",
+      "source":"codex-local-session",
+      "owner":"approved-owner",
+      "account_class":"approved-account-class",
+      "files":{"auth.json":".codex/auth.json"}
+    }
+  }]
+}

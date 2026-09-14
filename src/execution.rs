@@ -91,6 +91,8 @@ pub struct WorkerConfig {
     pub credentials: std::collections::BTreeMap<String, crate::repository::Credential>,
     #[serde(default)]
     pub coding_agent: Option<crate::coding_agent::Runtime>,
+    #[serde(default)]
+    pub acp_agents: Vec<crate::acp_runtime::Runtime>,
 }
 
 impl WorkerConfig {
@@ -121,6 +123,23 @@ impl WorkerConfig {
         }
         if let Some(agent) = &self.coding_agent {
             agent.validate()?;
+        }
+        ensure!(
+            self.acp_agents.len() <= 16,
+            "too many installed ACP runtimes"
+        );
+        let mut names = std::collections::BTreeSet::new();
+        let mut capabilities = std::collections::BTreeSet::new();
+        if let Some(agent) = &self.coding_agent {
+            names.insert(&agent.binding_name);
+            capabilities.insert(&agent.binding.runtime);
+        }
+        for agent in &self.acp_agents {
+            agent.validate()?;
+            ensure!(
+                names.insert(&agent.binding_name) && capabilities.insert(&agent.binding.runtime),
+                "ambiguous coding runtime registry"
+            );
         }
         Ok(())
     }

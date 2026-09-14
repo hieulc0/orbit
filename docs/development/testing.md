@@ -35,6 +35,11 @@ docker compose --profile compute exec -T minio mc mb --ignore-existing qualifica
 podman pull docker.io/library/alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
 npm --prefix ui run build
 
+# Separately download/review Codex 0.153.4; this builder never downloads it.
+# Provision the pinned Node base once, then assemble the offline ACP fixture.
+podman pull docker.io/library/node@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d
+export ORBIT_TEST_ACP_IMAGE=$(bash scripts/prepare-acp-fixture.sh /absolute/path/to/codex-0.153.4-linux-musl)
+
 ORBIT_TEST_DATABASE_URL=postgres://orbit:orbit-local-test@127.0.0.1:55439/orbit \
 ORBIT_TEST_S3_ACCESS_KEY=orbit-local-test \
 ORBIT_TEST_S3_SECRET_KEY=orbit-local-test-secret \
@@ -46,6 +51,14 @@ that runtime. The shell entry point does not pull images, provision services or
 silently skip prerequisites. Test schemas and `target/qualification-alpha` are
 retained. Use a targeted `cargo test --locked --test kernel NAME -- --ignored`
 for a database-only case; pass `fault-injection` for transaction-barrier tests.
+
+Qualification defaults to two concurrent cases (`RUST_TEST_THREADS=2`); each case
+may launch several servers/workers/containers. Override that variable only for a
+host with sufficient capacity. Lease, cleanup and fault deadlines are unchanged.
+Do not run regular Cargo checks/builds against the same target directory while
+qualification is running: they can replace the fault-enabled `orbit` binary used
+by subprocess tests. Run mocked UI checks separately from kernel qualification;
+both browser suites own loopback port 5173.
 
 The `remote_coding` cases require local Git/Python and rootless Podman with the
 pinned Alpine image even if legacy `ORBIT_CONTAINER_RUNTIME=docker` is selected.
@@ -61,6 +74,45 @@ cargo test --locked --features fault-injection --test kernel remote_coding -- --
 Regular `tests/execution.rs` and the repository-helper unit test need no database,
 container or credential account. Shared engine changes still require the full
 qualification suite, including legacy agent, artifact, governance and digest cases.
+
+ACP has offline subprocess, confinement, auth, contract and bridge tests:
+
+```sh
+cargo test --locked --test acp --test acp_contract --test acp_files --test acp_runtime --test codex_bridge
+ORBIT_TEST_DATABASE_URL=postgres://orbit:orbit-local-test@127.0.0.1:55439/orbit \
+ORBIT_EVIDENCE_DIR="$PWD/target/qualification-acp" \
+cargo test --locked --features fault-injection --test kernel acp_accounting -- --ignored
+```
+
+The targeted database cases use no model account or container runtime. They test
+competing execution-only reservations, replay, cancellation/lease fencing and
+pending-prompt intervention, not a launched Codex session. A real credential-free
+initialization is described in [ACP preflight](../guides/acp-preflight.md). No
+fixture result qualifies a live account or separately hosted worker.
+
+After provisioning `ORBIT_TEST_ACP_IMAGE` above, run the workflow cases:
+
+```sh
+ORBIT_TEST_DATABASE_URL=postgres://orbit:orbit-local-test@127.0.0.1:55439/orbit \
+ORBIT_EVIDENCE_DIR="$PWD/target/qualification-acp-runtime" \
+cargo test --locked --features fault-injection --test kernel acp_workflow:: -- --ignored
+```
+
+The fixture builder accepts only the reviewed Linux x86-64 musl Codex binary with
+SHA-256 `56ef98ab4032d317ab26e9b5e5a175650717351edb16ed9cde0cb6d1734d62da`.
+It copies that binary and the repository fixture into a new temporary build context,
+uses cached images with `--pull=never --network=none`, and prints the full local
+image ID. Contexts/images are retained for review. It performs no login, download,
+publication or deployment. Source/release provenance is recorded in
+[Codex compatibility](../operations/acp-codex-compatibility.md).
+
+`acp_workflow` uses disposable PostgreSQL, real worker/agent/tool processes, a
+fake ACP peer and the real pinned Codex binary against a loopback Responses peer.
+No real provider key, personal account or developer checkout is used. Cases cover
+inspect/fail/edit/retest, accepted transcripts, independent verification/review,
+denied paths/native approvals, output floods and active-terminal cancellation or
+worker SIGKILL. These tests are ignored without explicit invocation; their presence
+is not evidence they passed. Full qualification now requires this image too.
 
 ## CI and evidence
 

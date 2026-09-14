@@ -70,6 +70,36 @@ provider/model/account and a separately hosted worker, not more worker types.
 See [remote coding qualification](operations/remote-coding-qualification.md) for
 the passing local checks, reviewed artifacts and remaining live acceptance gates.
 
+## In progress: ACP agent integration
+
+Add a worker-side ACP adapter alongside the existing Responses and command
+adapters. The [design](architecture/acp-agent-integration.md) maps the external
+proposal to current Orbit contracts; the
+[implementation plan](development/acp-implementation-plan.md) tracks work packages
+and failure/acceptance gates. The probe, pinned worker registry, execution-only
+accounting, durable session batches, private auth supervision, confined file/terminal
+broker, Codex App Server bridge and patch/test/review routing are implemented.
+Real Codex and generic ACP offline workflows and all 60 shared local fault-regression
+cases have passed. Later named agents and live account/host qualification are not
+accepted.
+
+Delivery order is Codex, official Google Antigravity ACP, then Claude. The pinned
+Codex ACP adapter passes initialization but uses native tools. A version-specific
+Codex App Server bridge hands effects to Orbit before execution; see the
+[setup guide](guides/acp-coding.md) and [compatibility record](operations/acp-codex-compatibility.md).
+Next: resolve the specific terminal handoff gaps in
+[Antigravity/Claude](operations/acp-agent-compatibility.md), retaining Codex-first
+live account/host acceptance as a separately authorized gate.
+A prompt may hide multiple model calls; unknown billing stays unknown.
+Unresolved prompts retain intervention semantics, with automatic session resume
+deferred. Agent and repository tools have distinct OCI resource/network policies;
+agent host-network access is not provider-only egress.
+
+This increment does not close or remove the current live-provider and
+separate-worker acceptance gates above. Local fixtures precede a separately
+authorized live account/host qualification; actual adapter compatibility and
+reviewed evidence determine acceptance.
+
 ## Conditional follow-up work
 
 4. Additional isolation backends when a defined threat model requires them:

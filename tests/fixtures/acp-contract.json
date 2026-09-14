@@ -1,0 +1,54 @@
+{
+  "binding": {
+    "model": "fixture-model-v1",
+    "runtime": "agent.acp-codex-v1",
+    "tools": {
+      "read_file": "orbit.acp.workspace.read_file/v1",
+      "write_file": "orbit.acp.workspace.write_file/v1",
+      "shell": "orbit.acp.workspace.shell/v1"
+    },
+    "permissions": ["workspace.read", "workspace.write", "shell.execute"],
+    "max_budget": {"calls": 12},
+    "max_delegations": 0,
+    "acp": {
+      "agent_id": "codex",
+      "agent_revision": "fixture-bridge-v1",
+      "launch_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "protocol_version": 1,
+      "auth": {"source": "fixture-auth", "owner": "fixture-owner", "account_class": "fixture", "mode": "local_session"},
+      "security_profile": "trusted",
+      "filesystem_policy": "attempt_workspace",
+      "terminal_policy": "workspace_supervisor",
+      "model_policy": "exact",
+      "accounting": "execution_only",
+      "max_limits": {
+        "prompt_turns": 2,
+        "broker_calls": 8,
+        "reported_tool_calls": 16,
+        "turn_timeout_seconds": 30,
+        "terminal_timeout_seconds": 10,
+        "terminal_runtime_seconds": 20,
+        "output_bytes": 65536
+      }
+    }
+  },
+  "agent": {
+    "identity": "fixture-coder",
+    "binding": "codex-fixture",
+    "tools": ["read_file", "write_file", "shell"],
+    "permissions": ["workspace.read", "workspace.write", "shell.execute"],
+    "budget": {"calls": 10},
+    "max_delegations": 0,
+    "context": {},
+    "output": "object",
+    "acp_limits": {
+      "prompt_turns": 1,
+      "broker_calls": 4,
+      "reported_tool_calls": 8,
+      "turn_timeout_seconds": 20,
+      "terminal_timeout_seconds": 10,
+      "terminal_runtime_seconds": 15,
+      "output_bytes": 65536
+    }
+  }
+}

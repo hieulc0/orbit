@@ -213,11 +213,12 @@ fn coding_tools_are_bounded_and_tracked_dispatch_is_not_replay_permission() -> R
     let attempt = id();
     let call = CallReservation {
         call_id: format!("{attempt}-model-0"),
-        tokens: 73728,
-        cost_microusd: 1,
+        tokens: Some(73728),
+        cost_microusd: Some(1),
         tool: None,
         permissions: vec![],
         request_digest: Some(digest(b"request")),
+        acp_charge: None,
     };
     let spec = definition.steps["code"].agent.as_ref().unwrap();
     let mut usage = Usage::default();
@@ -236,7 +237,7 @@ fn coding_tools_are_bounded_and_tracked_dispatch_is_not_replay_permission() -> R
     let mut conflict = receipt;
     conflict.result_digest = digest(b"different");
     assert!(usage.finish(&conflict).is_err());
-    assert_eq!(usage.tokens, 73728);
+    assert_eq!(usage.tokens, Some(73728));
     let mut raw: Value = serde_json::from_str(include_str!("../examples/remote-worker.json"))?;
     raw["coding_agent"]["tokens_per_call"] = json!(1);
     assert!(

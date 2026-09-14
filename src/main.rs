@@ -40,6 +40,19 @@ fn scope_query(scope: Option<&str>) -> Result<String> {
 }
 #[derive(Subcommand)]
 enum Commands {
+    /// Validate an operator-owned ACP launch policy and print its canonical digest.
+    AcpLaunchDigest {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Check a pinned ACP installation using initialize only; no login or task execution.
+    AcpProbe {
+        #[arg(long)]
+        config: PathBuf,
+        /// Existing disposable directory for a fresh, credential-free probe HOME.
+        #[arg(long)]
+        workspaces: PathBuf,
+    },
     /// Print canonical package digest and domain-separated bytes for external signing.
     PackageDigest {
         manifest: PathBuf,
@@ -106,6 +119,11 @@ enum Commands {
     },
     #[command(hide = true)]
     WorkspaceSupervisor {
+        #[arg(long)]
+        request: PathBuf,
+    },
+    #[command(hide = true)]
+    AcpSupervisor {
         #[arg(long)]
         request: PathBuf,
     },
@@ -229,6 +247,55 @@ enum Commands {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let mut output_format = cli.output_format;
+    if let Commands::AcpLaunchDigest { config } = &cli.command {
+        use tokio::io::AsyncReadExt;
+        let mut bytes = Vec::new();
+        tokio::fs::File::open(config)
+            .await?
+            .take(65537)
+            .read_to_end(&mut bytes)
+            .await?;
+        anyhow::ensure!(
+            bytes.len() <= 65536,
+            "ACP launch configuration exceeds 64 KiB"
+        );
+        let launch: orbit::acp_runtime::Launch = serde_json::from_slice(&bytes)?;
+        launch.validate()?;
+        println!("{}", serde_json::json!({"launch_digest":launch.digest()?}));
+        return Ok(());
+    }
+    if let Commands::AcpSupervisor { request } = &cli.command {
+        let code = match orbit::acp_process::supervise(request).await {
+            Ok(code) => code,
+            Err(_) => {
+                eprintln!(
+                    "ACP supervisor failed; inspect private auth quarantine and container state"
+                );
+                1
+            }
+        };
+        std::process::exit(code);
+    }
+    if let Commands::AcpProbe { config, workspaces } = &cli.command {
+        use tokio::io::AsyncReadExt;
+        let mut bytes = Vec::new();
+        tokio::fs::File::open(config)
+            .await?
+            .take(65537)
+            .read_to_end(&mut bytes)
+            .await?;
+        anyhow::ensure!(
+            bytes.len() <= 65536,
+            "ACP probe configuration exceeds 64 KiB"
+        );
+        let config: orbit::acp::ProbeConfig = serde_json::from_slice(&bytes)?;
+        let value = orbit::acp::probe(&config, workspaces).await?;
+        match output_format {
+            Output::Json => println!("{}", serde_json::to_string_pretty(&value)?),
+            Output::Jsonl => println!("{}", serde_json::to_string(&value)?),
+        }
+        return Ok(());
+    }
     let token = if let Some(path) = cli.token_file {
         anyhow::ensure!(
             cli.token.is_empty(),
@@ -240,6 +307,15 @@ async fn main() -> Result<()> {
     };
     let client = Client::new(cli.url, token)?;
     let value = match cli.command {
+        Commands::AcpLaunchDigest { .. } => {
+            unreachable!("local launch digest handled before credentials")
+        }
+        Commands::AcpProbe { .. } => {
+            unreachable!("local probe handled before API credential resolution")
+        }
+        Commands::AcpSupervisor { .. } => {
+            unreachable!("supervisor handled before credential resolution")
+        }
         Commands::PackageDigest { manifest } => {
             let manifest: orbit::registry::Manifest =
                 serde_json::from_slice(&tokio::fs::read(manifest).await?)?;

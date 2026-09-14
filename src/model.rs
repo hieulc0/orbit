@@ -275,6 +275,11 @@ impl Definition {
                     .as_ref()
                     .context("agent configuration required")?
                     .validate()?;
+                ensure!(
+                    step.agent.as_ref().unwrap().acp_limits.is_none()
+                        || (step.uses == "repository.code" && step.execution.is_some()),
+                    "ACP requires isolated repository.code"
+                );
                 if step.uses == "repository.code" {
                     ensure!(
                         step.execution.is_some(),
@@ -859,6 +864,9 @@ pub struct Operation {
 pub enum Action {
     Start,
     Heartbeat,
+    RecordAcpSession {
+        batch: crate::acp_contract::RecordBatch,
+    },
     FinishAgentCall {
         receipt: crate::agent::CallReceipt,
     },
