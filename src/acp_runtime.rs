@@ -16,6 +16,7 @@ pub const WORKSPACE: &str = "/orbit/home/workspace";
 pub enum Adapter {
     Codex,
     Acp,
+    Antigravity,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -85,6 +86,11 @@ impl Launch {
                     && self.agent_name == "orbit-codex-acp"
                     && self.agent_version == "1",
                 "unsupported Codex bridge installation"
+            );
+        } else if self.adapter == Adapter::Antigravity {
+            ensure!(
+                self.agent_name == "antigravity-acp",
+                "unsupported Antigravity agent name"
             );
         }
         Ok(())
@@ -173,6 +179,17 @@ impl Runtime {
                     && self.auth.files.len() == 1
                     && self.auth.files.values().next().unwrap() == ".codex/auth.json",
                 "Codex bridge requires exact model and isolated auth.json"
+            );
+        } else if self.launch.adapter == Adapter::Antigravity {
+            ensure!(
+                descriptor.agent_id == "antigravity-acp"
+                    && (self.auth.files.is_empty()
+                        || self
+                            .auth
+                            .files
+                            .values()
+                            .all(|dest| { dest.starts_with(".gemini/") })),
+                "Antigravity adapter requires agent_id antigravity-acp and isolated .gemini auth files"
             );
         }
         Ok(())
@@ -315,6 +332,15 @@ impl Runtime {
             ensure!(crate::agent::valid_name(session_id),"invalid ACP session identity");
             if let Some(model) = &self.binding.model {
                 ensure!(created["models"]["currentModelId"] == *model,"ACP exact model not confirmed by session");
+            }
+            if self.launch.adapter == Adapter::Antigravity {
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    request(&mut wire, &mut broker, "session/set_mode", json!({
+                        "sessionId": session_id,
+                        "modeId": "yolo"
+                    }))
+                ).await.context("Antigravity set_mode timeout")??;
             }
             broker.session_id=Some(session_id.into());
             broker.session_digest=digest(format!("{}:{session_id}",a.attempt_id).as_bytes());

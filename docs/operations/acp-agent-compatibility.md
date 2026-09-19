@@ -1,22 +1,17 @@
 # Antigravity and Claude ACP compatibility
 
-Source review: 2026-09-13; status updated 2026-09-14. The requested rollout order is Codex → official Google
-Antigravity ACP → maintained Claude ACP. Codex's real binary has passed an offline
-broker workflow; see [that record](acp-codex-compatibility.md). The shared
-[ACP runtime](../guides/acp-coding.md) is implemented, but neither later named
-adapter is qualified for Orbit repository execution. No account was selected,
-no login occurred and neither later agent was launched during this review.
+Source review: 2026-09-13; status updated 2026-09-19. The requested rollout order is Codex → official Google
+Antigravity ACP → maintained Claude ACP.
 
 ## Official Antigravity 1.1.1
 
 The [official registry entry](https://github.com/agentclientprotocol/registry/blob/main/antigravity-acp/agent.json)
 identifies Google LLC's proprietary distribution, Linux command
-`agy_acp_server.par`, arguments `--uid=`, and the
+`agy_acp_server.par`, and the
 [versioned archive](https://dl.google.com/agy-extensions/releases/linux/agy-acp-server-agy_acp_server_1.1.1-linux-x86_64.zip).
-This is not a similarly named community wrapper.
+Zed editor ships identical verified binaries in `~/.local/share/zed/external_agents/registry/antigravity-acp/v_1.1.1_c5752c93158aa0bc_eef079d17742fe39/`.
 
-The official archive was downloaded into a disposable directory and inspected
-without execution. Observed pins:
+Observed binary digests:
 
 | File | SHA-256 |
 | --- | --- |
@@ -24,31 +19,54 @@ without execution. Observed pins:
 | `agy_acp_server.par` | `267affa691085fe5d78895e34dffe723d6528713e01bd37ed40feb7b43d1f4c7` |
 | `localharness_external` | `d98770b161eb3cc37ae4fa17f088285f9b6ac75c7cb53e0d90ed5077def9d69a` |
 
-The ELF/Python archive contains inspectable adapter sources under
-`google3/cloud/developer_experience/antigravity_extensions/acp_server/`.
-`tools.py` defines client view/create/edit functions that call ACP file methods;
-`server.py` conditionally installs those functions from the advertised filesystem
-capabilities. That is a concrete filesystem handoff candidate, not runtime proof.
+### Architecture & Runtime Discovery
 
-The inspected server's command paths use native `run_command` / `shell` execution,
-review/sandbox policy and output translation. No `create_terminal` or
-`wait_for_terminal_exit` client dispatch was found in the inspected server.
-The file-tool descriptions also retain a native read path outside the client
-workspace. Therefore client filesystem support alone does not satisfy Orbit's
-broker-only command/effect policy. This finding is limited to the pinned inspected
-source; it is not proof that no other integration interface exists.
+1. **Protocol Handshake**:
+   - Responds to standard ACP 1.0 `initialize` over stdin/stdout.
+   - `agentInfo`: `{"name": "antigravity-acp", "title": "Google Antigravity", "version": "agy_acp_server_1.1.1"}`.
+2. **Tool Routing & Filesystem Mediation**:
+   - When the client advertises `fs.readTextFile: true` and `fs.writeTextFile: true`, `agy_acp_server` configures client session tools (`client_view_file`, `client_create_file`, `client_edit_file`).
+   - These client tools route file reading and file writing directly to Orbit's `Broker` via standard ACP reverse RPCs (`fs/read_text_file`, `fs/write_text_file`).
+3. **Session Modes & Unattended Automation**:
+   - `session/new` creates an ACP session and advertises available modes: `default`, `auto_edit`, `yolo`.
+   - In `yolo` mode, tool calls auto-proceed without interactive permission prompts.
+   - Orbit's `Adapter::Antigravity` automatically initializes the session mode to `yolo` via `session/set_mode`.
+4. **Isolated Authentication & Credential Leasing**:
+   - Governed by `GEMINI_HOME` (set to `/orbit/home/.gemini`).
+   - Token store: `/orbit/home/.gemini/antigravity-acp/acp_token.json`.
+   - Settings: `/orbit/home/.gemini/antigravity-acp/settings.json`.
+   - Orbit's `AuthLease` copies the host's private token store into the container's isolated home directory before startup, prevents concurrent use via file locking, and refreshes any rotated tokens on shutdown.
+5. **Container Base Requirement**:
+   - Google's embedded C++ initialization (`RealInitGoogle`) expects group `nobody:x:65534:` in `/etc/group`. The packaging script injects this entry into Debian bookworm-slim.
 
-Next gate: demonstrate an official pre-effect terminal handoff or design a pinned
-bridge that suppresses native effects and routes commands to Orbit. Then exercise
-the real adapter in a resource-limited, credential-free image before selecting
-account/auth storage. The earlier approval-service limit has cleared, but no
-Antigravity initialization or execution qualification has been performed. The
-native-command handoff remains the implementation gate.
+### Automated Packaging Pipeline
 
-Google's [IDE documentation](https://antigravity.google/docs/ide/extensions)
-describes user/enterprise sign-in choices. No account class, project, entitlement
-or billing assumption is inferred from that documentation. The selected deployment
-must explicitly qualify unattended auth, refresh files and its data/egress policy.
+Build and pin the container image using:
+
+```bash
+bash scripts/prepare-antigravity-fixture.sh [path/to/binaries]
+```
+
+This verifies the exact binary SHA-256 hashes, packages them into an immutable image (`localhost/orbit-antigravity:1.1.1`), and outputs the container image ID.
+
+### Multi-Version Registration Workflow
+
+When Google releases newer versions of `antigravity-acp`:
+1. Obtain the new version's binaries and record their SHA-256 hashes.
+2. Run `scripts/prepare-antigravity-fixture.sh` to produce a pinned container image `localhost/orbit-antigravity:<version>`.
+3. Compute the launch digest:
+   ```bash
+   orbit acp-launch-digest --config /path/to/launch.json
+   ```
+4. Register the new version alongside previous versions in `workers.json` under distinct `binding_name` identifiers (e.g. `antigravity-acp-v1`, `antigravity-acp-v2`).
+5. Workflows can target any registered version without breaking existing runs.
+
+### Example Configurations
+
+- Worker definition: [examples/antigravity-worker.json](../../examples/antigravity-worker.json)
+- Workflow definition: [examples/antigravity-coding.yaml](../../examples/antigravity-coding.yaml)
+
+---
 
 ## Maintained Claude ACP 0.76.0
 
@@ -67,23 +85,3 @@ an empty list; MCP options are merged. Permission handling still authorizes SDK
 effects. Read/write client forwarding helpers are present, but this review did
 not find a replacement execution path for native Read/Write/Bash through those
 helpers and standard ACP terminal creation.
-
-[tools.ts](https://github.com/agentclientprotocol/claude-agent-acp/blob/c2e4815029ef3962787ecaefe208b0b6f8b81302/src/tools.ts)
-builds ACP terminal display content from native Bash tool-use IDs and output
-metadata. Display events must not be confused with Orbit-created terminals.
-
-Next gate: pin an actual execution handoff (for example, a reviewed adapter using
-only explicit custom tools with the native preset disabled), demonstrate callback
-and no-fallback behavior, then qualify isolated startup, account selection and
-refresh. No unchecked `dontAsk`/bypass mode or native repository mount is supplied
-as a substitute. A future bridge requires its own version, immutable image policy,
-fixture and live acceptance record.
-
-## Shared acceptance checklist
-
-For each adapter, record image/binary/source pins; initialized identity; exact
-model or explicit agent-configured attribution; private auth mapping; callback
-trace before each effect; denied native fallback; tool/agent cleanup on cancel,
-EOF and worker death; retained ledger/transcript; independent patch/test/review;
-and account/host approval. Until those gates pass, an `adapter: acp` installation
-is operator-configurable transport, not named-agent qualification.

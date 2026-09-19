@@ -290,3 +290,113 @@ fn acp_example_registry_pins_launch_scope_and_combined_resources() -> Result<()>
     );
     Ok(())
 }
+
+#[test]
+fn acp_antigravity_launch_and_isolated_gemini_auth_validate() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let auth = root.path().join("auth");
+    std::fs::create_dir(&auth)?;
+    std::fs::write(auth.join("acp_token.json"), "{}")?;
+    std::fs::write(auth.join("settings.json"), "{}")?;
+
+    let mut raw: Value = serde_json::from_str(include_str!("fixtures/acp-contract.json"))?;
+    raw["binding"]["acp"]["agent_id"] = json!("antigravity-acp");
+    raw["binding"]["acp"]["agent_revision"] = json!("agy_acp_server_1.1.1");
+    raw["binding"]["model"] = json!("gemini-3.7-flash-high");
+
+    let launch_val = json!({
+        "adapter": "antigravity",
+        "image": format!("sha256:{}", "c".repeat(64)),
+        "command": ["/opt/antigravity/agy_acp_server.par"],
+        "agent_name": "antigravity-acp",
+        "agent_version": "agy_acp_server_1.1.1",
+        "binary_revision": "agy_acp_server_1.1.1",
+        "cpu_millis": 2000,
+        "memory_mib": 4096,
+        "network": "host"
+    });
+    let launch: orbit::acp_runtime::Launch = serde_json::from_value(launch_val.clone())?;
+    launch.validate()?;
+
+    let mut runtime_val = json!({
+        "binding_name": "antigravity-fixture",
+        "binding": raw["binding"],
+        "launch": launch_val,
+        "auth": {
+            "path": auth,
+            "source": "fixture-auth",
+            "owner": "fixture-owner",
+            "account_class": "fixture",
+            "files": {
+                "acp_token.json": ".gemini/antigravity-acp/acp_token.json",
+                "settings.json": ".gemini/antigravity-acp/settings.json"
+            }
+        }
+    });
+    runtime_val["binding"]["acp"]["launch_digest"] = json!(launch.digest()?);
+
+    let runtime: orbit::acp_runtime::Runtime = serde_json::from_value(runtime_val.clone())?;
+    runtime.validate()?;
+
+    // Unconfined auth files outside .gemini/ must be rejected
+    let mut bad_auth_runtime = runtime_val.clone();
+    bad_auth_runtime["auth"]["files"] = json!({
+        "acp_token.json": "unconfined/acp_token.json"
+    });
+    let bad_runtime: orbit::acp_runtime::Runtime = serde_json::from_value(bad_auth_runtime)?;
+    assert!(bad_runtime.validate().is_err());
+
+    // Wrong agent_name in launch must be rejected
+    let mut bad_launch_runtime = runtime_val.clone();
+    bad_launch_runtime["launch"]["agent_name"] = json!("wrong-agent");
+    let bad_runtime: orbit::acp_runtime::Runtime = serde_json::from_value(bad_launch_runtime)?;
+    assert!(bad_runtime.validate().is_err());
+
+    Ok(())
+}
+
+#[test]
+fn acp_antigravity_example_registry_pins_launch_scope_and_combined_resources() -> Result<()> {
+    use orbit::model::*;
+    use std::collections::BTreeMap;
+    let mut raw: Value = serde_json::from_str(include_str!("../examples/antigravity-worker.json"))?;
+    raw["acp_agents"][0]["launch"]["image"] = json!(format!("sha256:{}", "b".repeat(64)));
+    let launch: orbit::acp_runtime::Launch =
+        serde_json::from_value(raw["acp_agents"][0]["launch"].clone())?;
+    raw["acp_agents"][0]["binding"]["acp"]["launch_digest"] = json!(launch.digest()?);
+    let worker: orbit::execution::WorkerConfig = serde_json::from_value(raw.clone())?;
+    worker.validate()?;
+    let runtime = &worker.acp_agents[0];
+    let definition = Definition::parse(
+        &include_str!("../examples/antigravity-coding.yaml")
+            .replace("REPLACE_WITH_FULL_COMMIT_ID", &"a".repeat(40)),
+    )?;
+    let server: orbit::api::Config =
+        serde_json::from_str(include_str!("../examples/server-remote-coding.json"))?;
+    let plan = Plan::compile_with_execution(
+        definition,
+        server.repositories["approved-repository"].clone(),
+        &BTreeMap::from([(runtime.binding_name.clone(), runtime.binding.clone())]),
+        &server.execution_profiles,
+    )?;
+    let assignment = Assignment {
+        run_id: id(),
+        task_id: id(),
+        attempt_id: id(),
+        generation: 1,
+        workspace_id: id(),
+        lease_token: String::new(),
+        lease_expires_at: 0,
+        heartbeat_interval: 1,
+        deadline_at: 0,
+        plan,
+        step: "code".into(),
+        input_artifacts: vec![],
+        idempotency_key: id(),
+        gpu_devices: vec![],
+        agent_binding_digest: Some(digest(&serde_json::to_vec(&runtime.binding)?)),
+    };
+    runtime.authorize(&assignment)?;
+    worker.authorize(&assignment)?;
+    Ok(())
+}
