@@ -231,7 +231,9 @@ pub(crate) async fn prepare_execution(
     tokio::fs::write(&request_path, serde_json::to_vec(&request)?).await?;
     let spec = CommandSpec {
         argv: vec![
-            std::env::current_exe()?.to_string_lossy().into(),
+            crate::worker::current_executable()?
+                .to_string_lossy()
+                .into(),
             "workspace-supervisor".into(),
             "--request".into(),
             request_path.to_string_lossy().into(),

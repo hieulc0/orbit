@@ -1,3 +1,12 @@
+pub fn current_executable() -> Result<std::path::PathBuf> {
+    let mut exe = std::env::current_exe()?;
+    let s = exe.to_string_lossy();
+    if let Some(stripped) = s.strip_suffix(" (deleted)") {
+        exe = std::path::PathBuf::from(stripped);
+    }
+    Ok(exe)
+}
+
 use crate::{
     api::{Registration, Upload},
     model::*,
@@ -401,7 +410,7 @@ pub async fn execute(client: &Client, assignment: &Assignment, root: &Path) -> R
                             failure: Some(Failure {
                                 category: "infrastructure_failure".into(),
                                 code: "worker_execution_error".into(),
-                                message: error.to_string(),
+                                message: format!("{error:#}"),
                                 side_effect_status: if assignment.plan.definition.steps
                                     [&assignment.step]
                                     .uses
@@ -752,7 +761,9 @@ async fn command_inner(
     }
     #[cfg(unix)]
     cmd.process_group(0);
-    let mut child = cmd.spawn().context("cannot start command")?;
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("cannot start command: {:?}", spec.argv))?;
     let group = if supervised {
         None
     } else {

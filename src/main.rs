@@ -277,10 +277,8 @@ async fn main() -> Result<()> {
     if let Commands::AcpSupervisor { request } = &cli.command {
         let code = match orbit::acp_process::supervise(request).await {
             Ok(code) => code,
-            Err(_) => {
-                eprintln!(
-                    "ACP supervisor failed; inspect private auth quarantine and container state"
-                );
+            Err(err) => {
+                eprintln!("ACP supervisor failed: {err:#}");
                 1
             }
         };

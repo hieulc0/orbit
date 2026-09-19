@@ -119,7 +119,7 @@ pub fn relative_file(path: &str) -> bool {
         && !path.contains('\0')
         && std::path::Path::new(path)
             .components()
-            .all(|c| matches!(c, Component::Normal(_)))
+            .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -272,7 +272,7 @@ impl Runtime {
             file.write_all(&serde_json::to_vec(&process_request)?)?;
             file.sync_all()?;
         }
-        let mut command = tokio::process::Command::new(std::env::current_exe()?);
+        let mut command = tokio::process::Command::new(crate::worker::current_executable()?);
         command
             .arg("acp-supervisor")
             .arg("--request")
@@ -295,7 +295,12 @@ impl Runtime {
         if let Some(value) = std::env::var_os("XDG_RUNTIME_DIR") {
             command.env("XDG_RUNTIME_DIR", value);
         }
-        let mut child = command.spawn().context("ACP supervisor launch failed")?;
+        let mut child = command.spawn().with_context(|| {
+            format!(
+                "ACP supervisor launch failed: current_exe={:?}",
+                std::env::current_exe()
+            )
+        })?;
         let mut wire = Wire::new(
             child.stdout.take().unwrap(),
             child.stdin.take().unwrap(),
@@ -333,6 +338,10 @@ impl Runtime {
             if let Some(model) = &self.binding.model {
                 ensure!(created["models"]["currentModelId"] == *model,"ACP exact model not confirmed by session");
             }
+            broker.session_id=Some(session_id.into());
+            broker.session_digest=digest(format!("{}:{session_id}",a.attempt_id).as_bytes());
+            broker.record(RecordKind::Started,&json!({"agent":self.launch.agent_name,"version":self.launch.agent_version,
+                "launch_digest":self.launch.digest()?,"model":self.binding.model}),0,0).await?;
             if self.launch.adapter == Adapter::Antigravity {
                 let _ = tokio::time::timeout(
                     Duration::from_secs(10),
@@ -342,10 +351,6 @@ impl Runtime {
                     }))
                 ).await.context("Antigravity set_mode timeout")??;
             }
-            broker.session_id=Some(session_id.into());
-            broker.session_digest=digest(format!("{}:{session_id}",a.attempt_id).as_bytes());
-            broker.record(RecordKind::Started,&json!({"agent":self.launch.agent_name,"version":self.launch.agent_version,
-                "launch_digest":self.launch.digest()?,"model":self.binding.model}),0,0).await?;
             let prompt = json!({"sessionId":session_id,"prompt":[{"type":"text","text":format!(
                 "Task: {}\nPinned base: {}\nContext: {}\nUse only client file and terminal callbacks. Preserve tests. Do not push, deploy, delegate, or install anything. Finish with a concise summary for independent verification.",
                 a.plan.definition.inputs.task,a.plan.definition.inputs.base_revision,spec.context)}]});

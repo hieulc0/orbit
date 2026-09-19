@@ -64,19 +64,44 @@ impl Root {
         let file = unsafe { File::from_raw_fd(fd) };
         let metadata = file.metadata()?;
         ensure!(
-            metadata.is_file()
+            (metadata.is_file()
                 && metadata.nlink() == 1
-                && metadata.uid() == unsafe { libc::geteuid() },
-            "broker file must be an owned regular file with one link"
+                && metadata.uid() == unsafe { libc::geteuid() })
+                || (flags == libc::O_RDONLY
+                    && metadata.is_dir()
+                    && metadata.uid() == unsafe { libc::geteuid() }),
+            "broker file must be an owned regular file with one link or directory"
         );
         Ok(file)
     }
     pub fn read(&self, path: &str, max: usize) -> Result<Vec<u8>> {
         let file = self.file(path, libc::O_RDONLY, 0)?;
-        ensure!(
-            file.metadata()?.len() <= max as u64,
-            "broker file exceeds bound"
-        );
+        let metadata = file.metadata()?;
+        if metadata.is_dir() {
+            let proc_path = format!("/proc/self/fd/{}", file.as_raw_fd());
+            let mut entries = Vec::new();
+            for entry in std::fs::read_dir(proc_path)? {
+                let entry = entry?;
+                let file_name = entry.file_name();
+                let name = file_name.to_string_lossy();
+                if !name.starts_with('.') {
+                    let is_dir = entry.file_type()?.is_dir();
+                    if is_dir {
+                        entries.push(format!("{name}/"));
+                    } else {
+                        entries.push(name.into_owned());
+                    }
+                }
+            }
+            entries.sort();
+            let listing = entries.join(
+                "
+",
+            );
+            ensure!(listing.len() <= max, "broker file exceeds bound");
+            return Ok(listing.into_bytes());
+        }
+        ensure!(metadata.len() <= max as u64, "broker file exceeds bound");
         let mut content = Vec::new();
         file.take(max as u64 + 1).read_to_end(&mut content)?;
         ensure!(content.len() <= max, "broker file exceeds bound");
@@ -84,8 +109,9 @@ impl Root {
     }
     pub fn read_private(&self, path: &str, max: usize) -> Result<Vec<u8>> {
         let file = self.file(path, libc::O_RDONLY, 0)?;
+        let metadata = file.metadata()?;
         ensure!(
-            file.metadata()?.mode() & 0o077 == 0,
+            metadata.is_file() && metadata.mode() & 0o077 == 0,
             "auth file must be private"
         );
         let mut content = Vec::new();

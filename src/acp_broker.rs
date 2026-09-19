@@ -162,6 +162,8 @@ impl<'a> Broker<'a> {
             .context("ACP path outside workspace")?
             .to_str()
             .context("non UTF-8 path")?;
+        let relative = relative.trim_end_matches('/');
+        let relative = if relative.is_empty() { "." } else { relative };
         ensure!(
             crate::acp_runtime::relative_file(relative),
             "invalid ACP relative path"
@@ -221,13 +223,14 @@ impl<'a> Broker<'a> {
     }
     fn owner(&self, params: &Value) -> Result<()> {
         ensure!(
-            self.active && self.session_id.as_deref() == params["sessionId"].as_str(),
+            self.session_id.as_deref() == params["sessionId"].as_str(),
             "foreign or inactive ACP session"
         );
         Ok(())
     }
     async fn callback(&mut self, method: &str, params: &Value) -> Result<Value> {
         self.owner(params)?;
+        ensure!(self.active, "callbacks require active turn");
         match method {
             "fs/read_text_file" | "fs/write_text_file" => {
                 ensure!(

@@ -109,7 +109,9 @@ impl Wire {
             &value["id"] == id && value.get("method").is_none(),
             "foreign agent response"
         );
-        ensure!(value.get("error").is_none(), "agent request rejected");
+        if let Some(err) = value.get("error") {
+            anyhow::bail!("agent request rejected: {}", err);
+        }
         value
             .get("result")
             .cloned()

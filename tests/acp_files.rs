@@ -13,6 +13,7 @@ fn acp_files_reject_escape_symlink_fifo_hardlink_and_support_private_refresh() -
     assert_eq!(broker.read("src/file", 65536)?, b"first");
     broker.write("src/file", b"next")?;
     assert_eq!(broker.read("src/file", 65536)?, b"next");
+    assert_eq!(broker.read("src", 65536)?, b"file");
     symlink(outside.path(), root.path().join("link"))?;
     std::fs::hard_link(outside.path().join("secret"), root.path().join("hard"))?;
     let fifo = std::ffi::CString::new(root.path().join("fifo").to_str().unwrap())?;

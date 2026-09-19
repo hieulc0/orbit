@@ -41,19 +41,24 @@ trap 'rm -rf "$BUILD_CONTEXT"' EXIT
 cat << 'EOF' > "$BUILD_CONTEXT/Containerfile"
 FROM docker.io/library/debian:bookworm-slim
 RUN echo "nobody:x:65534:" >> /etc/group
-RUN mkdir -p /opt/antigravity
+RUN mkdir -p /opt/antigravity /etc/ssl/certs
+COPY ssl-certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --chmod=755 agy_acp_server.par /opt/antigravity/agy_acp_server.par
 COPY --chmod=755 localharness_external /opt/antigravity/localharness_external
 ENV GEMINI_HOME=/orbit/home/.gemini \
     AGY_ACP_FORCE_FILE_STORAGE=1 \
     NO_BROWSER=1 \
-    ANTIGRAVITY_HARNESS_PATH=/opt/antigravity/localharness_external
+    ANTIGRAVITY_HARNESS_PATH=/opt/antigravity/localharness_external \
+    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+    REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
 WORKDIR /orbit/home
 ENTRYPOINT ["/opt/antigravity/agy_acp_server.par"]
 EOF
 
+mkdir -p "$BUILD_CONTEXT/ssl-certs"
+cp -L /etc/ssl/certs/ca-certificates.crt "$BUILD_CONTEXT/ssl-certs/ca-certificates.crt"
 cp "$SERVER_PAR" "$BUILD_CONTEXT/agy_acp_server.par"
-cp "$LOCALHARNESS" "$BUILD_CONTEXT/localharness_external"
+cp "$LOCALHARNESS" "$BUILD_CONTEXT/localharness_external" 
 
 IMAGE_TAG="localhost/orbit-antigravity:1.1.1"
 
