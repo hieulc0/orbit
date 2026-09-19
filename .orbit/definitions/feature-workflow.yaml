@@ -1,0 +1,57 @@
+apiVersion: orbit/v1
+kind: Definition
+metadata:
+  name: feature-workflow
+inputs:
+  repository_id: orbit
+  base_revision: a871d299778a5b13a647bdfb1caeb30a4423cf62
+  task: Implement the requested feature or fix; add and preserve automated tests.
+steps:
+  code:
+    uses: repository.code
+    recovery_policy: restart_from_inputs
+    max_attempts: 3
+    timeout_seconds: 1800
+    retry_backoff_seconds: 5
+    resources: { cpu_millis: 2000, memory_mib: 4096 }
+    execution: { isolation: trusted, network: none, filesystem: workspace }
+    agent:
+      identity: antigravity-coder
+      binding: antigravity-acp-v1
+      tools: [read_file, write_file, shell]
+      permissions: [workspace.read, workspace.write, shell.execute]
+      budget: { calls: 50 }
+      max_delegations: 0
+      context: {}
+      output: object
+      acp_limits:
+        prompt_turns: 1
+        broker_calls: 48
+        reported_tool_calls: 96
+        turn_timeout_seconds: 600
+        terminal_timeout_seconds: 60
+        terminal_runtime_seconds: 1200
+        output_bytes: 2097152
+  test:
+    uses: repository.test
+    needs: [code]
+    recovery_policy: restart_from_inputs
+    max_attempts: 2
+    timeout_seconds: 900
+    retry_backoff_seconds: 5
+    resources: { cpu_millis: 2000, memory_mib: 4096 }
+    execution: { isolation: trusted, network: none, filesystem: workspace }
+    commands:
+      - argv: [cargo, test]
+        cwd: .
+        timeout_seconds: 300
+  review:
+    uses: human.approval
+    needs: [test]
+    recovery_policy: restart_from_inputs
+    max_attempts: 1
+    timeout_seconds: 86400
+    retry_backoff_seconds: 0
+    approval:
+      assignees: [operator]
+      prompt: Review the accepted code patch, test results, and implementation evidence.
