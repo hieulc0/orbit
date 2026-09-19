@@ -24,14 +24,13 @@ bash scripts/check.sh ui
 
 ## Disposable database/process qualification
 
-The root Compose file is for qualification only. It must never be pointed at
+The root Compose file is for qualification only. It starts disposable PostgreSQL
+and RustFS (S3-compatible test server) services. It must never be pointed at
 deployment volumes. The credentials below belong only to its loopback fixtures.
 
 ```sh
 docker compose --profile compute up -d --wait
-docker compose --profile compute exec -T minio mc alias set qualification \
-  http://127.0.0.1:9000 orbit-local-test orbit-local-test-secret
-docker compose --profile compute exec -T minio mc mb --ignore-existing qualification/orbit-qualification
+python3 scripts/bootstrap-s3.py --endpoint http://127.0.0.1:55440 --bucket orbit-qualification --access-key orbit-local-test --secret-key orbit-local-test-secret
 podman pull docker.io/library/alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
 npm --prefix ui run build
 

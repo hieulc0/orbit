@@ -209,7 +209,7 @@ async fn gpu_device_reservations_and_capability_requirements() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires disposable PostgreSQL and MinIO; see Phase 4 qualification"]
+#[ignore = "requires disposable PostgreSQL and S3-compatible service (e.g. RustFS); see Phase 4 qualification"]
 async fn s3_artifacts_reopen_immutable_and_fenced() -> Result<()> {
     use orbit::artifacts::S3Config;
     let mut f = Fixture::new().await?;
@@ -218,7 +218,10 @@ async fn s3_artifacts_reopen_immutable_and_fenced() -> Result<()> {
         S3Config {
             bucket: "orbit-qualification".into(),
             region: "us-east-1".into(),
-            endpoint: Some("http://127.0.0.1:55440".into()),
+            endpoint: Some(
+                std::env::var("ORBIT_TEST_S3_ENDPOINT")
+                    .unwrap_or_else(|_| "http://127.0.0.1:55440".into()),
+            ),
             access_key_env: "ORBIT_TEST_S3_ACCESS_KEY".into(),
             secret_key_env: "ORBIT_TEST_S3_SECRET_KEY".into(),
             allow_http: true,

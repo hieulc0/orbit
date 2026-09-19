@@ -12,7 +12,7 @@ not assert that the complete long-term vision or production hardening is finishe
 ## Evidence map
 
 | Gate | Implementation and observed evidence |
-| --- | --- |
+| --- | --- |\
 | Current docs / fresh-agent entry | Indexed architecture/reference/guides/operations; historical records preserved; root AGENTS.md and two validated skills |
 | Repeatable checks | 24 regular Rust tests, formatting, Clippy all targets/features with warnings denied; 2 Python SDK + 3 operations tests; strict TypeScript/UI build and 5 mocked Chromium cases |
 | Durable regressions | 46 PostgreSQL/process/Podman/S3/real-browser cases passed together in 19.26s; the separate dogfood case also passed |
@@ -62,7 +62,7 @@ run in `target/qualification-alpha-final`, the failed Docker
 compute fixture in `target/qualification-alpha-docker`, and private deployment
 drills/backups in `target/deployment-smoke`. Drill containers/anonymous database
 volumes were removed; fixture files/backups are retained. The repository's
-disposable PostgreSQL/MinIO services and cached images remain available.
+disposable PostgreSQL/RustFS services and cached images remain available.
 
 `target/qualification-alpha-review` is a separate redacted export. Its initial
 1,049 files (2,776,155 bytes) and 141 accepted artifact references were independently

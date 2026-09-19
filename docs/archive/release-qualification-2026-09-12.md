@@ -33,7 +33,7 @@ definition, records a fixture human decision and checks durable completion.
 
 ## Reproduction
 
-Use the disposable PostgreSQL/MinIO setup and pinned Podman image from
+Use the disposable PostgreSQL/RustFS setup and pinned Podman image from
 [Phase 4 qualification](phase-4-qualification.md). Build the UI and install the
 pinned browser before the full ignored suite:
 

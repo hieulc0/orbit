@@ -105,9 +105,16 @@ by capability and pool. These are snapshots, not a claim of host health.
 
 ## Artifact providers
 
-The local provider remains the default. It publishes with an immutable link,
-file sync and directory sync. S3-compatible providers use conditional object
-creation; retransmission accepts the same bytes and rejects conflicting content.
+Orbit artifact storage uses a generic `ArtifactStore` abstraction:
+
+- **Local filesystem** (`local`): default simple, single-node artifact storage using immutable links and file/directory sync.
+- **S3 backend** (`s3`): distributed, shared artifact storage over standard AWS S3-compatible APIs.
+  - **RustFS**: default local and CI S3-compatible qualification target.
+  - **AWS S3, Cloudflare R2, and other S3-compatible implementations**: production alternatives.
+
+Orbit supports the standard S3 protocol generically; RustFS is used as the self-hosted development and qualification harness and is not a mandatory production dependency.
+
+S3-compatible providers use conditional object creation; retransmission accepts the same bytes and rejects conflicting content.
 If a PUT response is lost or a concurrent conditional PUT conflicts, a successful
 read with the expected length and SHA-256 reconciles the existing publication.
 Providers must support conditional writes. Configure S3 using server-local JSON:

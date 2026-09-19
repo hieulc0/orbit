@@ -1,17 +1,27 @@
-# Local PostgreSQL for kernel tests and the local runbook.
+# Local PostgreSQL and RustFS for kernel tests and the local runbook.
 # Not a production or deployment definition.
 services:
-  minio:
+  rustfs:
     profiles: [compute]
-    image: minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
-    command: [server, /data]
+    image: rustfs/rustfs:1.0.0@sha256:ba0a1b53e36f321c0d46f3867104abef169f7bc59c467c664ddac87e7ddc9a8b
     ports:
       - "127.0.0.1:55440:9000"
+      - "127.0.0.1:55441:9001"
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
     environment:
-      MINIO_ROOT_USER: orbit-local-test
-      MINIO_ROOT_PASSWORD: orbit-local-test-secret
+      RUSTFS_ADDRESS: "0.0.0.0:9000"
+      RUSTFS_CONSOLE_ADDRESS: "0.0.0.0:9001"
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_ACCESS_KEY: orbit-local-test
+      RUSTFS_SECRET_KEY: orbit-local-test-secret
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://127.0.0.1:9000/health/ready || exit 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
     volumes:
-      - orbit-minio:/data
+      - orbit-rustfs:/data
   postgres:
     image: postgres:17-alpine
     container_name: orbit-postgres
@@ -31,4 +41,4 @@ services:
 
 volumes:
   orbit-postgres:
-  orbit-minio:
+  orbit-rustfs:

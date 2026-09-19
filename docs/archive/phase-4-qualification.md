@@ -1,7 +1,7 @@
 # Phase 4 qualification
 
 Phase 4's bounded CPU/OCI and artifact contract is implemented and qualified
-with PostgreSQL, MinIO and rootless Podman. Do not infer production readiness,
+with PostgreSQL, RustFS (S3-compatible) and rootless Podman. Do not infer production readiness,
 hardware GPU qualification or completion of later roadmap phases.
 See [compute and artifact semantics](../reference/compute-artifacts.md).
 
@@ -11,10 +11,7 @@ Use only the disposable Compose services and fixture workspaces:
 
 ```sh
 docker compose --profile compute up -d --wait
-docker compose --profile compute exec -T minio mc alias set qualification \
-  http://127.0.0.1:9000 orbit-local-test orbit-local-test-secret
-docker compose --profile compute exec -T minio mc mb --ignore-existing \
-  qualification/orbit-qualification
+python3 scripts/bootstrap-s3.py --endpoint http://127.0.0.1:55440 --bucket orbit-qualification --access-key orbit-local-test --secret-key orbit-local-test-secret
 podman pull docker.io/library/alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
 
 cargo fmt --all -- --check
@@ -34,8 +31,8 @@ The container case requires the Alpine digest in `examples/container.yaml`
 already available in the selected runtime. For a working Docker installation,
 provision it there and select `ORBIT_CONTAINER_RUNTIME=docker`. Provisioning an
 image is an operator action.
-The MinIO credentials above belong only to the disposable local test service.
-MinIO is optional outside this qualification profile. Evidence and retained S3
+The S3/RustFS credentials above belong only to the disposable local test service.
+RustFS is optional outside this qualification profile. Evidence and retained S3
 test prefixes are disposable local data; review before exporting or sharing.
 
 ## Evidence mapping
@@ -49,7 +46,7 @@ test prefixes are disposable local data; review before exporting or sharing.
 | `slow_storage_verification_never_blocks_leases_or_cancellation` | A deliberately delayed storage read leaves renewal and cancellation responsive and rejects publication after cancellation |
 | `resource_reservations_and_pools_across_servers` | Shared resource reservations, wrong-pool rejection, conflicting server profile rejection, cancellation release and queue/worker inspection |
 | `gpu_device_reservations_and_capability_requirements` | Required-capability matching, disjoint logical GPU devices across simultaneous server claims, exhaustion and device reuse after cancellation; no GPU hardware execution |
-| `s3_artifacts_reopen_immutable_and_fenced` | Actual MinIO bytes, restart with changed default provider, denied unrelated reader, duplicate publication, conflict rejection, completion retransmission and stale completion fencing |
+| `s3_artifacts_reopen_immutable_and_fenced` | Actual S3/RustFS bytes, restart with changed default provider, denied unrelated reader, duplicate publication, conflict rejection, completion retransmission and stale completion fencing |
 | `container_worker_outputs_cancellation_and_kill_cleanup` | Actual OCI output through rootless Podman, API submission without a repository, cancellation, combined server/worker SIGKILL, independent cleanup, fresh retry and recovered result |
 | Existing 28 kernel cases | Repository execution, retry/fencing, recovery, child runs, timers/signals, SSE and SDK compatibility |
 

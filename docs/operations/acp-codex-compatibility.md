@@ -172,7 +172,7 @@ semantics, token refresh, rate limits, unattended execution, data/egress policy 
 a separate worker host require explicitly selected resources and live evidence.
 Antigravity/Claude have separate [compatibility gaps](acp-agent-compatibility.md).
 
-Retained local resources include disposable PostgreSQL/MinIO services, test
+Retained local resources include disposable PostgreSQL/RustFS services, test
 schemas, cached fixture images and private qualification directories. Earlier
 upstream downloads/build contexts were temporary and are no longer present at
 their recorded `/tmp` paths; reproduce them from the pinned sources when needed.

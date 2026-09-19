@@ -66,7 +66,7 @@ has not been observed here.
 Raw development attempts: `target/qualification-remote-coding`. The passing full
 regression record is `target/qualification-remote-coding-full`; pinned-baseline
 evidence is `target/qualification-remote-coding-dogfood`. Private fixture files,
-cached images and the disposable localhost PostgreSQL/MinIO services are retained.
+cached images and the disposable localhost PostgreSQL/RustFS services are retained.
 No Orbit-managed Podman task containers remained after qualification.
 The final eight-case rerun is retained in `target/qualification-remote-coding-final`.
 
