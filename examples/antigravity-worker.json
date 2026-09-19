@@ -63,7 +63,7 @@
         "network": "host"
       },
       "auth": {
-        "path": "/absolute/private/orbit-antigravity-auth",
+        "path": "/absolute/path/to/.orbit/credentials/antigravity",
         "source": "antigravity-local-session",
         "owner": "approved-owner",
         "account_class": "approved-account-class",

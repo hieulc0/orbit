@@ -324,6 +324,81 @@ async fn git_output(
     .context("Git operation timed out")?
 }
 
+/// Discover the Git repository root directory starting from `start_dir` (or cwd if None).
+pub fn find_repository_root(start_dir: Option<&Path>) -> Result<PathBuf> {
+    let mut cmd = std::process::Command::new("git");
+    let dir = match start_dir {
+        Some(p) if p.is_dir() => Some(p),
+        Some(p) => p.parent(),
+        None => None,
+    };
+    if let Some(d) = dir {
+        cmd.current_dir(d);
+    }
+    cmd.args(["rev-parse", "--show-toplevel"]);
+    let output = cmd.output().context("failed to execute git command")?;
+    ensure!(
+        output.status.success(),
+        "directory is not inside a Git repository: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let root = String::from_utf8(output.stdout)?.trim().to_string();
+    Ok(PathBuf::from(root))
+}
+
+/// Resolve a symbolic Git reference (such as HEAD, main, tags, or commit prefixes)
+/// to a full, immutable 40-character or 64-character hexadecimal commit SHA.
+/// If `start_dir` is provided, Git discovery begins from that path or its parent.
+pub fn resolve_git_revision(git_ref: &str, start_dir: Option<&Path>) -> Result<String> {
+    let git_ref = git_ref.trim();
+    ensure!(!git_ref.is_empty(), "Git revision cannot be empty");
+
+    let is_full_sha =
+        [40, 64].contains(&git_ref.len()) && git_ref.bytes().all(|b| b.is_ascii_hexdigit());
+
+    let mut cmd = std::process::Command::new("git");
+    let dir = match start_dir {
+        Some(p) if p.is_dir() => Some(p),
+        Some(p) => p.parent(),
+        None => None,
+    };
+    if let Some(d) = dir {
+        cmd.current_dir(d);
+    }
+    cmd.args(["rev-parse", "--verify", &format!("{git_ref}^{{commit}}")]);
+
+    match cmd.output() {
+        Ok(output) if output.status.success() => {
+            let sha = String::from_utf8(output.stdout)?.trim().to_string();
+            ensure!(
+                [40, 64].contains(&sha.len()) && sha.bytes().all(|b| b.is_ascii_hexdigit()),
+                "resolved revision '{sha}' is not a valid full Git commit SHA"
+            );
+            Ok(sha)
+        }
+        Ok(output) => {
+            if is_full_sha {
+                Ok(git_ref.to_string())
+            } else {
+                let err = String::from_utf8_lossy(&output.stderr);
+                let err_msg = err.trim();
+                if err_msg.is_empty() {
+                    anyhow::bail!("cannot resolve Git revision '{git_ref}'");
+                } else {
+                    anyhow::bail!("cannot resolve Git revision '{git_ref}': {err_msg}");
+                }
+            }
+        }
+        Err(e) => {
+            if is_full_sha {
+                Ok(git_ref.to_string())
+            } else {
+                anyhow::bail!("failed to invoke git to resolve revision '{git_ref}': {e:#}");
+            }
+        }
+    }
+}
+
 const GIT_CREDENTIAL_HELPER: &str = "#!/bin/sh
 [ \"$1\" = get ] || exit 0
 protocol= host= path=

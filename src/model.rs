@@ -156,6 +156,34 @@ impl Definition {
         value.validate()?;
         Ok(value)
     }
+
+    /// Load a definition from a file path, optionally overriding base_revision and task,
+    /// and resolving any symbolic Git revisions (e.g. HEAD, branch, tag) before validation.
+    pub fn load_with_overrides(
+        definition_path: &std::path::Path,
+        base_revision_override: Option<&str>,
+        task_override: Option<&str>,
+    ) -> Result<Self> {
+        let raw_yaml = std::fs::read_to_string(definition_path)
+            .with_context(|| format!("cannot read definition file: {:?}", definition_path))?;
+        let mut definition: Self = serde_yaml::from_str(&raw_yaml)
+            .with_context(|| format!("failed to parse YAML in {:?}", definition_path))?;
+
+        if let Some(task) = task_override {
+            definition.inputs.task = task.to_string();
+        }
+
+        let base_rev = base_revision_override.unwrap_or(&definition.inputs.base_revision);
+
+        if !base_rev.is_empty() {
+            let resolved_rev =
+                crate::repository::resolve_git_revision(base_rev, Some(definition_path))?;
+            definition.inputs.base_revision = resolved_rev;
+        }
+
+        definition.validate()?;
+        Ok(definition)
+    }
     pub fn validate(&self) -> Result<()> {
         self.validate_level(0).map(|_| ())
     }

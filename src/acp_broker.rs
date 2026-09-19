@@ -182,12 +182,18 @@ impl<'a> Broker<'a> {
                 "duplicate or invalid ACP request ID"
             );
             let result = self.callback(method, &value["params"]).await;
+            let err_detail = match &result {
+                Err(err) => Some(format!("method {}: {:#}", method, err)),
+                Ok(_) => None,
+            };
             self.poisoned |= result.is_err();
             wire.response(id.clone(), result).await?;
-            ensure!(
-                !self.poisoned,
-                "ACP broker denied or could not confirm a callback"
-            );
+            if let Some(detail) = err_detail {
+                anyhow::bail!(
+                    "ACP broker denied or could not confirm a callback: {}",
+                    detail
+                );
+            }
         } else {
             ensure!(method == "session/update", "unsupported ACP notification");
             let params = &value["params"];

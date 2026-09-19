@@ -38,6 +38,52 @@ fn scope_query(scope: Option<&str>) -> Result<String> {
         Ok(String::new())
     }
 }
+#[derive(clap::Args, Clone, Debug)]
+struct RunArgs {
+    #[command(subcommand)]
+    action: Option<RunAction>,
+    /// Path to definition YAML file (legacy positional syntax: orbit run <DEFINITION>)
+    #[arg(value_name = "DEFINITION")]
+    definition: Option<PathBuf>,
+    /// Base Git revision override (e.g. HEAD, branch name, or commit SHA)
+    #[arg(long)]
+    base_revision: Option<String>,
+    /// Task description override
+    #[arg(long)]
+    task: Option<String>,
+    #[arg(long)]
+    scope: Option<String>,
+    #[arg(long)]
+    request_id: Option<String>,
+    #[arg(long)]
+    parent_run_id: Option<String>,
+}
+
+#[derive(Subcommand, Clone, Debug)]
+enum RunAction {
+    /// Submit a workflow run
+    Submit(RunSubmitArgs),
+}
+
+#[derive(clap::Args, Clone, Debug)]
+struct RunSubmitArgs {
+    /// Path to definition YAML file
+    #[arg(long)]
+    definition: PathBuf,
+    /// Base Git revision override (e.g. HEAD, branch name, or commit SHA)
+    #[arg(long)]
+    base_revision: Option<String>,
+    /// Task description override
+    #[arg(long)]
+    task: Option<String>,
+    #[arg(long)]
+    scope: Option<String>,
+    #[arg(long)]
+    request_id: Option<String>,
+    #[arg(long)]
+    parent_run_id: Option<String>,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Validate an operator-owned ACP launch policy and print its canonical digest.
@@ -177,16 +223,12 @@ enum Commands {
     },
     Validate {
         definition: PathBuf,
+        #[arg(long)]
+        base_revision: Option<String>,
+        #[arg(long)]
+        task: Option<String>,
     },
-    Run {
-        definition: PathBuf,
-        #[arg(long)]
-        scope: Option<String>,
-        #[arg(long)]
-        request_id: Option<String>,
-        #[arg(long)]
-        parent_run_id: Option<String>,
-    },
+    Run(RunArgs),
     Runs {
         #[arg(long, value_enum)]
         output: Option<Output>,
@@ -539,17 +581,50 @@ async fn main() -> Result<()> {
             orbit::ops::log("server_stopped", serde_json::json!({}));
             return Ok(());
         }
-        Commands::Validate { definition } => {
-            let def = Definition::parse(&tokio::fs::read_to_string(definition).await?)?;
-            serde_json::json!({"valid":true,"name":def.metadata.name})
-        }
-        Commands::Run {
+        Commands::Validate {
             definition,
-            scope,
-            request_id,
-            parent_run_id,
+            base_revision,
+            task,
         } => {
-            let definition = Definition::parse(&tokio::fs::read_to_string(definition).await?)?;
+            let def = Definition::load_with_overrides(
+                &definition,
+                base_revision.as_deref(),
+                task.as_deref(),
+            )?;
+            serde_json::json!({"valid": true, "name": def.metadata.name})
+        }
+        Commands::Run(run_args) => {
+            let (definition_path, base_revision, task, scope, request_id, parent_run_id) =
+                match run_args.action {
+                    Some(RunAction::Submit(args)) => (
+                        args.definition,
+                        args.base_revision,
+                        args.task,
+                        args.scope,
+                        args.request_id,
+                        args.parent_run_id,
+                    ),
+                    None => {
+                        let path = run_args.definition.ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "definition path required; see 'orbit run submit --help' or 'orbit run --help'"
+                            )
+                        })?;
+                        (
+                            path,
+                            run_args.base_revision,
+                            run_args.task,
+                            run_args.scope,
+                            run_args.request_id,
+                            run_args.parent_run_id,
+                        )
+                    }
+                };
+            let definition = Definition::load_with_overrides(
+                &definition_path,
+                base_revision.as_deref(),
+                task.as_deref(),
+            )?;
             let request_id = request_id.unwrap_or_else(id);
             eprintln!("submission request_id={request_id}");
             client

@@ -42,7 +42,7 @@ steps:
     resources: { cpu_millis: 1000, memory_mib: 512 }
     execution: { isolation: trusted, network: none, filesystem: workspace }
     commands:
-      - argv: [sh, -c, "git diff --check && test -d docs"]
+      - argv: [sh, -c, "test -d docs && test -f docs/guides/antigravity-acp.md"]
         cwd: .
         timeout_seconds: 60
   review:

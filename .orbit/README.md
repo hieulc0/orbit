@@ -120,11 +120,43 @@ Before submission, validate the definition syntax and policy constraints:
 orbit validate .orbit/definitions/docs-workflow.yaml
 ```
 
-### Submitting a Run
-Submit the definition to an active Orbit server:
+Optionally validate with symbolic revision and task overrides:
+```bash
+orbit validate .orbit/definitions/feature-workflow.yaml --base-revision HEAD --task "Validate sample"
+```
+
+### Submitting a Run with Dynamic Overrides
+Submit the definition to an active Orbit server, providing task descriptions and symbolic Git revisions at submission time:
+
+```bash
+orbit run submit \
+  --definition .orbit/definitions/feature-workflow.yaml \
+  --base-revision HEAD \
+  --task "Implement feature X"
+```
+
+Or for documentation tasks:
+
+```bash
+orbit run submit \
+  --definition .orbit/definitions/docs-workflow.yaml \
+  --base-revision HEAD \
+  --task "Document worker capability matching and include examples."
+```
+
+#### How Symbolic Revision Resolution Works
+- The CLI submission boundary resolves symbolic references (`HEAD`, `main`, tags, or short commit prefixes) via Git (`git rev-parse --verify <ref>^{commit}`).
+- **Immutable Execution Identity**: The server and workers never receive or defer symbolic names like `HEAD`. Before model validation and server dispatch, `HEAD` is resolved into an immutable 40-character (or 64-character) hexadecimal commit SHA.
+- **Subdirectory Discovery**: Running `orbit run submit` from any repository subdirectory automatically discovers the Git repository root to resolve the revision.
+- **Non-Mutating**: The underlying repository YAML definition file remains unchanged on disk.
+
+### Legacy Positional Submission
+For backward compatibility, submitting an existing definition without overrides continues to work:
 
 ```bash
 orbit run .orbit/definitions/docs-workflow.yaml
+# or
+orbit run submit --definition .orbit/definitions/docs-workflow.yaml
 ```
 
 ### Human Review & Approval
@@ -135,13 +167,5 @@ When the `review` step reaches `WAITING`, review the patch and record operator a
 orbit artifact --output /tmp/patch.diff <RUN_ID> <ARTIFACT_ID>
 
 # Approve review step
-orbit approve <RUN_ID> review --comment "Documentation verified and approved"
+orbit approve <RUN_ID> review --comment "Changes verified and approved"
 ```
-
----
-
-## 6. Schema and Base Revision Note
-
-Orbit definition schema requires `base_revision` to be a 40-character or 64-character hexadecimal commit ID when `repository.*` steps are utilized. 
-
-When creating or modifying definitions, update `base_revision` to match your targeted baseline commit (or a pinned integration base). Future Orbit releases may introduce dynamic `HEAD` resolution during `orbit run`.
