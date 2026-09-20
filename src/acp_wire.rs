@@ -91,11 +91,26 @@ impl Wire {
             .await?;
         Ok(id)
     }
+    pub async fn response_ok(&mut self, id: Value, result: Value) -> Result<()> {
+        self.send(json!({"jsonrpc":"2.0","id":id,"result":result}))
+            .await
+    }
+    pub async fn response_error(&mut self, id: Value, code: i64, message: &str) -> Result<()> {
+        self.send(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": code,
+                "message": message,
+            }
+        }))
+        .await
+    }
     pub async fn response(&mut self, id: Value, result: Result<Value>) -> Result<()> {
         let value = match result {
             Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
-            Err(_) => {
-                json!({"jsonrpc":"2.0","id":id,"error":{"code":-32603,"message":"Orbit denied or could not confirm the operation"}})
+            Err(err) => {
+                json!({"jsonrpc":"2.0","id":id,"error":{"code":-32603,"message":format!("{:#}", err)}})
             }
         };
         self.send(value).await

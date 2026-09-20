@@ -13,6 +13,37 @@ use std::{
     rc::Rc,
 };
 
+#[derive(Debug)]
+pub enum BrokerError {
+    Recoverable { code: i64, message: String },
+    Fatal(anyhow::Error),
+}
+
+impl BrokerError {
+    pub fn recoverable(code: i64, message: impl Into<String>) -> Self {
+        Self::Recoverable {
+            code,
+            message: message.into(),
+        }
+    }
+    pub fn fatal(err: impl Into<anyhow::Error>) -> Self {
+        Self::Fatal(err.into())
+    }
+}
+
+impl std::fmt::Display for BrokerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Recoverable { code, message } => {
+                write!(f, "recoverable callback error ({code}): {message}")
+            }
+            Self::Fatal(err) => write!(f, "fatal broker error: {err:#}"),
+        }
+    }
+}
+
+impl std::error::Error for BrokerError {}
+
 struct Handle {
     terminal: Rc<Terminal>,
     call: String,
@@ -27,6 +58,10 @@ pub struct Broker<'a> {
     pub log: Vec<u8>,
     pub output_bytes: u64,
     pub reported_tools: u32,
+    pub tool_calls: u64,
+    pub tool_successes: u64,
+    pub tool_failures: u64,
+    pub tool_counts: BTreeMap<String, u64>,
     sequence: u32,
     terminals: BTreeMap<String, Handle>,
     seen_requests: BTreeSet<String>,
@@ -43,6 +78,10 @@ impl<'a> Broker<'a> {
             log: vec![],
             output_bytes: 0,
             reported_tools: 0,
+            tool_calls: 0,
+            tool_successes: 0,
+            tool_failures: 0,
+            tool_counts: BTreeMap::new(),
             sequence: 0,
             terminals: BTreeMap::new(),
             seen_requests: BTreeSet::new(),
@@ -182,22 +221,42 @@ impl<'a> Broker<'a> {
                 "duplicate or invalid ACP request ID"
             );
             let result = self.callback(method, &value["params"]).await;
-            let err_detail = match &result {
-                Err(err) => Some(format!("method {}: {:#}", method, err)),
-                Ok(_) => None,
-            };
-            self.poisoned |= result.is_err();
-            wire.response(id.clone(), result).await?;
-            if let Some(detail) = err_detail {
-                anyhow::bail!(
-                    "ACP broker denied or could not confirm a callback: {}",
-                    detail
-                );
+            match result {
+                Ok(val) => {
+                    self.tool_successes += 1;
+                    wire.response_ok(id.clone(), val).await?;
+                }
+                Err(BrokerError::Recoverable { code, message }) => {
+                    self.tool_failures += 1;
+                    let err_val = json!({
+                        "error": {
+                            "code": code,
+                            "message": &message,
+                        }
+                    });
+                    let _ = self
+                        .record(
+                            RecordKind::BrokerOutput,
+                            &err_val,
+                            serde_json::to_vec(&err_val)
+                                .map(|v| v.len() as u64)
+                                .unwrap_or(0),
+                            0,
+                        )
+                        .await;
+                    wire.response_error(id.clone(), code, &message).await?;
+                }
+                Err(BrokerError::Fatal(err)) => {
+                    self.poisoned = true;
+                    let detail = format!("{err:#}");
+                    let _ = wire.response_error(id.clone(), -32603, &detail).await;
+                    anyhow::bail!("ACP broker fatal error: {}", detail);
+                }
             }
         } else {
             ensure!(method == "session/update", "unsupported ACP notification");
             let params = &value["params"];
-            self.owner(params)?;
+            self.owner(params).map_err(|e| anyhow::anyhow!("{e}"))?;
             let _: agent_client_protocol::SessionNotification =
                 serde_json::from_value(params.clone())
                     .map_err(|_| anyhow::anyhow!("invalid ACP session update"))?;
@@ -227,84 +286,182 @@ impl<'a> Broker<'a> {
         }
         Ok(())
     }
-    fn owner(&self, params: &Value) -> Result<()> {
-        ensure!(
-            self.session_id.as_deref() == params["sessionId"].as_str(),
-            "foreign or inactive ACP session"
-        );
+    fn owner(&self, params: &Value) -> Result<(), BrokerError> {
+        if self.session_id.as_deref() != params.get("sessionId").and_then(|v| v.as_str()) {
+            return Err(BrokerError::fatal(anyhow::anyhow!(
+                "foreign or inactive ACP session"
+            )));
+        }
         Ok(())
     }
-    async fn callback(&mut self, method: &str, params: &Value) -> Result<Value> {
+    async fn callback(&mut self, method: &str, params: &Value) -> Result<Value, BrokerError> {
         self.owner(params)?;
-        ensure!(self.active, "callbacks require active turn");
+        if !self.active {
+            return Err(BrokerError::fatal(anyhow::anyhow!(
+                "callbacks require active turn"
+            )));
+        }
         match method {
             "fs/read_text_file" | "fs/write_text_file" => {
-                ensure!(
-                    self.terminals.is_empty(),
-                    "file callbacks require released terminals"
-                );
-                let path = self.path(&params["path"])?;
-                let root = crate::acp_files::Root::open(&self.session.workspace.path)?;
+                if !self.terminals.is_empty() {
+                    return Err(BrokerError::recoverable(
+                        -32603,
+                        "file callbacks require released terminals",
+                    ));
+                }
                 let tool = if method == "fs/read_text_file" {
                     "read_file"
                 } else {
                     "write_file"
                 };
-                if tool == "write_file" {
-                    ensure!(
-                        params["content"].as_str().is_some_and(|s| s.len() <= 65536),
-                        "ACP file content bound exceeded"
-                    );
-                }
-                let call = self.reserve(Some(tool), params, 0).await?;
-                let result = if tool == "read_file" {
-                    let text = String::from_utf8(root.read(&path, 65536)?)
-                        .context("ACP file is not UTF-8")?;
-                    let line = params
-                        .get("line")
-                        .filter(|value| !value.is_null())
-                        .map(|v| v.as_u64().filter(|n| *n > 0).context("invalid ACP line"))
-                        .transpose()?
-                        .unwrap_or(1);
-                    let limit = params
-                        .get("limit")
-                        .filter(|value| !value.is_null())
-                        .map(|v| {
-                            v.as_u64()
-                                .filter(|n| *n > 0)
-                                .context("invalid ACP line limit")
-                        })
-                        .transpose()?
-                        .unwrap_or(65536);
-                    ensure!(line <= 65536 && limit <= 65536, "ACP line bounds exceeded");
-                    json!({"content":text.split_inclusive('\n').skip((line-1) as usize).take(limit as usize).collect::<String>()})
-                } else {
-                    root.write(&path, params["content"].as_str().unwrap().as_bytes())?;
-                    json!({})
+                self.tool_calls += 1;
+                *self.tool_counts.entry(tool.to_string()).or_default() += 1;
+
+                let path = match self.path(&params["path"]) {
+                    Ok(p) => p,
+                    Err(err) => {
+                        return Err(BrokerError::recoverable(
+                            -32602,
+                            format!("invalid ACP path: {err:#}"),
+                        ));
+                    }
                 };
+
+                let root = match crate::acp_files::Root::open(&self.session.workspace.path) {
+                    Ok(r) => r,
+                    Err(err) => {
+                        return Err(BrokerError::fatal(err));
+                    }
+                };
+
+                let call = self
+                    .reserve(Some(tool), params, 0)
+                    .await
+                    .map_err(BrokerError::fatal)?;
+
+                let result = if tool == "read_file" {
+                    let line = match params.get("line") {
+                        Some(v) if !v.is_null() => match v.as_u64() {
+                            Some(n) if n > 0 => n,
+                            _ => {
+                                let err_val = json!({"error": "invalid ACP line"});
+                                let _ = self.finish(&call, &err_val).await;
+                                return Err(BrokerError::recoverable(
+                                    -32602,
+                                    "invalid ACP line: line must be a positive integer",
+                                ));
+                            }
+                        },
+                        _ => 1,
+                    };
+                    let limit = match params.get("limit") {
+                        Some(v) if !v.is_null() => match v.as_u64() {
+                            Some(n) if n > 0 && n <= crate::acp_files::MAX_LINE_LIMIT => n,
+                            _ => {
+                                let err_val = json!({"error": "invalid ACP line limit"});
+                                let _ = self.finish(&call, &err_val).await;
+                                return Err(BrokerError::recoverable(
+                                    -32602,
+                                    "invalid ACP line limit: limit must be between 1 and 65536",
+                                ));
+                            }
+                        },
+                        _ => crate::acp_files::MAX_LINE_LIMIT,
+                    };
+
+                    match root.read_text_range(
+                        &path,
+                        line,
+                        limit,
+                        crate::acp_files::MAX_RESPONSE_BYTES,
+                        crate::acp_files::MAX_LINE_BYTES,
+                    ) {
+                        Ok(text) => json!({"content": text}),
+                        Err(err) => {
+                            let err_msg = format!("{err:#}");
+                            let err_val = json!({"error": &err_msg});
+                            let _ = self.finish(&call, &err_val).await;
+                            return Err(BrokerError::recoverable(-32603, err_msg));
+                        }
+                    }
+                } else {
+                    let content = match params.get("content").and_then(|v| v.as_str()) {
+                        Some(s) if s.len() <= 65536 => s,
+                        Some(_) => {
+                            let err_val = json!({"error": "ACP file content bound exceeded"});
+                            let _ = self.finish(&call, &err_val).await;
+                            return Err(BrokerError::recoverable(
+                                -32602,
+                                "ACP file content bound exceeded",
+                            ));
+                        }
+                        None => {
+                            let err_val =
+                                json!({"error": "ACP file content missing or not a string"});
+                            let _ = self.finish(&call, &err_val).await;
+                            return Err(BrokerError::recoverable(
+                                -32602,
+                                "ACP file content missing or not a string",
+                            ));
+                        }
+                    };
+                    match root.write(&path, content.as_bytes()) {
+                        Ok(()) => json!({}),
+                        Err(err) => {
+                            let err_msg = format!("{err:#}");
+                            let err_val = json!({"error": &err_msg});
+                            let _ = self.finish(&call, &err_val).await;
+                            return Err(BrokerError::recoverable(-32603, err_msg));
+                        }
+                    }
+                };
+
                 self.record(
                     RecordKind::BrokerOutput,
                     &result,
-                    serde_json::to_vec(&result)?.len() as u64,
+                    serde_json::to_vec(&result)
+                        .map(|v| v.len() as u64)
+                        .unwrap_or(0),
                     0,
                 )
-                .await?;
-                self.finish(&call, &result).await?;
+                .await
+                .map_err(BrokerError::fatal)?;
+
+                self.finish(&call, &result)
+                    .await
+                    .map_err(BrokerError::fatal)?;
                 Ok(result)
             }
             "terminal/create" => {
                 let request: agent_client_protocol::CreateTerminalRequest =
-                    serde_json::from_value(params.clone())
-                        .map_err(|_| anyhow::anyhow!("invalid ACP terminal request"))?;
-                ensure!(
-                    self.terminals.is_empty() && request.env.is_empty(),
-                    "one terminal with no agent environment allowed"
-                );
+                    match serde_json::from_value(params.clone()) {
+                        Ok(req) => req,
+                        Err(err) => {
+                            return Err(BrokerError::recoverable(
+                                -32602,
+                                format!("invalid ACP terminal request: {err:#}"),
+                            ));
+                        }
+                    };
+                if !self.terminals.is_empty() || !request.env.is_empty() {
+                    return Err(BrokerError::recoverable(
+                        -32603,
+                        "one terminal with no agent environment allowed",
+                    ));
+                }
                 let cwd = match request.cwd {
                     Some(ref p) if p == std::path::Path::new(crate::acp_runtime::WORKSPACE) => {
                         ".".into()
                     }
-                    Some(p) => self.path(&json!(p))?,
+                    Some(p) => match self.path(&json!(p)) {
+                        Ok(p) => p,
+                        Err(err) => {
+                            return Err(BrokerError::recoverable(
+                                -32602,
+                                format!("invalid terminal cwd: {err:#}"),
+                            ));
+                        }
+                    },
                     None => ".".into(),
                 };
                 let command = CommandSpec {
@@ -314,27 +471,58 @@ impl<'a> Broker<'a> {
                     cwd,
                     timeout_seconds: self.limits().terminal_timeout_seconds,
                 };
-                crate::execution::validate_tool_command(&command)?;
+                if let Err(err) = crate::execution::validate_tool_command(&command) {
+                    return Err(BrokerError::recoverable(
+                        -32603,
+                        format!("command validation failed: {err:#}"),
+                    ));
+                }
                 let output_limit = request.output_byte_limit.unwrap_or(65536).min(65536) as usize;
-                ensure!(output_limit > 0, "empty ACP output allowance");
+                if output_limit == 0 {
+                    return Err(BrokerError::recoverable(
+                        -32602,
+                        "empty ACP output allowance",
+                    ));
+                }
+                self.tool_calls += 1;
+                *self.tool_counts.entry("shell".to_string()).or_default() += 1;
                 let call = self
                     .reserve(Some("shell"), params, command.timeout_seconds)
-                    .await?;
-                let spec = crate::workspace::prepare_execution(
+                    .await
+                    .map_err(BrokerError::fatal)?;
+                let spec = match crate::workspace::prepare_execution(
                     self.session.assignment,
                     &self.session.workspace.path,
                     self.session.directory,
                     self.session.profile,
                     &command,
                 )
-                .await?;
-                let terminal = Terminal::start(
+                .await
+                {
+                    Ok(s) => s,
+                    Err(err) => {
+                        let err_msg = format!("{err:#}");
+                        let err_val = json!({"error": &err_msg});
+                        let _ = self.finish(&call, &err_val).await;
+                        return Err(BrokerError::recoverable(-32603, err_msg));
+                    }
+                };
+                let terminal = match Terminal::start(
                     &spec,
                     self.session.directory,
                     output_limit,
                     self.limits().output_bytes.saturating_sub(self.output_bytes),
                 )
-                .await?;
+                .await
+                {
+                    Ok(t) => t,
+                    Err(err) => {
+                        let err_msg = format!("{err:#}");
+                        let err_val = json!({"error": &err_msg});
+                        let _ = self.finish(&call, &err_val).await;
+                        return Err(BrokerError::recoverable(-32603, err_msg));
+                    }
+                };
                 let id = id();
                 self.terminals.insert(
                     id.clone(),
@@ -344,47 +532,78 @@ impl<'a> Broker<'a> {
                         finished: false,
                     },
                 );
-                Ok(json!({"terminalId":id}))
+                Ok(json!({"terminalId": id}))
             }
             "terminal/output" | "terminal/wait_for_exit" | "terminal/kill" | "terminal/release" => {
-                let id = params["terminalId"]
-                    .as_str()
-                    .context("terminal ID missing")?;
-                let terminal = self
-                    .terminals
-                    .get(id)
-                    .context("foreign or released terminal")?
-                    .terminal
-                    .clone();
+                let id = match params.get("terminalId").and_then(|v| v.as_str()) {
+                    Some(id) => id,
+                    None => {
+                        return Err(BrokerError::recoverable(-32602, "terminal ID missing"));
+                    }
+                };
+                let terminal = match self.terminals.get(id) {
+                    Some(h) => h.terminal.clone(),
+                    None => {
+                        return Err(BrokerError::recoverable(
+                            -32602,
+                            "foreign or released terminal",
+                        ));
+                    }
+                };
                 let output = match method {
                     "terminal/output" => terminal.output(),
-                    "terminal/wait_for_exit" => terminal.wait().await?,
-                    _ => terminal.kill().await?,
+                    "terminal/wait_for_exit" => match terminal.wait().await {
+                        Ok(out) => out,
+                        Err(err) => {
+                            return Err(BrokerError::recoverable(-32603, format!("{err:#}")));
+                        }
+                    },
+                    _ => match terminal.kill().await {
+                        Ok(out) => out,
+                        Err(err) => {
+                            return Err(BrokerError::recoverable(-32603, format!("{err:#}")));
+                        }
+                    },
                 };
-                let exit = output.exit_code.map(|code| json!({"exitCode":code}));
+                let exit = output.exit_code.map(|code| json!({"exitCode": code}));
                 let result = match method {
                     "terminal/output" => {
                         let mut value =
-                            json!({"output":output.text(),"truncated":output.truncated});
+                            json!({"output": output.text(), "truncated": output.truncated});
                         if let Some(exit) = &exit {
                             value["exitStatus"] = exit.clone();
                         }
                         value
                     }
-                    "terminal/wait_for_exit" => {
-                        json!({"exitStatus":exit.context("terminal exit unavailable")?})
-                    }
+                    "terminal/wait_for_exit" => match exit {
+                        Some(exit) => json!({"exitStatus": exit}),
+                        None => {
+                            return Err(BrokerError::recoverable(
+                                -32603,
+                                "terminal exit unavailable",
+                            ));
+                        }
+                    },
                     _ => json!({}),
                 };
                 if output.complete && !self.terminals[id].finished {
-                    ensure!(
-                        output.cleanup_confirmed && !output.overflow,
-                        "terminal cleanup or output unconfirmed"
-                    );
-                    let receipt = json!({"exit_code":output.exit_code,"output_digest":digest(&output.bytes),"total_bytes":output.total,"cleanup_confirmed":true});
+                    if !output.cleanup_confirmed || output.overflow {
+                        return Err(BrokerError::fatal(anyhow::anyhow!(
+                            "terminal cleanup or output unconfirmed"
+                        )));
+                    }
+                    let receipt = json!({
+                        "exit_code": output.exit_code,
+                        "output_digest": digest(&output.bytes),
+                        "total_bytes": output.total,
+                        "cleanup_confirmed": true,
+                    });
                     self.record(RecordKind::BrokerOutput, &receipt, output.total, 0)
-                        .await?;
-                    self.finish(&self.terminals[id].call, &receipt).await?;
+                        .await
+                        .map_err(BrokerError::fatal)?;
+                    self.finish(&self.terminals[id].call, &receipt)
+                        .await
+                        .map_err(BrokerError::fatal)?;
                     self.terminals.get_mut(id).unwrap().finished = true;
                 }
                 if method == "terminal/release" {
@@ -394,17 +613,17 @@ impl<'a> Broker<'a> {
             }
             // Native approval is not a broker dispatch. No implicit auth, MCP,
             // extensions, URL opening or delegated process execution is permitted.
-            _ => anyhow::bail!("unsupported ACP client operation"),
+            _ => Err(BrokerError::recoverable(
+                -32601,
+                format!("unsupported ACP client operation: {method}"),
+            )),
         }
     }
     pub async fn close_terminals(&mut self) -> Result<()> {
-        for id in self.terminals.keys().cloned().collect::<Vec<_>>() {
-            self.callback(
-                "terminal/release",
-                &json!({"sessionId":self.session_id,"terminalId":id}),
-            )
-            .await?;
+        for handle in self.terminals.values() {
+            let _ = handle.terminal.kill().await;
         }
+        self.terminals.clear();
         Ok(())
     }
 }

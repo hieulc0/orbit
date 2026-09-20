@@ -192,11 +192,13 @@ pub struct AttemptObservabilityAggregate {
 
 impl AttemptObservabilityAggregate {
     pub fn from_executions(executions: &[crate::continuation::AgentExecution]) -> Self {
-        let mut agg = Self::default();
-        agg.execution_count = executions.len() as u32;
-        if agg.execution_count > 1 {
-            agg.continuation_count = agg.execution_count - 1;
-        }
+        let execution_count = executions.len() as u32;
+        let continuation_count = execution_count.saturating_sub(1);
+        let mut agg = Self {
+            execution_count,
+            continuation_count,
+            ..Default::default()
+        };
 
         for exec in executions {
             agg.total_tool_calls = agg.total_tool_calls.saturating_add(exec.tool_call_count);
@@ -265,8 +267,14 @@ pub fn format_inspect_human(value: &serde_json::Value) -> String {
     use std::fmt::Write;
     let mut out = String::new();
 
-    let run_id = value.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
-    let state = value.get("state").and_then(|v| v.as_str()).unwrap_or("UNKNOWN");
+    let run_id = value
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let state = value
+        .get("state")
+        .and_then(|v| v.as_str())
+        .unwrap_or("UNKNOWN");
 
     // Look for attempts across all tasks
     let mut all_executions: Vec<crate::continuation::AgentExecution> = Vec::new();
@@ -290,9 +298,13 @@ pub fn format_inspect_human(value: &serde_json::Value) -> String {
         for task in tasks {
             if let Some(attempts) = task.get("attempts").and_then(|v| v.as_array()) {
                 for attempt in attempts {
-                    if let Some(execs) = attempt.get("agent_executions").and_then(|v| v.as_array()) {
+                    if let Some(execs) = attempt.get("agent_executions").and_then(|v| v.as_array())
+                    {
                         for ex_val in execs {
-                            if let Ok(exec) = serde_json::from_value::<crate::continuation::AgentExecution>(ex_val.clone()) {
+                            if let Ok(exec) = serde_json::from_value::<
+                                crate::continuation::AgentExecution,
+                            >(ex_val.clone())
+                            {
                                 all_executions.push(exec);
                             }
                         }
@@ -307,30 +319,48 @@ pub fn format_inspect_human(value: &serde_json::Value) -> String {
     writeln!(out, "Run {}", run_id).unwrap();
     writeln!(out, "Status: {}", state).unwrap();
 
-    if let Some(plan) = value.get("plan") {
-        if let Some(def) = plan.get("definition") {
-            if let Some(inputs) = def.get("inputs") {
-                if let Some(base) = inputs.get("base_revision").and_then(|v| v.as_str()) {
-                    baseline_rev = base.to_string();
-                }
-            }
-        }
+    if let Some(base) = value
+        .get("plan")
+        .and_then(|p| p.get("definition"))
+        .and_then(|d| d.get("inputs"))
+        .and_then(|i| i.get("base_revision"))
+        .and_then(|v| v.as_str())
+    {
+        baseline_rev = base.to_string();
     }
 
     if !baseline_rev.is_empty() {
-        writeln!(out, "
-Workspace").unwrap();
-        writeln!(out, "  baseline: {}", &baseline_rev[..baseline_rev.len().min(12)]).unwrap();
+        writeln!(
+            out,
+            "
+Workspace"
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "  baseline: {}",
+            &baseline_rev[..baseline_rev.len().min(12)]
+        )
+        .unwrap();
     }
 
     if !all_executions.is_empty() {
-        writeln!(out, "
-Agent Executions").unwrap();
+        writeln!(
+            out,
+            "
+Agent Executions"
+        )
+        .unwrap();
         for (idx, exec) in all_executions.iter().enumerate() {
-            writeln!(out, "
-#{}", exec.sequence).unwrap();
+            writeln!(
+                out,
+                "
+#{}",
+                exec.sequence
+            )
+            .unwrap();
             writeln!(out, "  agent: {}", exec.agent_type).unwrap();
-            
+
             let req_model = exec.requested_model.as_deref().unwrap_or("default");
             let req_effort = exec.requested_reasoning_effort.as_deref().unwrap_or("none");
             if req_model != "default" || req_effort != "none" {
@@ -359,8 +389,14 @@ Agent Executions").unwrap();
             writeln!(out, "  tool failures: {}", exec.tool_failure_count).unwrap();
 
             if let Some(usage) = &exec.usage {
-                let in_t = usage.input_tokens.map(|n| n.to_string()).unwrap_or_else(|| "unavailable".into());
-                let out_t = usage.output_tokens.map(|n| n.to_string()).unwrap_or_else(|| "unavailable".into());
+                let in_t = usage
+                    .input_tokens
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "unavailable".into());
+                let out_t = usage
+                    .output_tokens
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "unavailable".into());
                 if in_t == "unavailable" && out_t == "unavailable" {
                     writeln!(out, "  tokens: unavailable").unwrap();
                 } else {
@@ -375,30 +411,54 @@ Agent Executions").unwrap();
             }
 
             if idx + 1 < all_executions.len() {
-                let next_term = exec.termination_reason.map(|t| format!("{:?}", t)).unwrap_or_else(|| "continuation".into());
-                writeln!(out, "
-  ↓ continuation: {}", next_term).unwrap();
+                let next_term = exec
+                    .termination_reason
+                    .map(|t| format!("{:?}", t))
+                    .unwrap_or_else(|| "continuation".into());
+                writeln!(
+                    out,
+                    "
+  ↓ continuation: {}",
+                    next_term
+                )
+                .unwrap();
             }
         }
     }
 
     if let Some(patch) = patch_artifact {
-        writeln!(out, "
-Artifacts").unwrap();
+        writeln!(
+            out,
+            "
+Artifacts"
+        )
+        .unwrap();
         writeln!(out, "  patch: {}", &patch[..patch.len().min(16)]).unwrap();
         if let Some(log) = log_artifact {
             writeln!(out, "  logs: {}", &log[..log.len().min(16)]).unwrap();
         }
     }
 
-    writeln!(out, "
-Totals").unwrap();
+    writeln!(
+        out,
+        "
+Totals"
+    )
+    .unwrap();
     writeln!(out, "  executions: {}", agg.execution_count).unwrap();
     writeln!(out, "  continuations: {}", agg.continuation_count).unwrap();
     writeln!(out, "  tool calls: {}", agg.total_tool_calls).unwrap();
 
-    let total_in = agg.usage.input_tokens.map(|n| n.to_string()).unwrap_or_else(|| "unavailable".into());
-    let total_out = agg.usage.output_tokens.map(|n| n.to_string()).unwrap_or_else(|| "unavailable".into());
+    let total_in = agg
+        .usage
+        .input_tokens
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "unavailable".into());
+    let total_out = agg
+        .usage
+        .output_tokens
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "unavailable".into());
     if total_in == "unavailable" && total_out == "unavailable" {
         writeln!(out, "  input tokens: unavailable").unwrap();
         writeln!(out, "  output tokens: unavailable").unwrap();
@@ -406,7 +466,12 @@ Totals").unwrap();
         writeln!(out, "  input tokens: {}", total_in).unwrap();
         writeln!(out, "  output tokens: {}", total_out).unwrap();
     }
-    writeln!(out, "  agent time: {}", format_duration_seconds(agg.agent_time_seconds)).unwrap();
+    writeln!(
+        out,
+        "  agent time: {}",
+        format_duration_seconds(agg.agent_time_seconds)
+    )
+    .unwrap();
 
     out
 }

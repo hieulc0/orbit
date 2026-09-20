@@ -1,5 +1,7 @@
 //! Operator-owned ACP installation registry. No executable or auth path enters a plan.
 use crate::{
+    acp_broker::Broker,
+    acp_wire::Wire,
     agent::{Binding, OutputContract, valid_name},
     model::{Assignment, digest},
 };
@@ -270,8 +272,8 @@ impl Runtime {
         &self,
         session: crate::coding_agent::Session<'_>,
     ) -> Result<(crate::agent::AgentReport, Vec<u8>)> {
-        use crate::{acp_broker::Broker, acp_contract::RecordKind, acp_wire::Wire};
-        use serde_json::{Value, json};
+        use crate::acp_contract::RecordKind;
+        use serde_json::json;
         use std::{os::unix::fs::OpenOptionsExt, process::Stdio, time::Duration};
         let a = session.assignment;
         let spec = a.plan.definition.steps[&a.step].agent.as_ref().unwrap();
@@ -330,24 +332,8 @@ impl Runtime {
             16 * 1024 * 1024,
         );
         let mut broker = Broker::new(session);
-        async fn request(
-            wire: &mut Wire,
-            broker: &mut Broker<'_>,
-            method: &str,
-            params: Value,
-        ) -> Result<Value> {
-            let id = wire.request(method, params).await?;
-            loop {
-                let value = wire.read().await?;
-                if value.get("method").is_some() {
-                    broker.message(wire, value).await?;
-                } else {
-                    return Wire::result(value, &id);
-                }
-            }
-        }
         let result = async {
-            let init = tokio::time::timeout(Duration::from_secs(30),request(&mut wire,&mut broker,"initialize",json!({
+            let init = tokio::time::timeout(Duration::from_secs(30),acp_request(&mut wire,&mut broker,"initialize",json!({
                 "protocolVersion":1,"clientInfo":{"name":"orbit","version":env!("CARGO_PKG_VERSION")},
                 "clientCapabilities":{"fs":{"readTextFile":spec.tools.iter().any(|s|s=="read_file"),"writeTextFile":spec.tools.iter().any(|s|s=="write_file")},"terminal":spec.tools.iter().any(|s|s=="shell")}
             }))).await.context("ACP initialize timeout")??;
@@ -355,12 +341,21 @@ impl Runtime {
                 && init["agentInfo"]["version"] == self.launch.agent_version,"ACP installed identity mismatch");
             // Existing, explicitly provisioned auth only. Never invoke authenticate.
             let create_params=json!({"cwd":WORKSPACE,"mcpServers":[]});
-            let created = tokio::time::timeout(Duration::from_secs(30),request(&mut wire,&mut broker,"session/new",create_params)).await.context("ACP session creation timeout")??;
+            let created = tokio::time::timeout(Duration::from_secs(30),acp_request(&mut wire,&mut broker,"session/new",create_params)).await.context("ACP session creation timeout")??;
             let session_id = created["sessionId"].as_str().context("ACP session identity missing")?;
             ensure!(crate::agent::valid_name(session_id),"invalid ACP session identity");
-            if let Some(model) = &self.binding.model {
-                ensure!(created["models"]["currentModelId"] == *model,"ACP exact model not confirmed by session");
-            }
+            let current_model = created
+                .get("models")
+                .and_then(|m| m.get("currentModelId"))
+                .and_then(|v| v.as_str());
+            select_model(
+                &mut wire,
+                &mut broker,
+                session_id,
+                self.binding.model.as_deref(),
+                current_model,
+            )
+            .await?;
             broker.session_id=Some(session_id.into());
             broker.session_digest=digest(format!("{}:{session_id}",a.attempt_id).as_bytes());
             broker.record(RecordKind::Started,&json!({"agent":self.launch.agent_name,"version":self.launch.agent_version,
@@ -368,7 +363,7 @@ impl Runtime {
             if self.launch.adapter == Adapter::Antigravity {
                 let _ = tokio::time::timeout(
                     Duration::from_secs(10),
-                    request(&mut wire, &mut broker, "session/set_mode", json!({
+                    acp_request(&mut wire, &mut broker, "session/set_mode", json!({
                         "sessionId": session_id,
                         "modeId": "yolo"
                     }))
@@ -380,7 +375,7 @@ impl Runtime {
             ensure!(serde_json::to_vec(&prompt)?.len() <= 262144,"ACP prompt too large");
             let call = broker.reserve(None,&prompt,0).await?;
             broker.active=true;
-            let response = tokio::time::timeout(Duration::from_secs(limits.turn_timeout_seconds),request(&mut wire,&mut broker,"session/prompt",prompt)).await;
+            let response = tokio::time::timeout(Duration::from_secs(limits.turn_timeout_seconds),acp_request(&mut wire,&mut broker,"session/prompt",prompt)).await;
             if response.is_err() {
                 let _ = tokio::time::timeout(Duration::from_secs(1),wire.notify("session/cancel",json!({"sessionId":session_id}))).await;
             }
@@ -421,10 +416,114 @@ impl Runtime {
                 "launch_digest":self.launch.digest()?,"model":self.binding.model,
                 "model_attribution":if self.binding.model.is_some(){"agent_confirmed_exact"}else{"agent_configured_unverified"},
                 "accounting":"execution_only","tokens":null,"cost_microusd":null,"stop_reason":"end_turn",
-                "cleanup_confirmed":true,"output_bytes":broker.output_bytes,"reported_tool_calls":broker.reported_tools
+                "cleanup_confirmed":true,"output_bytes":broker.output_bytes,"reported_tool_calls":broker.reported_tools,
+                "tool_calls":broker.tool_calls,"tool_successes":broker.tool_successes,"tool_failures":broker.tool_failures,"tool_counts":broker.tool_counts
             }}),
             delegation_inputs: vec![],
         };
         Ok((report, broker.log))
     }
+}
+
+pub async fn acp_request(
+    wire: &mut Wire,
+    broker: &mut Broker<'_>,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let id = wire.request(method, params).await?;
+    loop {
+        let value = wire.read().await?;
+        if value.get("method").is_some() {
+            broker.message(wire, value).await?;
+        } else {
+            return Wire::result(value, &id);
+        }
+    }
+}
+
+pub async fn select_model(
+    wire: &mut Wire,
+    broker: &mut Broker<'_>,
+    session_id: &str,
+    requested_model: Option<&str>,
+    current_model: Option<&str>,
+) -> Result<()> {
+    if let Some(model) = requested_model {
+        ensure!(
+            crate::agent::valid_name(model),
+            "invalid requested model name"
+        );
+        if current_model != Some(model) {
+            let mut confirmed = false;
+
+            // 1. Try session/set_config_option
+            let set_config_res = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                acp_request(
+                    wire,
+                    broker,
+                    "session/set_config_option",
+                    serde_json::json!({
+                        "sessionId": session_id,
+                        "configId": "model",
+                        "value": model,
+                    }),
+                ),
+            )
+            .await;
+
+            if let Ok(Ok(config_resp)) = set_config_res
+                && let Some(options) = config_resp.get("configOptions").and_then(|v| v.as_array())
+            {
+                for opt in options {
+                    if opt.get("id").and_then(|v| v.as_str()) == Some("model")
+                        && opt.get("currentValue").and_then(|v| v.as_str()) == Some(model)
+                    {
+                        confirmed = true;
+                        break;
+                    }
+                }
+            }
+
+            // 2. Fall back to session/set_model
+            if !confirmed {
+                let set_model_res = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    acp_request(
+                        wire,
+                        broker,
+                        "session/set_model",
+                        serde_json::json!({
+                            "sessionId": session_id,
+                            "modelId": model,
+                        }),
+                    ),
+                )
+                .await
+                .context("ACP set_model timeout")??;
+
+                if let Some(curr) = set_model_res
+                    .get("models")
+                    .and_then(|m| m.get("currentModelId"))
+                    .and_then(|v| v.as_str())
+                {
+                    ensure!(
+                        curr == model,
+                        "ACP set_model response returned mismatched model: expected {}, got {}",
+                        model,
+                        curr
+                    );
+                }
+                confirmed = true;
+            }
+
+            ensure!(
+                confirmed,
+                "ACP requested model could not be activated or confirmed: {}",
+                model
+            );
+        }
+    }
+    Ok(())
 }

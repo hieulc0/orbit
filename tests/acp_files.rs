@@ -1,5 +1,5 @@
 use anyhow::Result;
-use orbit::acp_files::Root;
+use orbit::acp_files::{MAX_LINE_BYTES, MAX_LINE_LIMIT, MAX_RESPONSE_BYTES, Root};
 use std::os::unix::fs::{PermissionsExt, symlink};
 
 #[test]
@@ -60,5 +60,97 @@ fn acp_files_symlink_swap_never_reaches_an_outside_marker() -> Result<()> {
         }
     });
     assert_eq!(std::fs::read(outside.path().join("marker"))?, b"private");
+    Ok(())
+}
+
+#[test]
+fn acp_files_read_text_range_on_large_file() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let broker = Root::open(root.path())?;
+
+    // Create a 100 KB file with 1,000 lines (each line ~100 bytes)
+    let mut large_content = String::new();
+    for i in 1..=1000 {
+        use std::fmt::Write;
+        writeln!(
+            &mut large_content,
+            "line {:04}: {}",
+            i,
+            "abcdefghijklmnopqrstuvwxyz0123456789".repeat(2)
+        )?;
+    }
+    assert!(
+        large_content.len() > 65536,
+        "test file must exceed 64 KB (is {} bytes)",
+        large_content.len()
+    );
+    std::fs::write(root.path().join("large.txt"), &large_content)?;
+
+    // 1. Read lines 1-120 (the exact operation that failed in dogfood #1)
+    let range1 = broker.read_text_range("large.txt", 1, 120, MAX_RESPONSE_BYTES, MAX_LINE_BYTES)?;
+    let lines1: Vec<&str> = range1.lines().collect();
+    assert_eq!(lines1.len(), 120);
+    assert!(lines1[0].starts_with("line 0001:"));
+    assert!(lines1[119].starts_with("line 0120:"));
+
+    // 2. Read lines 501-550 (later slice on large file)
+    let range2 =
+        broker.read_text_range("large.txt", 501, 50, MAX_RESPONSE_BYTES, MAX_LINE_BYTES)?;
+    let lines2: Vec<&str> = range2.lines().collect();
+    assert_eq!(lines2.len(), 50);
+    assert!(lines2[0].starts_with("line 0501:"));
+    assert!(lines2[49].starts_with("line 0550:"));
+
+    // 3. Read past EOF returns empty string
+    let past_eof =
+        broker.read_text_range("large.txt", 2000, 50, MAX_RESPONSE_BYTES, MAX_LINE_BYTES)?;
+    assert!(past_eof.is_empty());
+
+    // 4. Invalid line (0) or limit (0 or > MAX_LINE_LIMIT)
+    assert!(
+        broker
+            .read_text_range("large.txt", 0, 10, MAX_RESPONSE_BYTES, MAX_LINE_BYTES)
+            .is_err()
+    );
+    assert!(
+        broker
+            .read_text_range("large.txt", 1, 0, MAX_RESPONSE_BYTES, MAX_LINE_BYTES)
+            .is_err()
+    );
+    assert!(
+        broker
+            .read_text_range(
+                "large.txt",
+                1,
+                MAX_LINE_LIMIT + 1,
+                MAX_RESPONSE_BYTES,
+                MAX_LINE_BYTES
+            )
+            .is_err()
+    );
+
+    // 5. Response byte limit enforcement
+    assert!(
+        broker
+            .read_text_range("large.txt", 1, 1000, 1024, MAX_LINE_BYTES)
+            .is_err()
+    );
+
+    // 6. Path traversal protection
+    assert!(
+        broker
+            .read_text_range("../outside.txt", 1, 10, MAX_RESPONSE_BYTES, MAX_LINE_BYTES)
+            .is_err()
+    );
+
+    // 7. Pathological line exceeding MAX_LINE_BYTES
+    let long_line_content = format!("{}\nshort line\n", "x".repeat(MAX_LINE_BYTES + 10));
+    std::fs::write(root.path().join("long_line.txt"), &long_line_content)?;
+    assert!(
+        broker
+            .read_text_range("long_line.txt", 1, 10, MAX_RESPONSE_BYTES, MAX_LINE_BYTES)
+            .is_err()
+    );
+
     Ok(())
 }

@@ -4,13 +4,17 @@ use anyhow::{Context, Result, ensure};
 use std::{
     ffi::CString,
     fs::File,
-    io::{Read, Write},
+    io::{BufRead, BufReader, Read, Write},
     os::{
         fd::{AsRawFd, FromRawFd},
         unix::fs::{MetadataExt, OpenOptionsExt},
     },
     path::Path,
 };
+
+pub const MAX_RESPONSE_BYTES: usize = 65536;
+pub const MAX_LINE_BYTES: usize = 65536;
+pub const MAX_LINE_LIMIT: u64 = 65536;
 
 pub struct Root(File);
 #[repr(C)]
@@ -94,10 +98,7 @@ impl Root {
                 }
             }
             entries.sort();
-            let listing = entries.join(
-                "
-",
-            );
+            let listing = entries.join("\n");
             ensure!(listing.len() <= max, "broker file exceeds bound");
             return Ok(listing.into_bytes());
         }
@@ -106,6 +107,141 @@ impl Root {
         file.take(max as u64 + 1).read_to_end(&mut content)?;
         ensure!(content.len() <= max, "broker file exceeds bound");
         Ok(content)
+    }
+    pub fn read_text_range(
+        &self,
+        path: &str,
+        line: u64,
+        limit: u64,
+        max_response_bytes: usize,
+        max_line_bytes: usize,
+    ) -> Result<String> {
+        ensure!(line >= 1, "invalid line: line must be at least 1");
+        ensure!(limit >= 1, "invalid limit: limit must be at least 1");
+        ensure!(
+            limit <= MAX_LINE_LIMIT,
+            "limit exceeds maximum allowed lines ({MAX_LINE_LIMIT})"
+        );
+
+        let file = self.file(path, libc::O_RDONLY, 0)?;
+        let metadata = file.metadata()?;
+
+        if metadata.is_dir() {
+            let proc_path = format!("/proc/self/fd/{}", file.as_raw_fd());
+            let mut entries = Vec::new();
+            for entry in std::fs::read_dir(proc_path)? {
+                let entry = entry?;
+                let file_name = entry.file_name();
+                let name = file_name.to_string_lossy();
+                if !name.starts_with('.') {
+                    let is_dir = entry.file_type()?.is_dir();
+                    if is_dir {
+                        entries.push(format!("{name}/"));
+                    } else {
+                        entries.push(name.into_owned());
+                    }
+                }
+            }
+            entries.sort();
+            let listing = entries.join("\n");
+            let lines: Vec<&str> = listing.lines().collect();
+            let start = (line - 1) as usize;
+            if start >= lines.len() {
+                return Ok(String::new());
+            }
+            let end = (start + limit as usize).min(lines.len());
+            let selected = &lines[start..end];
+            let mut result = selected.join("\n");
+            if !result.is_empty() {
+                result.push('\n');
+            }
+            ensure!(
+                result.len() <= max_response_bytes,
+                "requested directory listing exceeds response bound of {max_response_bytes} bytes"
+            );
+            return Ok(result);
+        }
+
+        ensure!(
+            metadata.is_file(),
+            "broker path must be a regular file or directory"
+        );
+
+        let mut reader = BufReader::with_capacity(16 * 1024, file);
+        let mut current_line_num: u64 = 1;
+
+        // Skip lines before `line` without loading full file into memory
+        let mut skipped_line_bytes: usize = 0;
+        while current_line_num < line {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                // Reached EOF before start line
+                return Ok(String::new());
+            }
+            if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+                let take = pos + 1;
+                skipped_line_bytes += take;
+                ensure!(
+                    skipped_line_bytes <= max_line_bytes,
+                    "broker file line exceeds maximum allowed length"
+                );
+                reader.consume(take);
+                skipped_line_bytes = 0;
+                current_line_num += 1;
+            } else {
+                let take = available.len();
+                skipped_line_bytes += take;
+                ensure!(
+                    skipped_line_bytes <= max_line_bytes,
+                    "broker file line exceeds maximum allowed length"
+                );
+                reader.consume(take);
+            }
+        }
+
+        // Read up to `limit` lines
+        let mut response_bytes = Vec::new();
+        let mut lines_read: u64 = 0;
+        let mut current_line_bytes: usize = 0;
+
+        while lines_read < limit {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                // EOF reached
+                break;
+            }
+            if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+                let take = pos + 1;
+                current_line_bytes += take;
+                ensure!(
+                    current_line_bytes <= max_line_bytes,
+                    "broker file line exceeds maximum allowed length"
+                );
+                ensure!(
+                    response_bytes.len() + take <= max_response_bytes,
+                    "requested file range exceeds response bound of {max_response_bytes} bytes"
+                );
+                response_bytes.extend_from_slice(&available[..take]);
+                reader.consume(take);
+                current_line_bytes = 0;
+                lines_read += 1;
+            } else {
+                let take = available.len();
+                current_line_bytes += take;
+                ensure!(
+                    current_line_bytes <= max_line_bytes,
+                    "broker file line exceeds maximum allowed length"
+                );
+                ensure!(
+                    response_bytes.len() + take <= max_response_bytes,
+                    "requested file range exceeds response bound of {max_response_bytes} bytes"
+                );
+                response_bytes.extend_from_slice(available);
+                reader.consume(take);
+            }
+        }
+
+        String::from_utf8(response_bytes).context("ACP file is not UTF-8")
     }
     pub fn read_private(&self, path: &str, max: usize) -> Result<Vec<u8>> {
         let file = self.file(path, libc::O_RDONLY, 0)?;

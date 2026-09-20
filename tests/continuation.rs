@@ -847,7 +847,7 @@ fn test_legacy_configuration_without_continuation_does_not_trigger_fallback() {
             exit_code: None,
             message: Some(format!("failed with {reason:?}")),
             metadata: serde_json::Value::Null,
-        ..Default::default()
+            ..Default::default()
         };
 
         assert_eq!(

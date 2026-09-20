@@ -86,7 +86,7 @@ impl Operations {
                 self.requests[class].load(Ordering::Relaxed)
             ));
         }
-                text.push_str(&format!(
+        text.push_str(&format!(
             "# TYPE orbit_agent_executions_total counter
 orbit_agent_executions_total {}
 # TYPE orbit_agent_execution_duration_seconds counter
@@ -105,7 +105,8 @@ orbit_agent_continuations_total {}
 orbit_agent_terminations_total {}
 ",
             self.agent_executions_total.load(Ordering::Relaxed),
-            self.agent_execution_duration_seconds.load(Ordering::Relaxed),
+            self.agent_execution_duration_seconds
+                .load(Ordering::Relaxed),
             self.agent_tool_calls_total.load(Ordering::Relaxed),
             self.agent_tool_failures_total.load(Ordering::Relaxed),
             self.agent_input_tokens_total.load(Ordering::Relaxed),
@@ -113,7 +114,7 @@ orbit_agent_terminations_total {}
             self.agent_continuations_total.load(Ordering::Relaxed),
             self.agent_terminations_total.load(Ordering::Relaxed)
         ));
-text
+        text
     }
 }
 

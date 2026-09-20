@@ -28,6 +28,6 @@ pub mod registry;
 pub mod repository;
 pub mod run_export;
 pub mod sdk;
+pub mod telemetry;
 pub mod worker;
 pub mod workspace;
-pub mod telemetry;

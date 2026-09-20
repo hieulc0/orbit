@@ -291,22 +291,22 @@ impl CapabilityDiscoverer {
             .and_then(Value::as_array)
         {
             for opt in options {
-                if opt.get("id").and_then(Value::as_str) == Some("model") {
-                    if let Some(opts) = opt.get("options").and_then(Value::as_array) {
-                        for o in opts {
-                            if let Some(val) = o.get("value").and_then(Value::as_str) {
-                                if !models.iter().any(|m| m.id == val) {
-                                    models.push(ModelCapability {
-                                        id: val.to_string(),
-                                        display_name: o
-                                            .get("name")
-                                            .and_then(Value::as_str)
-                                            .map(|s| s.to_string()),
-                                        reasoning_efforts: Vec::new(),
-                                        metadata: BTreeMap::new(),
-                                    });
-                                }
-                            }
+                if opt.get("id").and_then(Value::as_str) == Some("model")
+                    && let Some(opts) = opt.get("options").and_then(Value::as_array)
+                {
+                    for o in opts {
+                        if let Some(val) = o.get("value").and_then(Value::as_str)
+                            && !models.iter().any(|m| m.id == val)
+                        {
+                            models.push(ModelCapability {
+                                id: val.to_string(),
+                                display_name: o
+                                    .get("name")
+                                    .and_then(Value::as_str)
+                                    .map(|s| s.to_string()),
+                                reasoning_efforts: Vec::new(),
+                                metadata: BTreeMap::new(),
+                            });
                         }
                     }
                 }
