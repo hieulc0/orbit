@@ -194,6 +194,29 @@ impl Runtime {
         }
         Ok(())
     }
+
+    /// Classifies an error that occurred during runtime execution into a normalized result.
+    pub fn classify_error(
+        &self,
+        error: &anyhow::Error,
+    ) -> crate::continuation::NormalizedAgentResult {
+        let err_str = error.to_string();
+        match self.launch.adapter {
+            Adapter::Antigravity => crate::continuation::normalize_antigravity_error(&err_str),
+            Adapter::Codex => crate::continuation::normalize_codex_error(&err_str),
+            Adapter::Acp => {
+                let lower = err_str.to_ascii_lowercase();
+                if lower.contains("turn timeout") {
+                    crate::continuation::NormalizedAgentResult::turn_limit(err_str)
+                } else if lower.contains("429") {
+                    crate::continuation::classify_http_429(&err_str, None)
+                } else {
+                    crate::continuation::NormalizedAgentResult::agent_error(err_str)
+                }
+            }
+        }
+    }
+
     pub fn authorize(&self, a: &Assignment) -> Result<()> {
         self.validate()?;
         let step = &a.plan.definition.steps[&a.step];

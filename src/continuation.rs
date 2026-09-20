@@ -232,3 +232,300 @@ impl HandoffRecord {
         Ok(())
     }
 }
+
+/// Normalized result of an agent execution produced by an adapter or runtime.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NormalizedAgentResult {
+    pub status: AgentExecutionStatus,
+    pub termination_reason: TerminationReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub metadata: serde_json::Value,
+}
+
+impl NormalizedAgentResult {
+    pub fn completed() -> Self {
+        Self {
+            status: AgentExecutionStatus::Completed,
+            termination_reason: TerminationReason::Success,
+            exit_code: Some(0),
+            message: None,
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    pub fn turn_limit(message: impl Into<String>) -> Self {
+        Self {
+            status: AgentExecutionStatus::Interrupted,
+            termination_reason: TerminationReason::TurnLimit,
+            exit_code: None,
+            message: Some(message.into()),
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    pub fn timeout(message: impl Into<String>) -> Self {
+        Self {
+            status: AgentExecutionStatus::Interrupted,
+            termination_reason: TerminationReason::Timeout,
+            exit_code: None,
+            message: Some(message.into()),
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    pub fn cancelled(message: impl Into<String>) -> Self {
+        Self {
+            status: AgentExecutionStatus::Interrupted,
+            termination_reason: TerminationReason::Cancelled,
+            exit_code: None,
+            message: Some(message.into()),
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    pub fn rate_limited(message: impl Into<String>) -> Self {
+        Self {
+            status: AgentExecutionStatus::Interrupted,
+            termination_reason: TerminationReason::RateLimited,
+            exit_code: None,
+            message: Some(message.into()),
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    pub fn quota_exhausted(message: impl Into<String>) -> Self {
+        Self {
+            status: AgentExecutionStatus::Interrupted,
+            termination_reason: TerminationReason::QuotaExhausted,
+            exit_code: None,
+            message: Some(message.into()),
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    pub fn resource_exhausted(message: impl Into<String>) -> Self {
+        Self {
+            status: AgentExecutionStatus::Interrupted,
+            termination_reason: TerminationReason::ResourceExhausted,
+            exit_code: None,
+            message: Some(message.into()),
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    pub fn process_crash(exit_code: Option<i32>, message: impl Into<String>) -> Self {
+        Self {
+            status: AgentExecutionStatus::Failed,
+            termination_reason: TerminationReason::ProcessCrash,
+            exit_code,
+            message: Some(message.into()),
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    pub fn credential_error(message: impl Into<String>) -> Self {
+        Self {
+            status: AgentExecutionStatus::Failed,
+            termination_reason: TerminationReason::CredentialError,
+            exit_code: None,
+            message: Some(message.into()),
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    pub fn infrastructure_error(message: impl Into<String>) -> Self {
+        Self {
+            status: AgentExecutionStatus::Failed,
+            termination_reason: TerminationReason::InfrastructureError,
+            exit_code: None,
+            message: Some(message.into()),
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    pub fn agent_error(message: impl Into<String>) -> Self {
+        Self {
+            status: AgentExecutionStatus::Failed,
+            termination_reason: TerminationReason::AgentError,
+            exit_code: None,
+            message: Some(message.into()),
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    pub fn unknown(message: impl Into<String>) -> Self {
+        Self {
+            status: AgentExecutionStatus::Failed,
+            termination_reason: TerminationReason::Unknown,
+            exit_code: None,
+            message: Some(message.into()),
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn into_execution(
+        self,
+        execution_id: impl Into<String>,
+        sequence: u32,
+        agent_type: impl Into<String>,
+        provider: Option<String>,
+        model: Option<String>,
+        started_at: i64,
+        finished_at: Option<i64>,
+    ) -> AgentExecution {
+        AgentExecution {
+            execution_id: execution_id.into(),
+            sequence,
+            agent_type: agent_type.into(),
+            provider,
+            model,
+            started_at,
+            finished_at,
+            status: self.status,
+            termination_reason: Some(self.termination_reason),
+            exit_code: self.exit_code,
+            message: self.message,
+            metadata: self.metadata,
+        }
+    }
+}
+
+/// Classify HTTP 429 or resource exhaustion errors.
+///
+/// Priority:
+/// 1. Known quota exhaustion -> QuotaExhausted
+/// 2. Known temporary rate limit -> RateLimited
+/// 3. Ambiguous resource exhaustion -> ResourceExhausted
+/// 4. Otherwise -> AgentError / fallback
+pub fn classify_http_429(error_text: &str, provider_code: Option<&str>) -> NormalizedAgentResult {
+    let lower = error_text.to_ascii_lowercase();
+    let code_lower = provider_code.unwrap_or("").to_ascii_lowercase();
+
+    // Check provider structured code or unambiguous quota phrasing first
+    if code_lower == "insufficient_quota"
+        || code_lower == "quota_exceeded"
+        || code_lower == "quota_exhausted"
+        || lower.contains("insufficient_quota")
+        || lower.contains("exceeded your current quota")
+        || lower.contains("quota exceeded")
+        || lower.contains("quota has been exhausted")
+        || lower.contains("monthly limit")
+        || lower.contains("usage limit")
+    {
+        return NormalizedAgentResult::quota_exhausted(error_text);
+    }
+
+    // Check temporary rate limit (tokens per minute, requests per minute)
+    if code_lower == "rate_limit_exceeded"
+        || code_lower == "requests_per_minute"
+        || lower.contains("rate limit")
+        || lower.contains("too many requests")
+        || lower.contains("requests per minute")
+        || lower.contains("tokens per minute")
+        || lower.contains("try again in")
+        || lower.contains("retry after")
+    {
+        return NormalizedAgentResult::rate_limited(error_text);
+    }
+
+    // Ambiguous resource exhaustion (e.g. gRPC RESOURCE_EXHAUSTED without subcode)
+    if code_lower == "resource_exhausted" || lower.contains("resource_exhausted") {
+        return NormalizedAgentResult::resource_exhausted(error_text);
+    }
+
+    NormalizedAgentResult::agent_error(error_text)
+}
+
+/// Normalizes Antigravity ACP adapter error conditions.
+pub fn normalize_antigravity_error(error_text: &str) -> NormalizedAgentResult {
+    let lower = error_text.to_ascii_lowercase();
+
+    if lower.contains("turn timeout") || lower.contains("turn did not complete") {
+        return NormalizedAgentResult::turn_limit(error_text);
+    }
+    if lower.contains("initialize timeout") || lower.contains("session creation timeout") {
+        return NormalizedAgentResult::timeout(error_text);
+    }
+    if lower.contains("session/cancel") || lower.contains("cancelled") {
+        return NormalizedAgentResult::cancelled(error_text);
+    }
+    if lower.contains("unauthenticated")
+        || lower.contains("auth store")
+        || lower.contains("quarantined")
+        || lower.contains("token expired")
+        || lower.contains("oauth")
+    {
+        return NormalizedAgentResult::credential_error(error_text);
+    }
+    if lower.contains("supervisor launch failed") || lower.contains("podman run") {
+        return NormalizedAgentResult::infrastructure_error(error_text);
+    }
+    if lower.contains("429") || lower.contains("resource_exhausted") {
+        return classify_http_429(error_text, None);
+    }
+
+    NormalizedAgentResult::agent_error(error_text)
+}
+
+/// Normalizes Codex ACP adapter error conditions.
+pub fn normalize_codex_error(error_text: &str) -> NormalizedAgentResult {
+    let lower = error_text.to_ascii_lowercase();
+
+    if lower.contains("cancelled") {
+        return NormalizedAgentResult::cancelled(error_text);
+    }
+    if lower.contains("codex setup failed") || lower.contains("codex turn failed") {
+        // Inspect for quota or rate limit indicators
+        if lower.contains("quota") || lower.contains("usage limit") {
+            return NormalizedAgentResult::quota_exhausted(error_text);
+        }
+        if lower.contains("rate limit") || lower.contains("too many requests") {
+            return NormalizedAgentResult::rate_limited(error_text);
+        }
+        return NormalizedAgentResult::agent_error(error_text);
+    }
+    if lower.contains("unauthorized")
+        || lower.contains("invalid_api_key")
+        || lower.contains("auth.json")
+    {
+        return NormalizedAgentResult::credential_error(error_text);
+    }
+    if lower.contains("turn timeout") {
+        return NormalizedAgentResult::turn_limit(error_text);
+    }
+    if lower.contains("supervisor launch failed") || lower.contains("podman run") {
+        return NormalizedAgentResult::infrastructure_error(error_text);
+    }
+    if lower.contains("429") {
+        return classify_http_429(error_text, None);
+    }
+
+    NormalizedAgentResult::agent_error(error_text)
+}
+
+/// Normalizes ACP process exit status.
+pub fn normalize_acp_process_exit(
+    exit_code: Option<i32>,
+    expected_clean: bool,
+    error_detail: Option<&str>,
+) -> NormalizedAgentResult {
+    match exit_code {
+        Some(0) if expected_clean => NormalizedAgentResult::completed(),
+        Some(code) => {
+            let msg = error_detail
+                .unwrap_or("ACP container or supervisor process exited with non-zero code");
+            NormalizedAgentResult::process_crash(Some(code), format!("{msg} (exit code {code})"))
+        }
+        None => {
+            let msg =
+                error_detail.unwrap_or("ACP container or supervisor process terminated by signal");
+            NormalizedAgentResult::process_crash(None, msg)
+        }
+    }
+}

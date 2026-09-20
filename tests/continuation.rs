@@ -251,3 +251,137 @@ fn legacy_attempt_deserializes_empty_agent_executions() {
     let attempt: orbit::model::Attempt = serde_json::from_value(legacy_json).unwrap();
     assert!(attempt.agent_executions.is_empty());
 }
+
+#[test]
+fn test_success_normalization() {
+    let result = NormalizedAgentResult::completed();
+    assert_eq!(result.status, AgentExecutionStatus::Completed);
+    assert_eq!(result.termination_reason, TerminationReason::Success);
+    assert_eq!(result.exit_code, Some(0));
+}
+
+#[test]
+fn test_turn_limit_normalization() {
+    let antigravity_err = "ACP turn timeout; prompt outcome unconfirmed";
+    let res = normalize_antigravity_error(antigravity_err);
+    assert_eq!(res.status, AgentExecutionStatus::Interrupted);
+    assert_eq!(res.termination_reason, TerminationReason::TurnLimit);
+
+    let codex_err = "turn timeout on thread 4";
+    let res_codex = normalize_codex_error(codex_err);
+    assert_eq!(res_codex.status, AgentExecutionStatus::Interrupted);
+    assert_eq!(res_codex.termination_reason, TerminationReason::TurnLimit);
+}
+
+#[test]
+fn test_temporary_rate_limit_normalization() {
+    let err = "HTTP 429: rate limit exceeded, requests per minute limit reached. Retry after 20s";
+    let res = classify_http_429(err, Some("rate_limit_exceeded"));
+    assert_eq!(res.status, AgentExecutionStatus::Interrupted);
+    assert_eq!(res.termination_reason, TerminationReason::RateLimited);
+
+    let res_antigravity =
+        normalize_antigravity_error("429: rate limit exceeded; tokens per minute");
+    assert_eq!(res_antigravity.status, AgentExecutionStatus::Interrupted);
+    assert_eq!(
+        res_antigravity.termination_reason,
+        TerminationReason::RateLimited
+    );
+}
+
+#[test]
+fn test_quota_exhaustion_normalization() {
+    let err =
+        "HTTP 429: You exceeded your current quota, please check your plan and billing details";
+    let res = classify_http_429(err, Some("insufficient_quota"));
+    assert_eq!(res.status, AgentExecutionStatus::Interrupted);
+    assert_eq!(res.termination_reason, TerminationReason::QuotaExhausted);
+
+    let codex_err = "Codex turn failed: usage limit reached for this month";
+    let res_codex = normalize_codex_error(codex_err);
+    assert_eq!(res_codex.status, AgentExecutionStatus::Interrupted);
+    assert_eq!(
+        res_codex.termination_reason,
+        TerminationReason::QuotaExhausted
+    );
+}
+
+#[test]
+fn test_ambiguous_resource_exhaustion_normalization() {
+    let err = "gRPC error status RESOURCE_EXHAUSTED";
+    let res = classify_http_429(err, Some("resource_exhausted"));
+    assert_eq!(res.status, AgentExecutionStatus::Interrupted);
+    assert_eq!(res.termination_reason, TerminationReason::ResourceExhausted);
+}
+
+#[test]
+fn test_timeout_normalization() {
+    let err = "ACP initialize timeout";
+    let res = normalize_antigravity_error(err);
+    assert_eq!(res.status, AgentExecutionStatus::Interrupted);
+    assert_eq!(res.termination_reason, TerminationReason::Timeout);
+}
+
+#[test]
+fn test_cancellation_normalization() {
+    let antigravity_err = "session/cancel received";
+    let res = normalize_antigravity_error(antigravity_err);
+    assert_eq!(res.status, AgentExecutionStatus::Interrupted);
+    assert_eq!(res.termination_reason, TerminationReason::Cancelled);
+
+    let codex_err = "cancelled by operator";
+    let res_codex = normalize_codex_error(codex_err);
+    assert_eq!(res_codex.status, AgentExecutionStatus::Interrupted);
+    assert_eq!(res_codex.termination_reason, TerminationReason::Cancelled);
+}
+
+#[test]
+fn test_credential_failure_normalization() {
+    let antigravity_err = "ACP process/auth cleanup unconfirmed; auth store may be quarantined";
+    let res = normalize_antigravity_error(antigravity_err);
+    assert_eq!(res.status, AgentExecutionStatus::Failed);
+    assert_eq!(res.termination_reason, TerminationReason::CredentialError);
+
+    let codex_err = "unauthorized: invalid_api_key in auth.json";
+    let res_codex = normalize_codex_error(codex_err);
+    assert_eq!(res_codex.status, AgentExecutionStatus::Failed);
+    assert_eq!(
+        res_codex.termination_reason,
+        TerminationReason::CredentialError
+    );
+}
+
+#[test]
+fn test_process_crash_normalization() {
+    let res = normalize_acp_process_exit(Some(17), false, None);
+    assert_eq!(res.status, AgentExecutionStatus::Failed);
+    assert_eq!(res.termination_reason, TerminationReason::ProcessCrash);
+    assert_eq!(res.exit_code, Some(17));
+
+    let res_signal = normalize_acp_process_exit(None, false, Some("SIGKILL"));
+    assert_eq!(res_signal.status, AgentExecutionStatus::Failed);
+    assert_eq!(
+        res_signal.termination_reason,
+        TerminationReason::ProcessCrash
+    );
+    assert_eq!(res_signal.exit_code, None);
+}
+
+#[test]
+fn test_infrastructure_failure_normalization() {
+    let err = r#"ACP supervisor launch failed: current_exe="/usr/bin/orbit""#;
+    let res = normalize_antigravity_error(err);
+    assert_eq!(res.status, AgentExecutionStatus::Failed);
+    assert_eq!(
+        res.termination_reason,
+        TerminationReason::InfrastructureError
+    );
+}
+
+#[test]
+fn test_unknown_or_generic_agent_error_normalization() {
+    let err = "unexpected parsing error in jsonrpc stream";
+    let res = normalize_antigravity_error(err);
+    assert_eq!(res.status, AgentExecutionStatus::Failed);
+    assert_eq!(res.termination_reason, TerminationReason::AgentError);
+}
