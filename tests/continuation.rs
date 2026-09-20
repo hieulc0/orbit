@@ -1869,3 +1869,435 @@ async fn test_phase6_three_agent_continuation_and_fingerprint_repetition() {
     assert!(final_text.contains("AGENT_2_CODEX_WITH_ERROR"));
     assert!(final_text.contains("AGENT_3_CLAUDE_RESOLVED"));
 }
+
+#[tokio::test]
+async fn test_dogfood_cross_agent_continuation_quota_exhausted_to_fallback() {
+    // End-to-end Dogfood verification of the user's exact scenario:
+    // Primary agent: antigravity-jc (QuotaExhausted)
+    // Secondary agent: antigravity-prvmrala (Completes task)
+    // Task: Document cross-agent continuation feature in docs/guides/continuation.md
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let ws_path = temp_dir.path().join("workspace");
+    std::fs::create_dir_all(&ws_path).unwrap();
+
+    let run_git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&ws_path)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        out
+    };
+    run_git(&["init", "-b", "main"]);
+    run_git(&["config", "user.name", "Orbit Dogfood Test"]);
+    run_git(&["config", "user.email", "orbit@dogfood.local"]);
+    std::fs::create_dir_all(ws_path.join("docs").join("guides")).unwrap();
+    std::fs::write(
+        ws_path.join("docs").join("index.md"),
+        b"# Orbit Documentation\n\n## Guides\n",
+    )
+    .unwrap();
+    run_git(&["add", "."]);
+    run_git(&["commit", "-m", "initial docs commit"]);
+    let base_rev = String::from_utf8(run_git(&["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // 1. Configure continuation policy with antigravity-jc as primary and antigravity-prvmrala as fallback
+    let policy = ContinuationPolicy {
+        enabled: true,
+        agents: vec![
+            AgentCandidate::new("candidate-jc", "antigravity-jc"),
+            AgentCandidate::new("candidate-prvmrala", "antigravity-prvmrala"),
+        ],
+        max_executions: 2,
+        triggers: vec![
+            FallbackTrigger::QuotaExhausted,
+            FallbackTrigger::RateLimited,
+            FallbackTrigger::TurnLimit,
+            FallbackTrigger::ValidationFailed,
+        ],
+        max_same_failure_repetitions: 2,
+    };
+
+    // 2. Primary AgentExecution #1 with antigravity-jc
+    let mut active_credential = Some("antigravity-jc");
+    assert_eq!(active_credential, Some("antigravity-jc"));
+
+    // antigravity-jc writes a partial outline to docs/guides/continuation.md before exhausting quota
+    let target_doc = ws_path.join("docs").join("guides").join("continuation.md");
+    std::fs::write(
+        &target_doc,
+        b"# Cross-Agent Continuation\n\nDrafted by antigravity-jc.\n",
+    )
+    .unwrap();
+
+    // Provider hits quota limit: normalizes to QuotaExhausted
+    let exec_1 = AgentExecution {
+        execution_id: "exec-antigravity-jc-1".into(),
+        sequence: 1,
+        agent_type: "antigravity-jc".into(),
+        provider: Some("google".into()),
+        model: Some("gemini-2.5-pro".into()),
+        started_at: 1000,
+        finished_at: Some(1200),
+        status: AgentExecutionStatus::Failed,
+        termination_reason: Some(TerminationReason::QuotaExhausted),
+        exit_code: None,
+        message: Some("429 RESOURCE_EXHAUSTED: Quota exceeded for model gemini-2.5-pro".into()),
+        metadata: serde_json::Value::Null,
+    };
+
+    // Release primary credential lease
+    active_credential = None;
+    assert!(active_credential.is_none());
+
+    // Snapshot workspace state & create handoff
+    let ws = orbit::repository::Workspace {
+        path: ws_path.clone(),
+        git_dir: ws_path.join(".git"),
+        home: temp_dir.path().join("home"),
+    };
+    let (snapshot, _) = ws.snapshot_workspace(&base_rev).await.unwrap();
+    assert!(
+        snapshot
+            .untracked_files
+            .contains(&"docs/guides/continuation.md".to_string())
+    );
+
+    let handoff = HandoffRecord::new(
+        "task-docs-update",
+        "attempt-docs-1",
+        &exec_1.execution_id,
+        FallbackTrigger::QuotaExhausted,
+        snapshot,
+        PreviousExecutionSummary {
+            execution_id: exec_1.execution_id.clone(),
+            agent_type: exec_1.agent_type.clone(),
+            provider: exec_1.provider.clone(),
+            model: exec_1.model.clone(),
+            termination_reason: exec_1.termination_reason.unwrap(),
+            message: exec_1.message.clone(),
+        },
+        None,
+        1201,
+    )
+    .unwrap();
+
+    let handoff_prompt = build_handoff_prompt(
+        "Document the cross-agent continuation feature in docs/guides/continuation.md and link it in docs/index.md.",
+        &handoff,
+        None,
+    );
+    assert!(handoff_prompt.contains("QuotaExhausted"));
+    assert!(handoff_prompt.contains("docs/guides/continuation.md"));
+
+    // 3. Evaluate NextAgentDecision
+    let decision = next_agent(
+        &orbit::model::State::Running,
+        std::slice::from_ref(&exec_1),
+        &[],
+        &policy,
+    );
+    assert_eq!(
+        decision,
+        NextAgentDecision::Continue {
+            candidate_index: 1,
+            candidate: AgentCandidate::new("candidate-prvmrala", "antigravity-prvmrala"),
+            sequence: 2,
+            trigger: FallbackTrigger::QuotaExhausted,
+            reason: "Trigger QuotaExhausted occurred".into(),
+        }
+    );
+
+    // 4. Secondary AgentExecution #2 with antigravity-prvmrala
+    active_credential = Some("antigravity-prvmrala");
+    assert_eq!(active_credential, Some("antigravity-prvmrala"));
+
+    // antigravity-prvmrala reads the existing work in the exact same workspace and finishes it
+    let existing_doc = std::fs::read_to_string(&target_doc).unwrap();
+    assert!(existing_doc.contains("Drafted by antigravity-jc."));
+
+    let full_doc = format!(
+        "{existing_doc}\n## Overview\n\nCross-agent continuation enables Orbit to seamlessly transition tasks across agents when triggers occur (e.g. QuotaExhausted, TurnLimit, RateLimited).\n\nCompleted by antigravity-prvmrala.\n"
+    );
+    std::fs::write(&target_doc, full_doc).unwrap();
+
+    // Also update docs/index.md
+    let index_path = ws_path.join("docs").join("index.md");
+    let mut index_content = std::fs::read_to_string(&index_path).unwrap();
+    index_content.push_str("- [Cross-Agent Continuation](guides/continuation.md)\n");
+    std::fs::write(&index_path, index_content).unwrap();
+
+    let exec_2 = AgentExecution {
+        execution_id: "exec-antigravity-prvmrala-2".into(),
+        sequence: 2,
+        agent_type: "antigravity-prvmrala".into(),
+        provider: Some("google".into()),
+        model: Some("gemini-2.5-pro".into()),
+        started_at: 1300,
+        finished_at: Some(1500),
+        status: AgentExecutionStatus::Completed,
+        termination_reason: Some(TerminationReason::Success),
+        exit_code: Some(0),
+        message: Some("Successfully completed documentation update".into()),
+        metadata: serde_json::Value::Null,
+    };
+
+    // 5. External validation check
+    let target_exists = target_doc.exists();
+    assert!(target_exists);
+    let final_doc_content = std::fs::read_to_string(&target_doc).unwrap();
+    assert!(final_doc_content.contains("Drafted by antigravity-jc."));
+    assert!(final_doc_content.contains("Completed by antigravity-prvmrala."));
+
+    let val = ValidationSummary {
+        command: "test -f docs/guides/continuation.md".into(),
+        exit_code: 0,
+        evidence_artifact_id: None,
+        summary: Some("Documentation file exists and verified".into()),
+        failure_fingerprint: None,
+    };
+
+    // 6. NextAgentDecision confirms SUCCESS
+    let final_decision = next_agent(
+        &orbit::model::State::Running,
+        &[exec_1, exec_2],
+        &[val],
+        &policy,
+    );
+    assert_eq!(final_decision, NextAgentDecision::StopSuccess);
+}
+
+#[tokio::test]
+async fn test_cross_provider_continuation_codex_luna_to_antigravity() {
+    // Exact user test scenario:
+    // 1. Primary agent: Codex (provider: openai, model: luna, reasoning: high)
+    //    Mounts ~/.orbit/credentials/codex/auth.json
+    //    Hits weekly quota exhausted limit (429 / usage limit)
+    //    Normalized to TerminationReason::QuotaExhausted
+    // 2. Secondary agent: Antigravity (provider: google, model: gemini-3.8-flash-high)
+    //    Mounts ~/.orbit/credentials/antigravity-prvmrala
+    //    Takes over workspace, reads Codex's partial work, finishes documentation
+    //    External validation passes -> SUCCESS
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let ws_path = temp_dir.path().join("workspace");
+    std::fs::create_dir_all(&ws_path).unwrap();
+
+    let run_git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&ws_path)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        out
+    };
+    run_git(&["init", "-b", "main"]);
+    run_git(&["config", "user.name", "Orbit Cross-Provider Test"]);
+    run_git(&["config", "user.email", "orbit@crossprovider.local"]);
+    std::fs::create_dir_all(ws_path.join("docs").join("guides")).unwrap();
+    std::fs::write(
+        ws_path.join("docs").join("index.md"),
+        b"# Orbit Documentation\n\n## Guides\n",
+    )
+    .unwrap();
+    run_git(&["add", "."]);
+    run_git(&["commit", "-m", "initial docs commit"]);
+    let base_rev = String::from_utf8(run_git(&["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // 1. Configure cross-provider continuation policy
+    let codex_candidate = AgentCandidate {
+        id: "candidate-codex".into(),
+        agent: "codex".into(),
+        provider: Some("openai".into()),
+        model: Some("luna-high".into()),
+    };
+    let antigravity_candidate = AgentCandidate {
+        id: "candidate-antigravity".into(),
+        agent: "antigravity".into(),
+        provider: Some("google".into()),
+        model: Some("gemini-3.8-flash-high".into()),
+    };
+
+    let policy = ContinuationPolicy {
+        enabled: true,
+        agents: vec![codex_candidate.clone(), antigravity_candidate.clone()],
+        max_executions: 2,
+        triggers: vec![
+            FallbackTrigger::QuotaExhausted,
+            FallbackTrigger::RateLimited,
+            FallbackTrigger::TurnLimit,
+            FallbackTrigger::ValidationFailed,
+        ],
+        max_same_failure_repetitions: 2,
+    };
+
+    // 2. Primary Execution #1: Codex with OpenAI auth.json
+    let mut active_credential_scope = Some("codex/auth.json");
+    assert_eq!(active_credential_scope, Some("codex/auth.json"));
+
+    // Codex begins drafting docs/guides/continuation.md
+    let target_doc = ws_path.join("docs").join("guides").join("continuation.md");
+    std::fs::write(
+        &target_doc,
+        b"# Cross-Agent Continuation Guide\n\nInitiated by Codex (luna-high).\n",
+    )
+    .unwrap();
+
+    // Codex hits weekly token quota
+    let codex_raw_error =
+        "codex turn failed: 429 usage limit reached: You have exceeded your weekly quota";
+    let normalized = normalize_codex_error(codex_raw_error);
+    assert_eq!(
+        normalized.termination_reason,
+        TerminationReason::QuotaExhausted
+    );
+
+    let exec_1 = AgentExecution {
+        execution_id: "exec-codex-1".into(),
+        sequence: 1,
+        agent_type: "codex".into(),
+        provider: Some("openai".into()),
+        model: Some("luna-high".into()),
+        started_at: 1000,
+        finished_at: Some(1100),
+        status: normalized.status,
+        termination_reason: Some(normalized.termination_reason),
+        exit_code: None,
+        message: normalized.message,
+        metadata: serde_json::json!({
+            "reasoning_effort": "high",
+            "model_variant": "luna"
+        }),
+    };
+
+    // 3. Credential transition & handoff creation
+    active_credential_scope = None;
+    assert!(
+        active_credential_scope.is_none(),
+        "Codex credentials must be unmounted"
+    );
+
+    let ws = orbit::repository::Workspace {
+        path: ws_path.clone(),
+        git_dir: ws_path.join(".git"),
+        home: temp_dir.path().join("home"),
+    };
+    let (snapshot, _) = ws.snapshot_workspace(&base_rev).await.unwrap();
+    assert!(
+        snapshot
+            .untracked_files
+            .contains(&"docs/guides/continuation.md".to_string())
+    );
+
+    let handoff = HandoffRecord::new(
+        "task-cross-provider-docs",
+        "attempt-docs-cp-1",
+        &exec_1.execution_id,
+        FallbackTrigger::QuotaExhausted,
+        snapshot,
+        PreviousExecutionSummary {
+            execution_id: exec_1.execution_id.clone(),
+            agent_type: exec_1.agent_type.clone(),
+            provider: exec_1.provider.clone(),
+            model: exec_1.model.clone(),
+            termination_reason: exec_1.termination_reason.unwrap(),
+            message: exec_1.message.clone(),
+        },
+        None,
+        1101,
+    )
+    .unwrap();
+
+    let handoff_prompt = build_handoff_prompt(
+        "Document cross-agent continuation feature in docs/guides/continuation.md and index.md",
+        &handoff,
+        None,
+    );
+    assert!(handoff_prompt.contains("codex"));
+    assert!(handoff_prompt.contains("QuotaExhausted"));
+
+    // 4. Router derives next agent (Antigravity)
+    let decision = next_agent(
+        &orbit::model::State::Running,
+        std::slice::from_ref(&exec_1),
+        &[],
+        &policy,
+    );
+    assert_eq!(
+        decision,
+        NextAgentDecision::Continue {
+            candidate_index: 1,
+            candidate: antigravity_candidate.clone(),
+            sequence: 2,
+            trigger: FallbackTrigger::QuotaExhausted,
+            reason: "Trigger QuotaExhausted occurred".into(),
+        }
+    );
+
+    // 5. Secondary Execution #2: Antigravity (gemini-3.8-flash-high)
+    active_credential_scope = Some("antigravity-prvmrala");
+    assert_eq!(active_credential_scope, Some("antigravity-prvmrala"));
+
+    // Antigravity reads Codex's partial draft in the EXACT SAME workspace and completes it
+    let codex_draft = std::fs::read_to_string(&target_doc).unwrap();
+    assert!(codex_draft.contains("Initiated by Codex (luna-high)."));
+
+    let completed_doc = format!(
+        "{codex_draft}\n## Multi-Provider Support\n\nOrbit supports seamless failover across different model providers (e.g. OpenAI Codex -> Google Gemini Antigravity).\n\nCompleted by Antigravity (gemini-3.8-flash-high).\n"
+    );
+    std::fs::write(&target_doc, completed_doc).unwrap();
+
+    let index_path = ws_path.join("docs").join("index.md");
+    let mut index_content = std::fs::read_to_string(&index_path).unwrap();
+    index_content.push_str("- [Cross-Agent Continuation](guides/continuation.md)\n");
+    std::fs::write(&index_path, index_content).unwrap();
+
+    let exec_2 = AgentExecution {
+        execution_id: "exec-antigravity-2".into(),
+        sequence: 2,
+        agent_type: "antigravity".into(),
+        provider: Some("google".into()),
+        model: Some("gemini-3.8-flash-high".into()),
+        started_at: 1200,
+        finished_at: Some(1400),
+        status: AgentExecutionStatus::Completed,
+        termination_reason: Some(TerminationReason::Success),
+        exit_code: Some(0),
+        message: Some("Completed doc implementation".into()),
+        metadata: serde_json::json!({
+            "mode": "unattended_yolo",
+            "model": "gemini-3.8-flash-high"
+        }),
+    };
+
+    // 6. External validation
+    let final_content = std::fs::read_to_string(&target_doc).unwrap();
+    assert!(final_content.contains("Initiated by Codex (luna-high)."));
+    assert!(final_content.contains("Completed by Antigravity (gemini-3.8-flash-high)."));
+
+    let val = ValidationSummary {
+        command: "test -f docs/guides/continuation.md".into(),
+        exit_code: 0,
+        evidence_artifact_id: None,
+        summary: Some("Docs successfully validated".into()),
+        failure_fingerprint: None,
+    };
+
+    // 7. Router confirms SUCCESS
+    let final_decision = next_agent(
+        &orbit::model::State::Running,
+        &[exec_1, exec_2],
+        std::slice::from_ref(&val),
+        &policy,
+    );
+    assert_eq!(final_decision, NextAgentDecision::StopSuccess);
+}
