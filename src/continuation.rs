@@ -701,3 +701,105 @@ The repository and Orbit validation evidence are authoritative."
 
     prompt
 }
+
+/// Policy configuring automatic cross-agent continuation and fallback.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FallbackPolicy {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_agent: Option<String>,
+    #[serde(default = "default_fallback_triggers")]
+    pub on_triggers: Vec<FallbackTrigger>,
+    #[serde(default = "default_max_executions")]
+    pub max_executions: u32,
+}
+
+fn default_fallback_triggers() -> Vec<FallbackTrigger> {
+    vec![
+        FallbackTrigger::TurnLimit,
+        FallbackTrigger::RateLimited,
+        FallbackTrigger::QuotaExhausted,
+        FallbackTrigger::Timeout,
+        FallbackTrigger::ValidationFailed,
+    ]
+}
+
+fn default_max_executions() -> u32 {
+    2
+}
+
+impl Default for FallbackPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            fallback_agent: None,
+            on_triggers: default_fallback_triggers(),
+            max_executions: 2,
+        }
+    }
+}
+
+/// Evaluates whether an agent execution and its subsequent external validation trigger a fallback.
+///
+/// Cancellation, CredentialError, InfrastructureError, and ProcessCrash do NOT trigger fallback
+/// in this phase to prevent uncontrolled retries of fundamental environment failures.
+pub fn fallback_trigger(
+    execution: &AgentExecution,
+    validation: Option<&ValidationSummary>,
+    policy: &FallbackPolicy,
+) -> Option<FallbackTrigger> {
+    if !policy.enabled {
+        return None;
+    }
+
+    // Cancellation has absolute priority: no fallback
+    if execution.status == AgentExecutionStatus::Interrupted
+        && execution.termination_reason == Some(TerminationReason::Cancelled)
+    {
+        return None;
+    }
+
+    // Explicit exclusions for safety:
+    if let Some(reason) = execution.termination_reason
+        && matches!(
+            reason,
+            TerminationReason::Cancelled
+                | TerminationReason::CredentialError
+                | TerminationReason::InfrastructureError
+                | TerminationReason::ProcessCrash
+        )
+    {
+        return None;
+    }
+
+    // Check agent termination reasons
+    let candidate = match execution.termination_reason {
+        Some(TerminationReason::TurnLimit) => Some(FallbackTrigger::TurnLimit),
+        Some(TerminationReason::RateLimited) => Some(FallbackTrigger::RateLimited),
+        Some(TerminationReason::QuotaExhausted) => Some(FallbackTrigger::QuotaExhausted),
+        Some(TerminationReason::ResourceExhausted) => Some(FallbackTrigger::RateLimited),
+        Some(TerminationReason::Timeout) => Some(FallbackTrigger::Timeout),
+        Some(TerminationReason::AgentError) => Some(FallbackTrigger::AgentFailure),
+        _ => None,
+    };
+
+    if let Some(trigger) = candidate
+        && policy.on_triggers.contains(&trigger)
+    {
+        return Some(trigger);
+    }
+
+    // External validation failure check (e.g. agent completed but tests failed)
+    if let Some(val) = validation
+        && val.exit_code != 0
+        && policy
+            .on_triggers
+            .contains(&FallbackTrigger::ValidationFailed)
+    {
+        return Some(FallbackTrigger::ValidationFailed);
+    }
+
+    None
+}

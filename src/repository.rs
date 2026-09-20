@@ -232,7 +232,9 @@ impl Workspace {
         let head_bytes = self.git(&["rev-parse", "HEAD"]).await?;
         let head_revision = String::from_utf8(head_bytes)?.trim().to_string();
 
-        let status_bytes = self.git(&["status", "--porcelain=v1", "-z"]).await?;
+        let status_bytes = self
+            .git(&["status", "--porcelain=v1", "--untracked-files=all", "-z"])
+            .await?;
         let (changed, added, deleted, untracked) = parse_porcelain_z(&status_bytes);
 
         let diff_bytes = self
