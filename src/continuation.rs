@@ -31,9 +31,10 @@ pub enum TerminationReason {
 }
 
 /// Lifecycle status of an individual agent execution within an attempt.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentExecutionStatus {
+    #[default]
     Pending,
     Running,
     Completed,
@@ -61,7 +62,7 @@ pub enum FallbackTrigger {
 /// A single execution of an agent within an attempt's workspace.
 ///
 /// An Attempt owns the workspace; an AgentExecution only uses it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentExecution {
     pub execution_id: String,
@@ -85,6 +86,23 @@ pub struct AgentExecution {
     pub exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_image: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_source: Option<crate::acp_capabilities::CapabilitySource>,
 
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub metadata: serde_json::Value,
@@ -393,6 +411,14 @@ impl NormalizedAgentResult {
             termination_reason: Some(self.termination_reason),
             exit_code: self.exit_code,
             message: self.message,
+            requested_model: None,
+            requested_reasoning_effort: None,
+            resolved_model: None,
+            resolved_reasoning_effort: None,
+            actual_model: None,
+            runtime_image: None,
+            runtime_digest: None,
+            capability_source: None,
             metadata: self.metadata,
         }
     }
@@ -1174,7 +1200,7 @@ pub fn repeated_failure_count(
 }
 
 /// Candidate agent in an ordered execution chain.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentCandidate {
     pub id: String,
@@ -1183,6 +1209,8 @@ pub struct AgentCandidate {
     pub provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 impl AgentCandidate {
@@ -1192,7 +1220,18 @@ impl AgentCandidate {
             agent: agent.into(),
             provider: None,
             model: None,
+            reasoning_effort: None,
         }
+    }
+
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
+        self
+    }
+
+    pub fn with_effort(mut self, effort: impl Into<String>) -> Self {
+        self.reasoning_effort = Some(effort.into());
+        self
     }
 }
 

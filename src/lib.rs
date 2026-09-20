@@ -1,5 +1,6 @@
 pub mod acp;
 pub mod acp_broker;
+pub mod acp_capabilities;
 pub mod acp_contract;
 pub mod acp_files;
 pub mod acp_process;

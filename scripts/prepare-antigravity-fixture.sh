@@ -41,8 +41,9 @@ trap 'rm -rf "$BUILD_CONTEXT"' EXIT
 cat << 'EOF' > "$BUILD_CONTEXT/Containerfile"
 FROM docker.io/library/debian:bookworm-slim
 RUN echo "nobody:x:65534:" >> /etc/group
-RUN mkdir -p /opt/antigravity /etc/ssl/certs
+RUN mkdir -p /opt/antigravity /etc/ssl/certs /etc/orbit
 COPY ssl-certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY agent-capabilities.json /etc/orbit/agent-capabilities.json
 COPY --chmod=755 agy_acp_server.par /opt/antigravity/agy_acp_server.par
 COPY --chmod=755 localharness_external /opt/antigravity/localharness_external
 ENV GEMINI_HOME=/orbit/home/.gemini \
@@ -54,6 +55,34 @@ ENV GEMINI_HOME=/orbit/home/.gemini \
 WORKDIR /orbit/home
 ENTRYPOINT ["/opt/antigravity/agy_acp_server.par"]
 EOF
+cat << 'CAP_EOF' > "$BUILD_CONTEXT/agent-capabilities.json"
+{
+  "agent": "antigravity-acp",
+  "runtime_version": "1.1.1",
+  "models": [
+    {
+      "id": "gemini-3.8-flash",
+      "display_name": "Gemini 3.8 Flash",
+      "reasoning_efforts": ["low", "medium", "high"]
+    },
+    {
+      "id": "gemini-3.7-flash",
+      "display_name": "Gemini 3.7 Flash",
+      "reasoning_efforts": ["low", "medium", "high"]
+    },
+    {
+      "id": "gemini-3.6-flash",
+      "display_name": "Gemini 3.6 Flash",
+      "reasoning_efforts": ["low", "medium", "high"]
+    },
+    {
+      "id": "gemini-3.1-pro",
+      "display_name": "Gemini 3.1 Pro",
+      "reasoning_efforts": ["low", "high"]
+    }
+  ]
+}
+CAP_EOF
 
 mkdir -p "$BUILD_CONTEXT/ssl-certs"
 cp -L /etc/ssl/certs/ca-certificates.crt "$BUILD_CONTEXT/ssl-certs/ca-certificates.crt"

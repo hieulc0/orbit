@@ -88,6 +88,7 @@ fn agent_execution_roundtrip() {
         exit_code: None,
         message: Some("prompt turn limit reached".into()),
         metadata: json!({"turns": 1, "adapter": "antigravity"}),
+        ..Default::default()
     };
 
     execution.validate().unwrap();
@@ -174,6 +175,7 @@ fn execution_sequence_represents_multi_agent_continuation() {
             exit_code: None,
             message: None,
             metadata: serde_json::Value::Null,
+            ..Default::default()
         },
         // 2. Codex fallback
         AgentExecution {
@@ -189,6 +191,7 @@ fn execution_sequence_represents_multi_agent_continuation() {
             exit_code: None,
             message: Some("rate limited".into()),
             metadata: serde_json::Value::Null,
+            ..Default::default()
         },
         // 3. Claude ACP tertiary fallback
         AgentExecution {
@@ -204,6 +207,7 @@ fn execution_sequence_represents_multi_agent_continuation() {
             exit_code: None,
             message: None,
             metadata: serde_json::Value::Null,
+            ..Default::default()
         },
     ];
 
@@ -618,6 +622,7 @@ fn test_fallback_policy_defaults_and_triggers() {
         exit_code: None,
         message: Some("turn limit reached".into()),
         metadata: serde_json::Value::Null,
+        ..Default::default()
     };
 
     // Trigger on turn limit
@@ -727,6 +732,7 @@ fn test_fallback_orchestration_boundary_and_invariants() {
         exit_code: None,
         message: Some("Reached limit of 32 turns".into()),
         metadata: serde_json::json!({"turns": 32}),
+        ..Default::default()
     };
 
     let policy = FallbackPolicy {
@@ -783,6 +789,7 @@ fn test_fallback_orchestration_boundary_and_invariants() {
         exit_code: Some(0),
         message: Some("Completed implementation and verified".into()),
         metadata: serde_json::Value::Null,
+        ..Default::default()
     };
 
     // Attempt has both executions preserved in order
@@ -837,6 +844,7 @@ fn test_legacy_configuration_without_continuation_does_not_trigger_fallback() {
             exit_code: None,
             message: Some(format!("failed with {reason:?}")),
             metadata: serde_json::Value::Null,
+        ..Default::default()
         };
 
         assert_eq!(
@@ -911,6 +919,7 @@ async fn test_cross_agent_continuation_in_same_workspace_and_credential_isolatio
         exit_code: None,
         message: Some("Turn limit reached".into()),
         metadata: serde_json::Value::Null,
+        ..Default::default()
     };
 
     // Primary AuthLease released upon Agent 1 exit
@@ -1027,6 +1036,7 @@ async fn test_cross_agent_continuation_in_same_workspace_and_credential_isolatio
         exit_code: Some(0),
         message: Some("Completed implementation".into()),
         metadata: serde_json::Value::Null,
+        ..Default::default()
     };
 
     // Release fallback auth lease
@@ -1074,6 +1084,7 @@ fn test_cancellation_at_handoff_boundary_prevents_fallback() {
         exit_code: None,
         message: Some("Turn limit reached".into()),
         metadata: serde_json::Value::Null,
+        ..Default::default()
     };
 
     let policy = FallbackPolicy {
@@ -1126,6 +1137,7 @@ fn test_no_third_execution_when_both_agents_fail() {
         exit_code: None,
         message: Some("Turn limit reached".into()),
         metadata: serde_json::Value::Null,
+        ..Default::default()
     };
 
     let exec_2 = AgentExecution {
@@ -1141,6 +1153,7 @@ fn test_no_third_execution_when_both_agents_fail() {
         exit_code: None,
         message: Some("Turn limit reached".into()),
         metadata: serde_json::Value::Null,
+        ..Default::default()
     };
 
     let executions = [exec_1, exec_2.clone()];
@@ -1209,6 +1222,7 @@ fn test_recovery_action_deterministic_matrix() {
         exit_code: None,
         message: Some("turn limit".into()),
         metadata: serde_json::Value::Null,
+        ..Default::default()
     };
 
     // If execution terminated with TurnLimit, fallback is triggered directly
@@ -1286,6 +1300,7 @@ fn test_recovery_action_deterministic_matrix() {
         exit_code: None,
         message: None,
         metadata: serde_json::Value::Null,
+        ..Default::default()
     };
 
     let action_d = continuation_recovery_action(
@@ -1390,6 +1405,7 @@ async fn test_phase5_real_restart_recovery_from_persistence() {
         exit_code: None,
         message: Some("Turn limit exhausted".into()),
         metadata: serde_json::Value::Null,
+        ..Default::default()
     };
 
     let ws = orbit::repository::Workspace {
@@ -1488,6 +1504,7 @@ async fn test_phase5_real_restart_recovery_from_persistence() {
         exit_code: Some(0),
         message: Some("Completed feature after restart recovery".into()),
         metadata: serde_json::Value::Null,
+        ..Default::default()
     };
 
     // Update persisted executions
@@ -1610,6 +1627,7 @@ fn test_generalized_agent_chain_progression_and_bounds() {
         exit_code: None,
         message: Some("turn limit".into()),
         metadata: serde_json::Value::Null,
+        ..Default::default()
     };
 
     // Step 1: Agent 1 terminates with TurnLimit -> Next agent is Codex (sequence 2)
@@ -1653,6 +1671,7 @@ fn test_generalized_agent_chain_progression_and_bounds() {
         exit_code: Some(0),
         message: Some("Completed turn".into()),
         metadata: serde_json::Value::Null,
+        ..Default::default()
     };
 
     let decision_2 = next_agent(
@@ -1686,6 +1705,7 @@ fn test_generalized_agent_chain_progression_and_bounds() {
         exit_code: Some(0),
         message: Some("Completed turn".into()),
         metadata: serde_json::Value::Null,
+        ..Default::default()
     };
 
     let decision_3 = next_agent(
@@ -1744,6 +1764,7 @@ async fn test_phase6_three_agent_continuation_and_fingerprint_repetition() {
         exit_code: None,
         message: Some("Turn limit exhausted".into()),
         metadata: serde_json::Value::Null,
+        ..Default::default()
     };
 
     // 2. Transition to Agent #2 (Codex)
@@ -1768,6 +1789,7 @@ async fn test_phase6_three_agent_continuation_and_fingerprint_repetition() {
         exit_code: Some(0),
         message: Some("Agent 2 finished turn".into()),
         metadata: serde_json::Value::Null,
+        ..Default::default()
     };
 
     let fp_codex =
@@ -1844,6 +1866,7 @@ async fn test_phase6_three_agent_continuation_and_fingerprint_repetition() {
         exit_code: Some(0),
         message: Some("All tests pass".into()),
         metadata: serde_json::Value::Null,
+        ..Default::default()
     };
 
     let final_val = ValidationSummary {
@@ -1949,6 +1972,7 @@ async fn test_dogfood_cross_agent_continuation_quota_exhausted_to_fallback() {
         exit_code: None,
         message: Some("429 RESOURCE_EXHAUSTED: Quota exceeded for model gemini-2.5-pro".into()),
         metadata: serde_json::Value::Null,
+        ..Default::default()
     };
 
     // Release primary credential lease
@@ -2045,6 +2069,7 @@ async fn test_dogfood_cross_agent_continuation_quota_exhausted_to_fallback() {
         exit_code: Some(0),
         message: Some("Successfully completed documentation update".into()),
         metadata: serde_json::Value::Null,
+        ..Default::default()
     };
 
     // 5. External validation check
@@ -2119,12 +2144,14 @@ async fn test_cross_provider_continuation_codex_luna_to_antigravity() {
         agent: "codex".into(),
         provider: Some("openai".into()),
         model: Some("luna-high".into()),
+        ..Default::default()
     };
     let antigravity_candidate = AgentCandidate {
         id: "candidate-antigravity".into(),
         agent: "antigravity".into(),
         provider: Some("google".into()),
         model: Some("gemini-3.8-flash-high".into()),
+        ..Default::default()
     };
 
     let policy = ContinuationPolicy {
@@ -2177,6 +2204,7 @@ async fn test_cross_provider_continuation_codex_luna_to_antigravity() {
             "reasoning_effort": "high",
             "model_variant": "luna"
         }),
+        ..Default::default()
     };
 
     // 3. Credential transition & handoff creation
@@ -2277,6 +2305,7 @@ async fn test_cross_provider_continuation_codex_luna_to_antigravity() {
             "mode": "unattended_yolo",
             "model": "gemini-3.8-flash-high"
         }),
+        ..Default::default()
     };
 
     // 6. External validation
