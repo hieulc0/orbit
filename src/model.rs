@@ -722,6 +722,8 @@ pub struct Attempt {
     pub outputs: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gpu_devices: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_executions: Vec<crate::continuation::AgentExecution>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Task {

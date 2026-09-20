@@ -389,6 +389,7 @@ impl Engine {
                     lease_expires_at: (now + self.lease_seconds * 1000).min(deadline),
                     reason: None,
                     outputs: vec![],
+                    agent_executions: vec![],
                     gpu_devices: (0..capacity.resources.gpu)
                         .filter(|device| !used_gpu_devices.contains(device))
                         .take(config.resources.as_ref().map_or(0, |r| r.gpu) as usize)

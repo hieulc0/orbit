@@ -15,6 +15,7 @@ pub mod coding_agent;
 pub mod command_agent;
 pub mod compute;
 pub mod container;
+pub mod continuation;
 pub mod engine;
 pub mod evidence;
 pub mod execution;
