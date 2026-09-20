@@ -385,3 +385,197 @@ fn test_unknown_or_generic_agent_error_normalization() {
     assert_eq!(res.status, AgentExecutionStatus::Failed);
     assert_eq!(res.termination_reason, TerminationReason::AgentError);
 }
+
+#[tokio::test]
+async fn test_workspace_snapshot_modifications_staged_untracked_and_renames() -> anyhow::Result<()>
+{
+    let temp = tempfile::tempdir()?;
+    let repo_dir = temp.path().join("repository");
+    let git_dir = temp.path().join("git");
+    let home = temp.path().join("home");
+    tokio::fs::create_dir(&repo_dir).await?;
+    tokio::fs::create_dir(&git_dir).await?;
+    tokio::fs::create_dir(&home).await?;
+
+    let ws = orbit::repository::Workspace {
+        path: repo_dir.clone(),
+        git_dir: git_dir.clone(),
+        home: home.clone(),
+    };
+
+    // Initialize git repo
+    ws.git(&["init"]).await?;
+    ws.git(&["config", "user.name", "orbit-test"]).await?;
+    ws.git(&["config", "user.email", "orbit@example.com"])
+        .await?;
+
+    // Create baseline files
+    tokio::fs::write(repo_dir.join("tracked.rs"), b"fn init() {}\n").await?;
+    tokio::fs::write(repo_dir.join("to_delete.rs"), b"fn delete_me() {}\n").await?;
+    tokio::fs::write(repo_dir.join("to_rename.rs"), b"fn rename_me() {}\n").await?;
+    ws.git(&["add", "tracked.rs", "to_delete.rs", "to_rename.rs"])
+        .await?;
+    ws.git(&["commit", "-m", "initial commit"]).await?;
+
+    let head_bytes = ws.git(&["rev-parse", "HEAD"]).await?;
+    let baseline = String::from_utf8(head_bytes)?.trim().to_string();
+
+    // 1. Modify tracked file (staged)
+    tokio::fs::write(
+        repo_dir.join("tracked.rs"),
+        b"fn init() { println!(\"staged\"); }\n",
+    )
+    .await?;
+    ws.git(&["add", "tracked.rs"]).await?;
+
+    // 2. Further unstaged edit to tracked file
+    tokio::fs::write(
+        repo_dir.join("tracked.rs"),
+        b"fn init() { println!(\"both\"); }\n",
+    )
+    .await?;
+
+    // 3. Staged new file
+    tokio::fs::write(repo_dir.join("added.rs"), b"pub fn added() {}\n").await?;
+    ws.git(&["add", "added.rs"]).await?;
+
+    // 4. Deleted file
+    tokio::fs::remove_file(repo_dir.join("to_delete.rs")).await?;
+
+    // 5. Renamed file
+    ws.git(&["mv", "to_rename.rs", "renamed.rs"]).await?;
+
+    // 6. Untracked file (with spaces and unicode)
+    tokio::fs::write(repo_dir.join("untracked test file.rs"), b"// untracked\n").await?;
+    tokio::fs::write(repo_dir.join("t\u{e9}st_unicode.rs"), b"// unicode\n").await?;
+
+    // Take snapshot
+    let (snapshot, diff_bytes) = ws.snapshot_workspace(&baseline).await?;
+
+    assert_eq!(snapshot.baseline_revision, baseline);
+    assert!(!snapshot.head_revision.is_empty());
+
+    // Verify changed files includes tracked.rs, added.rs, deleted, and renamed
+    assert!(snapshot.changed_files.contains(&"tracked.rs".to_string()));
+    assert!(snapshot.changed_files.contains(&"added.rs".to_string()));
+    assert!(snapshot.changed_files.contains(&"renamed.rs".to_string()));
+
+    // Verify added files
+    assert!(snapshot.added_files.contains(&"added.rs".to_string()));
+    assert!(snapshot.added_files.contains(&"renamed.rs".to_string()));
+
+    // Verify deleted files
+    assert!(snapshot.deleted_files.contains(&"to_delete.rs".to_string()));
+    assert!(snapshot.deleted_files.contains(&"to_rename.rs".to_string()));
+
+    // Verify untracked files
+    assert!(
+        snapshot
+            .untracked_files
+            .contains(&"untracked test file.rs".to_string())
+    );
+    assert!(
+        snapshot
+            .untracked_files
+            .contains(&"t\u{e9}st_unicode.rs".to_string())
+    );
+
+    // Verify diff artifact bytes and sha
+    let diff_str = String::from_utf8_lossy(&diff_bytes);
+    assert!(diff_str.contains("tracked.rs"));
+    assert!(diff_str.contains("added.rs"));
+    assert!(diff_str.contains("to_delete.rs"));
+    assert_eq!(
+        snapshot.diff_sha256,
+        Some(orbit::model::digest(&diff_bytes))
+    );
+
+    // Determinism test: take a second snapshot, verify equality
+    let (snapshot2, diff_bytes2) = ws.snapshot_workspace(&baseline).await?;
+    assert_eq!(snapshot, snapshot2);
+    assert_eq!(diff_bytes, diff_bytes2);
+
+    Ok(())
+}
+
+#[test]
+fn test_handoff_prompt_builder_structure_and_bounds() {
+    let ws = WorkspaceSnapshot {
+        baseline_revision: "base-1234567890".into(),
+        head_revision: "head-1234567890".into(),
+        changed_files: vec!["src/lib.rs".into(), "src/auth.rs".into()],
+        added_files: vec!["src/auth.rs".into()],
+        deleted_files: vec!["src/old.rs".into()],
+        untracked_files: vec!["tests/integration.rs".into()],
+        diff_sha256: Some("a".repeat(64)),
+        diff_artifact_id: Some("art-diff-001".into()),
+    };
+
+    let prev = PreviousExecutionSummary {
+        execution_id: "exec-001".into(),
+        agent_type: "antigravity".into(),
+        provider: Some("google".into()),
+        model: Some("gemini-2.5-pro".into()),
+        termination_reason: TerminationReason::TurnLimit,
+        message: Some("Turn limit of 32 reached before completion".into()),
+    };
+
+    let val = ValidationSummary {
+        command: "cargo test --locked".into(),
+        exit_code: 101,
+        evidence_artifact_id: Some("art-val-001".into()),
+        summary: Some("error[E0308]: mismatched types in src/auth.rs:42:5".into()),
+    };
+
+    let handoff = HandoffRecord::new(
+        "task-001",
+        "attempt-001",
+        "exec-001",
+        FallbackTrigger::TurnLimit,
+        ws,
+        prev,
+        Some(val.clone()),
+        1700000000,
+    )
+    .unwrap();
+
+    let task_desc = "Implement OAuth token exchange and integration tests for GitHub";
+    let prompt = build_handoff_prompt(task_desc, &handoff, Some(&val));
+
+    // Must include key orientation items
+    assert!(prompt.contains("You are continuing an existing implementation attempt."));
+    assert!(prompt.contains(task_desc));
+    assert!(prompt.contains("Agent: antigravity"));
+    assert!(prompt.contains("Termination: TurnLimit"));
+    assert!(prompt.contains("src/lib.rs"));
+    assert!(prompt.contains("src/auth.rs"));
+    assert!(prompt.contains("tests/integration.rs"));
+    assert!(prompt.contains("cargo test --locked"));
+    assert!(prompt.contains("error[E0308]"));
+
+    // Must not embed arbitrary large diff contents
+    assert!(!prompt.contains("diff --git"));
+    assert!(!prompt.contains("@@ -"));
+
+    // Instructions must be provider-neutral
+    assert!(!prompt.contains("Gemini"));
+    assert!(!prompt.contains("Codex"));
+    assert!(!prompt.contains("Claude"));
+    assert!(prompt.contains("1. Inspect the existing repository and git diff."));
+}
+
+#[test]
+fn test_parse_porcelain_z_with_newlines_and_spaces() {
+    let mut data = Vec::new();
+    data.extend_from_slice(b"M  file with space.rs\0");
+    data.extend_from_slice(b"?? untracked_file.rs\0");
+    data.extend_from_slice(b"R  new_name.rs\0old_name.rs\0");
+    data.extend_from_slice(b" D deleted.rs\0");
+
+    let (changed, added, deleted, untracked) = orbit::repository::parse_porcelain_z(&data);
+    assert!(changed.contains(&"file with space.rs".to_string()));
+    assert!(untracked.contains(&"untracked_file.rs".to_string()));
+    assert!(added.contains(&"new_name.rs".to_string()));
+    assert!(deleted.contains(&"old_name.rs".to_string()));
+    assert!(deleted.contains(&"deleted.rs".to_string()));
+}

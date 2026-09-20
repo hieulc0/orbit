@@ -221,6 +221,48 @@ impl Workspace {
         git_output(&argv, &self.path, &self.home, &BTreeMap::new()).await
     }
 
+    /// Non-destructively snapshot repository state and working tree status.
+    ///
+    /// Strictly read-only: observes git status, HEAD, and binary diff against baseline.
+    /// Does NOT run reset, checkout, clean, or mutate files.
+    pub async fn snapshot_workspace(
+        &self,
+        baseline_revision: &str,
+    ) -> Result<(crate::continuation::WorkspaceSnapshot, Vec<u8>)> {
+        let head_bytes = self.git(&["rev-parse", "HEAD"]).await?;
+        let head_revision = String::from_utf8(head_bytes)?.trim().to_string();
+
+        let status_bytes = self.git(&["status", "--porcelain=v1", "-z"]).await?;
+        let (changed, added, deleted, untracked) = parse_porcelain_z(&status_bytes);
+
+        let diff_bytes = self
+            .git(&[
+                "diff",
+                "--binary",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--full-index",
+                baseline_revision,
+                "--",
+            ])
+            .await?;
+
+        let diff_sha256 = crate::model::digest(&diff_bytes);
+
+        let snapshot = crate::continuation::WorkspaceSnapshot {
+            baseline_revision: baseline_revision.to_string(),
+            head_revision,
+            changed_files: changed,
+            added_files: added,
+            deleted_files: deleted,
+            untracked_files: untracked,
+            diff_sha256: Some(diff_sha256),
+            diff_artifact_id: None,
+        };
+
+        Ok((snapshot, diff_bytes))
+    }
+
     pub async fn patch(&self, a: &Assignment) -> Result<(Vec<u8>, Vec<u8>)> {
         self.git(&["add", "-A"]).await?;
         let base = &a.plan.definition.inputs.base_revision;
@@ -414,6 +456,88 @@ done
 [ \"${path%/}\" = \"$ORBIT_GIT_PATH\" ] || exit 0
 printf 'username=x-access-token\\npassword=%s\\n' \"$ORBIT_GIT_PASSWORD\"
 ";
+
+pub fn parse_porcelain_z(output: &[u8]) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+    let mut changed = std::collections::BTreeSet::new();
+    let mut added = std::collections::BTreeSet::new();
+    let mut deleted = std::collections::BTreeSet::new();
+    let mut untracked = std::collections::BTreeSet::new();
+
+    let entries: Vec<&[u8]> = output.split(|b| *b == 0).collect();
+    let mut i = 0;
+    while i < entries.len() {
+        let entry = entries[i];
+        if entry.is_empty() {
+            i += 1;
+            continue;
+        }
+
+        if entry.len() < 3 {
+            i += 1;
+            continue;
+        }
+
+        let x = entry[0] as char;
+        let y = entry[1] as char;
+        let path = String::from_utf8_lossy(&entry[3..]).into_owned();
+
+        // Renames in porcelain -z have the new path in entry, followed immediately
+        // by the next NUL-delimited entry containing the old path.
+        if x == 'R' || y == 'R' {
+            let old_path = if i + 1 < entries.len() && !entries[i + 1].is_empty() {
+                i += 1;
+                String::from_utf8_lossy(entries[i]).into_owned()
+            } else {
+                String::new()
+            };
+            // Represent rename deterministically in added (new) and deleted (old),
+            // and record changed.
+            added.insert(path.clone());
+            if !old_path.is_empty() {
+                deleted.insert(old_path);
+            }
+            changed.insert(path);
+            i += 1;
+            continue;
+        }
+
+        // Untracked files
+        if x == '?' && y == '?' {
+            untracked.insert(path);
+            i += 1;
+            continue;
+        }
+
+        // Added files
+        if x == 'A' || y == 'A' {
+            added.insert(path.clone());
+        }
+
+        // Deleted files
+        if x == 'D' || y == 'D' {
+            deleted.insert(path.clone());
+        }
+
+        // Modified files (staged or unstaged)
+        if x == 'M' || y == 'M' || x == 'T' || y == 'T' || x == 'U' || y == 'U' {
+            changed.insert(path.clone());
+        }
+
+        // Any tracked change (including added/deleted) is also a changed file
+        if (x != '?' && x != ' ') || (y != '?' && y != ' ') {
+            changed.insert(path);
+        }
+
+        i += 1;
+    }
+
+    (
+        changed.into_iter().collect(),
+        added.into_iter().collect(),
+        deleted.into_iter().collect(),
+        untracked.into_iter().collect(),
+    )
+}
 
 #[cfg(test)]
 mod tests {

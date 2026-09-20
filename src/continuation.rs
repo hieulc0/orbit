@@ -529,3 +529,175 @@ pub fn normalize_acp_process_exit(
         }
     }
 }
+
+/// Builds a provider-neutral continuation prompt for the next agent.
+///
+/// Instructs the receiving agent on:
+/// 1. The original task requirement
+/// 2. The previous agent's execution outcome and reason for continuation
+/// 3. The current repository state (changed, added, deleted, untracked files)
+/// 4. Recent validation results and diagnostics, if any
+/// 5. Standard continuation directives: inspect diff, keep valid work, fix defects, complete task
+///
+/// Note: Complete git diffs and raw logs are deliberately omitted from the prompt.
+/// The agent has direct access to the live workspace repository.
+pub fn build_handoff_prompt(
+    original_task: &str,
+    handoff_record: &HandoffRecord,
+    validation_summary: Option<&ValidationSummary>,
+) -> String {
+    use std::fmt::Write;
+    let mut prompt = String::new();
+
+    writeln!(
+        prompt,
+        "You are continuing an existing implementation attempt."
+    )
+    .unwrap();
+    writeln!(
+        prompt,
+        "
+Original task:
+{}",
+        original_task.trim()
+    )
+    .unwrap();
+    writeln!(
+        prompt,
+        "
+A previous coding agent worked on this repository."
+    )
+    .unwrap();
+    writeln!(prompt, "The current workspace contains that agent's changes. Do not discard those changes automatically.").unwrap();
+
+    let prev = &handoff_record.previous_execution;
+    writeln!(
+        prompt,
+        "
+Previous execution:"
+    )
+    .unwrap();
+    writeln!(prompt, "Agent: {}", prev.agent_type).unwrap();
+    if let Some(model) = &prev.model {
+        writeln!(prompt, "Model: {}", model).unwrap();
+    }
+    writeln!(prompt, "Termination: {:?}", prev.termination_reason).unwrap();
+    if let Some(msg) = &prev.message {
+        let trimmed_msg = if msg.len() > 500 {
+            &msg[..500]
+        } else {
+            msg.as_str()
+        };
+        writeln!(prompt, "Diagnostic: {}", trimmed_msg).unwrap();
+    }
+
+    let ws = &handoff_record.workspace;
+    writeln!(
+        prompt,
+        "
+Repository state:"
+    )
+    .unwrap();
+    writeln!(prompt, "Baseline: {}", ws.baseline_revision).unwrap();
+    if !ws.head_revision.is_empty() {
+        writeln!(prompt, "HEAD: {}", ws.head_revision).unwrap();
+    }
+
+    if !ws.changed_files.is_empty() {
+        writeln!(
+            prompt,
+            "
+Changed files:"
+        )
+        .unwrap();
+        for f in &ws.changed_files {
+            writeln!(prompt, "- {}", f).unwrap();
+        }
+    }
+    if !ws.added_files.is_empty() {
+        writeln!(
+            prompt,
+            "
+Added files:"
+        )
+        .unwrap();
+        for f in &ws.added_files {
+            writeln!(prompt, "- {}", f).unwrap();
+        }
+    }
+    if !ws.deleted_files.is_empty() {
+        writeln!(
+            prompt,
+            "
+Deleted files:"
+        )
+        .unwrap();
+        for f in &ws.deleted_files {
+            writeln!(prompt, "- {}", f).unwrap();
+        }
+    }
+    if !ws.untracked_files.is_empty() {
+        writeln!(
+            prompt,
+            "
+Untracked files:"
+        )
+        .unwrap();
+        for f in &ws.untracked_files {
+            writeln!(prompt, "- {}", f).unwrap();
+        }
+    }
+
+    let val = validation_summary.or(handoff_record.validation.as_ref());
+    if let Some(v) = val {
+        writeln!(
+            prompt,
+            "
+Latest validation:"
+        )
+        .unwrap();
+        writeln!(prompt, "Command: {}", v.command).unwrap();
+        writeln!(prompt, "Exit code: {}", v.exit_code).unwrap();
+        if let Some(summary) = &v.summary {
+            let bounded_summary = if summary.len() > 1000 {
+                &summary[..1000]
+            } else {
+                summary.as_str()
+            };
+            writeln!(
+                prompt,
+                "
+Failure summary:
+{}",
+                bounded_summary.trim()
+            )
+            .unwrap();
+        }
+    }
+
+    writeln!(
+        prompt,
+        "
+Instructions:"
+    )
+    .unwrap();
+    writeln!(prompt, "1. Inspect the existing repository and git diff.").unwrap();
+    writeln!(prompt, "2. Understand the previous changes before editing.").unwrap();
+    writeln!(prompt, "3. Keep correct existing work.").unwrap();
+    writeln!(prompt, "4. Correct incomplete or incorrect changes.").unwrap();
+    writeln!(prompt, "5. Complete the original task.").unwrap();
+    writeln!(prompt, "6. Run the required validation when possible.").unwrap();
+    writeln!(
+        prompt,
+        "
+The repository and Orbit validation evidence are authoritative."
+    )
+    .unwrap();
+    writeln!(
+        prompt,
+        "Do not assume the previous agent's implementation is correct."
+    )
+    .unwrap();
+
+    prompt
+}
