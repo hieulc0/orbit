@@ -803,3 +803,188 @@ pub fn fallback_trigger(
 
     None
 }
+
+/// Explicit action derived during crash recovery or reconciler passes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum ContinuationRecoveryAction {
+    /// No continuation action needed (e.g. terminal attempt, disabled policy, or attempt completed).
+    None,
+
+    /// Agent execution terminated, but external validation evidence is missing.
+    ResumeValidation { execution_id: String },
+
+    /// Validation failed or agent terminated with a fallback trigger, but handoff record is missing.
+    PrepareHandoff {
+        execution_id: String,
+        trigger: FallbackTrigger,
+    },
+
+    /// Handoff record exists and fallback agent needs to be launched.
+    StartFallback {
+        handoff_id: String,
+        sequence: u32,
+        agent: String,
+    },
+
+    /// A fallback execution is already pending and needs to be claimed/launched.
+    ClaimPendingExecution { execution_id: String, sequence: u32 },
+
+    /// An execution is currently marked running; verify worker/lease liveness.
+    ReconcileRunningExecution { execution_id: String },
+
+    /// Fallback budget exhausted, safety exclusion met, or workspace unrecoverable.
+    FinalizeFailure { reason: String },
+}
+
+/// Pure deterministic decision function for continuation crash recovery.
+///
+/// Derives the next continuation action strictly from durable state:
+/// - Attempt status and cancellation
+/// - Sequence of persisted AgentExecutions
+/// - Persisted ValidationSummary records
+/// - Persisted HandoffRecords
+/// - FallbackPolicy
+///
+/// Ensures idempotency, bounded executions (max = 2), and fail-closed safety.
+pub fn continuation_recovery_action(
+    attempt_state: &crate::model::State,
+    executions: &[AgentExecution],
+    validations: &[ValidationSummary],
+    handoffs: &[HandoffRecord],
+    policy: &FallbackPolicy,
+    current_workspace_diff_sha256: Option<&str>,
+) -> ContinuationRecoveryAction {
+    // 1. Terminal Attempt Protection: If Attempt is terminal, recovery is a no-op.
+    if attempt_state.terminal() {
+        return ContinuationRecoveryAction::None;
+    }
+
+    // 2. Cancellation has absolute priority.
+    if *attempt_state == crate::model::State::CancelRequested
+        || *attempt_state == crate::model::State::Cancelled
+    {
+        return ContinuationRecoveryAction::None;
+    }
+
+    // 3. If continuation is disabled, do not perform any continuation recovery.
+    if !policy.enabled {
+        return ContinuationRecoveryAction::None;
+    }
+
+    // 4. If no executions exist yet, initial primary agent has not started.
+    let last_exec = match executions.last() {
+        Some(e) => e,
+        None => return ContinuationRecoveryAction::None,
+    };
+
+    // If any execution was cancelled, cancel continuation immediately.
+    if last_exec.status == AgentExecutionStatus::Interrupted
+        && last_exec.termination_reason == Some(TerminationReason::Cancelled)
+    {
+        return ContinuationRecoveryAction::None;
+    }
+
+    // 5. Check if the latest execution is still Running or Pending.
+    if last_exec.status == AgentExecutionStatus::Running {
+        return ContinuationRecoveryAction::ReconcileRunningExecution {
+            execution_id: last_exec.execution_id.clone(),
+        };
+    }
+
+    if last_exec.status == AgentExecutionStatus::Pending {
+        return ContinuationRecoveryAction::ClaimPendingExecution {
+            execution_id: last_exec.execution_id.clone(),
+            sequence: last_exec.sequence,
+        };
+    }
+
+    // 6. Latest execution is terminal.
+    // If the latest execution succeeded and passed validation, attempt is complete!
+    let matching_val = validations
+        .iter()
+        .find(|v| v.summary.as_deref().is_some() || v.exit_code == 0 || v.exit_code != 0);
+
+    // If sequence == 2 (fallback already ran) or executions >= max_executions
+    if last_exec.sequence >= policy.max_executions
+        || executions.len() as u32 >= policy.max_executions
+    {
+        if last_exec.status == AgentExecutionStatus::Completed
+            && matching_val.is_some_and(|v| v.exit_code == 0)
+        {
+            return ContinuationRecoveryAction::None;
+        }
+        return ContinuationRecoveryAction::FinalizeFailure {
+            reason: format!(
+                "Max executions reached ({}/{}); fallback budget exhausted",
+                executions.len(),
+                policy.max_executions
+            ),
+        };
+    }
+
+    // 7. Sequence == 1: Evaluate fallback trigger.
+    let trigger = fallback_trigger(last_exec, matching_val, policy);
+
+    let Some(trigger) = trigger else {
+        // If primary succeeded and validation passed, no action needed (will finalize success)
+        if last_exec.status == AgentExecutionStatus::Completed
+            && matching_val.is_some_and(|v| v.exit_code == 0)
+        {
+            return ContinuationRecoveryAction::None;
+        }
+
+        // If primary finished but validation has not run yet:
+        if matching_val.is_none() && last_exec.status == AgentExecutionStatus::Completed {
+            return ContinuationRecoveryAction::ResumeValidation {
+                execution_id: last_exec.execution_id.clone(),
+            };
+        }
+
+        // Otherwise, terminated with a reason that is excluded from fallback (e.g. CredentialError, Cancelled)
+        return ContinuationRecoveryAction::FinalizeFailure {
+            reason: format!(
+                "Agent execution terminated with {:?}; not eligible for fallback",
+                last_exec.termination_reason
+            ),
+        };
+    };
+
+    // 8. Fallback triggered: Check if HandoffRecord exists.
+    let existing_handoff = handoffs
+        .iter()
+        .find(|h| h.from_execution_id == last_exec.execution_id);
+
+    let Some(handoff) = existing_handoff else {
+        return ContinuationRecoveryAction::PrepareHandoff {
+            execution_id: last_exec.execution_id.clone(),
+            trigger,
+        };
+    };
+
+    // 9. Workspace Staleness Check:
+    // If a current workspace diff SHA is provided, verify it matches the persisted handoff.
+    if let (Some(current_sha), Some(expected_sha)) = (
+        current_workspace_diff_sha256,
+        handoff.workspace.diff_sha256.as_deref(),
+    ) && current_sha != expected_sha
+    {
+        return ContinuationRecoveryAction::FinalizeFailure {
+            reason: format!(
+                "Workspace drift detected: expected diff digest {expected_sha}, found {current_sha}"
+            ),
+        };
+    }
+
+    // 10. Handoff is ready and valid: Start fallback agent with sequence = 2
+    let fallback_agent = policy
+        .fallback_agent
+        .clone()
+        .unwrap_or_else(|| "codex".into());
+
+    ContinuationRecoveryAction::StartFallback {
+        handoff_id: handoff.from_execution_id.clone(),
+        sequence: last_exec.sequence + 1,
+        agent: fallback_agent,
+    }
+}

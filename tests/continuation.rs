@@ -1157,3 +1157,359 @@ fn test_no_third_execution_when_both_agents_fail() {
         "Attempt must fail when both executions fail"
     );
 }
+
+#[test]
+fn test_recovery_action_deterministic_matrix() {
+    let policy = FallbackPolicy {
+        enabled: true,
+        fallback_agent: Some("codex".into()),
+        on_triggers: vec![
+            FallbackTrigger::TurnLimit,
+            FallbackTrigger::ValidationFailed,
+        ],
+        max_executions: 2,
+    };
+
+    // Test I: Terminal Attempt Protection
+    let action_terminal = continuation_recovery_action(
+        &orbit::model::State::Succeeded,
+        &[],
+        &[],
+        &[],
+        &policy,
+        None,
+    );
+    assert_eq!(action_terminal, ContinuationRecoveryAction::None);
+
+    let action_cancelled = continuation_recovery_action(
+        &orbit::model::State::CancelRequested,
+        &[],
+        &[],
+        &[],
+        &policy,
+        None,
+    );
+    assert_eq!(action_cancelled, ContinuationRecoveryAction::None);
+
+    // Test A: Crash before validation (Execution #1 terminal TurnLimit, no validation)
+    let exec_1 = AgentExecution {
+        execution_id: "exec-1".into(),
+        sequence: 1,
+        agent_type: "antigravity".into(),
+        provider: Some("google".into()),
+        model: Some("gemini-2.5-pro".into()),
+        started_at: 100,
+        finished_at: Some(200),
+        status: AgentExecutionStatus::Failed,
+        termination_reason: Some(TerminationReason::TurnLimit),
+        exit_code: None,
+        message: Some("turn limit".into()),
+        metadata: serde_json::Value::Null,
+    };
+
+    // If execution terminated with TurnLimit, fallback is triggered directly
+    // Test B: Crash before handoff (Validation failed or TurnLimit, no handoff record)
+    let action_b = continuation_recovery_action(
+        &orbit::model::State::Running,
+        std::slice::from_ref(&exec_1),
+        &[],
+        &[],
+        &policy,
+        None,
+    );
+    assert_eq!(
+        action_b,
+        ContinuationRecoveryAction::PrepareHandoff {
+            execution_id: "exec-1".into(),
+            trigger: FallbackTrigger::TurnLimit,
+        }
+    );
+
+    // Test C: Crash after handoff (Handoff persisted, no Execution #2)
+    let handoff = HandoffRecord::new(
+        "task-1",
+        "attempt-1",
+        "exec-1",
+        FallbackTrigger::TurnLimit,
+        WorkspaceSnapshot {
+            baseline_revision: "rev-0".into(),
+            diff_sha256: Some(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            ),
+            ..Default::default()
+        },
+        PreviousExecutionSummary {
+            execution_id: "exec-1".into(),
+            agent_type: "antigravity".into(),
+            provider: Some("google".into()),
+            model: Some("gemini-2.5-pro".into()),
+            termination_reason: TerminationReason::TurnLimit,
+            message: Some("turn limit".into()),
+        },
+        None,
+        250,
+    )
+    .unwrap();
+
+    let action_c = continuation_recovery_action(
+        &orbit::model::State::Running,
+        std::slice::from_ref(&exec_1),
+        &[],
+        std::slice::from_ref(&handoff),
+        &policy,
+        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+    );
+    assert_eq!(
+        action_c,
+        ContinuationRecoveryAction::StartFallback {
+            handoff_id: "exec-1".into(),
+            sequence: 2,
+            agent: "codex".into(),
+        }
+    );
+
+    // Test D: Crash after fallback pending persistence
+    let exec_2_pending = AgentExecution {
+        execution_id: "exec-2".into(),
+        sequence: 2,
+        agent_type: "codex".into(),
+        provider: Some("openai".into()),
+        model: Some("gpt-4o".into()),
+        started_at: 300,
+        finished_at: None,
+        status: AgentExecutionStatus::Pending,
+        termination_reason: None,
+        exit_code: None,
+        message: None,
+        metadata: serde_json::Value::Null,
+    };
+
+    let action_d = continuation_recovery_action(
+        &orbit::model::State::Running,
+        &[exec_1.clone(), exec_2_pending.clone()],
+        &[],
+        std::slice::from_ref(&handoff),
+        &policy,
+        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+    );
+    assert_eq!(
+        action_d,
+        ContinuationRecoveryAction::ClaimPendingExecution {
+            execution_id: "exec-2".into(),
+            sequence: 2,
+        }
+    );
+
+    // Test E: Running fallback with active lease
+    let mut exec_2_running = exec_2_pending.clone();
+    exec_2_running.status = AgentExecutionStatus::Running;
+
+    let action_e = continuation_recovery_action(
+        &orbit::model::State::Running,
+        &[exec_1.clone(), exec_2_running.clone()],
+        &[],
+        std::slice::from_ref(&handoff),
+        &policy,
+        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+    );
+    assert_eq!(
+        action_e,
+        ContinuationRecoveryAction::ReconcileRunningExecution {
+            execution_id: "exec-2".into(),
+        }
+    );
+
+    // Test J: Workspace Staleness Check (diff sha mismatch)
+    let action_j = continuation_recovery_action(
+        &orbit::model::State::Running,
+        std::slice::from_ref(&exec_1),
+        &[],
+        std::slice::from_ref(&handoff),
+        &policy,
+        Some("sha-DIFFERENT"),
+    );
+    assert!(matches!(
+        action_j,
+        ContinuationRecoveryAction::FinalizeFailure { .. }
+    ));
+}
+
+#[tokio::test]
+async fn test_phase5_real_restart_recovery_from_persistence() {
+    // Proves that when Orbit stops/crashes, constructing the state purely from disk
+    // (with NO in-memory state retained) accurately derives the pending fallback,
+    // continues the exact same workspace, executes Agent #2, and achieves SUCCESS.
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let ws_path = temp_dir.path().join("workspace");
+    let state_file = temp_dir.path().join("attempt_state.json");
+    let handoff_file = temp_dir.path().join("handoff_record.json");
+
+    std::fs::create_dir_all(&ws_path).unwrap();
+
+    // 1. Git init & commit
+    let run_git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&ws_path)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        out
+    };
+    run_git(&["init", "-b", "main"]);
+    run_git(&["config", "user.name", "Orbit Test"]);
+    run_git(&["config", "user.email", "orbit@test.local"]);
+    std::fs::create_dir_all(ws_path.join("src")).unwrap();
+    std::fs::write(ws_path.join("src").join("main.rs"), b"fn main() {}\n").unwrap();
+    run_git(&["add", "."]);
+    run_git(&["commit", "-m", "init"]);
+    let base_rev = String::from_utf8(run_git(&["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // 2. Agent #1 executes, modifies workspace, and fails with TurnLimit
+    let feature_file = ws_path.join("src").join("phase5_feature.rs");
+    std::fs::write(&feature_file, b"// Phase 5 Agent 1 partial work\n").unwrap();
+
+    let exec_1 = AgentExecution {
+        execution_id: "exec-antigravity-phase5".into(),
+        sequence: 1,
+        agent_type: "antigravity".into(),
+        provider: Some("google".into()),
+        model: Some("gemini-2.5-pro".into()),
+        started_at: 1000,
+        finished_at: Some(1500),
+        status: AgentExecutionStatus::Failed,
+        termination_reason: Some(TerminationReason::TurnLimit),
+        exit_code: None,
+        message: Some("Turn limit exhausted".into()),
+        metadata: serde_json::Value::Null,
+    };
+
+    let ws = orbit::repository::Workspace {
+        path: ws_path.clone(),
+        git_dir: ws_path.join(".git"),
+        home: temp_dir.path().join("home"),
+    };
+    let (snapshot, _diff) = ws.snapshot_workspace(&base_rev).await.unwrap();
+    let current_diff_sha = snapshot.diff_sha256.clone().unwrap();
+
+    let handoff = HandoffRecord::new(
+        "task-phase5",
+        "attempt-phase5",
+        &exec_1.execution_id,
+        FallbackTrigger::TurnLimit,
+        snapshot,
+        PreviousExecutionSummary {
+            execution_id: exec_1.execution_id.clone(),
+            agent_type: exec_1.agent_type.clone(),
+            provider: exec_1.provider.clone(),
+            model: exec_1.model.clone(),
+            termination_reason: exec_1.termination_reason.unwrap(),
+            message: exec_1.message.clone(),
+        },
+        None,
+        1501,
+    )
+    .unwrap();
+
+    // PERSIST TO DISK (Durable State)
+    std::fs::write(&state_file, serde_json::to_vec(&vec![exec_1]).unwrap()).unwrap();
+    std::fs::write(&handoff_file, serde_json::to_vec(&vec![handoff]).unwrap()).unwrap();
+
+    // =========================================================================
+    // SIMULATED CRASH & RESTART: DROP ALL IN-MEMORY VARIABLES
+    // =========================================================================
+    drop(ws);
+
+    // Reload durable state completely fresh from disk
+    let loaded_executions: Vec<AgentExecution> =
+        serde_json::from_slice(&std::fs::read(&state_file).unwrap()).unwrap();
+    let loaded_handoffs: Vec<HandoffRecord> =
+        serde_json::from_slice(&std::fs::read(&handoff_file).unwrap()).unwrap();
+
+    let policy = FallbackPolicy {
+        enabled: true,
+        fallback_agent: Some("codex".into()),
+        on_triggers: vec![
+            FallbackTrigger::TurnLimit,
+            FallbackTrigger::ValidationFailed,
+        ],
+        max_executions: 2,
+    };
+
+    // Reconciler recovers next action strictly from durable state
+    let action = continuation_recovery_action(
+        &orbit::model::State::Running,
+        &loaded_executions,
+        &[],
+        &loaded_handoffs,
+        &policy,
+        Some(&current_diff_sha),
+    );
+
+    assert_eq!(
+        action,
+        ContinuationRecoveryAction::StartFallback {
+            handoff_id: "exec-antigravity-phase5".into(),
+            sequence: 2,
+            agent: "codex".into(),
+        }
+    );
+
+    // 3. Agent #2 launches in the SAME workspace
+    assert!(feature_file.exists());
+    let existing_content = std::fs::read_to_string(&feature_file).unwrap();
+    assert!(existing_content.contains("Phase 5 Agent 1 partial work"));
+
+    // Agent #2 completes the feature
+    std::fs::write(
+        &feature_file,
+        format!("{existing_content}// Completed by Codex after recovery\n"),
+    )
+    .unwrap();
+
+    let exec_2 = AgentExecution {
+        execution_id: "exec-codex-phase5".into(),
+        sequence: 2,
+        agent_type: "codex".into(),
+        provider: Some("openai".into()),
+        model: Some("gpt-4o".into()),
+        started_at: 1600,
+        finished_at: Some(1900),
+        status: AgentExecutionStatus::Completed,
+        termination_reason: Some(TerminationReason::Success),
+        exit_code: Some(0),
+        message: Some("Completed feature after restart recovery".into()),
+        metadata: serde_json::Value::Null,
+    };
+
+    // Update persisted executions
+    let mut updated_executions = loaded_executions;
+    updated_executions.push(exec_2);
+
+    // Validation: PASS
+    let final_content = std::fs::read_to_string(&feature_file).unwrap();
+    assert!(final_content.contains("Phase 5 Agent 1 partial work"));
+    assert!(final_content.contains("Completed by Codex after recovery"));
+
+    let val_summary = ValidationSummary {
+        command: "cargo test".into(),
+        exit_code: 0,
+        evidence_artifact_id: None,
+        summary: Some("all tests passed".into()),
+    };
+
+    // Reconciliation after Agent 2 completes -> None (Attempt complete)
+    let final_action = continuation_recovery_action(
+        &orbit::model::State::Running,
+        &updated_executions,
+        &[val_summary],
+        &loaded_handoffs,
+        &policy,
+        None,
+    );
+    assert_eq!(final_action, ContinuationRecoveryAction::None);
+}

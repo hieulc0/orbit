@@ -846,7 +846,42 @@ impl Run {
         let mut value = serde_json::to_value(self).unwrap();
         for task in value["tasks"].as_array_mut().unwrap() {
             for attempt in task["attempts"].as_array_mut().unwrap() {
-                attempt.as_object_mut().unwrap().remove("token");
+                let obj = attempt.as_object_mut().unwrap();
+                obj.remove("token");
+                let executions = obj.get("agent_executions").and_then(|v| v.as_array());
+                let continuation_state = match executions {
+                    Some(execs) if !execs.is_empty() => {
+                        let last = execs.last().unwrap();
+                        let status = last.get("status").and_then(|s| s.as_str()).unwrap_or("");
+                        let seq = last.get("sequence").and_then(|s| s.as_u64()).unwrap_or(1);
+                        if status == "running" {
+                            serde_json::json!({
+                                "state": "fallback_running",
+                                "sequence": seq,
+                                "execution_id": last.get("execution_id")
+                            })
+                        } else if status == "completed" {
+                            serde_json::json!({
+                                "state": "completed",
+                                "sequence": seq
+                            })
+                        } else if seq == 1 {
+                            serde_json::json!({
+                                "state": "fallback_pending",
+                                "next_sequence": 2
+                            })
+                        } else {
+                            serde_json::json!({
+                                "state": "exhausted",
+                                "sequence": seq
+                            })
+                        }
+                    }
+                    _ => serde_json::json!({
+                        "state": "not_configured"
+                    }),
+                };
+                obj.insert("continuation".into(), continuation_state);
             }
         }
         value
