@@ -114,6 +114,7 @@ fn handoff_record_roundtrip_v1() {
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
         ),
         diff_artifact_id: Some("art-diff-001".into()),
+        diff_bytes: Some(1024),
     };
 
     let prev = PreviousExecutionSummary {
@@ -514,6 +515,7 @@ fn test_handoff_prompt_builder_structure_and_bounds() {
         untracked_files: vec!["tests/integration.rs".into()],
         diff_sha256: Some("a".repeat(64)),
         diff_artifact_id: Some("art-diff-001".into()),
+        diff_bytes: Some(1024),
     };
 
     let prev = PreviousExecutionSummary {
@@ -717,6 +719,7 @@ fn test_fallback_orchestration_boundary_and_invariants() {
         untracked_files: vec![],
         diff_sha256: Some("e".repeat(64)),
         diff_artifact_id: Some("art-diff-001".into()),
+        diff_bytes: Some(1024),
     };
 
     let exec_1 = AgentExecution {

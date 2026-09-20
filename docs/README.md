@@ -16,6 +16,7 @@ not the source of current setup instructions.
   offline workflow evidence and live acceptance gaps
 - [ACP installation preflight](guides/acp-preflight.md) — credential-free probe,
   not workflow execution
+- [Cross-agent continuation and workspace snapshots](guides/continuation.md)
 - [Operations console and definition studio](guides/console.md)
 - [Timers and signals](reference/timers-signals.md)
 - [Child runs, fan-out and limits](reference/children-limits.md)

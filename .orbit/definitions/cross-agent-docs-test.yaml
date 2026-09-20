@@ -1,0 +1,83 @@
+apiVersion: orbit/v1
+kind: Definition
+metadata:
+  name: cross-agent-docs-test
+inputs:
+  repository_id: orbit
+  base_revision: 78174688aaa37edaee05369988af66334a57454b
+  task: "Document the cross-agent continuation feature in docs/guides/continuation.md and link it in docs/README.md. Create docs/guides/continuation.md with an explanation of cross-agent continuation fallback and workspace snapshots. Then update docs/README.md to include the link."
+steps:
+  code:
+    uses: repository.code
+    needs: []
+    recovery_policy: restart_from_inputs
+    max_attempts: 2
+    retry_backoff_seconds: 5
+    timeout_seconds: 900
+    resources:
+      cpu_millis: 2000
+      memory_mib: 4096
+      gpu: 0
+    execution:
+      isolation: trusted
+      filesystem: workspace
+      network: none
+    agent:
+      identity: antigravity-primary
+      binding: antigravity-acp-v1
+      permissions:
+        - workspace.read
+        - workspace.write
+        - shell.execute
+      tools:
+        - read_file
+        - write_file
+        - shell
+      output: object
+      context: {}
+      budget:
+        calls: 33
+      max_delegations: 0
+      acp_limits:
+        prompt_turns: 1
+        broker_calls: 32
+        reported_tool_calls: 64
+        turn_timeout_seconds: 600
+        terminal_timeout_seconds: 30
+        terminal_runtime_seconds: 600
+        output_bytes: 1048576
+  test:
+    uses: repository.test
+    needs:
+      - code
+    recovery_policy: restart_from_inputs
+    max_attempts: 2
+    retry_backoff_seconds: 5
+    timeout_seconds: 600
+    resources:
+      cpu_millis: 1000
+      memory_mib: 512
+      gpu: 0
+    execution:
+      isolation: trusted
+      filesystem: workspace
+      network: none
+    commands:
+      - argv:
+          - sh
+          - -c
+          - "test -f docs/guides/continuation.md && git diff --name-only | grep docs"
+        cwd: .
+        timeout_seconds: 60
+  review:
+    uses: human.approval
+    needs:
+      - test
+    recovery_policy: restart_from_inputs
+    max_attempts: 1
+    retry_backoff_seconds: 0
+    timeout_seconds: 86400
+    approval:
+      prompt: "Review the documentation patch produced by cross-agent continuation."
+      assignees:
+        - operator

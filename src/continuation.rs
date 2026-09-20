@@ -104,6 +104,24 @@ pub struct AgentExecution {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capability_source: Option<crate::acp_capabilities::CapabilitySource>,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<crate::telemetry::AgentUsageSummary>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_count: Option<u64>,
+
+    #[serde(default)]
+    pub tool_call_count: u64,
+
+    #[serde(default)]
+    pub tool_success_count: u64,
+
+    #[serde(default)]
+    pub tool_failure_count: u64,
+
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub tool_counts: std::collections::BTreeMap<String, u64>,
+
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub metadata: serde_json::Value,
 }
@@ -145,6 +163,8 @@ pub struct WorkspaceSnapshot {
     pub diff_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff_artifact_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_bytes: Option<u64>,
 }
 
 impl WorkspaceSnapshot {
@@ -419,6 +439,12 @@ impl NormalizedAgentResult {
             runtime_image: None,
             runtime_digest: None,
             capability_source: None,
+            usage: None,
+            turn_count: None,
+            tool_call_count: 0,
+            tool_success_count: 0,
+            tool_failure_count: 0,
+            tool_counts: std::collections::BTreeMap::new(),
             metadata: self.metadata,
         }
     }

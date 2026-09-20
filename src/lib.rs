@@ -30,3 +30,4 @@ pub mod run_export;
 pub mod sdk;
 pub mod worker;
 pub mod workspace;
+pub mod telemetry;

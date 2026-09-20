@@ -251,6 +251,7 @@ impl Workspace {
 
         let diff_sha256 = crate::model::digest(&diff_bytes);
 
+        let diff_len = diff_bytes.len() as u64;
         let snapshot = crate::continuation::WorkspaceSnapshot {
             baseline_revision: baseline_revision.to_string(),
             head_revision,
@@ -260,6 +261,7 @@ impl Workspace {
             untracked_files: untracked,
             diff_sha256: Some(diff_sha256),
             diff_artifact_id: None,
+            diff_bytes: Some(diff_len),
         };
 
         Ok((snapshot, diff_bytes))

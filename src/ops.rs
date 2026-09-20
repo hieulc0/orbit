@@ -18,6 +18,14 @@ pub struct Operations {
     requests: [AtomicU64; 6],
     reconciliations: AtomicU64,
     reconciliation_errors: AtomicU64,
+    pub agent_executions_total: AtomicU64,
+    pub agent_execution_duration_seconds: AtomicU64,
+    pub agent_tool_calls_total: AtomicU64,
+    pub agent_tool_failures_total: AtomicU64,
+    pub agent_input_tokens_total: AtomicU64,
+    pub agent_output_tokens_total: AtomicU64,
+    pub agent_continuations_total: AtomicU64,
+    pub agent_terminations_total: AtomicU64,
 }
 impl Default for Operations {
     fn default() -> Self {
@@ -29,6 +37,14 @@ impl Default for Operations {
             requests: std::array::from_fn(|_| AtomicU64::new(0)),
             reconciliations: AtomicU64::new(0),
             reconciliation_errors: AtomicU64::new(0),
+            agent_executions_total: AtomicU64::new(0),
+            agent_execution_duration_seconds: AtomicU64::new(0),
+            agent_tool_calls_total: AtomicU64::new(0),
+            agent_tool_failures_total: AtomicU64::new(0),
+            agent_input_tokens_total: AtomicU64::new(0),
+            agent_output_tokens_total: AtomicU64::new(0),
+            agent_continuations_total: AtomicU64::new(0),
+            agent_terminations_total: AtomicU64::new(0),
         }
     }
 }
@@ -70,7 +86,34 @@ impl Operations {
                 self.requests[class].load(Ordering::Relaxed)
             ));
         }
-        text
+                text.push_str(&format!(
+            "# TYPE orbit_agent_executions_total counter
+orbit_agent_executions_total {}
+# TYPE orbit_agent_execution_duration_seconds counter
+orbit_agent_execution_duration_seconds {}
+# TYPE orbit_agent_tool_calls_total counter
+orbit_agent_tool_calls_total {}
+# TYPE orbit_agent_tool_failures_total counter
+orbit_agent_tool_failures_total {}
+# TYPE orbit_agent_input_tokens_total counter
+orbit_agent_input_tokens_total {}
+# TYPE orbit_agent_output_tokens_total counter
+orbit_agent_output_tokens_total {}
+# TYPE orbit_agent_continuations_total counter
+orbit_agent_continuations_total {}
+# TYPE orbit_agent_terminations_total counter
+orbit_agent_terminations_total {}
+",
+            self.agent_executions_total.load(Ordering::Relaxed),
+            self.agent_execution_duration_seconds.load(Ordering::Relaxed),
+            self.agent_tool_calls_total.load(Ordering::Relaxed),
+            self.agent_tool_failures_total.load(Ordering::Relaxed),
+            self.agent_input_tokens_total.load(Ordering::Relaxed),
+            self.agent_output_tokens_total.load(Ordering::Relaxed),
+            self.agent_continuations_total.load(Ordering::Relaxed),
+            self.agent_terminations_total.load(Ordering::Relaxed)
+        ));
+text
     }
 }
 

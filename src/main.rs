@@ -25,10 +25,11 @@ struct Cli {
     #[command(subcommand)]
     command: Commands,
 }
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Output {
     Json,
     Jsonl,
+    Text,
 }
 fn scope_query(scope: Option<&str>) -> Result<String> {
     if let Some(value) = scope {
@@ -248,6 +249,8 @@ enum Commands {
     },
     Inspect {
         run_id: String,
+        #[arg(long)]
+        json: bool,
     },
     Events {
         run_id: String,
@@ -341,7 +344,7 @@ async fn main() -> Result<()> {
         let config: orbit::acp::ProbeConfig = serde_json::from_slice(&bytes)?;
         let value = orbit::acp::probe(&config, workspaces).await?;
         match output_format {
-            Output::Json => println!("{}", serde_json::to_string_pretty(&value)?),
+            Output::Json | Output::Text => println!("{}", serde_json::to_string_pretty(&value)?),
             Output::Jsonl => println!("{}", serde_json::to_string(&value)?),
         }
         return Ok(());
@@ -662,7 +665,13 @@ async fn main() -> Result<()> {
             limits.validate()?;
             client.post("/limits", &limits).await?
         }
-        Commands::Inspect { run_id } => client.get(&format!("/runs/{run_id}")).await?,
+        Commands::Inspect { run_id, json } => {
+            let val = client.get(&format!("/runs/{run_id}")).await?;
+            if !json && output_format != Output::Jsonl {
+                output_format = Output::Text;
+            }
+            val
+        }
         Commands::ExportRun {
             run_id,
             output,
@@ -808,6 +817,7 @@ async fn main() -> Result<()> {
         }
     };
     match output_format {
+        Output::Text => print!("{}", orbit::telemetry::format_inspect_human(&value)),
         Output::Json => println!("{}", serde_json::to_string_pretty(&value)?),
         Output::Jsonl => {
             if let Some(rows) = value.as_array() {
