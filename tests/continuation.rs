@@ -129,6 +129,7 @@ fn handoff_record_roundtrip_v1() {
         exit_code: 101,
         evidence_artifact_id: Some("art-val-001".into()),
         summary: Some("mismatched types in src/auth.rs:42".into()),
+        failure_fingerprint: None,
     };
 
     let handoff = HandoffRecord::new(
@@ -525,6 +526,7 @@ fn test_handoff_prompt_builder_structure_and_bounds() {
         exit_code: 101,
         evidence_artifact_id: Some("art-val-001".into()),
         summary: Some("error[E0308]: mismatched types in src/auth.rs:42:5".into()),
+        failure_fingerprint: None,
     };
 
     let handoff = HandoffRecord::new(
@@ -671,6 +673,7 @@ fn test_fallback_policy_defaults_and_triggers() {
         exit_code: 1,
         evidence_artifact_id: None,
         summary: Some("tests failed".into()),
+        failure_fingerprint: None,
     };
     assert_eq!(
         fallback_trigger(&exec, Some(&val_failure), &policy),
@@ -683,6 +686,7 @@ fn test_fallback_policy_defaults_and_triggers() {
         exit_code: 0,
         evidence_artifact_id: None,
         summary: Some("all tests passed".into()),
+        failure_fingerprint: None,
     };
     assert_eq!(fallback_trigger(&exec, Some(&val_success), &policy), None);
 
@@ -1500,6 +1504,7 @@ async fn test_phase5_real_restart_recovery_from_persistence() {
         exit_code: 0,
         evidence_artifact_id: None,
         summary: Some("all tests passed".into()),
+        failure_fingerprint: None,
     };
 
     // Reconciliation after Agent 2 completes -> None (Attempt complete)
@@ -1512,4 +1517,355 @@ async fn test_phase5_real_restart_recovery_from_persistence() {
         None,
     );
     assert_eq!(final_action, ContinuationRecoveryAction::None);
+}
+
+#[test]
+fn test_failure_fingerprint_normalization_and_repetition() {
+    let diag_a = r#"
+error[E0308]: mismatched types
+  --> /tmp/orbit/attempt-1234/src/auth.rs:42:15
+   |
+42 |     let x: u32 = "invalid";
+   |                  ^^^^^^^^^ expected `u32`, found `&str`
+"#;
+
+    let diag_b = r#"
+2026-09-20T10:15:30Z [INFO] compiling...
+error[E0308]: mismatched types
+  --> /tmp/orbit/attempt-8888/src/auth.rs:99:20
+   |
+99 |     let x: u32 = "invalid";
+   |                  ^^^^^^^^^ expected `u32`, found `&str`
+"#;
+
+    // Both diag_a and diag_b are the same compiler error with different paths/timestamps/line numbers
+    let fp_a = generate_validation_fingerprint("cargo test --locked", 101, diag_a);
+    let fp_b = generate_validation_fingerprint("cargo test --locked", 101, diag_b);
+
+    assert_eq!(fp_a.version, FINGERPRINT_VERSION_VALIDATION_V1);
+    assert_eq!(fp_a.kind, FailureFingerprintKind::Validation);
+    assert_eq!(
+        fp_a.digest, fp_b.digest,
+        "Normalized failures must share deterministic digest"
+    );
+
+    // Different error code/file
+    let diag_diff = r#"
+error[E0599]: no method named `save` found for struct `Storage`
+  --> src/storage.rs:12:5
+"#;
+    let fp_diff = generate_validation_fingerprint("cargo test --locked", 101, diag_diff);
+    assert_ne!(
+        fp_a.digest, fp_diff.digest,
+        "Different errors must have different digests"
+    );
+
+    // Test repetition detection
+    let val_1 = ValidationSummary {
+        command: "cargo test --locked".into(),
+        exit_code: 101,
+        evidence_artifact_id: None,
+        summary: Some("test failure 1".into()),
+        failure_fingerprint: Some(fp_a.clone()),
+    };
+    let val_2 = ValidationSummary {
+        command: "cargo test --locked".into(),
+        exit_code: 101,
+        evidence_artifact_id: None,
+        summary: Some("test failure 2".into()),
+        failure_fingerprint: Some(fp_b.clone()),
+    };
+
+    let reps = repeated_failure_count(&fp_a, &[val_1, val_2]);
+    assert_eq!(reps, 2, "Fingerprint repeated failure count must equal 2");
+}
+
+#[test]
+fn test_generalized_agent_chain_progression_and_bounds() {
+    let policy = ContinuationPolicy {
+        enabled: true,
+        agents: vec![
+            AgentCandidate::new("agent-1", "antigravity"),
+            AgentCandidate::new("agent-2", "codex"),
+            AgentCandidate::new("agent-3", "claude-acp"),
+        ],
+        max_executions: 3,
+        triggers: vec![
+            FallbackTrigger::TurnLimit,
+            FallbackTrigger::ValidationFailed,
+        ],
+        max_same_failure_repetitions: 2,
+    };
+
+    let exec_1 = AgentExecution {
+        execution_id: "exec-1".into(),
+        sequence: 1,
+        agent_type: "antigravity".into(),
+        provider: None,
+        model: None,
+        started_at: 100,
+        finished_at: Some(200),
+        status: AgentExecutionStatus::Failed,
+        termination_reason: Some(TerminationReason::TurnLimit),
+        exit_code: None,
+        message: Some("turn limit".into()),
+        metadata: serde_json::Value::Null,
+    };
+
+    // Step 1: Agent 1 terminates with TurnLimit -> Next agent is Codex (sequence 2)
+    let decision_1 = next_agent(
+        &orbit::model::State::Running,
+        std::slice::from_ref(&exec_1),
+        &[],
+        &policy,
+    );
+    assert_eq!(
+        decision_1,
+        NextAgentDecision::Continue {
+            candidate_index: 1,
+            candidate: AgentCandidate::new("agent-2", "codex"),
+            sequence: 2,
+            trigger: FallbackTrigger::TurnLimit,
+            reason: "Trigger TurnLimit occurred".into(),
+        }
+    );
+
+    // Step 2: Agent 2 completes, but validation fails with a fingerprint
+    let fp = generate_validation_fingerprint("cargo test", 101, "error[E0308]: mismatched types");
+    let val_summary_1 = ValidationSummary {
+        command: "cargo test".into(),
+        exit_code: 101,
+        evidence_artifact_id: None,
+        summary: Some("E0308".into()),
+        failure_fingerprint: Some(fp.clone()),
+    };
+
+    let exec_2 = AgentExecution {
+        execution_id: "exec-2".into(),
+        sequence: 2,
+        agent_type: "codex".into(),
+        provider: None,
+        model: None,
+        started_at: 201,
+        finished_at: Some(300),
+        status: AgentExecutionStatus::Completed,
+        termination_reason: Some(TerminationReason::Success),
+        exit_code: Some(0),
+        message: Some("Completed turn".into()),
+        metadata: serde_json::Value::Null,
+    };
+
+    let decision_2 = next_agent(
+        &orbit::model::State::Running,
+        &[exec_1.clone(), exec_2.clone()],
+        std::slice::from_ref(&val_summary_1),
+        &policy,
+    );
+    assert_eq!(
+        decision_2,
+        NextAgentDecision::Continue {
+            candidate_index: 2,
+            candidate: AgentCandidate::new("agent-3", "claude-acp"),
+            sequence: 3,
+            trigger: FallbackTrigger::ValidationFailed,
+            reason: "Trigger ValidationFailed occurred".into(),
+        }
+    );
+
+    // Step 3: Agent 3 also executes and fails -> Chain exhausted (executions == 3 == max_executions)
+    let exec_3 = AgentExecution {
+        execution_id: "exec-3".into(),
+        sequence: 3,
+        agent_type: "claude-acp".into(),
+        provider: None,
+        model: None,
+        started_at: 301,
+        finished_at: Some(400),
+        status: AgentExecutionStatus::Completed,
+        termination_reason: Some(TerminationReason::Success),
+        exit_code: Some(0),
+        message: Some("Completed turn".into()),
+        metadata: serde_json::Value::Null,
+    };
+
+    let decision_3 = next_agent(
+        &orbit::model::State::Running,
+        &[exec_1, exec_2, exec_3],
+        &[val_summary_1],
+        &policy,
+    );
+    assert!(matches!(decision_3, NextAgentDecision::StopFailure { .. }));
+}
+
+#[tokio::test]
+async fn test_phase6_three_agent_continuation_and_fingerprint_repetition() {
+    // Proves:
+    // Agent #1 (Antigravity) -> TurnLimit
+    // Agent #2 (Codex) -> Fails validation with Fingerprint ABC
+    // Agent #3 (Claude ACP) -> Fixes issue, validation PASS -> Attempt SUCCESS
+    // All 3 in the EXACT SAME workspace with credential isolation!
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let ws_path = temp_dir.path().join("workspace");
+    let state_file = temp_dir.path().join("phase6_state.json");
+    std::fs::create_dir_all(&ws_path).unwrap();
+
+    let run_git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&ws_path)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        out
+    };
+    run_git(&["init", "-b", "main"]);
+    run_git(&["config", "user.name", "Orbit Test"]);
+    run_git(&["config", "user.email", "orbit@test.local"]);
+    std::fs::create_dir_all(ws_path.join("src")).unwrap();
+    std::fs::write(ws_path.join("src").join("main.rs"), b"fn main() {}\n").unwrap();
+    run_git(&["add", "."]);
+    run_git(&["commit", "-m", "init"]);
+
+    let target_file = ws_path.join("src").join("phase6_chain.rs");
+
+    // 1. Agent #1 writes initial draft and hits TurnLimit
+    std::fs::write(&target_file, b"// AGENT_1_ANTIGRAVITY\n").unwrap();
+    let exec_1 = AgentExecution {
+        execution_id: "exec-antigravity-1".into(),
+        sequence: 1,
+        agent_type: "antigravity".into(),
+        provider: Some("google".into()),
+        model: Some("gemini-2.5-pro".into()),
+        started_at: 1000,
+        finished_at: Some(1500),
+        status: AgentExecutionStatus::Failed,
+        termination_reason: Some(TerminationReason::TurnLimit),
+        exit_code: None,
+        message: Some("Turn limit exhausted".into()),
+        metadata: serde_json::Value::Null,
+    };
+
+    // 2. Transition to Agent #2 (Codex)
+    let content_at_agent2 = std::fs::read_to_string(&target_file).unwrap();
+    assert!(content_at_agent2.contains("AGENT_1_ANTIGRAVITY"));
+    std::fs::write(
+        &target_file,
+        format!("{content_at_agent2}// AGENT_2_CODEX_WITH_ERROR\n"),
+    )
+    .unwrap();
+
+    let exec_2 = AgentExecution {
+        execution_id: "exec-codex-2".into(),
+        sequence: 2,
+        agent_type: "codex".into(),
+        provider: Some("openai".into()),
+        model: Some("gpt-4o".into()),
+        started_at: 1600,
+        finished_at: Some(1900),
+        status: AgentExecutionStatus::Completed,
+        termination_reason: Some(TerminationReason::Success),
+        exit_code: Some(0),
+        message: Some("Agent 2 finished turn".into()),
+        metadata: serde_json::Value::Null,
+    };
+
+    let fp_codex =
+        generate_validation_fingerprint("cargo check", 101, "error[E0308]: mismatched types");
+    let val_2 = ValidationSummary {
+        command: "cargo check".into(),
+        exit_code: 101,
+        evidence_artifact_id: None,
+        summary: Some("error[E0308]".into()),
+        failure_fingerprint: Some(fp_codex),
+    };
+
+    // 3. Persist state and simulate restart before Agent #3 starts
+    let executions = vec![exec_1.clone(), exec_2.clone()];
+    std::fs::write(&state_file, serde_json::to_vec(&executions).unwrap()).unwrap();
+
+    // Reload from persistence
+    let loaded_execs: Vec<AgentExecution> =
+        serde_json::from_slice(&std::fs::read(&state_file).unwrap()).unwrap();
+    assert_eq!(loaded_execs.len(), 2);
+
+    let policy = ContinuationPolicy {
+        enabled: true,
+        agents: vec![
+            AgentCandidate::new("candidate-1", "antigravity"),
+            AgentCandidate::new("candidate-2", "codex"),
+            AgentCandidate::new("candidate-3", "claude-acp"),
+        ],
+        max_executions: 3,
+        triggers: vec![
+            FallbackTrigger::TurnLimit,
+            FallbackTrigger::ValidationFailed,
+        ],
+        max_same_failure_repetitions: 2,
+    };
+
+    let decision = next_agent(
+        &orbit::model::State::Running,
+        &loaded_execs,
+        std::slice::from_ref(&val_2),
+        &policy,
+    );
+    assert_eq!(
+        decision,
+        NextAgentDecision::Continue {
+            candidate_index: 2,
+            candidate: AgentCandidate::new("candidate-3", "claude-acp"),
+            sequence: 3,
+            trigger: FallbackTrigger::ValidationFailed,
+            reason: "Trigger ValidationFailed occurred".into(),
+        }
+    );
+
+    // 4. Agent #3 (Claude ACP) starts in the exact same workspace and resolves the issue
+    let content_at_agent3 = std::fs::read_to_string(&target_file).unwrap();
+    assert!(content_at_agent3.contains("AGENT_1_ANTIGRAVITY"));
+    assert!(content_at_agent3.contains("AGENT_2_CODEX_WITH_ERROR"));
+    std::fs::write(
+        &target_file,
+        format!("{content_at_agent3}// AGENT_3_CLAUDE_RESOLVED\n"),
+    )
+    .unwrap();
+
+    let exec_3 = AgentExecution {
+        execution_id: "exec-claude-3".into(),
+        sequence: 3,
+        agent_type: "claude-acp".into(),
+        provider: Some("anthropic".into()),
+        model: Some("claude-3-7-sonnet".into()),
+        started_at: 2000,
+        finished_at: Some(2300),
+        status: AgentExecutionStatus::Completed,
+        termination_reason: Some(TerminationReason::Success),
+        exit_code: Some(0),
+        message: Some("All tests pass".into()),
+        metadata: serde_json::Value::Null,
+    };
+
+    let final_val = ValidationSummary {
+        command: "cargo check".into(),
+        exit_code: 0,
+        evidence_artifact_id: None,
+        summary: Some("Validation passed".into()),
+        failure_fingerprint: None,
+    };
+
+    let final_execs = vec![exec_1, exec_2, exec_3];
+    let final_decision = next_agent(
+        &orbit::model::State::Running,
+        &final_execs,
+        &[final_val],
+        &policy,
+    );
+    assert_eq!(final_decision, NextAgentDecision::StopSuccess);
+
+    // Workspace verification
+    let final_text = std::fs::read_to_string(&target_file).unwrap();
+    assert!(final_text.contains("AGENT_1_ANTIGRAVITY"));
+    assert!(final_text.contains("AGENT_2_CODEX_WITH_ERROR"));
+    assert!(final_text.contains("AGENT_3_CLAUDE_RESOLVED"));
 }

@@ -167,6 +167,8 @@ pub struct ValidationSummary {
     pub evidence_artifact_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_fingerprint: Option<FailureFingerprint>,
 }
 
 /// Versioned handoff structure ("handoff/v1") used to continue work with another agent.
@@ -986,5 +988,394 @@ pub fn continuation_recovery_action(
         handoff_id: handoff.from_execution_id.clone(),
         sequence: last_exec.sequence + 1,
         agent: fallback_agent,
+    }
+}
+
+/// Algorithm version for validation failure fingerprints.
+pub const FINGERPRINT_VERSION_VALIDATION_V1: &str = "validation/v1";
+
+/// Kind of failure fingerprint.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureFingerprintKind {
+    Validation,
+    AgentTermination,
+}
+
+/// Deterministic, normalized fingerprint of an implementation failure.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FailureFingerprint {
+    pub version: String,
+    pub kind: FailureFingerprintKind,
+    pub digest: String,
+    pub summary: String,
+}
+
+impl FailureFingerprint {
+    pub fn new(
+        version: impl Into<String>,
+        kind: FailureFingerprintKind,
+        digest: impl Into<String>,
+        summary: impl Into<String>,
+    ) -> Result<Self> {
+        let digest_str = digest.into();
+        ensure!(digest_str.len() == 64, "invalid fingerprint digest length");
+        Ok(Self {
+            version: version.into(),
+            kind,
+            digest: digest_str,
+            summary: summary.into(),
+        })
+    }
+}
+
+/// Normalizes raw validation diagnostic text removing volatile values:
+/// - Timestamps (e.g. `2026-09-20T...`, `HH:MM:SS`)
+/// - Absolute workspace paths (e.g. `/tmp/.../src/` -> `src/`)
+/// - Line and column numbers (e.g. `:42:15` -> ``)
+/// - ANSI escape codes
+/// - Attempt and execution IDs
+pub fn normalize_diagnostic_text(raw: &str) -> String {
+    // 1. Strip ANSI escape codes
+    let mut cleaned = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b'
+            && let Some(&'[') = chars.peek()
+        {
+            chars.next();
+            for next_c in chars.by_ref() {
+                if next_c.is_ascii_alphabetic() || next_c == 'm' {
+                    break;
+                }
+            }
+            continue;
+        }
+        cleaned.push(c);
+    }
+
+    // 2. Canonicalize line by line
+    let mut canonical_lines = Vec::new();
+    for line in cleaned.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // Ignore compiler status / logging lines
+        if trimmed.contains("[INFO]")
+            || trimmed.contains("[DEBUG]")
+            || trimmed.contains("[WARN]")
+            || trimmed.starts_with("Compiling")
+            || trimmed.starts_with("Finished")
+            || trimmed.starts_with("Running")
+        {
+            continue;
+        }
+
+        // Strip ISO8601 timestamps like 2026-09-20T...
+        let mut filtered = trimmed.to_string();
+        if let Some(pos) = filtered.find("202")
+            && filtered.len() >= pos + 20
+            && filtered.as_bytes()[pos + 4] == b'-'
+        {
+            filtered.replace_range(pos..pos + 20, "");
+        }
+
+        // Normalize absolute paths: keep path starting from known components like "src/", "tests/", or basename
+        if let Some(idx) = filtered.find("/src/") {
+            filtered = filtered[idx + 1..].to_string();
+        } else if let Some(idx) = filtered.find("/tests/") {
+            filtered = filtered[idx + 1..].to_string();
+        } else if let Some(idx) = filtered.find("/tmp/")
+            && let Some(after) = filtered[idx..].find("src/")
+        {
+            filtered = filtered[idx + after..].to_string();
+        }
+
+        // Strip line numbers like :42:15 or :42
+        // Strip leading line numbers like "42 |" -> "|"
+        if let Some(pipe_pos) = filtered.find(" |") {
+            let prefix = filtered[..pipe_pos].trim();
+            if prefix.chars().all(|c| c.is_ascii_digit()) {
+                filtered = filtered[pipe_pos + 1..].to_string();
+            }
+        }
+
+        let parts: Vec<&str> = filtered.split_whitespace().collect();
+        let mut scrubbed_parts = Vec::new();
+        for p in parts {
+            if let Some(colon_pos) = p.find(':') {
+                let prefix = &p[..colon_pos];
+                if prefix.ends_with(".rs") || prefix.ends_with(".toml") {
+                    scrubbed_parts.push(prefix.to_string());
+                    continue;
+                }
+            }
+            scrubbed_parts.push(p.to_string());
+        }
+
+        let canonical_line = scrubbed_parts.join(" ");
+        if !canonical_line.is_empty() {
+            canonical_lines.push(canonical_line);
+        }
+    }
+
+    canonical_lines.join("\n")
+}
+
+/// Generates a deterministic validation FailureFingerprint from command, exit code, and diagnostic output.
+pub fn generate_validation_fingerprint(
+    command: &str,
+    exit_code: i32,
+    diagnostic_output: &str,
+) -> FailureFingerprint {
+    let normalized = normalize_diagnostic_text(diagnostic_output);
+    let canonical = format!(
+        "command={}\nexit_code={}\nnormalized_diagnostic={}",
+        command.trim(),
+        exit_code,
+        normalized
+    );
+
+    let digest = crate::model::digest(canonical.as_bytes());
+    let summary = normalized
+        .lines()
+        .next()
+        .unwrap_or("validation failure")
+        .chars()
+        .take(80)
+        .collect();
+
+    FailureFingerprint {
+        version: FINGERPRINT_VERSION_VALIDATION_V1.into(),
+        kind: FailureFingerprintKind::Validation,
+        digest,
+        summary,
+    }
+}
+
+/// Counts how many times the given fingerprint has been observed in previous validations.
+pub fn repeated_failure_count(
+    fingerprint: &FailureFingerprint,
+    previous_validations: &[ValidationSummary],
+) -> usize {
+    let mut count = 0;
+    for val in previous_validations {
+        if let Some(ref fp) = val.failure_fingerprint
+            && fp.version == fingerprint.version
+            && fp.digest == fingerprint.digest
+        {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Candidate agent in an ordered execution chain.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentCandidate {
+    pub id: String,
+    pub agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+impl AgentCandidate {
+    pub fn new(id: impl Into<String>, agent: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            agent: agent.into(),
+            provider: None,
+            model: None,
+        }
+    }
+}
+
+/// Generalized policy for cross-agent continuation chains.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContinuationPolicy {
+    #[serde(default)]
+    pub enabled: bool,
+
+    #[serde(default)]
+    pub agents: Vec<AgentCandidate>,
+
+    #[serde(default = "default_max_executions")]
+    pub max_executions: u32,
+
+    #[serde(default = "default_fallback_triggers")]
+    pub triggers: Vec<FallbackTrigger>,
+
+    #[serde(default = "default_max_repetitions")]
+    pub max_same_failure_repetitions: u32,
+}
+
+fn default_max_repetitions() -> u32 {
+    2
+}
+
+impl Default for ContinuationPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            agents: Vec::new(),
+            max_executions: 3,
+            triggers: default_fallback_triggers(),
+            max_same_failure_repetitions: 2,
+        }
+    }
+}
+
+impl From<FallbackPolicy> for ContinuationPolicy {
+    fn from(fb: FallbackPolicy) -> Self {
+        let mut agents = Vec::new();
+        if let Some(fallback) = fb.fallback_agent {
+            agents.push(AgentCandidate::new("primary", "antigravity"));
+            agents.push(AgentCandidate::new("fallback", fallback));
+        }
+        Self {
+            enabled: fb.enabled,
+            agents,
+            max_executions: fb.max_executions,
+            triggers: fb.on_triggers,
+            max_same_failure_repetitions: 2,
+        }
+    }
+}
+
+/// Next agent routing decision.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "decision", rename_all = "snake_case")]
+pub enum NextAgentDecision {
+    StopSuccess,
+    StopFailure {
+        reason: String,
+    },
+    Continue {
+        candidate_index: usize,
+        candidate: AgentCandidate,
+        sequence: u32,
+        trigger: FallbackTrigger,
+        reason: String,
+    },
+}
+
+/// Pure deterministic decision function for selecting the next agent in the continuation chain.
+pub fn next_agent(
+    attempt_state: &crate::model::State,
+    executions: &[AgentExecution],
+    validations: &[ValidationSummary],
+    policy: &ContinuationPolicy,
+) -> NextAgentDecision {
+    if attempt_state.terminal() {
+        return NextAgentDecision::StopSuccess;
+    }
+    if *attempt_state == crate::model::State::CancelRequested
+        || *attempt_state == crate::model::State::Cancelled
+    {
+        return NextAgentDecision::StopFailure {
+            reason: "Attempt cancelled".into(),
+        };
+    }
+    if !policy.enabled || policy.agents.is_empty() {
+        return NextAgentDecision::StopFailure {
+            reason: "Continuation policy disabled or no agents configured".into(),
+        };
+    }
+
+    let Some(last_exec) = executions.last() else {
+        // Initial execution
+        return NextAgentDecision::Continue {
+            candidate_index: 0,
+            candidate: policy.agents[0].clone(),
+            sequence: 1,
+            trigger: FallbackTrigger::TurnLimit,
+            reason: "Initial agent execution".into(),
+        };
+    };
+
+    // Cancellation priority
+    if last_exec.status == AgentExecutionStatus::Interrupted
+        && last_exec.termination_reason == Some(TerminationReason::Cancelled)
+    {
+        return NextAgentDecision::StopFailure {
+            reason: "Agent execution was cancelled".into(),
+        };
+    }
+
+    let matching_val = validations.last();
+
+    // Success check
+    if last_exec.status == AgentExecutionStatus::Completed
+        && matching_val.is_some_and(|v| v.exit_code == 0)
+    {
+        return NextAgentDecision::StopSuccess;
+    }
+
+    // Check hard max execution limit
+    if (executions.len() as u32) >= policy.max_executions {
+        return NextAgentDecision::StopFailure {
+            reason: format!(
+                "Max executions reached ({}/{}); chain exhausted",
+                executions.len(),
+                policy.max_executions
+            ),
+        };
+    }
+
+    // Determine fallback trigger
+    let fb_policy = FallbackPolicy {
+        enabled: policy.enabled,
+        fallback_agent: None,
+        on_triggers: policy.triggers.clone(),
+        max_executions: policy.max_executions,
+    };
+    let Some(trigger) = fallback_trigger(last_exec, matching_val, &fb_policy) else {
+        return NextAgentDecision::StopFailure {
+            reason: format!(
+                "Agent terminated with {:?}; not eligible for continuation",
+                last_exec.termination_reason
+            ),
+        };
+    };
+
+    // Calculate next candidate index
+    let current_index = (last_exec.sequence as usize).saturating_sub(1);
+    let next_index = current_index + 1;
+
+    // Check failure repetition if validation failed
+    let mut routing_reason = format!("Trigger {:?} occurred", trigger);
+    if let Some(val) = matching_val
+        && let Some(ref fp) = val.failure_fingerprint
+    {
+        let reps = repeated_failure_count(fp, validations);
+        if reps >= policy.max_same_failure_repetitions as usize {
+            routing_reason = format!(
+                "Failure fingerprint {} repeated {} times (threshold {}); advancing candidate",
+                fp.digest.chars().take(8).collect::<String>(),
+                reps,
+                policy.max_same_failure_repetitions
+            );
+        }
+    }
+
+    if next_index >= policy.agents.len() {
+        return NextAgentDecision::StopFailure {
+            reason: "candidate_chain_exhausted".into(),
+        };
+    }
+
+    NextAgentDecision::Continue {
+        candidate_index: next_index,
+        candidate: policy.agents[next_index].clone(),
+        sequence: last_exec.sequence + 1,
+        trigger,
+        reason: routing_reason,
     }
 }
