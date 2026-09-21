@@ -84,7 +84,7 @@ fn test_attempt_observability_aggregate() {
         provider: Some("google".to_string()),
         model: Some("gemini-3.8-flash".to_string()),
         started_at: 1000,
-        finished_at: Some(1030), // 30s
+        finished_at: Some(31000), // 30s
         status: AgentExecutionStatus::Interrupted,
         termination_reason: Some(TerminationReason::QuotaExhausted),
         turn_count: Some(2),
@@ -111,8 +111,8 @@ fn test_attempt_observability_aggregate() {
         agent_type: "codex".to_string(),
         provider: Some("openai".to_string()),
         model: Some("codex-luna".to_string()),
-        started_at: 1035,
-        finished_at: Some(1075), // 40s
+        started_at: 31035,
+        finished_at: Some(71035), // 40s
         status: AgentExecutionStatus::Completed,
         termination_reason: Some(TerminationReason::Success),
         turn_count: Some(3),
@@ -239,8 +239,8 @@ fn test_human_inspect_formatting() {
                                 "requested_model": "gemini-3.8-flash",
                                 "requested_reasoning_effort": "high",
                                 "resolved_model": "gemini-3.8-flash",
-                                "started_at": 100,
-                                "finished_at": 145,
+                                "started_at": 1000,
+                                "finished_at": 46000,
                                 "status": "interrupted",
                                 "termination_reason": "quota_exhausted",
                                 "turn_count": 2,
@@ -259,8 +259,8 @@ fn test_human_inspect_formatting() {
                                 "requested_model": "codex-luna",
                                 "requested_reasoning_effort": "low",
                                 "resolved_model": "codex-luna",
-                                "started_at": 150,
-                                "finished_at": 180,
+                                "started_at": 47000,
+                                "finished_at": 77000,
                                 "status": "completed",
                                 "termination_reason": "success",
                                 "turn_count": 1,
@@ -298,4 +298,33 @@ fn test_human_inspect_formatting() {
     assert!(rendered.contains("input tokens: 2000"));
     assert!(rendered.contains("output tokens: 500"));
     assert!(rendered.contains("agent time: 1m15s"));
+}
+
+#[test]
+fn execution_duration_uses_epoch_milliseconds_for_json_and_human_views() {
+    let execution = AgentExecution {
+        execution_id: "exec-duration".into(),
+        sequence: 1,
+        agent_type: "antigravity".into(),
+        started_at: 1_000,
+        finished_at: Some(1_220),
+        status: AgentExecutionStatus::Failed,
+        termination_reason: Some(TerminationReason::InfrastructureError),
+        ..Default::default()
+    };
+    let json_run = json!({
+        "id": "run-duration-test",
+        "state": "FAILED",
+        "tasks": [{"attempts": [{"agent_executions": [execution]}]}]
+    });
+    let parsed: AgentExecution =
+        serde_json::from_value(json_run["tasks"][0]["attempts"][0]["agent_executions"][0].clone())
+            .unwrap();
+    assert_eq!(parsed.finished_at.unwrap() - parsed.started_at, 220);
+    assert_eq!(
+        AttemptObservabilityAggregate::from_executions(&[parsed]).agent_time_seconds,
+        0
+    );
+    assert!(format_inspect_human(&json_run).contains("duration: 0s"));
+    assert!(format_inspect_human(&json_run).contains("agent time: 0s"));
 }

@@ -91,6 +91,17 @@ per container. Containers also have a read-only root, dropped capabilities,
 no-new-privileges, 128 PID limit and bounded temporary storage. This remains the
 existing **trusted** isolation class, not hostile-code or provider-only isolation.
 
+### Workspace capacity
+
+Coding worker `--workspaces` roots must be dedicated, disk-backed storage with an
+operator-enforced bounded allocation of at least 12 GiB per active Rust attempt.
+The repository, Cargo `target/` data, temporary files, logs and retained review
+artifacts all count against that allocation. Do not place coding workspaces on a
+small `/tmp` tmpfs: a normal Orbit Rust validation can require several GiB even
+when the container writable layer is read-only. After evidence export and review,
+apply the operator's retention policy to reclaim the attempt directory; the
+worker does not silently delete workspaces needed for recovery or qualification.
+
 Filesystem callbacks reject traversal, symlinks, mount crossings, hard links,
 devices and FIFOs using directory-relative Linux `openat2`. Reads/writes are UTF-8
 and bounded to 64 KiB. Reads accept positive one-based line/limit values. Writes

@@ -333,6 +333,7 @@ impl Runtime {
             16 * 1024 * 1024,
         );
         let mut broker = Broker::new(session);
+        let mut turn_count = 0;
         let result = async {
             let init = tokio::time::timeout(Duration::from_secs(30),acp_request(&mut wire,&mut broker,"initialize",json!({
                 "protocolVersion":1,"clientInfo":{"name":"orbit","version":env!("CARGO_PKG_VERSION")},
@@ -398,6 +399,7 @@ impl Runtime {
                 a.plan.definition.inputs.task,a.plan.definition.inputs.base_revision,spec.context)}]});
             ensure!(serde_json::to_vec(&prompt)?.len() <= 262144,"ACP prompt too large");
             let call = broker.reserve(None,&prompt,0).await?;
+            turn_count = 1;
             broker.active=true;
             let response = tokio::time::timeout(Duration::from_secs(limits.turn_timeout_seconds),acp_request(&mut wire,&mut broker,"session/prompt",prompt)).await;
             let response = match response {
@@ -447,6 +449,10 @@ impl Runtime {
                 == Some(code)),
             "ACP process/auth cleanup unconfirmed; auth store may be quarantined"
         );
+        let launch_diagnostic =
+            crate::acp_process::read_cleanup_diagnostic(&request_path, Some(&a.attempt_id))
+                .ok()
+                .flatten();
         if let Some(execution_id) = a.execution_id.as_deref() {
             let _ = client
                 .operation(
@@ -454,7 +460,7 @@ impl Runtime {
                     crate::model::Action::UpdateExecution {
                         execution_id: execution_id.to_string(),
                         actual_model: None,
-                        turn_count: Some(1),
+                        turn_count: Some(turn_count),
                         tool_call_count: Some(broker.tool_calls),
                         tool_success_count: Some(broker.tool_successes),
                         tool_failure_count: Some(broker.tool_failures),
@@ -463,6 +469,13 @@ impl Runtime {
                 )
                 .await;
         }
+        let result = result.map_err(|error| {
+            if let Some(diagnostic) = launch_diagnostic {
+                anyhow::anyhow!("{error:#}; launch diagnostics: {diagnostic}")
+            } else {
+                error
+            }
+        });
         let (call, response) = result?;
         broker.finish(&call, &response).await?;
         broker

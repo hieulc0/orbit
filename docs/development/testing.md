@@ -59,6 +59,13 @@ qualification is running: they can replace the fault-enabled `orbit` binary used
 by subprocess tests. Run mocked UI checks separately from kernel qualification;
 both browser suites own loopback port 5173.
 
+For real Rust coding attempts, provision the worker `--workspaces` directory on a
+dedicated disk-backed filesystem or bounded allocation with at least 12 GiB per
+active attempt. `/tmp` is a small tmpfs on many hosts and is not a suitable
+coding workspace: Cargo's repository and `target/` output share that filesystem.
+Include artifact staging and retained review workspaces in the allocation and
+reclaim completed directories only after their evidence has been exported.
+
 The `remote_coding` cases require local Git/Python and rootless Podman with the
 pinned Alpine image even if legacy `ORBIT_CONTAINER_RUNTIME=docker` is selected.
 They run authenticated loopback Git and deterministic Responses fixtures, never

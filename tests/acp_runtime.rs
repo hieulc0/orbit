@@ -141,6 +141,20 @@ fn acp_cleanup_receipt_binds_request_and_attempt_and_terminal_utf8_is_bounded() 
     );
     assert!(orbit::acp_process::read_cleanup(&request, Some("foreign")).is_err());
     assert!(orbit::acp_process::write_cleanup(&request, "attempt", 1).is_err());
+    let diagnostic_request = root.path().join("diagnostic.json");
+    std::fs::write(&diagnostic_request, b"{}")?;
+    orbit::acp_process::write_cleanup_diagnostic(
+        &diagnostic_request,
+        "attempt",
+        125,
+        "container_startup",
+        Some("sha256:abc"),
+        Some("image not known"),
+    )?;
+    let diagnostic =
+        orbit::acp_process::read_cleanup_diagnostic(&diagnostic_request, Some("attempt"))?.unwrap();
+    assert!(diagnostic.contains("container_startup"));
+    assert!(diagnostic.contains("image not known"));
     let output = orbit::acp_terminal::Output {
         bytes: vec![0xff, 0xfe, b'a'],
         ..Default::default()

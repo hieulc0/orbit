@@ -3,6 +3,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+fn execution_duration_seconds(started: i64, finished: Option<i64>) -> Option<u64> {
+    finished.map(|finished| finished.saturating_sub(started).max(0) as u64 / 1000)
+}
+
 /// Bounded provider-neutral token usage summary.
 ///
 /// If a runtime or provider does not report a metric, `None` is preserved.
@@ -213,8 +217,7 @@ impl AttemptObservabilityAggregate {
                 *agg.tool_counts_by_name.entry(tool.clone()).or_insert(0) += count;
             }
 
-            if let (started, Some(finished)) = (exec.started_at, exec.finished_at) {
-                let dur = finished.saturating_sub(started).max(0) as u64;
+            if let Some(dur) = execution_duration_seconds(exec.started_at, exec.finished_at) {
                 agg.agent_time_seconds = agg.agent_time_seconds.saturating_add(dur);
             }
 
@@ -377,11 +380,9 @@ Agent Executions"
                 writeln!(out, "  runtime: {}", &digest[..digest.len().min(19)]).unwrap();
             }
 
-            let dur = if let (started, Some(finished)) = (exec.started_at, exec.finished_at) {
-                format_duration_seconds(finished.saturating_sub(started).max(0) as u64)
-            } else {
-                "running".to_string()
-            };
+            let dur = execution_duration_seconds(exec.started_at, exec.finished_at)
+                .map(format_duration_seconds)
+                .unwrap_or_else(|| "running".to_string());
             writeln!(out, "  duration: {}", dur).unwrap();
 
             if let Some(turns) = exec.turn_count {
