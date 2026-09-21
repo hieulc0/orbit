@@ -893,6 +893,89 @@ impl Engine {
                         )?;
                     }
                     run.tasks[ti].expansion = Some(report.delegation_inputs);
+                    if let Some(acp) = report.output.get("acp") {
+                        let stop_reason_str = acp.get("stop_reason").and_then(|s| s.as_str());
+                        let termination_reason = if stop_reason_str == Some("budget_exhausted") {
+                            Some(crate::continuation::TerminationReason::BudgetExhausted)
+                        } else if stop_reason_str == Some("end_turn") {
+                            Some(crate::continuation::TerminationReason::Success)
+                        } else {
+                            None
+                        };
+                        let status = if termination_reason
+                            == Some(crate::continuation::TerminationReason::BudgetExhausted)
+                        {
+                            crate::continuation::AgentExecutionStatus::Interrupted
+                        } else if termination_reason
+                            == Some(crate::continuation::TerminationReason::Success)
+                        {
+                            crate::continuation::AgentExecutionStatus::Completed
+                        } else {
+                            crate::continuation::AgentExecutionStatus::Failed
+                        };
+                        let exec = crate::continuation::AgentExecution {
+                            execution_id: format!(
+                                "{}-exec-{}",
+                                op.attempt_id,
+                                run.tasks[ti].attempts[ai].agent_executions.len() + 1
+                            ),
+                            sequence: (run.tasks[ti].attempts[ai].agent_executions.len() + 1)
+                                as u32,
+                            agent_type: acp
+                                .get("agent")
+                                .and_then(|a| a.as_str())
+                                .unwrap_or("antigravity")
+                                .to_string(),
+                            provider: None,
+                            model: acp.get("model").and_then(|m| m.as_str()).map(String::from),
+                            started_at: now,
+                            finished_at: Some(now),
+                            status,
+                            termination_reason,
+                            exit_code: None,
+                            message: if termination_reason
+                                == Some(crate::continuation::TerminationReason::BudgetExhausted)
+                            {
+                                Some("Orbit call budget exhausted".to_string())
+                            } else {
+                                None
+                            },
+                            requested_model: None,
+                            requested_reasoning_effort: None,
+                            resolved_model: acp
+                                .get("model")
+                                .and_then(|m| m.as_str())
+                                .map(String::from),
+                            resolved_reasoning_effort: None,
+                            actual_model: acp
+                                .get("model")
+                                .and_then(|m| m.as_str())
+                                .map(String::from),
+                            runtime_image: None,
+                            runtime_digest: None,
+                            capability_source: None,
+                            usage: None,
+                            turn_count: Some(1),
+                            tool_call_count: acp
+                                .get("tool_calls")
+                                .and_then(|t| t.as_u64())
+                                .unwrap_or(0),
+                            tool_success_count: acp
+                                .get("tool_successes")
+                                .and_then(|t| t.as_u64())
+                                .unwrap_or(0),
+                            tool_failure_count: acp
+                                .get("tool_failures")
+                                .and_then(|t| t.as_u64())
+                                .unwrap_or(0),
+                            tool_counts: serde_json::from_value(
+                                acp.get("tool_counts").cloned().unwrap_or(json!({})),
+                            )
+                            .unwrap_or_default(),
+                            metadata: Value::Null,
+                        };
+                        run.tasks[ti].attempts[ai].agent_executions.push(exec);
+                    }
                 }
                 if *success
                     && run.plan.definition.steps[&run.tasks[ti].step]

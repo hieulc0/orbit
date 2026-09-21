@@ -508,3 +508,283 @@ async fn test_model_selection_lifecycle_scenarios() -> Result<()> {
 
     Ok(())
 }
+
+async fn start_budget_mock_server(
+    allowed_reservations: usize,
+) -> (String, tokio::sync::oneshot::Sender<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    tokio::spawn(async move {
+        loop {
+            let counter = counter.clone();
+            tokio::select! {
+                _ = &mut rx => break,
+                Ok((mut socket, _)) = listener.accept() => {
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut buf = [0u8; 8192];
+                        let n = socket.read(&mut buf).await.unwrap_or(0);
+                        let req_str = String::from_utf8_lossy(&buf[..n]);
+                        let (status, body) = if req_str.contains("reserve_agent_call") {
+                            let count = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            if count >= allowed_reservations {
+                                ("400 Bad Request", r#"{"error":"agent budget exhausted","code":"budget_exhausted"}"#)
+                            } else {
+                                ("200 OK", r#"{"status":"accepted","replayed":false}"#)
+                            }
+                        } else {
+                            ("200 OK", r#"{"status":"accepted","replayed":false}"#)
+                        };
+                        let resp = format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = socket.write_all(resp.as_bytes()).await;
+                    });
+                }
+            }
+        }
+    });
+    (format!("http://127.0.0.1:{}", addr.port()), tx)
+}
+
+#[tokio::test]
+async fn test_broker_budget_exhaustion_terminates_cleanly_without_poisoning() -> Result<()> {
+    // Mock server allows exactly 1 reservation; 2nd reservation returns budget exhausted
+    let (server_url, _shutdown) = start_budget_mock_server(1).await;
+    let client = Client::new(server_url, "test-token".into())?;
+
+    let root = tempfile::tempdir()?;
+    let ws_path = root.path().join("workspace");
+    std::fs::create_dir_all(&ws_path)?;
+    std::fs::write(ws_path.join("file.txt"), "budget test file\n")?;
+
+    let limits = Limits {
+        prompt_turns: 1,
+        broker_calls: 10,
+        reported_tool_calls: 10,
+        turn_timeout_seconds: 10,
+        terminal_timeout_seconds: 5,
+        terminal_runtime_seconds: 10,
+        output_bytes: 65536,
+    };
+    let assignment = create_assignment(limits)?;
+    let workspace = Workspace {
+        path: ws_path.clone(),
+        git_dir: root.path().join("git"),
+        home: root.path().join("home"),
+    };
+    let profile = Profile {
+        backend: Backend::RootlessPodman,
+        image: "test-image".into(),
+    };
+    let creds = BTreeMap::new();
+
+    let session = Session {
+        client: &client,
+        assignment: &assignment,
+        workspace: &workspace,
+        directory: root.path(),
+        home: root.path(),
+        profile: &profile,
+        credentials: &creds,
+    };
+
+    let mut broker = Broker::new(session);
+    broker.session_id = Some("test-session-budget".into());
+    broker.session_digest = "test-session-digest".into();
+    broker.active = true;
+
+    let (pipe_in_read, pipe_in_write) = tokio::io::duplex(4096);
+    let (pipe_out_read, pipe_out_write) = tokio::io::duplex(4096);
+    let mut wire = Wire::new(pipe_in_read, pipe_out_write, 1024 * 1024);
+    let mut peer_wire = Wire::new(pipe_out_read, pipe_in_write, 1024 * 1024);
+
+    // Call 1: 1st reservation succeeds
+    let req1 = json!({
+        "jsonrpc": "2.0",
+        "id": "req-1",
+        "method": "fs/read_text_file",
+        "params": {
+            "sessionId": "test-session-budget",
+            "path": format!("{WORKSPACE}/file.txt"),
+            "line": 1,
+            "limit": 10
+        }
+    });
+
+    broker.message(&mut wire, req1).await?;
+    let resp1 = peer_wire.read().await?;
+    assert_eq!(resp1["id"], "req-1");
+    assert_eq!(resp1["result"]["content"], "budget test file\n");
+    assert!(!broker.poisoned);
+    assert_eq!(broker.tool_calls, 1);
+    assert_eq!(broker.tool_successes, 1);
+    assert_eq!(broker.tool_failures, 0);
+
+    // Call 2: 2nd reservation rejected with 400 budget exhausted
+    let req2 = json!({
+        "jsonrpc": "2.0",
+        "id": "req-2",
+        "method": "fs/read_text_file",
+        "params": {
+            "sessionId": "test-session-budget",
+            "path": format!("{WORKSPACE}/file.txt"),
+            "line": 1,
+            "limit": 10
+        }
+    });
+
+    let res = broker.message(&mut wire, req2).await;
+    assert!(
+        res.is_err(),
+        "execution limit must return Err to abort message loop"
+    );
+    let err = res.unwrap_err();
+    assert!(
+        err.downcast_ref::<orbit::acp_broker::ExecutionLimitError>()
+            .is_some(),
+        "error must be ExecutionLimitError"
+    );
+
+    // Crucial invariants:
+    // 1. Broker must NOT be poisoned
+    assert!(
+        !broker.poisoned,
+        "broker must NOT be poisoned on budget exhaustion"
+    );
+    // 2. Execution limit state is preserved on broker
+    assert_eq!(
+        broker.execution_limit.as_ref().map(|(r, _)| *r),
+        Some(orbit::continuation::TerminationReason::BudgetExhausted)
+    );
+    // 3. Tool failure count tracked
+    assert_eq!(broker.tool_failures, 1);
+
+    // 4. Wire received clean JSON-RPC -32000 error with execution_limit indication
+    let err_resp = peer_wire.read().await?;
+    assert_eq!(err_resp["id"], "req-2");
+    assert_eq!(err_resp["error"]["code"], -32000);
+    assert!(
+        err_resp["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("budget exhausted")
+    );
+
+    // 5. Wire received session/cancel notification
+    let cancel_notif = peer_wire.read().await?;
+    assert_eq!(cancel_notif["method"], "session/cancel");
+    assert_eq!(cancel_notif["params"]["sessionId"], "test-session-budget");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_broker_server_fatal_error_poisons_session() -> Result<()> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut rx => break,
+                Ok((mut socket, _)) = listener.accept() => {
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut buf = [0u8; 4096];
+                        let _ = socket.read(&mut buf).await;
+                        let body = r#"{"error":"internal server failure"}"#;
+                        let resp = format!(
+                            "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = socket.write_all(resp.as_bytes()).await;
+                    });
+                }
+            }
+        }
+    });
+
+    let client = Client::new(
+        format!("http://127.0.0.1:{}", addr.port()),
+        "test-token".into(),
+    )?;
+    let root = tempfile::tempdir()?;
+    let ws_path = root.path().join("workspace");
+    std::fs::create_dir_all(&ws_path)?;
+    std::fs::write(ws_path.join("file.txt"), "hello\n")?;
+
+    let limits = Limits {
+        prompt_turns: 1,
+        broker_calls: 10,
+        reported_tool_calls: 10,
+        turn_timeout_seconds: 10,
+        terminal_timeout_seconds: 5,
+        terminal_runtime_seconds: 10,
+        output_bytes: 65536,
+    };
+    let assignment = create_assignment(limits)?;
+    let workspace = Workspace {
+        path: ws_path,
+        git_dir: root.path().join("git"),
+        home: root.path().join("home"),
+    };
+    let profile = Profile {
+        backend: Backend::RootlessPodman,
+        image: "test-image".into(),
+    };
+    let creds = BTreeMap::new();
+
+    let session = Session {
+        client: &client,
+        assignment: &assignment,
+        workspace: &workspace,
+        directory: root.path(),
+        home: root.path(),
+        profile: &profile,
+        credentials: &creds,
+    };
+
+    let mut broker = Broker::new(session);
+    broker.session_id = Some("test-session-fatal".into());
+    broker.session_digest = "test-session-digest".into();
+    broker.active = true;
+
+    let (pipe_in_read, pipe_in_write) = tokio::io::duplex(4096);
+    let (pipe_out_read, pipe_out_write) = tokio::io::duplex(4096);
+    let mut wire = Wire::new(pipe_in_read, pipe_out_write, 1024 * 1024);
+    let mut peer_wire = Wire::new(pipe_out_read, pipe_in_write, 1024 * 1024);
+
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": "req-fatal",
+        "method": "fs/read_text_file",
+        "params": {
+            "sessionId": "test-session-fatal",
+            "path": format!("{WORKSPACE}/file.txt"),
+            "line": 1,
+            "limit": 10
+        }
+    });
+
+    let res = broker.message(&mut wire, req).await;
+    assert!(res.is_err());
+    // Invariant: Broker MUST be poisoned on fatal infrastructure failure
+    assert!(
+        broker.poisoned,
+        "broker must be poisoned on fatal server error"
+    );
+    assert!(broker.execution_limit.is_none());
+
+    let err_resp = peer_wire.read().await?;
+    assert_eq!(err_resp["id"], "req-fatal");
+    assert_eq!(err_resp["error"]["code"], -32603);
+
+    let _ = tx.send(());
+    Ok(())
+}

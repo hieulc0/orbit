@@ -27,6 +27,7 @@ pub enum TerminationReason {
     Cancelled,
     InfrastructureError,
     ResourceExhausted,
+    BudgetExhausted,
     Unknown,
 }
 
@@ -358,6 +359,16 @@ impl NormalizedAgentResult {
         }
     }
 
+    pub fn budget_exhausted(message: impl Into<String>) -> Self {
+        Self {
+            status: AgentExecutionStatus::Interrupted,
+            termination_reason: TerminationReason::BudgetExhausted,
+            exit_code: None,
+            message: Some(message.into()),
+            metadata: serde_json::Value::Null,
+        }
+    }
+
     pub fn process_crash(exit_code: Option<i32>, message: impl Into<String>) -> Self {
         Self {
             status: AgentExecutionStatus::Failed,
@@ -500,6 +511,10 @@ pub fn classify_http_429(error_text: &str, provider_code: Option<&str>) -> Norma
 pub fn normalize_antigravity_error(error_text: &str) -> NormalizedAgentResult {
     let lower = error_text.to_ascii_lowercase();
 
+    if lower.contains("budget exhausted") {
+        return NormalizedAgentResult::budget_exhausted(error_text);
+    }
+
     if lower.contains("turn timeout") || lower.contains("turn did not complete") {
         return NormalizedAgentResult::turn_limit(error_text);
     }
@@ -530,6 +545,10 @@ pub fn normalize_antigravity_error(error_text: &str) -> NormalizedAgentResult {
 /// Normalizes Codex ACP adapter error conditions.
 pub fn normalize_codex_error(error_text: &str) -> NormalizedAgentResult {
     let lower = error_text.to_ascii_lowercase();
+
+    if lower.contains("budget exhausted") {
+        return NormalizedAgentResult::budget_exhausted(error_text);
+    }
 
     if lower.contains("cancelled") {
         return NormalizedAgentResult::cancelled(error_text);
@@ -823,6 +842,7 @@ pub fn fallback_trigger(
                 | TerminationReason::CredentialError
                 | TerminationReason::InfrastructureError
                 | TerminationReason::ProcessCrash
+                | TerminationReason::BudgetExhausted
         )
     {
         return None;

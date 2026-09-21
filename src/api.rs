@@ -70,16 +70,25 @@ impl From<anyhow::Error> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let message = self.0.to_string();
-        let status = if message.contains("unauthorized") {
-            StatusCode::UNAUTHORIZED
+        let (status, code) = if message.contains("unauthorized") {
+            (StatusCode::UNAUTHORIZED, "unauthorized")
         } else if message.starts_with("backpressure:") {
-            StatusCode::TOO_MANY_REQUESTS
+            (StatusCode::TOO_MANY_REQUESTS, "backpressure")
         } else if message.contains("conflict") {
-            StatusCode::CONFLICT
+            (StatusCode::CONFLICT, "conflict")
+        } else if message.contains("budget exhausted") {
+            (StatusCode::BAD_REQUEST, "budget_exhausted")
         } else {
-            StatusCode::BAD_REQUEST
+            (StatusCode::BAD_REQUEST, "bad_request")
         };
-        let mut response = (status, Json(json!({"error":message}))).into_response();
+        let mut response = (
+            status,
+            Json(json!({
+                "error": message,
+                "code": code,
+            })),
+        )
+            .into_response();
         if status == StatusCode::TOO_MANY_REQUESTS {
             response
                 .headers_mut()

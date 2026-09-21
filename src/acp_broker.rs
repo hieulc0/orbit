@@ -15,7 +15,14 @@ use std::{
 
 #[derive(Debug)]
 pub enum BrokerError {
-    Recoverable { code: i64, message: String },
+    Recoverable {
+        code: i64,
+        message: String,
+    },
+    ExecutionLimit {
+        reason: crate::continuation::TerminationReason,
+        message: String,
+    },
     Fatal(anyhow::Error),
 }
 
@@ -26,8 +33,29 @@ impl BrokerError {
             message: message.into(),
         }
     }
+    pub fn execution_limit(
+        reason: crate::continuation::TerminationReason,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::ExecutionLimit {
+            reason,
+            message: message.into(),
+        }
+    }
     pub fn fatal(err: impl Into<anyhow::Error>) -> Self {
         Self::Fatal(err.into())
+    }
+    pub fn from_reserve_error(err: anyhow::Error) -> Self {
+        if let Some(crate::worker::ClientError::BudgetExhausted { message }) =
+            err.downcast_ref::<crate::worker::ClientError>()
+        {
+            Self::ExecutionLimit {
+                reason: crate::continuation::TerminationReason::BudgetExhausted,
+                message: message.clone(),
+            }
+        } else {
+            Self::Fatal(err)
+        }
     }
 }
 
@@ -37,12 +65,33 @@ impl std::fmt::Display for BrokerError {
             Self::Recoverable { code, message } => {
                 write!(f, "recoverable callback error ({code}): {message}")
             }
+            Self::ExecutionLimit { reason, message } => {
+                write!(f, "execution limit reached ({reason:?}): {message}")
+            }
             Self::Fatal(err) => write!(f, "fatal broker error: {err:#}"),
         }
     }
 }
 
 impl std::error::Error for BrokerError {}
+
+#[derive(Debug, Clone)]
+pub struct ExecutionLimitError {
+    pub reason: crate::continuation::TerminationReason,
+    pub message: String,
+}
+
+impl std::fmt::Display for ExecutionLimitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "execution limit reached ({:?}): {}",
+            self.reason, self.message
+        )
+    }
+}
+
+impl std::error::Error for ExecutionLimitError {}
 
 struct Handle {
     terminal: Rc<Terminal>,
@@ -62,6 +111,7 @@ pub struct Broker<'a> {
     pub tool_successes: u64,
     pub tool_failures: u64,
     pub tool_counts: BTreeMap<String, u64>,
+    pub execution_limit: Option<(crate::continuation::TerminationReason, String)>,
     sequence: u32,
     terminals: BTreeMap<String, Handle>,
     seen_requests: BTreeSet<String>,
@@ -82,6 +132,7 @@ impl<'a> Broker<'a> {
             tool_successes: 0,
             tool_failures: 0,
             tool_counts: BTreeMap::new(),
+            execution_limit: None,
             sequence: 0,
             terminals: BTreeMap::new(),
             seen_requests: BTreeSet::new(),
@@ -246,6 +297,34 @@ impl<'a> Broker<'a> {
                         .await;
                     wire.response_error(id.clone(), code, &message).await?;
                 }
+                Err(BrokerError::ExecutionLimit { reason, message }) => {
+                    self.tool_failures += 1;
+                    self.execution_limit = Some((reason, message.clone()));
+                    let err_val = json!({
+                        "error": {
+                            "code": -32000,
+                            "message": &message,
+                            "execution_limit": true,
+                        }
+                    });
+                    let _ = self
+                        .record(
+                            RecordKind::BrokerOutput,
+                            &err_val,
+                            serde_json::to_vec(&err_val)
+                                .map(|v| v.len() as u64)
+                                .unwrap_or(0),
+                            0,
+                        )
+                        .await;
+                    let _ = wire.response_error(id.clone(), -32000, &message).await;
+                    if let Some(session_id) = &self.session_id {
+                        let _ = wire
+                            .notify("session/cancel", json!({ "sessionId": session_id }))
+                            .await;
+                    }
+                    return Err(ExecutionLimitError { reason, message }.into());
+                }
                 Err(BrokerError::Fatal(err)) => {
                     self.poisoned = true;
                     let detail = format!("{err:#}");
@@ -337,7 +416,7 @@ impl<'a> Broker<'a> {
                 let call = self
                     .reserve(Some(tool), params, 0)
                     .await
-                    .map_err(BrokerError::fatal)?;
+                    .map_err(BrokerError::from_reserve_error)?;
 
                 let result = if tool == "read_file" {
                     let line = match params.get("line") {
@@ -489,7 +568,7 @@ impl<'a> Broker<'a> {
                 let call = self
                     .reserve(Some("shell"), params, command.timeout_seconds)
                     .await
-                    .map_err(BrokerError::fatal)?;
+                    .map_err(BrokerError::from_reserve_error)?;
                 let spec = match crate::workspace::prepare_execution(
                     self.session.assignment,
                     &self.session.workspace.path,

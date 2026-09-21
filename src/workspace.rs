@@ -44,6 +44,7 @@ pub async fn perform(
     let workspace = Workspace::materialize(a, directory, &config.credentials).await?;
     let mut artifacts = vec![];
     let mut logs = Vec::new();
+    let mut failure: Option<Failure> = None;
     let success;
     if step.uses == "repository.code" {
         if step.agent.is_some() {
@@ -91,7 +92,23 @@ pub async fn perform(
                     .upload(a, "agent_report", serde_json::to_vec(&report)?)
                     .await?,
             );
-            success = true;
+            if report
+                .output
+                .get("acp")
+                .and_then(|a| a.get("stop_reason"))
+                .and_then(|s| s.as_str())
+                == Some("budget_exhausted")
+            {
+                success = false;
+                failure = Some(Failure {
+                    category: "task_failure".into(),
+                    code: "budget_exhausted".into(),
+                    message: "Orbit call budget exhausted".into(),
+                    side_effect_status: "none".into(),
+                });
+            } else {
+                success = true;
+            }
         } else {
             ensure!(step.agent.is_none(), "coding runtime unavailable");
             let result = execute(
@@ -173,11 +190,14 @@ pub async fn perform(
     Ok((
         success,
         artifacts,
-        (!success).then(|| Failure {
-            category: "task_failure".into(),
-            code: "validation_failed".into(),
-            message: "workspace command or independent verification failed; see artifacts".into(),
-            side_effect_status: "none".into(),
+        failure.or_else(|| {
+            (!success).then(|| Failure {
+                category: "task_failure".into(),
+                code: "validation_failed".into(),
+                message: "workspace command or independent verification failed; see artifacts"
+                    .into(),
+                side_effect_status: "none".into(),
+            })
         }),
     ))
 }

@@ -23,6 +23,28 @@ use tokio::{
     time::{Instant, sleep},
 };
 
+#[derive(Debug)]
+pub enum ClientError {
+    BudgetExhausted {
+        message: String,
+    },
+    Server {
+        status: reqwest::StatusCode,
+        value: Value,
+    },
+}
+
+impl std::fmt::Display for ClientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BudgetExhausted { message } => write!(f, "budget exhausted: {message}"),
+            Self::Server { status, value } => write!(f, "server {status}: {value}"),
+        }
+    }
+}
+
+impl std::error::Error for ClientError {}
+
 #[derive(Clone)]
 pub struct Client {
     pub url: String,
@@ -66,7 +88,22 @@ impl Client {
             .await?;
         let status = response.status();
         let value: Value = response.json().await?;
-        ensure!(status.is_success(), "server {status}: {value}");
+        if !status.is_success() {
+            if value.get("code").and_then(|c| c.as_str()) == Some("budget_exhausted")
+                || value
+                    .get("error")
+                    .and_then(|e| e.as_str())
+                    .is_some_and(|e| e.contains("budget exhausted"))
+            {
+                let message = value
+                    .get("error")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("budget exhausted")
+                    .to_string();
+                return Err(ClientError::BudgetExhausted { message }.into());
+            }
+            return Err(ClientError::Server { status, value }.into());
+        }
         Ok(value)
     }
     pub async fn get(&self, path: &str) -> Result<Value> {
@@ -122,6 +159,11 @@ impl Client {
                     return Ok(value);
                 }
                 Err(error) => {
+                    if let Some(ClientError::BudgetExhausted { .. }) =
+                        error.downcast_ref::<ClientError>()
+                    {
+                        return Err(error);
+                    }
                     last = Some(error);
                     sleep(Duration::from_millis(100)).await;
                 }

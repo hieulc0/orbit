@@ -376,15 +376,35 @@ impl Runtime {
             let call = broker.reserve(None,&prompt,0).await?;
             broker.active=true;
             let response = tokio::time::timeout(Duration::from_secs(limits.turn_timeout_seconds),acp_request(&mut wire,&mut broker,"session/prompt",prompt)).await;
-            if response.is_err() {
-                let _ = tokio::time::timeout(Duration::from_secs(1),wire.notify("session/cancel",json!({"sessionId":session_id}))).await;
-            }
-            let response = response.context("ACP turn timeout; prompt outcome unconfirmed")??;
-            ensure!(response["stopReason"] == "end_turn","ACP turn did not complete");
+            let response = match response {
+                Ok(Ok(val)) => val,
+                Ok(Err(err)) => {
+                    if err.downcast_ref::<crate::acp_broker::ExecutionLimitError>().is_some()
+                        || broker.execution_limit.is_some()
+                    {
+                        json!({"stopReason": "budget_exhausted"})
+                    } else {
+                        return Err(err);
+                    }
+                }
+                Err(_timeout) => {
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(1),
+                        wire.notify("session/cancel", json!({"sessionId": session_id})),
+                    )
+                    .await;
+                    anyhow::bail!("ACP turn timeout; prompt outcome unconfirmed");
+                }
+            };
+            let stop_reason = response["stopReason"].as_str().unwrap_or("unknown");
+            ensure!(
+                ["end_turn", "budget_exhausted"].contains(&stop_reason),
+                "ACP turn did not complete: {stop_reason}"
+            );
             broker.close_terminals().await?;
-            broker.active=false;
-            ensure!(!broker.poisoned,"ACP broker failed");
-            Ok::<_,anyhow::Error>((call,response))
+            broker.active = false;
+            ensure!(!broker.poisoned, "ACP broker failed");
+            Ok::<_, anyhow::Error>((call, response))
         }.await;
         // Dropping the only protocol writer closes the independent supervisor's
         // lifeline. A future dropped by lease loss follows the same cleanup path.
@@ -408,6 +428,7 @@ impl Runtime {
         broker
             .record(RecordKind::Completed, &response, 0, 0)
             .await?;
+        let stop_reason = response["stopReason"].as_str().unwrap_or("end_turn");
         let report = crate::agent::AgentReport {
             attempt_id: a.attempt_id.clone(),
             binding_digest: a.agent_binding_digest.clone().unwrap(),
@@ -415,7 +436,7 @@ impl Runtime {
                 "session_digest":broker.session_digest,"agent":self.launch.agent_name,"version":self.launch.agent_version,
                 "launch_digest":self.launch.digest()?,"model":self.binding.model,
                 "model_attribution":if self.binding.model.is_some(){"agent_confirmed_exact"}else{"agent_configured_unverified"},
-                "accounting":"execution_only","tokens":null,"cost_microusd":null,"stop_reason":"end_turn",
+                "accounting":"execution_only","tokens":null,"cost_microusd":null,"stop_reason":stop_reason,
                 "cleanup_confirmed":true,"output_bytes":broker.output_bytes,"reported_tool_calls":broker.reported_tools,
                 "tool_calls":broker.tool_calls,"tool_successes":broker.tool_successes,"tool_failures":broker.tool_failures,"tool_counts":broker.tool_counts
             }}),

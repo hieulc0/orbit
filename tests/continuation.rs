@@ -21,6 +21,7 @@ fn termination_reason_serialization() {
             TerminationReason::ResourceExhausted,
             "\"resource_exhausted\"",
         ),
+        (TerminationReason::BudgetExhausted, "\"budget_exhausted\""),
         (TerminationReason::Unknown, "\"unknown\""),
     ];
 
