@@ -418,6 +418,7 @@ impl Engine {
                                 .map(|bytes| digest(&bytes))
                         })
                         .transpose()?,
+                    execution_id: None,
                 };
                 run.tasks[index].attempts.push(attempt);
                 run.tasks[index].state = State::Claimed;
@@ -614,6 +615,127 @@ impl Engine {
                     json!({"status":"accepted","deadline_remaining_ms":run.tasks[ti].deadline_at.unwrap()-now,
                         "lease_remaining_ms":run.tasks[ti].attempts[ai].lease_expires_at-now}),
                 );
+            }
+            Action::StartExecution { evidence } => {
+                ensure!(
+                    run.tasks[ti].state == State::Running,
+                    "agent execution requires running task"
+                );
+                ensure!(
+                    run.plan.definition.steps[&run.tasks[ti].step]
+                        .agent
+                        .is_some(),
+                    "agent execution requires an agent step"
+                );
+                ensure!(!evidence.agent_type.is_empty(), "agent type required");
+                if let Some(reference) = &evidence.credential_reference {
+                    ensure!(
+                        crate::agent::valid_name(reference),
+                        "credential reference must be a logical name"
+                    );
+                }
+                if let Some(existing) = run.tasks[ti].attempts[ai]
+                    .agent_executions
+                    .iter()
+                    .rev()
+                    .find(|execution| {
+                        matches!(
+                            execution.status,
+                            crate::continuation::AgentExecutionStatus::Pending
+                                | crate::continuation::AgentExecutionStatus::Running
+                        )
+                    })
+                {
+                    return Ok(json!({
+                        "status":"accepted",
+                        "replayed":true,
+                        "execution_id":existing.execution_id,
+                        "sequence":existing.sequence,
+                        "execution":existing
+                    }));
+                }
+                let sequence = run.tasks[ti].attempts[ai]
+                    .agent_executions
+                    .iter()
+                    .map(|execution| execution.sequence)
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                let execution_id = format!("{}-exec-{sequence}", op.attempt_id);
+                let execution = evidence
+                    .clone()
+                    .into_pending(execution_id.clone(), sequence, now);
+                execution.validate()?;
+                run.tasks[ti].attempts[ai]
+                    .agent_executions
+                    .push(execution.clone());
+                return Ok(json!({
+                    "status":"accepted",
+                    "replayed":false,
+                    "execution_id":execution_id,
+                    "sequence":sequence,
+                    "execution":execution
+                }));
+            }
+            Action::MarkExecutionRunning { execution_id } => {
+                let execution = run.tasks[ti].attempts[ai]
+                    .agent_executions
+                    .iter_mut()
+                    .find(|execution| execution.execution_id == *execution_id)
+                    .context("agent execution not owned by attempt")?;
+                let replayed =
+                    execution.status != crate::continuation::AgentExecutionStatus::Pending;
+                if !replayed {
+                    execution.status = crate::continuation::AgentExecutionStatus::Running;
+                }
+                return Ok(json!({
+                    "status":"accepted",
+                    "replayed":replayed,
+                    "execution_id":execution_id
+                }));
+            }
+            Action::UpdateExecution {
+                execution_id,
+                actual_model,
+                turn_count,
+                tool_call_count,
+                tool_success_count,
+                tool_failure_count,
+                tool_counts,
+            } => {
+                let execution = run.tasks[ti].attempts[ai]
+                    .agent_executions
+                    .iter_mut()
+                    .find(|execution| execution.execution_id == *execution_id)
+                    .context("agent execution not owned by attempt")?;
+                if let Some(model) = actual_model {
+                    ensure!(!model.is_empty(), "actual model cannot be empty");
+                    if let Some(previous) = &execution.actual_model {
+                        ensure!(previous == model, "actual model evidence conflict");
+                    } else {
+                        execution.actual_model = Some(model.clone());
+                    }
+                }
+                if let Some(value) = turn_count {
+                    execution.turn_count = Some(*value);
+                }
+                if let Some(value) = tool_call_count {
+                    execution.tool_call_count = *value;
+                }
+                if let Some(value) = tool_success_count {
+                    execution.tool_success_count = *value;
+                }
+                if let Some(value) = tool_failure_count {
+                    execution.tool_failure_count = *value;
+                }
+                if !tool_counts.is_empty() {
+                    execution.tool_counts = tool_counts.clone();
+                }
+                return Ok(json!({
+                    "status":"accepted",
+                    "replayed":false,
+                    "execution_id":execution_id
+                }));
             }
             Action::Heartbeat => {
                 let expires =
@@ -825,6 +947,7 @@ impl Engine {
                         "container report provenance mismatch"
                     );
                 }
+                let mut report_acp = None;
                 if *success
                     && run.plan.definition.steps[&run.tasks[ti].step]
                         .agent
@@ -893,89 +1016,19 @@ impl Engine {
                         )?;
                     }
                     run.tasks[ti].expansion = Some(report.delegation_inputs);
-                    if let Some(acp) = report.output.get("acp") {
-                        let stop_reason_str = acp.get("stop_reason").and_then(|s| s.as_str());
-                        let termination_reason = if stop_reason_str == Some("budget_exhausted") {
-                            Some(crate::continuation::TerminationReason::BudgetExhausted)
-                        } else if stop_reason_str == Some("end_turn") {
-                            Some(crate::continuation::TerminationReason::Success)
-                        } else {
-                            None
-                        };
-                        let status = if termination_reason
-                            == Some(crate::continuation::TerminationReason::BudgetExhausted)
-                        {
-                            crate::continuation::AgentExecutionStatus::Interrupted
-                        } else if termination_reason
-                            == Some(crate::continuation::TerminationReason::Success)
-                        {
-                            crate::continuation::AgentExecutionStatus::Completed
-                        } else {
-                            crate::continuation::AgentExecutionStatus::Failed
-                        };
-                        let exec = crate::continuation::AgentExecution {
-                            execution_id: format!(
-                                "{}-exec-{}",
-                                op.attempt_id,
-                                run.tasks[ti].attempts[ai].agent_executions.len() + 1
-                            ),
-                            sequence: (run.tasks[ti].attempts[ai].agent_executions.len() + 1)
-                                as u32,
-                            agent_type: acp
-                                .get("agent")
-                                .and_then(|a| a.as_str())
-                                .unwrap_or("antigravity")
-                                .to_string(),
-                            provider: None,
-                            model: acp.get("model").and_then(|m| m.as_str()).map(String::from),
-                            started_at: now,
-                            finished_at: Some(now),
-                            status,
-                            termination_reason,
-                            exit_code: None,
-                            message: if termination_reason
-                                == Some(crate::continuation::TerminationReason::BudgetExhausted)
-                            {
-                                Some("Orbit call budget exhausted".to_string())
-                            } else {
-                                None
-                            },
-                            requested_model: None,
-                            requested_reasoning_effort: None,
-                            resolved_model: acp
-                                .get("model")
-                                .and_then(|m| m.as_str())
-                                .map(String::from),
-                            resolved_reasoning_effort: None,
-                            actual_model: acp
-                                .get("model")
-                                .and_then(|m| m.as_str())
-                                .map(String::from),
-                            runtime_image: None,
-                            runtime_digest: None,
-                            capability_source: None,
-                            usage: None,
-                            turn_count: Some(1),
-                            tool_call_count: acp
-                                .get("tool_calls")
-                                .and_then(|t| t.as_u64())
-                                .unwrap_or(0),
-                            tool_success_count: acp
-                                .get("tool_successes")
-                                .and_then(|t| t.as_u64())
-                                .unwrap_or(0),
-                            tool_failure_count: acp
-                                .get("tool_failures")
-                                .and_then(|t| t.as_u64())
-                                .unwrap_or(0),
-                            tool_counts: serde_json::from_value(
-                                acp.get("tool_counts").cloned().unwrap_or(json!({})),
-                            )
-                            .unwrap_or_default(),
-                            metadata: Value::Null,
-                        };
-                        run.tasks[ti].attempts[ai].agent_executions.push(exec);
-                    }
+                    report_acp = report.output.get("acp").cloned();
+                }
+                if run.plan.definition.steps[&run.tasks[ti].step]
+                    .agent
+                    .is_some()
+                {
+                    finalize_agent_execution(
+                        &mut run.tasks[ti].attempts[ai],
+                        now,
+                        *success,
+                        failure.as_ref(),
+                        report_acp.as_ref(),
+                    )?;
                 }
                 if *success
                     && run.plan.definition.steps[&run.tasks[ti].step]
@@ -1357,6 +1410,18 @@ impl Engine {
                         if let Some(attempt) =
                             task.attempts.last_mut().filter(|a| !a.state.terminal())
                         {
+                            finalize_agent_execution(
+                                attempt,
+                                now,
+                                false,
+                                Some(&Failure {
+                                    category: "infrastructure_failure".into(),
+                                    code: "cancelled".into(),
+                                    message: "cancellation requested".into(),
+                                    side_effect_status: "unknown".into(),
+                                }),
+                                None,
+                            )?;
                             attempt.state = State::Cancelled;
                             attempt.reason = task.reason.clone();
                         }
@@ -1379,12 +1444,42 @@ impl Engine {
                             "deadline exceeded; prior reason: {}",
                             run.tasks[ti].reason.as_deref().unwrap_or("none")
                         );
+                        if let Some(attempt) = run.tasks[ti]
+                            .attempts
+                            .last_mut()
+                            .filter(|a| !a.state.terminal())
+                        {
+                            finalize_agent_execution(
+                                attempt,
+                                now,
+                                false,
+                                Some(&Failure {
+                                    category: "infrastructure_failure".into(),
+                                    code: "timeout".into(),
+                                    message: "task deadline exceeded".into(),
+                                    side_effect_status: "unknown".into(),
+                                }),
+                                None,
+                            )?;
+                        }
                         fail_task(&mut run, ti, &reason);
                     } else if run.tasks[ti]
                         .attempts
                         .last()
                         .is_some_and(|a| !a.state.terminal() && a.lease_expires_at <= now)
                     {
+                        finalize_agent_execution(
+                            run.tasks[ti].attempts.last_mut().unwrap(),
+                            now,
+                            false,
+                            Some(&Failure {
+                                category: "infrastructure_failure".into(),
+                                code: "lease_expired".into(),
+                                message: "worker lease expired".into(),
+                                side_effect_status: "unknown".into(),
+                            }),
+                            None,
+                        )?;
                         run.tasks[ti].attempts.last_mut().unwrap().state = State::Lost;
                         recover(
                             &mut run,
@@ -1823,6 +1918,93 @@ fn locate(run: &Run, attempt_id: &str) -> Option<(usize, usize)> {
             .map(|ai| (ti, ai))
     })
 }
+
+fn finalize_agent_execution(
+    attempt: &mut Attempt,
+    now: i64,
+    success: bool,
+    failure: Option<&Failure>,
+    acp: Option<&Value>,
+) -> Result<()> {
+    let Some(execution) = attempt.agent_executions.iter_mut().rev().find(|execution| {
+        matches!(
+            execution.status,
+            crate::continuation::AgentExecutionStatus::Pending
+                | crate::continuation::AgentExecutionStatus::Running
+        )
+    }) else {
+        // Legacy completion-only records remain valid. Do not synthesize a
+        // record for a failure from an old worker that never dispatched one.
+        return Ok(());
+    };
+
+    let (status, reason, message) = if success {
+        (
+            crate::continuation::AgentExecutionStatus::Completed,
+            crate::continuation::TerminationReason::Success,
+            None,
+        )
+    } else {
+        let failure = failure.context("failed agent execution missing failure")?;
+        let (status, reason, message) = match failure.code.as_str() {
+            "budget_exhausted" => (
+                crate::continuation::AgentExecutionStatus::Interrupted,
+                crate::continuation::TerminationReason::BudgetExhausted,
+                Some("Orbit call budget exhausted".to_string()),
+            ),
+            "cancelled" => (
+                crate::continuation::AgentExecutionStatus::Interrupted,
+                crate::continuation::TerminationReason::Cancelled,
+                Some("Execution cancelled".to_string()),
+            ),
+            "timeout" | "turn_timeout" => (
+                crate::continuation::AgentExecutionStatus::Interrupted,
+                crate::continuation::TerminationReason::Timeout,
+                Some("Agent execution timed out".to_string()),
+            ),
+            "coding_agent_failed" | "worker_execution_error" | "runtime_failure" => (
+                crate::continuation::AgentExecutionStatus::Failed,
+                crate::continuation::TerminationReason::InfrastructureError,
+                Some("Agent runtime or infrastructure failed before a report".to_string()),
+            ),
+            _ => (
+                crate::continuation::AgentExecutionStatus::Failed,
+                if failure.category == "task_failure" {
+                    crate::continuation::TerminationReason::AgentError
+                } else {
+                    crate::continuation::TerminationReason::InfrastructureError
+                },
+                Some("Agent execution did not produce a report".to_string()),
+            ),
+        };
+        (status, reason, message)
+    };
+
+    if let Some(acp) = acp {
+        execution.turn_count = Some(1);
+        execution.tool_call_count = acp
+            .get("tool_calls")
+            .and_then(Value::as_u64)
+            .unwrap_or(execution.tool_call_count);
+        execution.tool_success_count = acp
+            .get("tool_successes")
+            .and_then(Value::as_u64)
+            .unwrap_or(execution.tool_success_count);
+        execution.tool_failure_count = acp
+            .get("tool_failures")
+            .and_then(Value::as_u64)
+            .unwrap_or(execution.tool_failure_count);
+        if let Some(counts) = acp.get("tool_counts") {
+            execution.tool_counts = serde_json::from_value(counts.clone()).unwrap_or_default();
+        }
+    }
+    execution.status = status;
+    execution.termination_reason = Some(reason);
+    execution.finished_at = Some(now);
+    execution.message = message;
+    Ok(())
+}
+
 async fn now(tx: &mut Tx<'_>) -> Result<i64> {
     Ok(
         sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint")
@@ -1873,6 +2055,24 @@ async fn transitions(
             let prev = old.attempts.iter().find(|a| a.id == attempt.id);
             if prev.is_none_or(|a| a.state != attempt.state) {
                 events.push(json!({"type":"ATTEMPT_STATE_CHANGED","task_id":task.id,"attempt_id":attempt.id,"worker_id":attempt.worker_id,"workspace_id":attempt.workspace_id,"generation":attempt.generation,"from":prev.map(|a|a.state),"to":attempt.state,"reason":attempt.reason.as_deref().unwrap_or(reason)}));
+            }
+            let previous_executions = prev.map(|a| &a.agent_executions);
+            for execution in &attempt.agent_executions {
+                let changed = previous_executions
+                    .and_then(|executions| {
+                        executions
+                            .iter()
+                            .find(|previous| previous.execution_id == execution.execution_id)
+                    })
+                    .is_none_or(|previous| previous != execution);
+                if changed {
+                    events.push(json!({
+                        "type":"AGENT_EXECUTION_CHANGED",
+                        "task_id":task.id,
+                        "attempt_id":attempt.id,
+                        "execution":execution
+                    }));
+                }
             }
         }
     }
@@ -2007,4 +2207,95 @@ async fn fault(point: &str) {
     }
     #[cfg(not(feature = "fault-injection"))]
     let _ = point;
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    fn attempt_with_execution() -> Attempt {
+        let execution = crate::continuation::AgentExecutionStart {
+            agent_type: "antigravity".into(),
+            requested_model: Some("gemini-3.8-flash".into()),
+            resolved_model: Some("gemini-3.8-flash-high".into()),
+            ..Default::default()
+        }
+        .into_pending("attempt-exec-1".into(), 1, 100);
+        Attempt {
+            id: "attempt".into(),
+            generation: 1,
+            worker_id: "worker".into(),
+            workspace_id: "workspace".into(),
+            token: "token".into(),
+            state: State::Running,
+            lease_expires_at: 1000,
+            reason: None,
+            outputs: vec![],
+            gpu_devices: vec![],
+            agent_executions: vec![execution],
+        }
+    }
+
+    #[test]
+    fn completion_finalizes_the_existing_execution_id() {
+        let mut attempt = attempt_with_execution();
+        let id = attempt.agent_executions[0].execution_id.clone();
+        finalize_agent_execution(&mut attempt, 200, true, None, None).unwrap();
+        assert_eq!(attempt.agent_executions.len(), 1);
+        assert_eq!(attempt.agent_executions[0].execution_id, id);
+        assert_eq!(
+            attempt.agent_executions[0].status,
+            crate::continuation::AgentExecutionStatus::Completed
+        );
+
+        // A replay after terminal finalization is a no-op, not a second record.
+        finalize_agent_execution(&mut attempt, 300, true, None, None).unwrap();
+        assert_eq!(attempt.agent_executions.len(), 1);
+        assert_eq!(attempt.agent_executions[0].finished_at, Some(200));
+    }
+
+    #[test]
+    fn infrastructure_failure_and_budget_exhaustion_keep_distinct_semantics() {
+        let mut infrastructure = attempt_with_execution();
+        finalize_agent_execution(
+            &mut infrastructure,
+            200,
+            false,
+            Some(&Failure {
+                category: "task_failure".into(),
+                code: "coding_agent_failed".into(),
+                message: "not persisted".into(),
+                side_effect_status: "none".into(),
+            }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            infrastructure.agent_executions[0].termination_reason,
+            Some(crate::continuation::TerminationReason::InfrastructureError)
+        );
+
+        let mut budget = attempt_with_execution();
+        finalize_agent_execution(
+            &mut budget,
+            200,
+            false,
+            Some(&Failure {
+                category: "task_failure".into(),
+                code: "budget_exhausted".into(),
+                message: "not persisted".into(),
+                side_effect_status: "none".into(),
+            }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            budget.agent_executions[0].status,
+            crate::continuation::AgentExecutionStatus::Interrupted
+        );
+        assert_eq!(
+            budget.agent_executions[0].termination_reason,
+            Some(crate::continuation::TerminationReason::BudgetExhausted)
+        );
+    }
 }

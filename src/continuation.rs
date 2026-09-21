@@ -127,6 +127,77 @@ pub struct AgentExecution {
     pub metadata: serde_json::Value,
 }
 
+/// Evidence known by the worker when an agent execution is durably dispatched.
+///
+/// This is deliberately separate from [`AgentExecution`]: the engine assigns
+/// the stable execution identity and sequence while holding the run fence.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentExecutionStart {
+    pub agent_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_image: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_source: Option<crate::acp_capabilities::CapabilitySource>,
+    /// A logical credential identity only; never a credential value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_reference: Option<String>,
+}
+
+impl AgentExecutionStart {
+    pub fn into_pending(
+        self,
+        execution_id: String,
+        sequence: u32,
+        started_at: i64,
+    ) -> AgentExecution {
+        let mut metadata = serde_json::Value::Null;
+        if let Some(reference) = self.credential_reference {
+            metadata = serde_json::json!({"credential_reference": reference});
+        }
+        AgentExecution {
+            execution_id,
+            sequence,
+            agent_type: self.agent_type,
+            provider: self.provider,
+            model: self.resolved_model.clone().or(self.requested_model.clone()),
+            started_at,
+            finished_at: None,
+            status: AgentExecutionStatus::Pending,
+            termination_reason: None,
+            exit_code: None,
+            message: None,
+            requested_model: self.requested_model,
+            requested_reasoning_effort: self.requested_reasoning_effort,
+            resolved_model: self.resolved_model,
+            resolved_reasoning_effort: self.resolved_reasoning_effort,
+            actual_model: None,
+            runtime_image: self.runtime_image,
+            runtime_digest: self.runtime_digest,
+            capability_source: self.capability_source,
+            usage: None,
+            turn_count: None,
+            tool_call_count: 0,
+            tool_success_count: 0,
+            tool_failure_count: 0,
+            tool_counts: std::collections::BTreeMap::new(),
+            metadata,
+        }
+    }
+}
+
 impl AgentExecution {
     pub fn validate(&self) -> Result<()> {
         ensure!(!self.execution_id.is_empty(), "execution_id required");

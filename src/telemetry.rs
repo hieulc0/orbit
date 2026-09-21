@@ -359,7 +359,9 @@ Agent Executions"
                 exec.sequence
             )
             .unwrap();
+            writeln!(out, "  id: {}", exec.execution_id).unwrap();
             writeln!(out, "  agent: {}", exec.agent_type).unwrap();
+            writeln!(out, "  status: {:?}", exec.status).unwrap();
 
             let req_model = exec.requested_model.as_deref().unwrap_or("default");
             let req_effort = exec.requested_reasoning_effort.as_deref().unwrap_or("none");

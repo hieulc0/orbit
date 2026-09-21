@@ -907,6 +907,10 @@ pub struct Assignment {
     pub gpu_devices: Vec<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_binding_digest: Option<String>,
+    /// Set by the worker after the fenced execution-dispatch action is accepted.
+    /// It is not an authority token and is never trusted without the run record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -928,6 +932,30 @@ pub struct Operation {
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum Action {
     Start,
+    /// Atomically records that a concrete agent dispatch was accepted.
+    StartExecution {
+        evidence: crate::continuation::AgentExecutionStart,
+    },
+    /// Marks the accepted execution as actively running. Replays are no-ops.
+    MarkExecutionRunning {
+        execution_id: String,
+    },
+    /// Records confirmed runtime identity and bounded partial telemetry.
+    UpdateExecution {
+        execution_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actual_model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_count: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_call_count: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_success_count: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_failure_count: Option<u64>,
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        tool_counts: std::collections::BTreeMap<String, u64>,
+    },
     Heartbeat,
     RecordAcpSession {
         batch: crate::acp_contract::RecordBatch,

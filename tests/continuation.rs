@@ -103,6 +103,52 @@ fn agent_execution_roundtrip() {
 }
 
 #[test]
+fn dispatched_execution_starts_pending_without_fabricating_actual_model() {
+    let execution = AgentExecutionStart {
+        agent_type: "antigravity".into(),
+        requested_model: Some("gemini-3.8-flash".into()),
+        requested_reasoning_effort: Some("high".into()),
+        resolved_model: Some("gemini-3.8-flash-high".into()),
+        resolved_reasoning_effort: Some("high".into()),
+        runtime_image: Some("sha256:image".into()),
+        runtime_digest: Some("digest".into()),
+        credential_reference: Some("antigravity-weedy".into()),
+        ..Default::default()
+    };
+    let execution = execution.into_pending("attempt-exec-1".into(), 1, 100);
+
+    assert_eq!(execution.status, AgentExecutionStatus::Pending);
+    assert_eq!(execution.actual_model, None);
+    assert_eq!(
+        execution.resolved_model.as_deref(),
+        Some("gemini-3.8-flash-high")
+    );
+    assert_eq!(execution.sequence, 1);
+    assert_eq!(
+        execution.metadata["credential_reference"],
+        "antigravity-weedy"
+    );
+
+    let encoded = serde_json::to_string(&execution).unwrap();
+    assert!(!encoded.contains("secret"));
+    assert!(!encoded.contains("Authorization"));
+}
+
+#[test]
+fn legacy_agent_execution_without_new_fields_remains_readable() {
+    let value = json!({
+        "execution_id":"legacy-exec",
+        "sequence":1,
+        "agent_type":"codex",
+        "started_at":100,
+        "status":"completed"
+    });
+    let execution: AgentExecution = serde_json::from_value(value).unwrap();
+    assert_eq!(execution.actual_model, None);
+    assert_eq!(execution.tool_call_count, 0);
+}
+
+#[test]
 fn handoff_record_roundtrip_v1() {
     let snapshot = WorkspaceSnapshot {
         baseline_revision: "0123456789abcdef0123456789abcdef01234567".into(),

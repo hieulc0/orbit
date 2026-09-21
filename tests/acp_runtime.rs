@@ -250,6 +250,7 @@ fn acp_example_registry_pins_launch_scope_and_combined_resources() -> Result<()>
         idempotency_key: id(),
         gpu_devices: vec![],
         agent_binding_digest: Some(digest(&serde_json::to_vec(&runtime.binding)?)),
+        execution_id: None,
     };
     runtime.authorize(&assignment)?;
     worker.authorize(&assignment)?;
@@ -395,6 +396,7 @@ fn acp_antigravity_example_registry_pins_launch_scope_and_combined_resources() -
         idempotency_key: id(),
         gpu_devices: vec![],
         agent_binding_digest: Some(digest(&serde_json::to_vec(&runtime.binding)?)),
+        execution_id: None,
     };
     runtime.authorize(&assignment)?;
     worker.authorize(&assignment)?;

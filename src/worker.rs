@@ -145,6 +145,54 @@ impl Client {
     pub async fn operation(&self, assignment: &Assignment, action: Action) -> Result<Value> {
         self.send_operation(&operation(assignment, action)).await
     }
+
+    /// Resolve only safe, operator-visible execution identity for the durable
+    /// lifecycle record. Secrets and auth material never cross this boundary.
+    pub fn agent_execution_start(
+        &self,
+        assignment: &Assignment,
+    ) -> Result<Option<crate::continuation::AgentExecutionStart>> {
+        let Some(spec) = assignment.plan.definition.steps[&assignment.step]
+            .agent
+            .as_ref()
+        else {
+            return Ok(None);
+        };
+        let binding = assignment
+            .plan
+            .agent_bindings
+            .get(&spec.binding)
+            .context("agent binding missing")?;
+        let mut evidence = crate::continuation::AgentExecutionStart {
+            agent_type: spec.identity.clone(),
+            provider: None,
+            requested_model: binding.model.clone(),
+            requested_reasoning_effort: None,
+            resolved_model: binding.model.clone(),
+            resolved_reasoning_effort: None,
+            runtime_image: None,
+            runtime_digest: None,
+            capability_source: None,
+            credential_reference: None,
+        };
+        if let Some(config) = &self.execution_config {
+            if let Some(runtime) = config
+                .acp_agents
+                .iter()
+                .find(|runtime| runtime.binding_name == spec.binding)
+            {
+                evidence.agent_type = runtime.launch.agent_name.clone();
+                evidence.runtime_image = Some(runtime.launch.image.clone());
+                evidence.runtime_digest = Some(runtime.launch.digest()?);
+                evidence.credential_reference = Some(runtime.auth.source.clone());
+            } else if let Some(runtime) = &config.coding_agent
+                && runtime.binding_name == spec.binding
+            {
+                evidence.credential_reference = Some(runtime.credential.clone());
+            }
+        }
+        Ok(Some(evidence))
+    }
     pub async fn send_operation(&self, operation: &Operation) -> Result<Value> {
         // Retransmit exactly the same request after a lost response. Never re-execute work here.
         let mut last = None;
@@ -416,6 +464,26 @@ pub async fn run_until(
 pub async fn execute(client: &Client, assignment: &Assignment, root: &Path) -> Result<()> {
     let sent_at = Instant::now();
     let started = client.operation(assignment, Action::Start).await?;
+    let mut assignment = assignment.clone();
+    if let Some(evidence) = client.agent_execution_start(&assignment)? {
+        let accepted = client
+            .operation(&assignment, Action::StartExecution { evidence })
+            .await?;
+        assignment.execution_id = Some(
+            accepted["execution_id"]
+                .as_str()
+                .context("execution ID missing from dispatch acknowledgement")?
+                .to_string(),
+        );
+        client
+            .operation(
+                &assignment,
+                Action::MarkExecutionRunning {
+                    execution_id: assignment.execution_id.clone().unwrap(),
+                },
+            )
+            .await?;
+    }
     let deadline = sent_at
         + Duration::from_millis(
             started["deadline_remaining_ms"]
@@ -428,12 +496,12 @@ pub async fn execute(client: &Client, assignment: &Assignment, root: &Path) -> R
         "start acknowledgement arrived after confirmed lease expiry"
     );
     let execution = async {
-        let outcome = perform(client, assignment, root).await;
+        let outcome = perform(client, &assignment, root).await;
         match outcome {
             Ok((success, outputs, failure)) => {
                 client
                     .operation(
-                        assignment,
+                        &assignment,
                         Action::Complete {
                             success,
                             outputs,
@@ -445,7 +513,7 @@ pub async fn execute(client: &Client, assignment: &Assignment, root: &Path) -> R
             Err(error) => {
                 client
                     .operation(
-                        assignment,
+                        &assignment,
                         Action::Complete {
                             success: false,
                             outputs: vec![],
@@ -483,7 +551,7 @@ pub async fn execute(client: &Client, assignment: &Assignment, root: &Path) -> R
                 sleep(Duration::from_millis(assignment.heartbeat_interval).min(remaining / 2))
                     .await;
                 let sent_at = Instant::now();
-                let renewed = client.operation(assignment, Action::Heartbeat).await?;
+                let renewed = client.operation(&assignment, Action::Heartbeat).await?;
                 ensure!(
                     Instant::now() < lease_until,
                     "confirmed lease expired before heartbeat acknowledgement"

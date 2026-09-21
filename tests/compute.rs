@@ -114,6 +114,7 @@ async fn supervisor_cleans_up_after_lifeline_process_dies() -> Result<()> {
     )?;
     let assignment = Assignment {
         agent_binding_digest: None,
+        execution_id: None,
         run_id: id(),
         task_id: id(),
         attempt_id: id(),
@@ -175,6 +176,7 @@ fn local_container_recovery_preserves_result_and_provenance() -> Result<()> {
     let original_attempt = id();
     let assignment = Assignment {
         agent_binding_digest: None,
+        execution_id: None,
         run_id: id(),
         task_id: id(),
         attempt_id: original_attempt.clone(),

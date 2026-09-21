@@ -276,6 +276,7 @@ impl Runtime {
         use serde_json::json;
         use std::{os::unix::fs::OpenOptionsExt, process::Stdio, time::Duration};
         let a = session.assignment;
+        let client = session.client;
         let spec = a.plan.definition.steps[&a.step].agent.as_ref().unwrap();
         let limits = spec.acp_limits.as_ref().unwrap();
         let request_path = session
@@ -356,7 +357,7 @@ impl Runtime {
                 .get("models")
                 .and_then(|m| m.get("currentModelId"))
                 .and_then(|v| v.as_str());
-            select_model(
+            let model_confirmed = select_model(
                 &mut wire,
                 &mut broker,
                 session_id,
@@ -364,6 +365,25 @@ impl Runtime {
                 current_model,
             )
             .await?;
+            if model_confirmed
+                && let (Some(execution_id), Some(actual_model)) =
+                    (a.execution_id.as_deref(), self.binding.model.as_deref())
+            {
+                client
+                    .operation(
+                        a,
+                        crate::model::Action::UpdateExecution {
+                            execution_id: execution_id.to_string(),
+                            actual_model: Some(actual_model.to_string()),
+                            turn_count: None,
+                            tool_call_count: None,
+                            tool_success_count: None,
+                            tool_failure_count: None,
+                            tool_counts: std::collections::BTreeMap::new(),
+                        },
+                    )
+                    .await?;
+            }
             if self.launch.adapter == Adapter::Antigravity {
                 let _ = tokio::time::timeout(
                     Duration::from_secs(10),
@@ -427,6 +447,22 @@ impl Runtime {
                 == Some(code)),
             "ACP process/auth cleanup unconfirmed; auth store may be quarantined"
         );
+        if let Some(execution_id) = a.execution_id.as_deref() {
+            let _ = client
+                .operation(
+                    a,
+                    crate::model::Action::UpdateExecution {
+                        execution_id: execution_id.to_string(),
+                        actual_model: None,
+                        turn_count: Some(1),
+                        tool_call_count: Some(broker.tool_calls),
+                        tool_success_count: Some(broker.tool_successes),
+                        tool_failure_count: Some(broker.tool_failures),
+                        tool_counts: broker.tool_counts.clone(),
+                    },
+                )
+                .await;
+        }
         let (call, response) = result?;
         broker.finish(&call, &response).await?;
         broker
@@ -473,92 +509,98 @@ pub async fn select_model(
     session_id: &str,
     requested_model: Option<&str>,
     current_model: Option<&str>,
-) -> Result<()> {
-    if let Some(model) = requested_model {
-        ensure!(
-            crate::agent::valid_name(model),
-            "invalid requested model name"
-        );
-        if current_model != Some(model) {
-            let mut confirmed = false;
+) -> Result<bool> {
+    let Some(model) = requested_model else {
+        return Ok(false);
+    };
+    ensure!(
+        crate::agent::valid_name(model),
+        "invalid requested model name"
+    );
+    if current_model != Some(model) {
+        let mut confirmed = false;
+        let mut evidence_confirmed = false;
 
-            // 1. Try session/set_config_option
-            let set_config_res = tokio::time::timeout(
+        // 1. Try session/set_config_option
+        let set_config_res = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            acp_request(
+                wire,
+                broker,
+                "session/set_config_option",
+                serde_json::json!({
+                    "sessionId": session_id,
+                    "configId": "model",
+                    "value": model,
+                }),
+            ),
+        )
+        .await;
+
+        ensure!(
+            !broker.poisoned,
+            "ACP broker poisoned during model selection"
+        );
+
+        if let Ok(Ok(config_resp)) = set_config_res
+            && let Some(options) = config_resp.get("configOptions").and_then(|v| v.as_array())
+        {
+            for opt in options {
+                if opt.get("id").and_then(|v| v.as_str()) == Some("model")
+                    && opt.get("currentValue").and_then(|v| v.as_str()) == Some(model)
+                {
+                    confirmed = true;
+                    evidence_confirmed = true;
+                    break;
+                }
+            }
+        }
+
+        // 2. Fall back to session/set_model
+        if !confirmed {
+            let set_model_res = tokio::time::timeout(
                 std::time::Duration::from_secs(10),
                 acp_request(
                     wire,
                     broker,
-                    "session/set_config_option",
+                    "session/set_model",
                     serde_json::json!({
                         "sessionId": session_id,
-                        "configId": "model",
-                        "value": model,
+                        "modelId": model,
                     }),
                 ),
             )
-            .await;
+            .await
+            .context("ACP set_model timeout")??;
 
             ensure!(
                 !broker.poisoned,
                 "ACP broker poisoned during model selection"
             );
 
-            if let Ok(Ok(config_resp)) = set_config_res
-                && let Some(options) = config_resp.get("configOptions").and_then(|v| v.as_array())
+            if let Some(curr) = set_model_res
+                .get("models")
+                .and_then(|m| m.get("currentModelId"))
+                .and_then(|v| v.as_str())
             {
-                for opt in options {
-                    if opt.get("id").and_then(|v| v.as_str()) == Some("model")
-                        && opt.get("currentValue").and_then(|v| v.as_str()) == Some(model)
-                    {
-                        confirmed = true;
-                        break;
-                    }
-                }
-            }
-
-            // 2. Fall back to session/set_model
-            if !confirmed {
-                let set_model_res = tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
-                    acp_request(
-                        wire,
-                        broker,
-                        "session/set_model",
-                        serde_json::json!({
-                            "sessionId": session_id,
-                            "modelId": model,
-                        }),
-                    ),
-                )
-                .await
-                .context("ACP set_model timeout")??;
-
                 ensure!(
-                    !broker.poisoned,
-                    "ACP broker poisoned during model selection"
+                    curr == model,
+                    "ACP set_model response returned mismatched model: expected {}, got {}",
+                    model,
+                    curr
                 );
-
-                if let Some(curr) = set_model_res
-                    .get("models")
-                    .and_then(|m| m.get("currentModelId"))
-                    .and_then(|v| v.as_str())
-                {
-                    ensure!(
-                        curr == model,
-                        "ACP set_model response returned mismatched model: expected {}, got {}",
-                        model,
-                        curr
-                    );
-                }
-                confirmed = true;
+                evidence_confirmed = true;
             }
-
-            ensure!(
-                confirmed,
-                "ACP requested model could not be activated or confirmed: {}",
-                model
-            );
+            confirmed = true;
         }
+
+        ensure!(
+            confirmed,
+            "ACP requested model could not be activated or confirmed: {}",
+            model
+        );
+        return Ok(evidence_confirmed);
     }
-    Ok(())
+
+    Ok(true)
 }

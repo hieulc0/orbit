@@ -66,6 +66,237 @@ async fn report(f: &Fixture, a: &Assignment, items: Vec<String>) -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL"]
+async fn agent_execution_lifecycle_is_durable_before_report_and_replay_safe() -> Result<()> {
+    let f = Fixture::new().await?;
+    let mut def = definition();
+    def.steps.retain(|name, _| name == "planner");
+    let run = f.engine.submit(&id(), plan(def)?, None).await?["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let a = claim(&f.engine).await?;
+    f.start("agent", &a).await?;
+
+    let start = operation(
+        &a,
+        Action::StartExecution {
+            evidence: orbit::continuation::AgentExecutionStart {
+                agent_type: "fixture-agent".into(),
+                requested_model: Some("requested-model".into()),
+                resolved_model: Some("resolved-model".into()),
+                runtime_image: Some("fixture-image".into()),
+                runtime_digest: Some("fixture-digest".into()),
+                credential_reference: Some("fixture-credential".into()),
+                ..Default::default()
+            },
+        },
+    );
+    let accepted = f.engine.operate("agent", &start).await?;
+    assert_eq!(accepted["replayed"], false);
+    let execution_id = accepted["execution_id"].as_str().unwrap().to_string();
+    let pending = f.engine.inspect(&run).await?;
+    let execution = &pending["tasks"][0]["attempts"][0]["agent_executions"][0];
+    assert_eq!(execution["execution_id"], execution_id);
+    assert_eq!(execution["status"], "pending");
+    assert_eq!(execution["actual_model"], Value::Null);
+
+    let mut duplicate_start = start.clone();
+    duplicate_start.request_id = id();
+    let replayed = f.engine.operate("agent", &duplicate_start).await?;
+    assert_eq!(replayed["replayed"], true);
+    assert_eq!(replayed["execution_id"], execution_id);
+
+    f.engine
+        .operate(
+            "agent",
+            &operation(
+                &a,
+                Action::MarkExecutionRunning {
+                    execution_id: execution_id.clone(),
+                },
+            ),
+        )
+        .await?;
+    f.engine
+        .operate(
+            "agent",
+            &operation(
+                &a,
+                Action::UpdateExecution {
+                    execution_id: execution_id.clone(),
+                    actual_model: Some("confirmed-model".into()),
+                    turn_count: Some(1),
+                    tool_call_count: Some(17),
+                    tool_success_count: Some(16),
+                    tool_failure_count: Some(1),
+                    tool_counts: BTreeMap::from([("shell".into(), 17)]),
+                },
+            ),
+        )
+        .await?;
+    let running = f.engine.inspect(&run).await?;
+    assert_eq!(
+        running["tasks"][0]["attempts"][0]["agent_executions"][0]["status"],
+        "running"
+    );
+    assert_eq!(
+        running["tasks"][0]["attempts"][0]["agent_executions"][0]["actual_model"],
+        "confirmed-model"
+    );
+    assert_eq!(
+        running["tasks"][0]["attempts"][0]["agent_executions"][0]["tool_call_count"],
+        17
+    );
+
+    let logs = f.upload("agent", &a, "logs", b"fixture output").await?;
+    let report = AgentReport {
+        attempt_id: a.attempt_id.clone(),
+        binding_digest: a.agent_binding_digest.clone().unwrap(),
+        output: json!({"result":"fixture"}),
+        delegation_inputs: vec![],
+    };
+    let report = f
+        .upload("agent", &a, "agent_report", &serde_json::to_vec(&report)?)
+        .await?;
+    let complete = operation(
+        &a,
+        Action::Complete {
+            success: true,
+            outputs: vec![logs, report],
+            failure: None,
+        },
+    );
+    f.engine.operate("agent", &complete).await?;
+    assert_eq!(
+        f.engine.operate("agent", &complete).await?["status"],
+        "accepted"
+    );
+    let final_state = f.engine.inspect(&run).await?;
+    let executions = final_state["tasks"][0]["attempts"][0]["agent_executions"]
+        .as_array()
+        .unwrap();
+    assert_eq!(executions.len(), 1);
+    assert_eq!(executions[0]["execution_id"], execution_id);
+    assert_eq!(executions[0]["status"], "completed");
+    assert_eq!(executions[0]["actual_model"], "confirmed-model");
+    assert_eq!(executions[0]["usage"], Value::Null);
+    assert_eq!(
+        final_state["tasks"][0]["attempts"][0]["agent_executions"][0]["metadata"]["credential_reference"],
+        "fixture-credential"
+    );
+
+    let reopened = Engine::connect(&f.url, f.engine.artifact_root.clone(), 3).await?;
+    assert_eq!(
+        reopened.inspect(&run).await?["tasks"][0]["attempts"][0]["agent_executions"][0]["execution_id"],
+        execution_id
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL"]
+async fn agent_execution_failure_and_budget_exhaustion_finalize_existing_records() -> Result<()> {
+    let f = Fixture::new().await?;
+    let mut def = definition();
+    def.steps.retain(|name, _| name == "planner");
+    let plan = plan(def)?;
+    let run = f.engine.submit(&id(), plan.clone(), None).await?["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let a = claim(&f.engine).await?;
+    f.start("agent", &a).await?;
+    let start = |a: &Assignment| {
+        operation(
+            a,
+            Action::StartExecution {
+                evidence: orbit::continuation::AgentExecutionStart {
+                    agent_type: "fixture-agent".into(),
+                    ..Default::default()
+                },
+            },
+        )
+    };
+    let first = f.engine.operate("agent", &start(&a)).await?;
+    let first_id = first["execution_id"].as_str().unwrap().to_string();
+    f.engine
+        .operate(
+            "agent",
+            &operation(
+                &a,
+                Action::Complete {
+                    success: false,
+                    outputs: vec![],
+                    failure: Some(Failure {
+                        category: "infrastructure_failure".into(),
+                        code: "coding_agent_failed".into(),
+                        message: "runtime failed before report".into(),
+                        side_effect_status: "none".into(),
+                    }),
+                },
+            ),
+        )
+        .await?;
+    let failed = f.engine.inspect(&run).await?;
+    assert_eq!(
+        failed["tasks"][0]["attempts"][0]["agent_executions"][0]["execution_id"],
+        first_id
+    );
+    assert_eq!(
+        failed["tasks"][0]["attempts"][0]["agent_executions"][0]["status"],
+        "failed"
+    );
+    assert_eq!(
+        failed["tasks"][0]["attempts"][0]["agent_executions"][0]["termination_reason"],
+        "infrastructure_error"
+    );
+
+    let run = f.engine.submit(&id(), plan, None).await?["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let a = claim(&f.engine).await?;
+    f.start("agent", &a).await?;
+    let execution_id = f.engine.operate("agent", &start(&a)).await?["execution_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    f.engine
+        .operate(
+            "agent",
+            &operation(
+                &a,
+                Action::Complete {
+                    success: false,
+                    outputs: vec![],
+                    failure: Some(Failure {
+                        category: "task_failure".into(),
+                        code: "budget_exhausted".into(),
+                        message: "budget".into(),
+                        side_effect_status: "none".into(),
+                    }),
+                },
+            ),
+        )
+        .await?;
+    let exhausted = f.engine.inspect(&run).await?;
+    assert_eq!(
+        exhausted["tasks"][0]["attempts"][0]["agent_executions"][0]["execution_id"],
+        execution_id
+    );
+    assert_eq!(
+        exhausted["tasks"][0]["attempts"][0]["agent_executions"][0]["status"],
+        "interrupted"
+    );
+    assert_eq!(
+        exhausted["tasks"][0]["attempts"][0]["agent_executions"][0]["termination_reason"],
+        "budget_exhausted"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL"]
 async fn agent_budgets_permissions_and_retries_are_transactional() -> Result<()> {
     let f = Fixture::new().await?;
     let mut def = definition();

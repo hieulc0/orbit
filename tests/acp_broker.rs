@@ -74,6 +74,7 @@ fn create_assignment(acp_limits: Limits) -> Result<Assignment> {
         idempotency_key: "test-key".into(),
         gpu_devices: vec![],
         agent_binding_digest: Some("test-digest".into()),
+        execution_id: None,
     })
 }
 

@@ -35,6 +35,25 @@ are separate, potentially sensitive data. Review before sharing. These logs
 complement durable journals and governance audit; they do not replace them.
 External collection and retention are host policy, not installed services.
 
+## Agent execution lifecycle
+
+An AgentExecution is created by the fenced worker StartExecution operation,
+after the Attempt has entered RUNNING and the worker has resolved a concrete
+agent/runtime dispatch. This is the authoritative creation boundary: candidate
+selection alone does not create a record, and completion is not required. The
+engine assigns a deterministic Attempt-scoped execution ID and sequence while
+holding the run fence, persists the record in the Run aggregate, and journals
+the change.
+
+The worker then acknowledges active dispatch with MarkExecutionRunning.
+Runtime-confirmed model identity and bounded partial tool counters use
+idempotent UpdateExecution operations. Completion, lease expiry, cancellation,
+and task deadline handling finalize that same record. A pre-AgentReport runtime
+failure therefore remains visible as a terminal execution even though no report
+artifact exists. Unknown model or provider usage remains absent; the resolved
+model is never copied into actual_model without runtime evidence. Only logical
+credential references may be recorded.
+
 ## Drain and shutdown
 
 ```sh
