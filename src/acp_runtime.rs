@@ -414,12 +414,15 @@ impl Runtime {
                     }
                 }
                 Err(_timeout) => {
+                    let diagnostic = broker.timeout_diagnostic();
                     let _ = tokio::time::timeout(
                         Duration::from_secs(1),
                         wire.notify("session/cancel", json!({"sessionId": session_id})),
                     )
                     .await;
-                    anyhow::bail!("ACP turn timeout; prompt outcome unconfirmed");
+                    anyhow::bail!(
+                        "ACP turn timeout; prompt outcome unconfirmed; {diagnostic}"
+                    );
                 }
             };
             let stop_reason = response["stopReason"].as_str().unwrap_or("unknown");

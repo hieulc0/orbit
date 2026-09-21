@@ -592,16 +592,31 @@ async fn perform(
 ) -> Result<(bool, Vec<String>, Option<Failure>)> {
     uuid::Uuid::parse_str(&a.workspace_id)?;
     let directory = root.join(&a.workspace_id);
-    tokio::fs::create_dir(&directory)
-        .await
-        .context("attempt workspace already exists or cannot be created")?;
+    match tokio::fs::create_dir(&directory).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Reclaim the same Attempt directory after a worker restart. The
+            // marker binds it to this fenced assignment; unrelated or stale
+            // directories are never silently reused.
+            let marker: serde_json::Value =
+                serde_json::from_slice(&tokio::fs::read(directory.join("attempt.json")).await?)?;
+            ensure!(
+                marker["attempt_id"] == a.attempt_id
+                    && marker["workspace_id"] == a.workspace_id
+                    && marker["base_revision"] == a.plan.definition.inputs.base_revision
+                    && marker["plan_digest"] == a.plan.digest,
+                "Attempt workspace identity or baseline mismatch"
+            );
+        }
+        Err(error) => return Err(error).context("cannot create Attempt workspace"),
+    }
     if a.plan.definition.steps[&a.step].execution.is_some() {
         use std::os::unix::fs::PermissionsExt;
         tokio::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).await?;
     }
     let repo = directory.join("repository");
     let home = directory.join("home");
-    tokio::fs::create_dir(&home).await?;
+    tokio::fs::create_dir_all(&home).await?;
     let metadata = json!({"run_id":a.run_id,"task_id":a.task_id,"attempt_id":a.attempt_id,"workspace_id":a.workspace_id,"base_revision":a.plan.definition.inputs.base_revision,"plan_digest":a.plan.digest,"recovery_policy":a.plan.definition.steps[&a.step].recovery_policy});
     tokio::fs::write(
         directory.join("attempt.json"),

@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     rc::Rc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Debug)]
@@ -112,6 +113,15 @@ pub struct Broker<'a> {
     pub tool_failures: u64,
     pub tool_counts: BTreeMap<String, u64>,
     pub execution_limit: Option<(crate::continuation::TerminationReason, String)>,
+    /// Bounded protocol state retained for diagnosing an uncertain ACP turn.
+    /// These fields contain no prompt, tool argument, or credential material.
+    pub last_activity_epoch_ms: Option<u64>,
+    pub last_activity_kind: Option<String>,
+    pub turn_started_epoch_ms: Option<u64>,
+    pub pending_model_call: bool,
+    pub pending_tool_callbacks: u32,
+    pending_model_call_id: Option<String>,
+    pending_tool_call_ids: BTreeSet<String>,
     sequence: u32,
     terminals: BTreeMap<String, Handle>,
     seen_requests: BTreeSet<String>,
@@ -133,6 +143,13 @@ impl<'a> Broker<'a> {
             tool_failures: 0,
             tool_counts: BTreeMap::new(),
             execution_limit: None,
+            last_activity_epoch_ms: None,
+            last_activity_kind: None,
+            turn_started_epoch_ms: None,
+            pending_model_call: false,
+            pending_tool_callbacks: 0,
+            pending_model_call_id: None,
+            pending_tool_call_ids: BTreeSet::new(),
             sequence: 0,
             terminals: BTreeMap::new(),
             seen_requests: BTreeSet::new(),
@@ -148,6 +165,50 @@ impl<'a> Broker<'a> {
             .as_ref()
             .unwrap()
     }
+    fn touch(&mut self, kind: &str) {
+        self.last_activity_epoch_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| u64::try_from(duration.as_millis()).ok());
+        self.last_activity_kind = Some(
+            kind.chars()
+                .take(64)
+                .map(|character| {
+                    if character.is_ascii_alphanumeric() || character == '_' || character == '/' {
+                        character
+                    } else {
+                        '_'
+                    }
+                })
+                .collect(),
+        );
+    }
+    pub fn timeout_diagnostic(&self) -> String {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| u64::try_from(duration.as_millis()).ok());
+        let elapsed = self
+            .turn_started_epoch_ms
+            .zip(now)
+            .map(|(started, now)| now.saturating_sub(started));
+        format!(
+            "session_id={} session_digest={} turn_elapsed_ms={:?} last_activity_epoch_ms={:?} last_activity_kind={} pending_model_call={} active_tool_callbacks={} broker_poisoned={} active_terminals={} runtime_process_state=running_at_timeout",
+            self.session_id.as_deref().unwrap_or("unknown"),
+            if self.session_digest.is_empty() {
+                "unknown"
+            } else {
+                &self.session_digest
+            },
+            elapsed,
+            self.last_activity_epoch_ms,
+            self.last_activity_kind.as_deref().unwrap_or("none"),
+            self.pending_model_call,
+            self.pending_tool_callbacks,
+            self.poisoned,
+            self.terminals.len(),
+        )
+    }
     pub async fn record(
         &mut self,
         kind: RecordKind,
@@ -155,6 +216,12 @@ impl<'a> Broker<'a> {
         bytes: u64,
         tools: u32,
     ) -> Result<()> {
+        self.touch(match &kind {
+            RecordKind::Started => "record_started",
+            RecordKind::Update => "record_update",
+            RecordKind::BrokerOutput => "record_broker_output",
+            RecordKind::Completed => "record_completed",
+        });
         let record = Record {
             kind,
             digest: digest(&serde_json::to_vec(value)?),
@@ -188,8 +255,27 @@ impl<'a> Broker<'a> {
         self.log.push(b'\n');
         Ok(())
     }
-    pub async fn reserve(&self, tool: Option<&str>, value: &Value, seconds: u64) -> Result<String> {
+    pub async fn reserve(
+        &mut self,
+        tool: Option<&str>,
+        value: &Value,
+        seconds: u64,
+    ) -> Result<String> {
         let call = format!("{}-{}", self.session.assignment.attempt_id, id());
+        let is_model = tool.is_none();
+        if is_model {
+            self.pending_model_call = true;
+            self.pending_model_call_id = Some(call.clone());
+            self.turn_started_epoch_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .and_then(|duration| u64::try_from(duration.as_millis()).ok());
+            self.touch("model_call_reservation");
+        } else {
+            self.pending_tool_callbacks = self.pending_tool_callbacks.saturating_add(1);
+            self.pending_tool_call_ids.insert(call.clone());
+            self.touch("tool_call_reservation");
+        }
         let response = self
             .session
             .client
@@ -221,15 +307,36 @@ impl<'a> Broker<'a> {
                     },
                 },
             )
-            .await?;
-        ensure!(
-            response["replayed"] == false,
-            "replayed call cannot dispatch"
-        );
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                if is_model {
+                    self.pending_model_call = false;
+                    self.pending_model_call_id = None;
+                } else {
+                    self.pending_tool_callbacks = self.pending_tool_callbacks.saturating_sub(1);
+                    self.pending_tool_call_ids.remove(&call);
+                }
+                return Err(error);
+            }
+        };
+        if response["replayed"] != false {
+            if is_model {
+                self.pending_model_call = false;
+                self.pending_model_call_id = None;
+            } else {
+                self.pending_tool_callbacks = self.pending_tool_callbacks.saturating_sub(1);
+                self.pending_tool_call_ids.remove(&call);
+            }
+            anyhow::bail!("replayed call cannot dispatch");
+        }
         Ok(call)
     }
-    pub async fn finish(&self, call: &str, value: &Value) -> Result<()> {
-        self.session
+    pub async fn finish(&mut self, call: &str, value: &Value) -> Result<()> {
+        self.touch("call_finished");
+        let result = self
+            .session
             .client
             .operation(
                 self.session.assignment,
@@ -242,8 +349,17 @@ impl<'a> Broker<'a> {
                     },
                 },
             )
-            .await?;
-        Ok(())
+            .await;
+        if result.is_ok() {
+            if self.pending_model_call_id.as_deref() == Some(call) {
+                self.pending_model_call = false;
+                self.pending_model_call_id = None;
+            } else {
+                self.pending_tool_callbacks = self.pending_tool_callbacks.saturating_sub(1);
+                self.pending_tool_call_ids.remove(call);
+            }
+        }
+        result.map(|_| ())
     }
     fn path(&self, value: &Value) -> Result<String> {
         let path = std::path::Path::new(value.as_str().context("ACP path missing")?);
@@ -262,6 +378,13 @@ impl<'a> Broker<'a> {
     }
     pub async fn message(&mut self, wire: &mut crate::acp_wire::Wire, value: Value) -> Result<()> {
         let method = value["method"].as_str().context("ACP method missing")?;
+        self.touch(if value.get("id").is_some() {
+            "agent_callback"
+        } else {
+            value["params"]["update"]["sessionUpdate"]
+                .as_str()
+                .unwrap_or("session_notification")
+        });
         if let Some(id) = value.get("id") {
             let key = serde_json::to_string(id)?;
             ensure!(
@@ -699,7 +822,8 @@ impl<'a> Broker<'a> {
                     self.record(RecordKind::BrokerOutput, &receipt, output.total, 0)
                         .await
                         .map_err(BrokerError::fatal)?;
-                    self.finish(&self.terminals[id].call, &receipt)
+                    let call = self.terminals[id].call.clone();
+                    self.finish(&call, &receipt)
                         .await
                         .map_err(BrokerError::fatal)?;
                     self.terminals.get_mut(id).unwrap().finished = true;

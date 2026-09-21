@@ -1100,6 +1100,56 @@ async fn test_response_id_mismatch_fails_closed() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn timeout_diagnostic_contains_only_bounded_protocol_state() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let client = Client::new("http://127.0.0.1:1".into(), String::new())?;
+    let assignment = create_assignment(Limits {
+        prompt_turns: 1,
+        broker_calls: 10,
+        reported_tool_calls: 10,
+        turn_timeout_seconds: 10,
+        terminal_timeout_seconds: 5,
+        terminal_runtime_seconds: 10,
+        output_bytes: 65536,
+    })?;
+    let workspace = Workspace {
+        path: root.path().join("workspace"),
+        git_dir: root.path().join("git"),
+        home: root.path().join("home"),
+    };
+    let profile = Profile {
+        backend: Backend::RootlessPodman,
+        image: "sha256:fixture".into(),
+    };
+    let credentials = BTreeMap::new();
+    let session = Session {
+        client: &client,
+        assignment: &assignment,
+        workspace: &workspace,
+        directory: root.path(),
+        home: root.path(),
+        profile: &profile,
+        credentials: &credentials,
+    };
+    let mut broker = Broker::new(session);
+    broker.session_id = Some("session-1".into());
+    broker.session_digest = "digest".into();
+    broker.last_activity_epoch_ms = Some(1000);
+    broker.last_activity_kind = Some("read_file".into());
+    broker.turn_started_epoch_ms = Some(900);
+    broker.pending_model_call = true;
+    broker.pending_tool_callbacks = 1;
+    let diagnostic = broker.timeout_diagnostic();
+    assert!(diagnostic.contains("session_id=session-1"));
+    assert!(diagnostic.contains("last_activity_kind=read_file"));
+    assert!(diagnostic.contains("pending_model_call=true"));
+    assert!(diagnostic.contains("active_tool_callbacks=1"));
+    assert!(!diagnostic.contains("Authorization"));
+    assert!(!diagnostic.contains("token"));
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_multiple_interleaved_notifications_and_callbacks() -> Result<()> {
     let (server_url, _shutdown) = start_mock_server().await;

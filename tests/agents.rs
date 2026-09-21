@@ -1,11 +1,21 @@
 use orbit::{
     agent::*,
+    coding_agent::{tool_command, tool_definitions},
     mcp::{Session, tools},
     model::*,
     worker::Client,
 };
+
 use serde_json::json;
 use std::collections::BTreeMap;
+
+#[test]
+fn coding_runtime_exposes_bounded_shell_capability() {
+    let definitions = tool_definitions(&["shell".into()]).unwrap();
+    assert_eq!(definitions[0]["name"], "shell");
+    assert!(tool_command("shell", &json!({"command":"git status --short"}), 30).is_ok());
+    assert!(tool_command("shell", &json!({"command":""}), 30).is_err());
+}
 
 fn bindings() -> BTreeMap<String, Binding> {
     serde_json::from_str(include_str!("../examples/agent-bindings.json")).unwrap()

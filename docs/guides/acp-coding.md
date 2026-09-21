@@ -72,11 +72,13 @@ The server still authorizes each registration, claim, operation and artifact.
 ## What the agent and tools can access
 
 The agent runs in a separate read-only OCI image, with only a fresh private
-control HOME mounted. It receives the selected auth files, not the real repository,
-Git metadata, provider API tokens from Orbit's credential registry, worker tokens,
-container socket or developer HOME. The ACP-visible cwd is the empty control path
-`/orbit/home/workspace`. Client file/terminal requests under that virtual root map
-to the actual attempt repository; host paths are not exposed as a second namespace.
+control HOME mounted. It receives the selected auth files and an isolated Attempt
+repository, not the developer checkout, provider API tokens from Orbit's credential
+registry, worker tokens, container socket or developer HOME. The Attempt repository
+contains normal Git metadata and starts detached at the pinned baseline; the ACP-visible
+cwd is the virtual path `/orbit/home/workspace`. Client file/terminal requests under
+that virtual root map only to the actual Attempt repository; host paths are not
+exposed as a second namespace.
 
 `launch.network: none` is appropriate for pure offline ACP fixtures. `host` gives
 the agent host-network connectivity, **not provider-only egress**. A live provider
@@ -118,6 +120,15 @@ for revision, not treated as successful verification. Native permission requests
 extensions, external MCP, delegation, interactive auth and automatic resume are
 not supported. A denied callback fails the turn; it never authorizes native effects.
 
+An existing Attempt directory is reclaimable after a worker restart only when its
+persisted identity marker and Git `HEAD` still match the assignment. A mismatch
+fails closed. Continuation reuses that Attempt repository, including its uncommitted
+changes; it does not create a fresh repository for each AgentExecution.
+Each Attempt uses a `--no-local --no-hardlinks` clone, so cleanup removes the
+Attempt directory and its private `.git` together; it does not create shared
+`.git/worktrees` entries in the operator checkout. Retention remains governed by
+the existing evidence policy.
+
 ## Accounting, evidence and recovery
 
 The [submit, inspect and review workflow](repository-review.md) applies to ACP too.
@@ -147,6 +158,10 @@ written only after confirmed container removal. The worker cannot accept a patch
 from an unconfirmed cleanup. A pending prompt stays externally uncertain and blocks
 automatic retry even if local containers were removed. Killing a local process
 does not prove a remote provider stopped computation or billing.
+If the ACP turn deadline expires, the bounded failure log records the session
+identity, elapsed time, last protocol activity kind/time, pending model/tool state,
+broker poison state, active terminal count and runtime state observed at the
+deadline. It does not record prompts, credentials or raw tool payloads.
 
 The selected auth store has an exclusive file lock and a durable
 `.orbit-acp-active.json` marker. After confirmed container removal, approved refresh

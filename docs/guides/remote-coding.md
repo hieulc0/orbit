@@ -21,9 +21,10 @@ requiring deliberate path/identity mapping and qualification; it is not implemen
 by mounting the socket into the server image.
 
 The trusted worker performs Git authentication and model HTTP calls. Only the
-repository worktree is mounted read/write at `/workspace` in tool containers.
-Git metadata, host HOME, Orbit/lease credentials, model/Git secrets, and runtime
-sockets remain outside that mount. Containers have no network, a read-only image
+Attempt repository is mounted read/write at `/workspace` in tool containers.
+The Attempt contains its own normal Git metadata, while host Git configuration,
+host HOME, Orbit/lease credentials, model/Git secrets, and runtime sockets remain
+outside that mount. Containers have no network, a read-only image
 root, dropped capabilities, no new privileges, PID/CPU/memory limits, and a bounded
 writable `/tmp`. Filesystem `workspace` describes the writable repository boundary;
 tools can still read their image's files and use its scratch tmpfs. Rootless OCI
@@ -130,7 +131,8 @@ correctness oracle: the human must review test changes as well as implementation
 The bounded tools are `read_file`, `write_file`, and `shell`. Each has an exact
 implementation revision and checked permissions. Shell needs all of
 `workspace.read`, `workspace.write` and `shell.execute`; it can read and write the
-mounted worktree, not just the path named in a high-level tool call. No delegation,
+mounted Attempt repository, including its Git metadata, not just the path named in
+a high-level tool call. No delegation,
 provider-native tools, dynamic tool installation or parallel calls are enabled.
 
 Before each model/tool call, Orbit durably reserves budget with an attempt-bound
