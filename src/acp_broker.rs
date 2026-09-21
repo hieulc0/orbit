@@ -333,25 +333,44 @@ impl<'a> Broker<'a> {
                 }
             }
         } else {
-            ensure!(method == "session/update", "unsupported ACP notification");
+            if method != "session/update" {
+                self.poisoned = true;
+                anyhow::bail!("unsupported ACP notification: {method}");
+            }
             let params = &value["params"];
-            self.owner(params).map_err(|e| anyhow::anyhow!("{e}"))?;
+            if let Err(e) = self.owner(params) {
+                self.poisoned = true;
+                anyhow::bail!("ACP broker fatal error: {e}");
+            }
             let _: agent_client_protocol::SessionNotification =
-                serde_json::from_value(params.clone())
-                    .map_err(|_| anyhow::anyhow!("invalid ACP session update"))?;
+                match serde_json::from_value(params.clone()) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        self.poisoned = true;
+                        anyhow::bail!("invalid ACP session update: {e}");
+                    }
+                };
             let update = &params["update"];
-            let kind = update["sessionUpdate"]
-                .as_str()
-                .context("ACP update kind missing")?;
+            let kind = match update["sessionUpdate"].as_str() {
+                Some(k) => k,
+                None => {
+                    self.poisoned = true;
+                    anyhow::bail!("ACP update kind missing");
+                }
+            };
             let mut tools = 0;
             if kind == "tool_call" {
-                let id = update["toolCallId"]
-                    .as_str()
-                    .context("reported tool identity missing")?;
-                ensure!(
-                    id.len() <= 256 && self.seen_tools.insert(digest(id.as_bytes())),
-                    "duplicate reported tool"
-                );
+                let id = match update["toolCallId"].as_str() {
+                    Some(id) => id,
+                    None => {
+                        self.poisoned = true;
+                        anyhow::bail!("reported tool identity missing");
+                    }
+                };
+                if id.len() > 256 || !self.seen_tools.insert(digest(id.as_bytes())) {
+                    self.poisoned = true;
+                    anyhow::bail!("duplicate reported tool");
+                }
                 tools = 1;
             }
             // Persist counts and digests only, never raw thoughts/auth/provider data.

@@ -344,6 +344,14 @@ impl Runtime {
             let created = tokio::time::timeout(Duration::from_secs(30),acp_request(&mut wire,&mut broker,"session/new",create_params)).await.context("ACP session creation timeout")??;
             let session_id = created["sessionId"].as_str().context("ACP session identity missing")?;
             ensure!(crate::agent::valid_name(session_id),"invalid ACP session identity");
+            broker.session_id = Some(session_id.into());
+            broker.session_digest = digest(format!("{}:{session_id}", a.attempt_id).as_bytes());
+            broker.record(RecordKind::Started, &json!({
+                "agent": self.launch.agent_name,
+                "version": self.launch.agent_version,
+                "launch_digest": self.launch.digest()?,
+                "model": self.binding.model
+            }), 0, 0).await?;
             let current_model = created
                 .get("models")
                 .and_then(|m| m.get("currentModelId"))
@@ -356,10 +364,6 @@ impl Runtime {
                 current_model,
             )
             .await?;
-            broker.session_id=Some(session_id.into());
-            broker.session_digest=digest(format!("{}:{session_id}",a.attempt_id).as_bytes());
-            broker.record(RecordKind::Started,&json!({"agent":self.launch.agent_name,"version":self.launch.agent_version,
-                "launch_digest":self.launch.digest()?,"model":self.binding.model}),0,0).await?;
             if self.launch.adapter == Adapter::Antigravity {
                 let _ = tokio::time::timeout(
                     Duration::from_secs(10),
@@ -494,6 +498,11 @@ pub async fn select_model(
             )
             .await;
 
+            ensure!(
+                !broker.poisoned,
+                "ACP broker poisoned during model selection"
+            );
+
             if let Ok(Ok(config_resp)) = set_config_res
                 && let Some(options) = config_resp.get("configOptions").and_then(|v| v.as_array())
             {
@@ -523,6 +532,11 @@ pub async fn select_model(
                 )
                 .await
                 .context("ACP set_model timeout")??;
+
+                ensure!(
+                    !broker.poisoned,
+                    "ACP broker poisoned during model selection"
+                );
 
                 if let Some(curr) = set_model_res
                     .get("models")

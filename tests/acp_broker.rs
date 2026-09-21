@@ -2,7 +2,7 @@ use anyhow::Result;
 use orbit::{
     acp_broker::Broker,
     acp_contract::Limits,
-    acp_runtime::{WORKSPACE, select_model},
+    acp_runtime::{WORKSPACE, acp_request, select_model},
     acp_wire::Wire,
     coding_agent::Session,
     execution::{Backend, Profile},
@@ -786,5 +786,456 @@ async fn test_broker_server_fatal_error_poisons_session() -> Result<()> {
     assert_eq!(err_resp["error"]["code"], -32603);
 
     let _ = tx.send(());
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_wire_sync_interleaved_session_update_exact_q3_sequence() -> Result<()> {
+    let (server_url, _shutdown) = start_mock_server().await;
+    let client = Client::new(server_url, "test-token".into())?;
+
+    let root = tempfile::tempdir()?;
+    let ws_path = root.path().join("workspace");
+    std::fs::create_dir_all(&ws_path)?;
+
+    let limits = Limits {
+        prompt_turns: 1,
+        broker_calls: 10,
+        reported_tool_calls: 10,
+        turn_timeout_seconds: 10,
+        terminal_timeout_seconds: 5,
+        terminal_runtime_seconds: 10,
+        output_bytes: 65536,
+    };
+    let assignment = create_assignment(limits)?;
+    let workspace = Workspace {
+        path: ws_path,
+        git_dir: root.path().join("git"),
+        home: root.path().join("home"),
+    };
+    let profile = Profile {
+        backend: Backend::RootlessPodman,
+        image: "test-image".into(),
+    };
+    let creds = BTreeMap::new();
+
+    let session = Session {
+        client: &client,
+        assignment: &assignment,
+        workspace: &workspace,
+        directory: root.path(),
+        home: root.path(),
+        profile: &profile,
+        credentials: &creds,
+    };
+
+    let mut broker = Broker::new(session);
+    let session_id = "sess-q3";
+    // Invariant: Broker ownership established immediately upon session creation
+    broker.session_id = Some(session_id.into());
+    broker.session_digest = digest(format!("{}:{session_id}", assignment.attempt_id).as_bytes());
+
+    let (pipe_in_read, pipe_in_write) = tokio::io::duplex(4096);
+    let (pipe_out_read, pipe_out_write) = tokio::io::duplex(4096);
+    let mut wire = Wire::new(pipe_in_read, pipe_out_write, 1024 * 1024);
+    let mut peer_wire = Wire::new(pipe_out_read, pipe_in_write, 1024 * 1024);
+
+    let select_fut = select_model(
+        &mut wire,
+        &mut broker,
+        session_id,
+        Some("gemini-3.8-flash-high"),
+        Some("gemini-3.8-flash"),
+    );
+
+    let peer_fut = async {
+        // 1. Peer receives session/set_config_option (e.g. orbit-1 or orbit-3)
+        let req1 = peer_wire.read().await?;
+        assert_eq!(req1["method"], "session/set_config_option");
+        assert_eq!(req1["params"]["configId"], "model");
+        assert_eq!(req1["params"]["value"], "gemini-3.8-flash-high");
+        let req1_id = req1["id"].clone();
+
+        // 2. Peer emits interleaved session/update notification before response
+        peer_wire
+            .send(json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "available_commands_update",
+                        "availableCommands": []
+                    }
+                }
+            }))
+            .await?;
+
+        // 3. Peer responds to req1 with confirmed configOptions
+        peer_wire
+            .response_ok(
+                req1_id,
+                json!({
+                    "configOptions": [
+                        {
+                            "id": "model",
+                            "currentValue": "gemini-3.8-flash-high"
+                        }
+                    ]
+                }),
+            )
+            .await?;
+        Ok::<(), anyhow::Error>(())
+    };
+
+    let (select_res, peer_res) = tokio::join!(select_fut, peer_fut);
+    select_res.expect("select_model must succeed with interleaved notification");
+    assert!(peer_res.is_ok());
+    assert!(!broker.poisoned, "broker must NOT be poisoned");
+
+    // 4. Now send next request (e.g. session/set_mode)
+    let next_req_fut = acp_request(
+        &mut wire,
+        &mut broker,
+        "session/set_mode",
+        json!({
+            "sessionId": session_id,
+            "modeId": "yolo"
+        }),
+    );
+
+    let next_peer_fut = async {
+        let req2 = peer_wire.read().await?;
+        assert_eq!(req2["method"], "session/set_mode");
+        peer_wire.response_ok(req2["id"].clone(), json!({})).await?;
+        Ok::<(), anyhow::Error>(())
+    };
+
+    let (next_res, next_peer_res) = tokio::join!(next_req_fut, next_peer_fut);
+    assert!(
+        next_res.is_ok(),
+        "subsequent request must succeed without stale response on wire"
+    );
+    assert!(next_peer_res.is_ok());
+    assert!(!broker.poisoned);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_foreign_session_notification_poisons_broker_and_fails() -> Result<()> {
+    let (server_url, _shutdown) = start_mock_server().await;
+    let client = Client::new(server_url, "test-token".into())?;
+
+    let root = tempfile::tempdir()?;
+    let ws_path = root.path().join("workspace");
+    std::fs::create_dir_all(&ws_path)?;
+
+    let limits = Limits {
+        prompt_turns: 1,
+        broker_calls: 10,
+        reported_tool_calls: 10,
+        turn_timeout_seconds: 10,
+        terminal_timeout_seconds: 5,
+        terminal_runtime_seconds: 10,
+        output_bytes: 65536,
+    };
+    let assignment = create_assignment(limits)?;
+    let workspace = Workspace {
+        path: ws_path,
+        git_dir: root.path().join("git"),
+        home: root.path().join("home"),
+    };
+    let profile = Profile {
+        backend: Backend::RootlessPodman,
+        image: "test-image".into(),
+    };
+    let creds = BTreeMap::new();
+
+    let session = Session {
+        client: &client,
+        assignment: &assignment,
+        workspace: &workspace,
+        directory: root.path(),
+        home: root.path(),
+        profile: &profile,
+        credentials: &creds,
+    };
+
+    let mut broker = Broker::new(session);
+    let session_id = "sess-owner";
+    broker.session_id = Some(session_id.into());
+    broker.session_digest = digest(format!("{}:{session_id}", assignment.attempt_id).as_bytes());
+
+    let (pipe_in_read, pipe_in_write) = tokio::io::duplex(4096);
+    let (pipe_out_read, pipe_out_write) = tokio::io::duplex(4096);
+    let mut wire = Wire::new(pipe_in_read, pipe_out_write, 1024 * 1024);
+    let mut peer_wire = Wire::new(pipe_out_read, pipe_in_write, 1024 * 1024);
+
+    let req_fut = acp_request(
+        &mut wire,
+        &mut broker,
+        "session/set_config_option",
+        json!({
+            "sessionId": session_id,
+            "configId": "model",
+            "value": "gemini-3.8-flash"
+        }),
+    );
+
+    let peer_fut = async {
+        let req = peer_wire.read().await?;
+        assert_eq!(req["method"], "session/set_config_option");
+
+        // Peer sends notification with FOREIGN sessionId
+        peer_wire
+            .send(json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": "sess-foreign",
+                    "update": {
+                        "sessionUpdate": "available_commands_update",
+                        "availableCommands": []
+                    }
+                }
+            }))
+            .await?;
+        Ok::<(), anyhow::Error>(())
+    };
+
+    let (req_res, peer_res) = tokio::join!(req_fut, peer_fut);
+    assert!(peer_res.is_ok());
+    assert!(
+        req_res.is_err(),
+        "must fail when foreign notification is received"
+    );
+    assert!(
+        broker.poisoned,
+        "broker must be poisoned on foreign session ID"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_response_id_mismatch_fails_closed() -> Result<()> {
+    let (server_url, _shutdown) = start_mock_server().await;
+    let client = Client::new(server_url, "test-token".into())?;
+
+    let root = tempfile::tempdir()?;
+    let ws_path = root.path().join("workspace");
+    std::fs::create_dir_all(&ws_path)?;
+
+    let limits = Limits {
+        prompt_turns: 1,
+        broker_calls: 10,
+        reported_tool_calls: 10,
+        turn_timeout_seconds: 10,
+        terminal_timeout_seconds: 5,
+        terminal_runtime_seconds: 10,
+        output_bytes: 65536,
+    };
+    let assignment = create_assignment(limits)?;
+    let workspace = Workspace {
+        path: ws_path,
+        git_dir: root.path().join("git"),
+        home: root.path().join("home"),
+    };
+    let profile = Profile {
+        backend: Backend::RootlessPodman,
+        image: "test-image".into(),
+    };
+    let creds = BTreeMap::new();
+
+    let session = Session {
+        client: &client,
+        assignment: &assignment,
+        workspace: &workspace,
+        directory: root.path(),
+        home: root.path(),
+        profile: &profile,
+        credentials: &creds,
+    };
+
+    let mut broker = Broker::new(session);
+    broker.session_id = Some("sess-id-test".into());
+
+    let (pipe_in_read, pipe_in_write) = tokio::io::duplex(4096);
+    let (pipe_out_read, pipe_out_write) = tokio::io::duplex(4096);
+    let mut wire = Wire::new(pipe_in_read, pipe_out_write, 1024 * 1024);
+    let mut peer_wire = Wire::new(pipe_out_read, pipe_in_write, 1024 * 1024);
+
+    let req_fut = acp_request(
+        &mut wire,
+        &mut broker,
+        "session/test_method",
+        json!({"sessionId": "sess-id-test"}),
+    );
+
+    let peer_fut = async {
+        let req = peer_wire.read().await?;
+        assert_eq!(req["id"], "orbit-1");
+
+        // Peer sends response with mismatched ID orbit-999
+        peer_wire
+            .response_ok(json!("orbit-999"), json!({"status": "ok"}))
+            .await?;
+        Ok::<(), anyhow::Error>(())
+    };
+
+    let (req_res, peer_res) = tokio::join!(req_fut, peer_fut);
+    assert!(peer_res.is_ok());
+    assert!(
+        req_res.is_err(),
+        "must fail closed when response ID mismatches"
+    );
+    let err_str = req_res.unwrap_err().to_string();
+    assert!(
+        err_str.contains("foreign agent response"),
+        "error message should indicate foreign agent response: {err_str}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_multiple_interleaved_notifications_and_callbacks() -> Result<()> {
+    let (server_url, _shutdown) = start_mock_server().await;
+    let client = Client::new(server_url, "test-token".into())?;
+
+    let root = tempfile::tempdir()?;
+    let ws_path = root.path().join("workspace");
+    std::fs::create_dir_all(&ws_path)?;
+    std::fs::write(ws_path.join("read_me.txt"), "interleaved test file\n")?;
+
+    let limits = Limits {
+        prompt_turns: 1,
+        broker_calls: 10,
+        reported_tool_calls: 10,
+        turn_timeout_seconds: 10,
+        terminal_timeout_seconds: 5,
+        terminal_runtime_seconds: 10,
+        output_bytes: 65536,
+    };
+    let assignment = create_assignment(limits)?;
+    let workspace = Workspace {
+        path: ws_path,
+        git_dir: root.path().join("git"),
+        home: root.path().join("home"),
+    };
+    let profile = Profile {
+        backend: Backend::RootlessPodman,
+        image: "test-image".into(),
+    };
+    let creds = BTreeMap::new();
+
+    let session = Session {
+        client: &client,
+        assignment: &assignment,
+        workspace: &workspace,
+        directory: root.path(),
+        home: root.path(),
+        profile: &profile,
+        credentials: &creds,
+    };
+
+    let mut broker = Broker::new(session);
+    let session_id = "sess-multi";
+    broker.session_id = Some(session_id.into());
+    broker.session_digest = digest(format!("{}:{session_id}", assignment.attempt_id).as_bytes());
+    broker.active = true; // allow callbacks
+
+    let (pipe_in_read, pipe_in_write) = tokio::io::duplex(4096);
+    let (pipe_out_read, pipe_out_write) = tokio::io::duplex(4096);
+    let mut wire = Wire::new(pipe_in_read, pipe_out_write, 1024 * 1024);
+    let mut peer_wire = Wire::new(pipe_out_read, pipe_in_write, 1024 * 1024);
+
+    let req_fut = acp_request(
+        &mut wire,
+        &mut broker,
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "do something"}]
+        }),
+    );
+
+    let peer_fut = async {
+        let req = peer_wire.read().await?;
+        assert_eq!(req["method"], "session/prompt");
+        let prompt_req_id = req["id"].clone();
+
+        // 1. Interleaved notification 1: state update
+        peer_wire
+            .send(json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": "thinking"}
+                    }
+                }
+            }))
+            .await?;
+
+        // 2. Interleaved notification 2: available commands
+        peer_wire
+            .send(json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "available_commands_update",
+                        "availableCommands": []
+                    }
+                }
+            }))
+            .await?;
+
+        // 3. Interleaved client callback request: fs/read_text_file
+        let callback_id = json!("call-1");
+        peer_wire
+            .send(json!({
+                "jsonrpc": "2.0",
+                "id": callback_id,
+                "method": "fs/read_text_file",
+                "params": {
+                    "sessionId": session_id,
+                    "path": format!("{WORKSPACE}/read_me.txt"),
+                    "line": 1,
+                    "limit": 10
+                }
+            }))
+            .await?;
+
+        // Read callback response from Orbit broker
+        let cb_resp = peer_wire.read().await?;
+        assert_eq!(cb_resp["id"], callback_id);
+        assert_eq!(cb_resp["result"]["content"], "interleaved test file\n");
+
+        // 4. Finally, send response to original request
+        peer_wire
+            .response_ok(prompt_req_id, json!({"stopReason": "end_turn"}))
+            .await?;
+
+        Ok::<(), anyhow::Error>(())
+    };
+
+    let (req_res, peer_res) = tokio::join!(req_fut, peer_fut);
+    assert!(peer_res.is_ok());
+    assert!(
+        req_res.is_ok(),
+        "acp_request must succeed after multiple interleaved notifications and callbacks"
+    );
+    let resp = req_res.unwrap();
+    assert_eq!(resp["stopReason"], "end_turn");
+    assert!(!broker.poisoned);
+    assert_eq!(broker.tool_calls, 1);
+    assert_eq!(broker.tool_successes, 1);
+
     Ok(())
 }
