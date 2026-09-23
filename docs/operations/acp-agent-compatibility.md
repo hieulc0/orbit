@@ -5,6 +5,19 @@ Antigravity ACP → maintained Claude ACP.
 
 ## Official Antigravity 1.1.1
 
+Post-Q6 controlled preflight: exact model and client file access work, but this
+pinned distribution does not wire the client's terminal capability into a model
+tool. Its native command tools do not use Orbit's terminal broker. See the
+[source review and live evidence](post-q6-hardening.md#live-antigravity-terminal-blocker).
+Do not treat an advertised Orbit terminal capability as proof of agent-side
+terminal mediation or readiness for another coding qualification.
+
+The [cross-provider remediation](cross-provider-coding.md) supplies a separately
+pinned, exact-version build overlay exposing a client-terminal tool and removing
+native command execution/local file fallback. It is an Orbit-maintained image
+variant, not a claim about the unmodified Google release. Its readiness must be
+established by the live model preflight independently of Codex.
+
 The [official registry entry](https://github.com/agentclientprotocol/registry/blob/main/antigravity-acp/agent.json)
 identifies Google LLC's proprietary distribution, Linux command
 `agy_acp_server.par`, and the

@@ -697,6 +697,8 @@ impl Engine {
             Action::UpdateExecution {
                 execution_id,
                 actual_model,
+                resolved_reasoning_effort,
+                actual_reasoning_effort,
                 turn_count,
                 tool_call_count,
                 tool_success_count,
@@ -714,6 +716,34 @@ impl Engine {
                         ensure!(previous == model, "actual model evidence conflict");
                     } else {
                         execution.actual_model = Some(model.clone());
+                    }
+                }
+                if let Some(effort) = resolved_reasoning_effort {
+                    ensure!(
+                        !effort.is_empty(),
+                        "resolved reasoning effort cannot be empty"
+                    );
+                    if let Some(previous) = &execution.resolved_reasoning_effort {
+                        ensure!(
+                            previous == effort,
+                            "resolved reasoning effort evidence conflict"
+                        );
+                    } else {
+                        execution.resolved_reasoning_effort = Some(effort.clone());
+                    }
+                }
+                if let Some(effort) = actual_reasoning_effort {
+                    ensure!(
+                        !effort.is_empty(),
+                        "actual reasoning effort cannot be empty"
+                    );
+                    if let Some(previous) = &execution.actual_reasoning_effort {
+                        ensure!(
+                            previous == effort,
+                            "actual reasoning effort evidence conflict"
+                        );
+                    } else {
+                        execution.actual_reasoning_effort = Some(effort.clone());
                     }
                 }
                 if let Some(value) = turn_count {

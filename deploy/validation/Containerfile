@@ -1,0 +1,11 @@
+# Provision once, then pin the resulting image digest in both server and worker.
+# Network is required only at image construction for rustup's verified components.
+FROM docker.io/library/rust@sha256:9a73a5088750b4c95158ab26629c854c3d6fc4b173cb7bc8079ad252d8ed7bfa
+RUN rustup component add --toolchain 1.98.1 rustfmt clippy \
+    && cargo +1.98.1 --version \
+    && cargo +1.98.1 fmt --version \
+    && cargo +1.98.1 clippy --version \
+    && rustc +1.98.1 --version \
+    && git --version
+ENV RUSTUP_TOOLCHAIN=1.98.1-x86_64-unknown-linux-gnu
+WORKDIR /workspace

@@ -7,8 +7,122 @@ use crate::{
 };
 use agent_client_protocol as acp;
 use anyhow::{Context, Result, ensure};
+use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
+
+/// Bounded protocol state for cleanup evidence. Every string is a fixed local
+/// category; peer-controlled method names, IDs and payloads are never retained.
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionDiagnostics {
+    pub(crate) phase: &'static str,
+    pub(crate) last_activity: &'static str,
+    pub(crate) pending_request: Option<&'static str>,
+    pub(crate) outcome: &'static str,
+    pub(crate) turn_outcome: &'static str,
+    pub(crate) server_request_count: u8,
+    pub(crate) peer_eof_observed: bool,
+    pub(crate) app_server_stdout_eof_observed: bool,
+}
+
+impl Default for SessionDiagnostics {
+    fn default() -> Self {
+        Self {
+            phase: "bridge_start",
+            last_activity: "none",
+            pending_request: None,
+            outcome: "running",
+            turn_outcome: "not_started",
+            server_request_count: 0,
+            peer_eof_observed: false,
+            app_server_stdout_eof_observed: false,
+        }
+    }
+}
+
+impl SessionDiagnostics {
+    fn request_sent(&mut self, method: &str) {
+        let (phase, category) = match method {
+            "initialize" => ("initializing", "initialize"),
+            "account/read" => ("session_setup", "account_read"),
+            "thread/start" => ("session_setup", "thread_start"),
+            "turn/start" => ("turn_start", "turn_start"),
+            "turn/interrupt" => ("cancelling", "turn_interrupt"),
+            _ => ("protocol", "other_request"),
+        };
+        self.phase = phase;
+        self.last_activity = "app_server_request_sent";
+        self.pending_request = Some(category);
+    }
+
+    fn server_message(&mut self, message: &Value) {
+        if message.get("id").is_some() {
+            self.server_request_count = self.server_request_count.saturating_add(1).min(64);
+            self.last_activity = if message["method"] == "item/tool/call" {
+                "dynamic_tool_request_received"
+            } else {
+                "server_request_received"
+            };
+            return;
+        }
+        self.last_activity = match message["method"].as_str() {
+            Some("error") => "server_error_notification",
+            Some("turn/started") => "turn_started_notification",
+            Some("turn/completed") => "turn_completed_notification",
+            Some("item/started" | "item/completed") => "item_lifecycle_notification",
+            Some("item/agentMessage/delta") => "agent_message_notification",
+            Some("warning" | "configWarning") => "server_warning_notification",
+            _ => "server_notification",
+        };
+    }
+
+    fn app_server_read_error(&mut self, error: &anyhow::Error) {
+        self.last_activity = if error
+            .downcast_ref::<crate::acp_wire::StreamClosed>()
+            .is_some()
+        {
+            "app_server_stdout_eof"
+        } else {
+            "app_server_stdout_read_error"
+        };
+        self.outcome = if self.last_activity == "app_server_stdout_eof" {
+            "app_server_eof"
+        } else {
+            "protocol_read_failure"
+        };
+        self.app_server_stdout_eof_observed = self.last_activity == "app_server_stdout_eof";
+    }
+
+    fn peer_read_error(&mut self, error: &anyhow::Error) {
+        self.last_activity = if error
+            .downcast_ref::<crate::acp_wire::StreamClosed>()
+            .is_some()
+        {
+            "acp_peer_eof"
+        } else {
+            "acp_peer_read_error"
+        };
+        self.peer_eof_observed = self.last_activity == "acp_peer_eof";
+        self.outcome = if self.peer_eof_observed && self.turn_outcome == "end_turn" {
+            "peer_eof_after_end_turn"
+        } else if self.peer_eof_observed {
+            "peer_eof"
+        } else {
+            "protocol_read_failure"
+        };
+    }
+
+    fn correlation_failure(&mut self) {
+        self.last_activity = "response_correlation_failure";
+        self.outcome = "correlation_failure";
+    }
+
+    fn protocol_rejection(&mut self) {
+        self.last_activity = "correlated_protocol_rejection";
+        self.outcome = "protocol_rejection";
+        self.pending_request = None;
+    }
+}
 
 struct Client(Mutex<Wire>);
 impl Client {
@@ -87,31 +201,69 @@ impl acp::Client for Client {
     }
 }
 
-async fn control(server: &mut Wire, method: &str, params: Value) -> Result<Value> {
+async fn control(
+    server: &mut Wire,
+    method: &str,
+    params: Value,
+    diagnostics: &mut SessionDiagnostics,
+) -> Result<Value> {
+    diagnostics.request_sent(method);
     let id = server.request(method, params).await?;
     loop {
-        let message = server.read().await?;
+        let message = match server.read().await {
+            Ok(message) => message,
+            Err(error) => {
+                diagnostics.app_server_read_error(&error);
+                return Err(error).context("Codex App Server read failed");
+            }
+        };
         if message.get("method").is_none() {
-            return Wire::result(message, &id);
+            if message.get("id") != Some(&id) {
+                diagnostics.correlation_failure();
+                anyhow::bail!("Codex App Server response ID mismatch");
+            }
+            let result = Wire::result(message, &id);
+            if result.is_err() {
+                diagnostics.protocol_rejection();
+            } else {
+                diagnostics.pending_request = None;
+                diagnostics.last_activity = "app_server_response_received";
+            }
+            return result;
         }
-        ensure!(
-            message.get("id").is_none(),
-            "unexpected Codex reverse request before turn"
-        );
+        diagnostics.server_message(&message);
+        if message.get("id").is_some() {
+            diagnostics.outcome = "server_request_rejected";
+            anyhow::bail!("unexpected Codex server request during setup");
+        }
         if message["method"] == "error" {
+            diagnostics.outcome = "app_server_error_notification";
             anyhow::bail!("Codex setup failed");
         }
     }
 }
 
-pub async fn run(request: &Request, mut server: Wire, client: Wire) -> Result<()> {
+pub async fn run(
+    request: &Request,
+    mut server: Wire,
+    client: Wire,
+    diagnostics: &mut SessionDiagnostics,
+) -> Result<()> {
     let client = Client(Mutex::new(client));
     let mut initialized = false;
     let mut session: Option<(String, String, std::path::PathBuf)> = None;
     let mut prompted = false;
     let mut seen = std::collections::BTreeSet::new();
     loop {
-        let message = client.0.lock().await.read().await?;
+        let message = match client.0.lock().await.read().await {
+            Ok(message) => message,
+            Err(error) => {
+                diagnostics.peer_read_error(&error);
+                return Err(error).context("Codex ACP peer read failed");
+            }
+        };
+        diagnostics.phase = "bridge_request";
+        diagnostics.last_activity = "acp_request_received";
         let id = message
             .get("id")
             .cloned()
@@ -132,6 +284,7 @@ pub async fn run(request: &Request, mut server: Wire, client: Wire) -> Result<()
                     "initialize",
                     json!({"clientInfo":{"name":"orbit","version":"1"},
                     "capabilities":{"experimentalApi":true}}),
+                    diagnostics,
                 )
                 .await?;
                 ensure!(
@@ -139,6 +292,7 @@ pub async fn run(request: &Request, mut server: Wire, client: Wire) -> Result<()
                     "Codex control HOME mismatch"
                 );
                 server.notify("initialized", json!({})).await?;
+                diagnostics.last_activity = "initialized_notification_sent";
                 initialized = true;
                 json!({"protocolVersion":1,"agentInfo":{"name":"orbit-codex-acp","version":"1"},"agentCapabilities":{},"authMethods":[]})
             }
@@ -151,8 +305,13 @@ pub async fn run(request: &Request, mut server: Wire, client: Wire) -> Result<()
                     params["cwd"].as_str().context("ACP workspace missing")?,
                 );
                 ensure!(workspace.is_absolute(), "ACP workspace must be absolute");
-                let account =
-                    control(&mut server, "account/read", json!({"refreshToken":false})).await?;
+                let account = control(
+                    &mut server,
+                    "account/read",
+                    json!({"refreshToken":false}),
+                    diagnostics,
+                )
+                .await?;
                 ensure!(
                     !account["account"].is_null() || account["requiresOpenaiAuth"] == false,
                     "Codex authentication required; provision selected account outside workflow"
@@ -169,19 +328,35 @@ pub async fn run(request: &Request, mut server: Wire, client: Wire) -> Result<()
                     thread_start(
                         &request.runtime.launch.binary_revision,
                         model,
+                        request.runtime.reasoning_effort.as_deref(),
                         std::path::Path::new("/orbit/home"),
                         &request.tools,
                     )?,
+                    diagnostics,
                 )
                 .await?;
                 ensure!(created["model"] == *model, "Codex model mismatch");
+                let actual_reasoning_effort =
+                    created.get("reasoningEffort").and_then(Value::as_str);
+                if let Some(requested) = request.runtime.reasoning_effort.as_deref() {
+                    ensure!(
+                        actual_reasoning_effort == Some(requested),
+                        "Codex reasoning effort mismatch"
+                    );
+                }
+                diagnostics.phase = "session_ready";
+                diagnostics.last_activity = "session_created";
                 let thread = created["thread"]["id"]
                     .as_str()
                     .context("Codex thread identity missing")?;
                 ensure!(crate::agent::valid_name(thread), "invalid Codex thread");
                 let session_id = crate::model::id();
                 session = Some((session_id.clone(), thread.into(), workspace));
-                json!({"sessionId":session_id,"models":{"currentModelId":model,"availableModels":[{"modelId":model,"name":model}]}})
+                let mut response = json!({"sessionId":session_id,"models":{"currentModelId":model,"availableModels":[{"modelId":model,"name":model}]}});
+                if let Some(effort) = actual_reasoning_effort {
+                    response["_meta"] = json!({"orbit":{"codexReasoningEffort":effort}});
+                }
+                response
             }
             Some("session/prompt") => {
                 let (session_id, thread, workspace) =
@@ -191,6 +366,8 @@ pub async fn run(request: &Request, mut server: Wire, client: Wire) -> Result<()
                     "bridge accepts one prompt per new session"
                 );
                 prompted = true;
+                diagnostics.phase = "prompt_received";
+                diagnostics.last_activity = "prompt_received";
                 let prompt = params["prompt"].as_array().context("text prompt missing")?;
                 ensure!(
                     (1..=16).contains(&prompt.len())
@@ -203,16 +380,12 @@ pub async fn run(request: &Request, mut server: Wire, client: Wire) -> Result<()
                     .iter()
                     .map(|p| json!({"type":"text","text":p["text"],"text_elements":[]}))
                     .collect::<Vec<_>>();
-                turn(
-                    request,
-                    &mut server,
-                    &client,
-                    session_id,
+                let active = ActiveSession {
+                    session: session_id,
                     thread,
                     workspace,
-                    input,
-                )
-                .await?
+                };
+                turn(request, &mut server, &client, active, input, diagnostics).await?
             }
             _ => {
                 client
@@ -221,22 +394,40 @@ pub async fn run(request: &Request, mut server: Wire, client: Wire) -> Result<()
                     .await
                     .response(id, Err(anyhow::anyhow!("unsupported bridge operation")))
                     .await?;
+                diagnostics.last_activity = "acp_request_rejected";
                 continue;
             }
         };
         client.0.lock().await.response(id, Ok(result)).await?;
+        if diagnostics.outcome == "end_turn" {
+            diagnostics.last_activity = "acp_end_turn_response_sent";
+        }
     }
+}
+
+struct ActiveSession<'a> {
+    session: &'a str,
+    thread: &'a str,
+    workspace: &'a std::path::Path,
 }
 
 async fn turn(
     request: &Request,
     server: &mut Wire,
     client: &Client,
-    session: &str,
-    thread: &str,
-    workspace: &std::path::Path,
+    active: ActiveSession<'_>,
     input: Vec<Value>,
+    diagnostics: &mut SessionDiagnostics,
 ) -> Result<Value> {
+    let ActiveSession {
+        session,
+        thread,
+        workspace,
+    } = active;
+    diagnostics.phase = "turn_start";
+    diagnostics.pending_request = Some("turn_start");
+    diagnostics.last_activity = "app_server_request_sent";
+    diagnostics.turn_outcome = "start_pending";
     let request_id = server
         .request("turn/start", json!({"threadId":thread,"input":input}))
         .await?;
@@ -245,23 +436,51 @@ async fn turn(
     let mut acknowledged = false;
     let mut requests = std::collections::BTreeSet::new();
     loop {
-        let message = {
+        let incoming = {
             let mut wire = client.0.lock().await;
             tokio::select! {
-                result=server.read()=>result?,
-                result=wire.read()=>{
-                    let message=result?;
-                    ensure!(message["method"] == "session/cancel" && message["params"]["sessionId"] == session,"unexpected ACP request during prompt");
-                    if let Some(turn)=&turn_id {let _=server.request("turn/interrupt",json!({"threadId":thread,"turnId":turn})).await;}
-                    // Returning closes the ACP prompt; the supervisor is then
-                    // stopped by the worker and confirms complete container removal.
-                    return Ok(json!({"stopReason":"cancelled"}));
-                }
+                result=server.read()=> (true, result),
+                result=wire.read()=> (false, result),
             }
         };
+        let (from_server, result) = incoming;
+        let message = match result {
+            Ok(message) => message,
+            Err(error) => {
+                if from_server {
+                    diagnostics.app_server_read_error(&error);
+                    return Err(error).context("Codex App Server turn stream read failed");
+                }
+                diagnostics.peer_read_error(&error);
+                return Err(error).context("Codex ACP peer turn read failed");
+            }
+        };
+        if !from_server {
+            ensure!(
+                message["method"] == "session/cancel" && message["params"]["sessionId"] == session,
+                "unexpected ACP request during prompt"
+            );
+            diagnostics.phase = "cancelling";
+            diagnostics.last_activity = "acp_cancel_received";
+            diagnostics.outcome = "cancelled";
+            if let Some(turn) = &turn_id {
+                let _ = server
+                    .request("turn/interrupt", json!({"threadId":thread,"turnId":turn}))
+                    .await;
+            }
+            // Returning closes the ACP prompt; the supervisor is then
+            // stopped by the worker and confirms complete container removal.
+            return Ok(json!({"stopReason":"cancelled"}));
+        }
         if message.get("method").is_none() {
             ensure!(!acknowledged, "duplicate Codex turn response");
-            let result = Wire::result(message, &request_id)?;
+            if message.get("id") != Some(&request_id) {
+                diagnostics.correlation_failure();
+                anyhow::bail!("Codex turn response ID mismatch");
+            }
+            let result = Wire::result(message, &request_id).inspect_err(|_error| {
+                diagnostics.protocol_rejection();
+            })?;
             let id = result["turn"]["id"]
                 .as_str()
                 .context("Codex turn identity missing")?;
@@ -271,8 +490,13 @@ async fn turn(
             );
             turn_id = Some(id.into());
             acknowledged = true;
+            diagnostics.pending_request = None;
+            diagnostics.phase = "turn_running";
+            diagnostics.last_activity = "turn_start_response_received";
+            diagnostics.turn_outcome = "running";
             continue;
         }
+        diagnostics.server_message(&message);
         let method = message["method"].as_str().context("Codex method missing")?;
         let params = &message["params"];
         if let Some(id) = message.get("id") {
@@ -280,7 +504,11 @@ async fn turn(
                 requests.len() < 1024 && requests.insert(serde_json::to_string(id)?),
                 "duplicate Codex reverse request"
             );
-            ensure!(method == "item/tool/call", "native Codex request denied");
+            if method != "item/tool/call" {
+                diagnostics.outcome = "server_request_rejected";
+                anyhow::bail!("unexpected Codex server request during turn");
+            }
+            diagnostics.last_activity = "dynamic_tool_request_received";
             let turn = turn_id
                 .as_deref()
                 .context("Codex tool before turn identity")?;
@@ -308,7 +536,11 @@ async fn turn(
             let result = router.as_mut().unwrap().dispatch(client, call).await;
             let failed = result.is_err();
             server.response(id.clone(), result).await?;
-            ensure!(!failed, "Codex broker call failed");
+            if failed {
+                diagnostics.outcome = "tool_callback_failed";
+                anyhow::bail!("Codex broker callback failed");
+            }
+            diagnostics.last_activity = "dynamic_tool_result_sent";
         } else {
             if let Some(owner) = params.get("threadId") {
                 ensure!(owner == thread, "foreign Codex thread notification");
@@ -321,6 +553,8 @@ async fn turn(
             }
             match method {
                 "turn/started" => {
+                    diagnostics.phase = "turn_running";
+                    diagnostics.last_activity = "turn_started_notification";
                     let id = params["turn"]["id"]
                         .as_str()
                         .context("Codex turn notification missing identity")?;
@@ -329,14 +563,21 @@ async fn turn(
                         "Codex turn notification mismatch"
                     );
                     turn_id = Some(id.into());
+                    diagnostics.turn_outcome = "running";
                 }
                 "turn/completed" => {
-                    ensure!(
-                        acknowledged
-                            && params["turn"]["id"].as_str() == turn_id.as_deref()
-                            && params["turn"]["status"] == "completed",
-                        "Codex turn incomplete"
-                    );
+                    if !(acknowledged
+                        && params["turn"]["id"].as_str() == turn_id.as_deref()
+                        && params["turn"]["status"] == "completed")
+                    {
+                        diagnostics.outcome = "turn_incomplete";
+                        diagnostics.last_activity = "turn_completed_not_successful";
+                        anyhow::bail!("Codex turn incomplete");
+                    }
+                    diagnostics.phase = "turn_completed";
+                    diagnostics.last_activity = "turn_completed_notification";
+                    diagnostics.outcome = "end_turn";
+                    diagnostics.turn_outcome = "end_turn";
                     return Ok(json!({"stopReason":"end_turn"}));
                 }
                 "item/started" | "item/completed" => {
@@ -359,9 +600,34 @@ async fn turn(
                     client.0.lock().await.notify("session/update",json!({"sessionId":session,
                         "update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":delta}}})).await?;
                 }
-                "error" => anyhow::bail!("Codex turn failed"),
+                "error" => {
+                    diagnostics.outcome = "app_server_error_notification";
+                    diagnostics.turn_outcome = "app_server_error_notification";
+                    anyhow::bail!("Codex turn failed")
+                }
                 _ => {} // bounded control telemetry; never raw-reasoning persistence
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SessionDiagnostics;
+    use serde_json::json;
+
+    #[test]
+    fn lifecycle_evidence_uses_fixed_categories_and_preserves_turn_result() -> anyhow::Result<()> {
+        let mut diagnostics = SessionDiagnostics::default();
+        diagnostics.server_message(&json!({"method":"error","params":{"message":"prompt-secret"}}));
+        assert_eq!(diagnostics.last_activity, "server_error_notification");
+        diagnostics.turn_outcome = "end_turn";
+        diagnostics.peer_read_error(&crate::acp_wire::StreamClosed.into());
+        assert_eq!(diagnostics.outcome, "peer_eof_after_end_turn");
+        let serialized = serde_json::to_string(&diagnostics)?;
+        assert!(!serialized.contains("prompt-secret"));
+        assert!(!serialized.contains("\"method\""));
+        assert!(serialized.len() <= 1024);
+        Ok(())
     }
 }

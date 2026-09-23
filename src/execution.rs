@@ -82,11 +82,43 @@ pub fn validate_tool_command(command: &CommandSpec) -> Result<()> {
     Ok(())
 }
 
+/// Operator-local capability checks; never serialized into an immutable plan.
+/// Prefixes match argv elements, not shell text. Every matching rule is required.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ValidatorRequirement {
+    pub command_prefix: Vec<String>,
+    pub probes: Vec<Vec<String>>,
+}
+
+impl ValidatorRequirement {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.probes.is_empty() && self.probes.len() <= 8,
+            "validator requirement needs 1..8 probes"
+        );
+        for argv in std::iter::once(&self.command_prefix).chain(&self.probes) {
+            validate_tool_command(&CommandSpec {
+                argv: argv.clone(),
+                cwd: ".".into(),
+                timeout_seconds: 30,
+            })?;
+            ensure!(
+                argv.iter().map(String::len).sum::<usize>() <= 8192,
+                "validator requirement argv exceeds 8 KiB"
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerConfig {
     pub profiles: Vec<Profile>,
     pub repository_ids: Vec<String>,
+    #[serde(default)]
+    pub validator_requirements: Vec<ValidatorRequirement>,
     #[serde(default)]
     pub credentials: std::collections::BTreeMap<String, crate::repository::Credential>,
     #[serde(default)]
@@ -97,6 +129,13 @@ pub struct WorkerConfig {
 
 impl WorkerConfig {
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.validator_requirements.len() <= 32,
+            "too many validator requirements"
+        );
+        for requirement in &self.validator_requirements {
+            requirement.validate()?;
+        }
         ensure!(
             !self.profiles.is_empty() && self.profiles.len() <= 16,
             "provision execution profiles"

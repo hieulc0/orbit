@@ -32,7 +32,7 @@ an in-memory broker or a second execution authority.
 The [remote coding worker](../guides/remote-coding.md) materializes private HTTPS
 Git repositories and performs a bounded model loop on the trusted worker. Each
 repository tool runs in a disposable host-managed rootless Podman container,
-without Git metadata, credentials or network. Tasks request a logical isolation
+with Attempt-owned Git metadata, without provider credentials or network. Tasks request a logical isolation
 class; the operator pins its execution profile. Only `trusted` workspace execution
 is implemented. Optional governance stays compatible, but adding a tenant
 hierarchy is not part of this milestone. Authorization and containment are

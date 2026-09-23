@@ -32,6 +32,9 @@ pub enum ClientError {
         status: reqwest::StatusCode,
         value: Value,
     },
+    OperationRejected {
+        status: &'static str,
+    },
 }
 
 impl std::fmt::Display for ClientError {
@@ -39,6 +42,7 @@ impl std::fmt::Display for ClientError {
         match self {
             Self::BudgetExhausted { message } => write!(f, "budget exhausted: {message}"),
             Self::Server { status, value } => write!(f, "server {status}: {value}"),
+            Self::OperationRejected { status } => write!(f, "worker operation rejected: {status}"),
         }
     }
 }
@@ -182,6 +186,7 @@ impl Client {
                 .find(|runtime| runtime.binding_name == spec.binding)
             {
                 evidence.agent_type = runtime.launch.agent_name.clone();
+                evidence.requested_reasoning_effort = runtime.reasoning_effort.clone();
                 evidence.runtime_image = Some(runtime.launch.image.clone());
                 evidence.runtime_digest = Some(runtime.launch.digest()?);
                 evidence.credential_reference = Some(runtime.auth.source.clone());
@@ -199,11 +204,19 @@ impl Client {
         for _ in 0..3 {
             match self.post("/worker/operate", operation).await {
                 Ok(value) => {
-                    ensure!(
-                        value["status"] == "accepted",
-                        "worker operation rejected: {}",
-                        value["status"]
-                    );
+                    if value["status"] != "accepted" {
+                        let status = match value["status"].as_str() {
+                            Some("ownership_lost") => "ownership_lost",
+                            Some("cancelled") => "cancelled",
+                            Some("deadline_exceeded") => "deadline_exceeded",
+                            Some("invalid_payload") => "invalid_payload",
+                            Some("conflict") => "conflict",
+                            _ => "unexpected_status",
+                        };
+                        last = Some(ClientError::OperationRejected { status }.into());
+                        sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
                     return Ok(value);
                 }
                 Err(error) => {
@@ -369,6 +382,14 @@ pub async fn run_until(
             capabilities.push(agent.binding.runtime.clone());
         }
         if capability == "repository.code" {
+            // A pinned coding runtime must be executable before this worker
+            // advertises the capability or claims an Attempt. No credential or
+            // model request is involved in this check.
+            for agent in &config.acp_agents {
+                if agent.launch.adapter == crate::acp_runtime::Adapter::Codex {
+                    crate::acp_process::preflight_codex_launch(&agent.launch).await?;
+                }
+            }
             capabilities.extend(
                 config
                     .acp_agents
@@ -540,8 +561,17 @@ pub async fn execute(client: &Client, assignment: &Assignment, root: &Path) -> R
         Ok::<_, anyhow::Error>(())
     };
     tokio::pin!(execution);
-    let heartbeats = async {
+    // Renewal must be scheduled independently of the model/ACP future. A
+    // synchronous callback inside that future can otherwise prevent a
+    // `select!` branch in the same task from being polled until the lease dies.
+    let heartbeat_client = client.clone();
+    let heartbeat_assignment = assignment.clone();
+    let mut heartbeats = LeaseHeartbeatTask(tokio::spawn(async move {
+        let client = heartbeat_client;
+        let assignment = heartbeat_assignment;
         let mut lease_until = lease_until;
+        let mut count = 0_u64;
+        lease_event(&assignment, "started", 0, lease_until, None);
         loop {
             // The interval schedules renewal; the last confirmed lease bounds
             // how long we can wait for its response. Anchor durations to the
@@ -551,28 +581,146 @@ pub async fn execute(client: &Client, assignment: &Assignment, root: &Path) -> R
                 sleep(Duration::from_millis(assignment.heartbeat_interval).min(remaining / 2))
                     .await;
                 let sent_at = Instant::now();
-                let renewed = client.operation(&assignment, Action::Heartbeat).await?;
+                lease_event(&assignment, "sent", count + 1, lease_until, None);
+                let renewed = match client.operation(&assignment, Action::Heartbeat).await {
+                    Ok(renewed) => renewed,
+                    Err(error) => {
+                        lease_event(
+                            &assignment,
+                            "request_failed",
+                            count + 1,
+                            lease_until,
+                            Some(heartbeat_error_class(&error)),
+                        );
+                        return Err(error);
+                    }
+                };
+                if Instant::now() >= lease_until {
+                    lease_event(&assignment, "late_ack", count + 1, lease_until, None);
+                }
                 ensure!(
                     Instant::now() < lease_until,
                     "confirmed lease expired before heartbeat acknowledgement"
                 );
-                confirmed_lease(sent_at, &renewed)
+                let confirmed = confirmed_lease(sent_at, &renewed);
+                if confirmed.is_err() {
+                    lease_event(&assignment, "invalid_ack", count + 1, lease_until, None);
+                }
+                confirmed
             };
-            lease_until = tokio::time::timeout_at(lease_until, renewal)
-                .await
-                .context("confirmed lease expired before heartbeat acknowledgement")??;
+            lease_until = match tokio::time::timeout_at(lease_until, renewal).await {
+                Ok(result) => result?,
+                Err(error) => {
+                    lease_event(&assignment, "ack_timeout", count + 1, lease_until, None);
+                    return Err(error)
+                        .context("confirmed lease expired before heartbeat acknowledgement");
+                }
+            };
             ensure!(
                 Instant::now() < lease_until,
                 "heartbeat acknowledgement arrived after confirmed lease expiry"
             );
+            count += 1;
+            lease_event(&assignment, "accepted", count, lease_until, None);
         }
         #[allow(unreachable_code)]
         Ok::<(), anyhow::Error>(())
+    }));
+    let (result, heartbeat_finished) = tokio::select! {
+        result = &mut execution => {
+            lease_branch_event(&assignment, "execution_returned");
+            (result, false)
+        },
+        result = &mut heartbeats.0 => {
+            lease_branch_event(&assignment, "heartbeat_returned");
+            (result.context("lease heartbeat task stopped").and_then(|result| result), true)
+        },
+        _ = tokio::time::sleep_until(deadline) => {
+            lease_branch_event(&assignment, "task_deadline");
+            (Err(anyhow::anyhow!("task deadline exceeded; execution stopped")), false)
+        },
     };
-    tokio::select! {
-        result = &mut execution => result,
-        result = heartbeats => result,
-        _ = tokio::time::sleep_until(deadline) => anyhow::bail!("task deadline exceeded; execution stopped"),
+    // Do not detach a renewing task after completion, cancellation, or a
+    // failed ownership check. In-flight renewal is abandoned as before.
+    if !heartbeat_finished {
+        heartbeats.0.abort();
+        let _ = (&mut heartbeats.0).await;
+    }
+    result
+}
+
+/// A cancelled worker execution cannot leave a detached task renewing its lease.
+struct LeaseHeartbeatTask(tokio::task::JoinHandle<Result<()>>);
+
+impl Drop for LeaseHeartbeatTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Only structural, bounded lease evidence is logged. Never include the
+/// operation error: HTTP response bodies may contain peer-controlled text.
+fn lease_event(
+    assignment: &Assignment,
+    event: &'static str,
+    heartbeat: u64,
+    lease_until: Instant,
+    error_class: Option<&'static str>,
+) {
+    let at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    crate::ops::log(
+        "attempt_lease",
+        json!({
+            "attempt_id": assignment.attempt_id,
+            "generation": assignment.generation,
+            "heartbeat_interval_ms": assignment.heartbeat_interval,
+            "event": event,
+            "at_ms": at_ms,
+            "heartbeat": heartbeat,
+            "confirmed_remaining_ms": lease_until.saturating_duration_since(Instant::now()).as_millis(),
+            "error_class": error_class,
+        }),
+    );
+}
+
+fn lease_branch_event(assignment: &Assignment, event: &'static str) {
+    crate::ops::log(
+        "attempt_lease_branch",
+        json!({
+            "attempt_id": assignment.attempt_id,
+            "generation": assignment.generation,
+            "event": event,
+            "at_ms": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        }),
+    );
+}
+
+fn heartbeat_error_class(error: &anyhow::Error) -> &'static str {
+    if let Some(ClientError::OperationRejected { status }) = error.downcast_ref::<ClientError>() {
+        return status;
+    }
+    if let Some(ClientError::Server { status, .. }) = error.downcast_ref::<ClientError>() {
+        return if status.is_server_error() {
+            "server_error"
+        } else {
+            "server_rejection"
+        };
+    }
+    if error
+        .downcast_ref::<reqwest::Error>()
+        .is_some_and(reqwest::Error::is_timeout)
+    {
+        "transport_timeout"
+    } else if error.downcast_ref::<reqwest::Error>().is_some() {
+        "transport_error"
+    } else {
+        "invalid_ack"
     }
 }
 
@@ -947,4 +1095,49 @@ async fn read_stream(
     }
     log.sync_all().await?;
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod lease_tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn heartbeat_task_progresses_during_blocking_execution_and_stops_on_drop() {
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let observed = ticks.clone();
+        let guard = LeaseHeartbeatTask(tokio::spawn(async move {
+            loop {
+                observed.fetch_add(1, Ordering::SeqCst);
+                sleep(Duration::from_millis(10)).await;
+            }
+            #[allow(unreachable_code)]
+            Ok(())
+        }));
+        // The real worker uses a multi-thread Tokio runtime. A blocked ACP
+        // callback cannot starve an independently scheduled renewal task.
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(ticks.load(Ordering::SeqCst) >= 3);
+        drop(guard);
+        sleep(Duration::from_millis(30)).await;
+        let stopped_at = ticks.load(Ordering::SeqCst);
+        sleep(Duration::from_millis(30)).await;
+        assert_eq!(ticks.load(Ordering::SeqCst), stopped_at);
+    }
+
+    #[test]
+    fn heartbeat_classification_never_includes_peer_text() {
+        let rejected = anyhow::Error::new(ClientError::OperationRejected {
+            status: "ownership_lost",
+        });
+        assert_eq!(heartbeat_error_class(&rejected), "ownership_lost");
+        let server = anyhow::Error::new(ClientError::Server {
+            status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            value: json!({"error":"Authorization: Bearer private-token"}),
+        });
+        assert_eq!(heartbeat_error_class(&server), "server_error");
+    }
 }

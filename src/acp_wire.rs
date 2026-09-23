@@ -4,6 +4,31 @@ use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
+/// A correlated peer rejection. Never retain peer message/data in durable errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestRejected {
+    pub code: Option<i64>,
+}
+
+impl std::fmt::Display for RequestRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "agent request rejected (code={:?})", self.code)
+    }
+}
+
+impl std::error::Error for RequestRejected {}
+
+#[derive(Debug, Clone, Copy)]
+pub struct StreamClosed;
+
+impl std::fmt::Display for StreamClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("agent stream closed")
+    }
+}
+
+impl std::error::Error for StreamClosed {}
+
 pub struct Wire {
     input: BufReader<Box<dyn AsyncRead + Unpin>>,
     output: Box<dyn AsyncWrite + Unpin>,
@@ -37,7 +62,9 @@ impl Wire {
         let mut frame = Vec::new();
         loop {
             let data = self.input.fill_buf().await.context("agent stream failed")?;
-            ensure!(!data.is_empty(), "agent stream closed");
+            if data.is_empty() {
+                return Err(StreamClosed.into());
+            }
             let end = data.iter().position(|b| *b == b'\n').map(|n| n + 1);
             let n = end.unwrap_or(data.len());
             self.bytes = self.bytes.saturating_add(n as u64);
@@ -62,7 +89,8 @@ impl Wire {
         );
         ensure!(
             value.get("method").is_some()
-                != (value.get("result").is_some() || value.get("error").is_some()),
+                != (value.get("result").is_some() || value.get("error").is_some())
+                && !(value.get("result").is_some() && value.get("error").is_some()),
             "ambiguous agent message"
         );
         Ok(value)
@@ -125,7 +153,12 @@ impl Wire {
             "foreign agent response"
         );
         if let Some(err) = value.get("error") {
-            anyhow::bail!("agent request rejected: {}", err);
+            // Peer messages/data can contain credentials, prompt text or arbitrary
+            // control characters. Only the bounded numeric protocol code is safe.
+            return Err(RequestRejected {
+                code: err["code"].as_i64(),
+            }
+            .into());
         }
         value
             .get("result")

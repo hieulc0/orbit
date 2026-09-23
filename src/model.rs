@@ -946,6 +946,10 @@ pub enum Action {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actual_model: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        resolved_reasoning_effort: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actual_reasoning_effort: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         turn_count: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_call_count: Option<u64>,

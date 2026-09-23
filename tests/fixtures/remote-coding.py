@@ -56,7 +56,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             ("write_file", {"path": "calc.sh", "content": "#!/bin/sh\nprintf '%s\\n' 0\n"}),
             ("shell", {"command": "sh test.sh"}),
             ("write_file", {"path": "calc.sh", "content": "#!/bin/sh\nprintf '%s\\n' \"$(( $1 + $2 ))\"\n"}),
-            ("shell", {"command": "sh test.sh && test ! -e /run/orbit && test ! -e .git && test -z \"$ORBIT_TOKEN$ORBIT_GIT_PASSWORD$PROVIDER_API_KEY\" && test ! -e '" + config["host_marker"] + "' && ! touch /orbit-host-write-check && test \"$(ls /sys/class/net)\" = lo && test \"$(cat /sys/fs/cgroup/memory.max)\" = 536870912 && test \"$(cat /sys/fs/cgroup/cpu.max)\" = '100000 100000' && test \"$(cat /sys/fs/cgroup/pids.max)\" = 128"}),
+            ("shell", {"command": "sh test.sh && test ! -e /run/orbit && test -d .git && test -z \"$ORBIT_TOKEN$ORBIT_GIT_PASSWORD$PROVIDER_API_KEY\" && test ! -e '" + config["host_marker"] + "' && ! touch /orbit-host-write-check && test \"$(ls /sys/class/net)\" = lo && test \"$(cat /sys/fs/cgroup/memory.max)\" = 536870912 && test \"$(cat /sys/fs/cgroup/cpu.max)\" = '100000 100000' && test \"$(cat /sys/fs/cgroup/pids.max)\" = 128"}),
         ]
         if mode == "forbidden":
             name, args = "network", {"url": "https://example.invalid"}

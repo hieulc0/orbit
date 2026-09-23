@@ -1,11 +1,16 @@
 # ACP repository workers
 
 Orbit implements an experimental ACP v1 worker and a version-pinned Codex bridge.
-The real Codex 0.153.4 binary has passed a disposable, loopback-provider workflow:
-read → failing test → edit → passing test → independent verification → review.
-This is not live-account or separately hosted worker acceptance. The latest
-qualification status and unrun checks are in the
-[compatibility record](../operations/acp-codex-compatibility.md).
+The historical Codex 0.153.4 binary passed a disposable, loopback-provider
+workflow. The current pinned package is Codex 0.156.0, selected after the
+dedicated account's model catalog advertised GPT-6 Luna and high reasoning.
+However, the current 0.156.0 offline broker regression failed after prompt
+reservation and before any dynamic-tool callback; do not treat the Codex runtime
+as ready for live coding. See the
+[post-Q6 runtime report](../operations/post-q6-hardening.md#gpt-6-luna-runtime-requirement--2026-09-23)
+for the exact evidence and stop decision, and the
+[historical compatibility record](../operations/acp-codex-compatibility.md) for
+earlier checks.
 
 Delivery order remains Codex, official Google Antigravity ACP, then Claude.
 The generic `adapter: acp` registry supports client-brokered agents, but does not
@@ -20,14 +25,15 @@ repository, pinned tool image and worker identities as described in
 [remote coding](remote-coding.md). ACP is used only on isolated `repository.code`;
 the tester and approval step are unchanged. Regular tests need no provider account.
 
-1. Review and install Codex **0.153.4** into an operator-built immutable OCI image.
-   The image must include the executable at the configured absolute image path.
-   Pin `name@sha256:…` or a full local `sha256:…` image ID; task execution uses
-   `--pull=never`. Do not use `npx`, floating tags, package installers or a host
-   executable in an assignment. The
-   [offline fixture builder](../../scripts/prepare-acp-fixture.sh) demonstrates
-   assembling an image from a separately downloaded, checksum-verified binary;
-   its Node/fixture contents are test infrastructure, not a production image.
+1. The current release package builder is
+   [build_codex_runtime.sh](../../scripts/build_codex_runtime.sh); it verifies
+   the official Codex 0.156.0 package and matching Code Mode host before building
+   the local digest-addressed image. Use only the printed immutable image digest
+   and `--pull=never`. Do not use `npx`, floating tags, a host executable or a
+   mixed-version helper in an assignment. Note that package/smoke verification
+   has passed but the current offline Orbit broker compatibility gate has not.
+   The older [offline fixture builder](../../scripts/prepare-acp-fixture.sh)
+   remains test infrastructure only.
 2. Select and provision the account **outside Orbit tasks**. Create a private
    directory (0700) containing only its explicitly selected `auth.json` (0600).
    Do not point Orbit at your whole developer HOME or copy your Codex config,

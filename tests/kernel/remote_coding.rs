@@ -422,9 +422,17 @@ async fn remote_coding_private_git_oci_revision_independent_tests_and_review() -
         tested["tasks"][2]["attempts"][0]["id"]
     );
     assert_eq!(report["commands"][0]["success"], true);
-    assert_eq!(report["commands"][1]["argv"], json!(["sh", "test.sh"]));
-    assert_eq!(report["commands"][1]["exit_code"], 0);
-    assert_eq!(report["commands"][1]["timed_out"], false);
+    assert_eq!(report["commands"][1]["phase"], "preflight");
+    assert_eq!(report["commands"][1]["success"], true);
+    let validated = report["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|command| command["phase"] == "validate")
+        .context("independent validation command missing")?;
+    assert_eq!(validated["argv"], json!(["sh", "test.sh"]));
+    assert_eq!(validated["exit_code"], 0);
+    assert_eq!(validated["timed_out"], false);
     assert_eq!(operator.get(&format!("/runs/{run}")).await?, tested);
 
     // Kill the real API process while human review is waiting. Recovery must

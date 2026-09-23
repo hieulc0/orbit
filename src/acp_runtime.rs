@@ -13,6 +13,23 @@ use std::{
 };
 pub const WORKSPACE: &str = "/orbit/home/workspace";
 
+/// A prompt deadline is distinct from a launcher/transport failure. Its remote
+/// outcome is still unknown until the existing durable reservation is settled.
+#[derive(Debug)]
+pub struct TurnTimeout {
+    pub diagnostic: String,
+}
+impl std::fmt::Display for TurnTimeout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "ACP turn timeout; prompt outcome unconfirmed; {}",
+            self.diagnostic
+        )
+    }
+}
+impl std::error::Error for TurnTimeout {}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Adapter {
@@ -131,6 +148,9 @@ pub struct Runtime {
     pub binding: Binding,
     pub launch: Launch,
     pub auth: AuthStore,
+    /// Optional provider-native reasoning level pinned by the worker operator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 impl Runtime {
     pub fn validate(&self) -> Result<()> {
@@ -145,6 +165,17 @@ impl Runtime {
             valid_name(&self.binding_name) && descriptor.launch_digest == self.launch.digest()?,
             "ACP launch does not match pinned policy"
         );
+        if let Some(effort) = &self.reasoning_effort {
+            ensure!(
+                self.launch.adapter == Adapter::Codex
+                    && !effort.trim().is_empty()
+                    && effort.len() <= 32
+                    && effort.bytes().all(|b| {
+                        b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-'
+                    }),
+                "invalid ACP reasoning effort"
+            );
+        }
         ensure!(
             self.auth.source == descriptor.auth.source
                 && self.auth.owner == descriptor.auth.owner
@@ -358,6 +389,19 @@ impl Runtime {
                 .get("models")
                 .and_then(|m| m.get("currentModelId"))
                 .and_then(|v| v.as_str());
+            let actual_reasoning_effort = created
+                .get("_meta")
+                .and_then(|meta| meta.get("orbit"))
+                .and_then(|orbit| orbit.get("codexReasoningEffort"))
+                .and_then(serde_json::Value::as_str);
+            if self.launch.adapter == Adapter::Codex
+                && let Some(requested) = self.reasoning_effort.as_deref()
+            {
+                ensure!(
+                    actual_reasoning_effort == Some(requested),
+                    "Codex reasoning effort was not confirmed exactly; prompt not dispatched"
+                );
+            }
             let model_confirmed = select_model(
                 &mut wire,
                 &mut broker,
@@ -366,6 +410,10 @@ impl Runtime {
                 current_model,
             )
             .await?;
+            ensure!(
+                self.binding.model.is_none() || model_confirmed,
+                "ACP exact model was not confirmed; prompt not dispatched"
+            );
             if model_confirmed
                 && let (Some(execution_id), Some(actual_model)) =
                     (a.execution_id.as_deref(), self.binding.model.as_deref())
@@ -376,6 +424,8 @@ impl Runtime {
                         crate::model::Action::UpdateExecution {
                             execution_id: execution_id.to_string(),
                             actual_model: Some(actual_model.to_string()),
+                            resolved_reasoning_effort: actual_reasoning_effort.map(str::to_owned),
+                            actual_reasoning_effort: actual_reasoning_effort.map(str::to_owned),
                             turn_count: None,
                             tool_call_count: None,
                             tool_success_count: None,
@@ -395,8 +445,9 @@ impl Runtime {
                 ).await.context("Antigravity set_mode timeout")??;
             }
             let prompt = json!({"sessionId":session_id,"prompt":[{"type":"text","text":format!(
-                "Task: {}\nPinned base: {}\nContext: {}\nUse only client file and terminal callbacks. Preserve tests. Do not push, deploy, delegate, or install anything. Finish with a concise summary for independent verification.",
-                a.plan.definition.inputs.task,a.plan.definition.inputs.base_revision,spec.context)}]});
+                "Task: {}\nPinned base: {}\nContext: {}\n{}\nUse only client file and terminal callbacks.",
+                a.plan.definition.inputs.task,a.plan.definition.inputs.base_revision,spec.context,
+                crate::coding_agent::completion_instructions(WORKSPACE, &spec.tools))}]});
             ensure!(serde_json::to_vec(&prompt)?.len() <= 262144,"ACP prompt too large");
             let call = broker.reserve(None,&prompt,0).await?;
             turn_count = 1;
@@ -415,20 +466,25 @@ impl Runtime {
                 }
                 Err(_timeout) => {
                     let diagnostic = broker.timeout_diagnostic();
+                    let supervisor_state = match child.try_wait() {
+                        Ok(Some(_)) => "exited",
+                        Ok(None) => "running",
+                        Err(_) => "unknown",
+                    };
                     let _ = tokio::time::timeout(
                         Duration::from_secs(1),
                         wire.notify("session/cancel", json!({"sessionId": session_id})),
                     )
                     .await;
-                    anyhow::bail!(
-                        "ACP turn timeout; prompt outcome unconfirmed; {diagnostic}"
-                    );
+                    return Err(TurnTimeout {
+                        diagnostic: format!("{diagnostic} supervisor_state={supervisor_state}"),
+                    }.into());
                 }
             };
             let stop_reason = response["stopReason"].as_str().unwrap_or("unknown");
             ensure!(
                 ["end_turn", "budget_exhausted"].contains(&stop_reason),
-                "ACP turn did not complete: {stop_reason}"
+                "ACP turn did not complete with a supported stop reason"
             );
             broker.close_terminals().await?;
             broker.active = false;
@@ -463,6 +519,8 @@ impl Runtime {
                     crate::model::Action::UpdateExecution {
                         execution_id: execution_id.to_string(),
                         actual_model: None,
+                        resolved_reasoning_effort: None,
+                        actual_reasoning_effort: None,
                         turn_count: Some(turn_count),
                         tool_call_count: Some(broker.tool_calls),
                         tool_success_count: Some(broker.tool_successes),
@@ -474,7 +532,7 @@ impl Runtime {
         }
         let result = result.map_err(|error| {
             if let Some(diagnostic) = launch_diagnostic {
-                anyhow::anyhow!("{error:#}; launch diagnostics: {diagnostic}")
+                error.context(format!("launch diagnostics: {diagnostic}"))
             } else {
                 error
             }
@@ -551,14 +609,23 @@ pub async fn select_model(
                 }),
             ),
         )
-        .await;
+        .await
+        .context("ACP set_config_option timeout; protocol outcome unconfirmed")?;
 
         ensure!(
             !broker.poisoned,
             "ACP broker poisoned during model selection"
         );
 
-        if let Ok(Ok(config_resp)) = set_config_res
+        // Only a correlated rejection permits the legacy protocol fallback.
+        // A dropped request can leave a partial frame or late response on this
+        // stream; dispatching another request would reuse a desynchronized wire.
+        let config_response = match set_config_res {
+            Ok(response) => Some(response),
+            Err(error) if error.is::<crate::acp_wire::RequestRejected>() => None,
+            Err(error) => return Err(error),
+        };
+        if let Some(config_resp) = config_response
             && let Some(options) = config_resp.get("configOptions").and_then(|v| v.as_array())
         {
             for opt in options {
@@ -601,9 +668,7 @@ pub async fn select_model(
             {
                 ensure!(
                     curr == model,
-                    "ACP set_model response returned mismatched model: expected {}, got {}",
-                    model,
-                    curr
+                    "ACP set_model response returned mismatched model"
                 );
                 evidence_confirmed = true;
             }
@@ -611,7 +676,7 @@ pub async fn select_model(
         }
 
         ensure!(
-            confirmed,
+            confirmed && evidence_confirmed,
             "ACP requested model could not be activated or confirmed: {}",
             model
         );

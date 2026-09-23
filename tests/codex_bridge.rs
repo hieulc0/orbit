@@ -8,6 +8,7 @@ use std::{cell::RefCell, path::Path};
 struct Client {
     calls: RefCell<Vec<(&'static str, Value)>>,
     fail_wait: bool,
+    exit_code: Option<u32>,
 }
 impl Client {
     fn record(&self, method: &'static str, value: impl serde::Serialize) {
@@ -57,7 +58,7 @@ impl acp::Client for Client {
             return Err(acp::Error::internal_error().data("secret-provider-payload"));
         }
         Ok(acp::WaitForTerminalExitResponse::new(
-            acp::TerminalExitStatus::new().exit_code(1),
+            acp::TerminalExitStatus::new().exit_code(self.exit_code.unwrap_or(1)),
         ))
     }
     async fn terminal_output(
@@ -74,6 +75,47 @@ impl acp::Client for Client {
         self.record("release", request);
         Ok(acp::ReleaseTerminalResponse::new())
     }
+}
+
+#[tokio::test]
+async fn codex_nonzero_command_preserves_session_for_next_tool() -> Result<()> {
+    let mut client = Client {
+        exit_code: Some(7),
+        ..Default::default()
+    };
+    let mut router = router()?;
+    let first = router
+        .dispatch(
+            &client,
+            call("negative", "orbit_shell", json!({"command":"exit 7"})),
+        )
+        .await?;
+    assert_eq!(first["success"], true); // Tool delivery, not command/test success.
+    let result: Value = serde_json::from_str(first["contentItems"][0]["text"].as_str().unwrap())?;
+    assert_eq!(result["exit_code"], 7);
+    client.exit_code = Some(0);
+    let next = router
+        .dispatch(
+            &client,
+            call(
+                "subsequent",
+                "orbit_shell",
+                json!({"command":"git status --short"}),
+            ),
+        )
+        .await?;
+    let result: Value = serde_json::from_str(next["contentItems"][0]["text"].as_str().unwrap())?;
+    assert_eq!(result["exit_code"], 0);
+    assert_eq!(
+        client
+            .calls
+            .borrow()
+            .iter()
+            .filter(|(method, _)| *method == "release")
+            .count(),
+        2
+    );
+    Ok(())
 }
 fn router() -> Result<ToolRouter> {
     ToolRouter::new(
@@ -96,6 +138,7 @@ fn codex_bridge_pins_closed_no_environment_dynamic_tool_contract() -> Result<()>
     let request = thread_start(
         CODEX_VERSION,
         "fixture-model",
+        Some("high"),
         Path::new("/private/control"),
         &["read_file".into(), "shell".into()],
     )?;
@@ -105,7 +148,9 @@ fn codex_bridge_pins_closed_no_environment_dynamic_tool_contract() -> Result<()>
     assert_eq!(request["approvalPolicy"], "never");
     assert_eq!(request["allowProviderModelFallback"], false);
     assert_eq!(request["config"]["web_search"], "disabled");
+    assert_eq!(request["config"]["model_reasoning_effort"], "high");
     assert_eq!(request["config"]["mcp_servers"], json!({}));
+    assert_eq!(request["config"]["features.goals"], false);
     assert_eq!(request["dynamicTools"][0]["name"], "orbit_read_file");
     assert_eq!(request["dynamicTools"][1]["name"], "orbit_shell");
     for (name, value) in request["config"].as_object().unwrap() {
@@ -113,13 +158,24 @@ fn codex_bridge_pins_closed_no_environment_dynamic_tool_contract() -> Result<()>
             assert_eq!(*value, false);
         }
     }
-    assert!(thread_start("latest", "model", Path::new("/private/control"), &[]).is_err());
-    assert!(thread_start(CODEX_VERSION, "", Path::new("/private/control"), &[]).is_err());
-    assert!(thread_start(CODEX_VERSION, "model", Path::new("relative"), &[]).is_err());
+    assert!(thread_start("latest", "model", None, Path::new("/private/control"), &[]).is_err());
+    assert!(thread_start(CODEX_VERSION, "", None, Path::new("/private/control"), &[]).is_err());
+    assert!(thread_start(CODEX_VERSION, "model", None, Path::new("relative"), &[]).is_err());
     assert!(
         thread_start(
             CODEX_VERSION,
             "model",
+            Some("HIGH"),
+            Path::new("/private/control"),
+            &[]
+        )
+        .is_err()
+    );
+    assert!(
+        thread_start(
+            CODEX_VERSION,
+            "model",
+            None,
             Path::new("/control"),
             &["native_shell".into()]
         )
@@ -143,6 +199,16 @@ async fn codex_bridge_routes_file_and_terminal_effects_only_to_client() -> Resul
         .dispatch(
             &client,
             call(
+                "read-absolute-1",
+                "orbit_read_file",
+                json!({"path":"/workspace/src/file"}),
+            ),
+        )
+        .await?;
+    router
+        .dispatch(
+            &client,
+            call(
                 "write-1",
                 "orbit_write_file",
                 json!({"path":"src/file","content":"changed"}),
@@ -160,12 +226,15 @@ async fn codex_bridge_routes_file_and_terminal_effects_only_to_client() -> Resul
     let requests = client.calls.borrow();
     assert_eq!(
         requests.iter().map(|r| r.0).collect::<Vec<_>>(),
-        ["read", "write", "create", "wait", "output", "release"]
+        [
+            "read", "read", "write", "create", "wait", "output", "release"
+        ]
     );
     assert_eq!(requests[0].1["path"], "/workspace/src/file");
-    assert_eq!(requests[2].1["command"], "sh");
-    assert_eq!(requests[2].1["args"], json!(["-c", "sh test.sh"]));
-    assert_eq!(requests[2].1["outputByteLimit"], 65536);
+    assert_eq!(requests[1].1["path"], "/workspace/src/file");
+    assert_eq!(requests[3].1["command"], "sh");
+    assert_eq!(requests[3].1["args"], json!(["-c", "sh test.sh"]));
+    assert_eq!(requests[3].1["outputByteLimit"], 65536);
     for (_, request) in requests.iter() {
         assert_eq!(request["sessionId"], "session-1");
     }
@@ -186,7 +255,12 @@ async fn codex_bridge_rejects_foreign_duplicate_native_and_escape_calls_before_e
     for (tool, args) in [
         ("exec_command", json!({"command":"true"})),
         ("orbit_read_file", json!({"path":"/etc/passwd"})),
+        (
+            "orbit_read_file",
+            json!({"path":"/workspace-sibling/secret"}),
+        ),
         ("orbit_read_file", json!({"path":"../private"})),
+        ("orbit_read_file", json!({"path":"/workspace/../private"})),
         (
             "orbit_write_file",
             json!({"path":"file","content":"new","extra":true}),

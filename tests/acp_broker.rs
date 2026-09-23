@@ -203,6 +203,22 @@ async fn test_broker_recoverable_tool_error_preserves_session() -> Result<()> {
     assert_eq!(broker.tool_successes, 1);
     assert_eq!(broker.tool_counts.get("read_file"), Some(&3));
 
+    // Terminal handle operations have outcomes too, even when rejected before
+    // any effect reservation. They must belong to the same counter population.
+    broker
+        .message(
+            &mut wire,
+            json!({"jsonrpc":"2.0","id":"bad-terminal",
+        "method":"terminal/output","params":{"sessionId":"test-session-1","terminalId":"missing"}}),
+        )
+        .await?;
+    assert!(peer_wire.read().await?["error"].is_object());
+    assert_eq!(broker.tool_counts.get("terminal/output"), Some(&1));
+    assert_eq!(
+        broker.tool_calls,
+        broker.tool_successes + broker.tool_failures
+    );
+
     // Call 3: Fatal error - foreign session ID
     let fatal_req = json!({
         "jsonrpc": "2.0",
@@ -217,6 +233,11 @@ async fn test_broker_recoverable_tool_error_preserves_session() -> Result<()> {
     let res = broker.message(&mut wire, fatal_req).await;
     assert!(res.is_err(), "fatal error must bail");
     assert!(broker.poisoned, "broker MUST be poisoned on fatal error");
+    assert_eq!(
+        broker.tool_calls,
+        broker.tool_successes + broker.tool_failures
+    );
+    assert_eq!(broker.tool_calls, broker.tool_counts.values().sum::<u64>());
 
     Ok(())
 }
@@ -248,6 +269,23 @@ async fn test_wire_error_responses_do_not_poison_framing() -> Result<()> {
     assert_eq!(msg2["result"]["content"], "recovered");
 
     Ok(())
+}
+
+#[test]
+fn wire_rejection_diagnostics_do_not_persist_peer_secrets() {
+    let error = Wire::result(
+        json!({"jsonrpc":"2.0","id":"r","error":{
+        "code":-32603,"message":"Authorization: Bearer SECRET".repeat(10000),
+        "data":{"prompt":"private engineering prompt","token":"secret"}}}),
+        &json!("r"),
+    )
+    .unwrap_err();
+    assert!(error.is::<orbit::acp_wire::RequestRejected>());
+    let diagnostic = error.to_string();
+    assert!(diagnostic.len() < 100);
+    assert!(diagnostic.contains("-32603"));
+    assert!(!diagnostic.contains("SECRET"));
+    assert!(!diagnostic.contains("prompt"));
 }
 
 #[tokio::test]
@@ -1133,20 +1171,66 @@ fn timeout_diagnostic_contains_only_bounded_protocol_state() -> Result<()> {
         credentials: &credentials,
     };
     let mut broker = Broker::new(session);
-    broker.session_id = Some("session-1".into());
-    broker.session_digest = "digest".into();
+    broker.session_id = Some("secret-session-token".repeat(4096));
+    broker.session_digest = "untrusted-digest-Authorization".repeat(4096);
     broker.last_activity_epoch_ms = Some(1000);
-    broker.last_activity_kind = Some("read_file".into());
     broker.turn_started_epoch_ms = Some(900);
     broker.pending_model_call = true;
     broker.pending_tool_callbacks = 1;
     let diagnostic = broker.timeout_diagnostic();
-    assert!(diagnostic.contains("session_id=session-1"));
-    assert!(diagnostic.contains("last_activity_kind=read_file"));
+    assert!(diagnostic.contains("session_digest="));
+    assert!(diagnostic.contains("last_activity_kind=none"));
     assert!(diagnostic.contains("pending_model_call=true"));
-    assert!(diagnostic.contains("active_tool_callbacks=1"));
+    assert!(diagnostic.contains("pending_tool_reservations=1"));
+    assert!(diagnostic.contains("active_tool_callbacks=0"));
+    assert!(diagnostic.contains("runtime_process_state=unknown"));
+    assert!(diagnostic.len() < 1024);
     assert!(!diagnostic.contains("Authorization"));
     assert!(!diagnostic.contains("token"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn untrusted_notification_kind_cannot_enter_timeout_diagnostics() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let client = Client::new("http://127.0.0.1:1".into(), String::new())?;
+    let assignment = create_assignment(Limits {
+        prompt_turns: 1,
+        broker_calls: 1,
+        reported_tool_calls: 1,
+        turn_timeout_seconds: 10,
+        terminal_timeout_seconds: 5,
+        terminal_runtime_seconds: 5,
+        output_bytes: 65536,
+    })?;
+    let workspace = Workspace {
+        path: root.path().into(),
+        git_dir: root.path().join("git"),
+        home: root.path().into(),
+    };
+    let profile = Profile {
+        backend: Backend::RootlessPodman,
+        image: "unused".into(),
+    };
+    let credentials = BTreeMap::new();
+    let mut broker = Broker::new(Session {
+        client: &client,
+        assignment: &assignment,
+        workspace: &workspace,
+        directory: root.path(),
+        home: root.path(),
+        profile: &profile,
+        credentials: &credentials,
+    });
+    broker.session_id = Some("session".into());
+    let mut wire = Wire::new(tokio::io::empty(), tokio::io::sink(), 65536);
+    let error = broker.message(&mut wire, json!({"jsonrpc":"2.0", "method":"session/update",
+        "params":{"sessionId":"session","update":{"sessionUpdate":"Authorization_Bearer_SECRET".repeat(10000)}}})).await.unwrap_err();
+    assert!(!error.to_string().contains("SECRET"));
+    let diagnostic = broker.timeout_diagnostic();
+    assert!(diagnostic.len() < 1024);
+    assert!(!diagnostic.contains("SECRET"));
+    assert!(diagnostic.contains("last_activity_kind=session_notification"));
     Ok(())
 }
 

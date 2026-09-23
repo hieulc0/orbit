@@ -26,6 +26,26 @@ fn fixture() -> Result<(Definition, RepositoryBinding, WorkerConfig)> {
 }
 
 #[test]
+fn validator_requirements_are_optional_local_and_bounded() -> Result<()> {
+    let (_, _, legacy) = fixture()?;
+    assert!(legacy.validator_requirements.is_empty());
+    let mut raw: Value = serde_json::from_str(include_str!("../examples/remote-worker.json"))?;
+    let requirements: Value =
+        serde_json::from_str(include_str!("../examples/rust-validator-requirements.json"))?;
+    raw["validator_requirements"] = requirements["validator_requirements"].clone();
+    let configured: WorkerConfig = serde_json::from_value(raw.clone())?;
+    configured.validate()?;
+    assert_eq!(configured.validator_requirements.len(), 3);
+    raw["validator_requirements"][0]["command_prefix"] = json!([]);
+    assert!(
+        serde_json::from_value::<WorkerConfig>(raw)?
+            .validate()
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
 fn execution_requirements_pin_profiles_preserve_legacy_and_reject_downgrades() -> Result<()> {
     let (definition, repository, worker) = fixture()?;
     worker.validate()?;

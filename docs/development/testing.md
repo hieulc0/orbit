@@ -32,6 +32,7 @@ deployment volumes. The credentials below belong only to its loopback fixtures.
 docker compose --profile compute up -d --wait
 python3 scripts/bootstrap-s3.py --endpoint http://127.0.0.1:55440 --bucket orbit-qualification --access-key orbit-local-test --secret-key orbit-local-test-secret
 podman pull docker.io/library/alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
+podman --remote=false image exists docker.io/library/alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
 npm --prefix ui run build
 
 # Separately download/review Codex 0.153.4; this builder never downloads it.
@@ -70,6 +71,14 @@ The `remote_coding` cases require local Git/Python and rootless Podman with the
 pinned Alpine image even if legacy `ORBIT_CONTAINER_RUNTIME=docker` is selected.
 They run authenticated loopback Git and deterministic Responses fixtures, never
 a paid provider, private production repository or remote deployment:
+
+That pinned Alpine profile in `examples/remote-worker.json` is the minimal
+`sh test.sh` runtime for the shell-based integration fixtures; it is not the
+separate Rust validation image. The ACP workflow fixtures check that the exact
+profile digest exists in the active rootless Podman store before creating a run
+or dispatching a model interaction. Runtime execution continues to use
+`--pull=never`. Rust validation workers should use the separately built and
+digest-pinned image from `deploy/validation/Containerfile`.
 
 ```sh
 ORBIT_TEST_DATABASE_URL=postgres://orbit:orbit-local-test@127.0.0.1:55439/orbit \
@@ -111,6 +120,28 @@ ORBIT_EVIDENCE_DIR="$PWD/target/qualification-acp" \
 cargo test --locked --features fault-injection --test kernel acp_accounting -- --ignored
 ```
 
+For validator provisioning, build `deploy/validation/Containerfile`, pin its
+resulting digest, and merge `examples/rust-validator-requirements.json` into the
+private worker config. See [post-Q6 hardening](../operations/post-q6-hardening.md)
+for counter semantics, capability failure classification and live compatibility
+limitations. The image capability smoke check is separate from project dependency
+provisioning; network-disabled validation needs the locked project dependencies
+available in the approved environment.
+
+The ignored `live_acp_git_terminal_and_accounting_preflight` test requires explicit
+live-account authorization. Set `ORBIT_LIVE_PREFLIGHT_WORKER_CONFIG` to the private
+selected runtime config alongside `ORBIT_TEST_DATABASE_URL` and a disk-backed
+`ORBIT_EVIDENCE_DIR`. It runs one small repair task in a disposable Git Attempt
+with 16 calls maximum, requires an observed terminal callback and exact model
+evidence, and never
+submits the qualification engineering task. Failure must be reported, not treated
+as a passing capability check. The unmodified Antigravity 1.1.1 distribution fails
+this terminal gate despite successfully initializing and reading a file. See the
+[cross-provider adapter build and gate](../operations/cross-provider-coding.md) for
+the exact-version overlay and model-driven nonzero-command/recovery checks.
+The independent `repository.test` task reconstructs a fresh validation workspace
+from the pinned baseline and accepted coding patch, then runs `sh test.sh`.
+
 The targeted database cases use no model account or container runtime. They test
 competing execution-only reservations, replay, cancellation/lease fencing and
 pending-prompt intervention, not a launched Codex session. A real credential-free
@@ -135,6 +166,17 @@ publication or deployment. Source/release provenance is recorded in
 
 `acp_workflow` uses disposable PostgreSQL, real worker/agent/tool processes, a
 fake ACP peer and the real pinned Codex binary against a loopback Responses peer.
+For the official 0.156.0 image, set `ORBIT_TEST_ACP_IMAGE` to its immutable
+local digest reference; the Codex fixture reads the declared executable from
+`examples/acp-worker.json` unless explicitly overridden for a different test
+image. Before submitting the fixture Run, a credential-free rootless Podman
+preflight runs that declared executable with `--version`, `--pull=never`, and
+network disabled. Coding workers perform the same check before registering the
+Codex capability. A missing/misdeclared runtime fails before an Attempt is
+claimed. On unexpected fixture termination, `ORBIT_EVIDENCE_DIR` receives a
+whitelisted `acp-workflow-failures/<run-id>/summary.json` containing IDs, states,
+journal sequence and accounting counts, but no prompts, tool arguments, raw
+diagnostics or credential material.
 No real provider key, personal account or developer checkout is used. Cases cover
 inspect/fail/edit/retest, accepted transcripts, independent verification/review,
 denied paths/native approvals, output floods and active-terminal cancellation or

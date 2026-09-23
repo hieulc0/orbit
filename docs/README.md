@@ -41,6 +41,8 @@ not the source of current setup instructions.
 - [ACP implementation and acceptance plan](development/acp-implementation-plan.md)
 - [Codex ACP compatibility and implementation record](operations/acp-codex-compatibility.md)
 - [Antigravity and Claude compatibility](operations/acp-agent-compatibility.md)
+- [Post-Q6 coding runtime hardening and accounting](operations/post-q6-hardening.md)
+- [Cross-provider coding adapters and preflights](operations/cross-provider-coding.md)
 - [Current roadmap](ROADMAP.md), [alpha qualification](operations/qualification.md)
 - [Remote coding qualification](operations/remote-coding-qualification.md)
 - [Historical records](archive/README.md)

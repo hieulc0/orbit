@@ -99,6 +99,8 @@ pub struct AgentExecution {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actual_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_image: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_digest: Option<String>,
@@ -184,6 +186,7 @@ impl AgentExecutionStart {
             resolved_model: self.resolved_model,
             resolved_reasoning_effort: self.resolved_reasoning_effort,
             actual_model: None,
+            actual_reasoning_effort: None,
             runtime_image: self.runtime_image,
             runtime_digest: self.runtime_digest,
             capability_source: self.capability_source,
@@ -204,6 +207,19 @@ impl AgentExecution {
         ensure!(self.sequence > 0, "sequence must be >= 1");
         ensure!(!self.agent_type.is_empty(), "agent_type required");
         ensure!(self.started_at >= 0, "started_at must be non-negative");
+        for effort in [
+            self.requested_reasoning_effort.as_ref(),
+            self.resolved_reasoning_effort.as_ref(),
+            self.actual_reasoning_effort.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            ensure!(
+                !effort.is_empty(),
+                "reasoning effort evidence cannot be empty"
+            );
+        }
         if let Some(finished) = self.finished_at {
             ensure!(
                 finished >= self.started_at,
@@ -518,6 +534,7 @@ impl NormalizedAgentResult {
             resolved_model: None,
             resolved_reasoning_effort: None,
             actual_model: None,
+            actual_reasoning_effort: None,
             runtime_image: None,
             runtime_digest: None,
             capability_source: None,

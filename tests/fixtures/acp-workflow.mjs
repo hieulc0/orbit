@@ -9,18 +9,31 @@ const actions = [
   ['write_file', {path:'calc.sh',content:fixed}],
   ['shell', {command:'sh test.sh && test ! -e /orbit/home/.codex/auth.json && test -z "$ORBIT_TOKEN"'}],
 ];
-if(process.argv[2] === 'responses') {
+if(process.argv[2] === 'responses' || process.argv[2] === 'responses-silent') {
   let calls=0;
   const server=http.createServer(async(req,res)=>{
     const chunks=[]; for await (const chunk of req) chunks.push(chunk);
     if(req.method!=='POST' || !req.url.endsWith('/responses')) {res.writeHead(404);res.end();return;}
     const body=JSON.parse(Buffer.concat(chunks));
     const names=body.tools.filter(t=>t.type==='function').map(t=>t.name);
-    if(!['orbit_read_file','orbit_write_file','orbit_shell'].every(n=>names.includes(n)) || names.some(n=>!n.startsWith('orbit_') && n!=='update_plan')) {
+    const accepted=['orbit_read_file','orbit_write_file','orbit_shell'].every(n=>names.includes(n)) && !names.some(n=>!n.startsWith('orbit_') && n!=='update_plan');
+    // Count every received provider request, including schema rejections. Store
+    // names only: never persist prompt text or arbitrary tool arguments.
+    fs.appendFileSync(process.argv[3]+'.requests',JSON.stringify({model:body.model,tool_names:names,accepted})+'\n');
+    if(!accepted) {
       fs.writeFileSync(process.argv[3]+'.error',JSON.stringify(names));res.writeHead(400);res.end();return;
     }
-    fs.appendFileSync(process.argv[3]+'.requests',JSON.stringify({model:body.model,tool_names:names})+'\n');
     const index=calls++;
+    if(process.argv[2] === 'responses-silent' && index === actions.length) {
+      // The final provider response is deliberately silent until the test
+      // releases it. No ACP notification or tool callback can renew a lease.
+      fs.writeFileSync(process.argv[3]+'.silent','ready');
+      const release=process.argv[3]+'.release';
+      const started=Date.now();
+      while(!fs.existsSync(release) && Date.now()-started < 15000)
+        await new Promise(resolve=>setTimeout(resolve,25));
+      if(!fs.existsSync(release)) {res.writeHead(503);res.end();return;}
+    }
     const output=index<actions.length ? {type:'function_call',id:`fc_${index}`,call_id:`call_${index}`,name:`orbit_${actions[index][0]}`,arguments:JSON.stringify(actions[index][1]),status:'completed'}
       : {type:'message',id:'msg_final',role:'assistant',content:[{type:'output_text',text:'Fixed addition and ran the preserved tests.',annotations:[]}],status:'completed'};
     res.writeHead(200,{'content-type':'text/event-stream'});
@@ -48,6 +61,7 @@ if(process.argv[2] === 'responses') {
     if(request.method==='initialize') response(request.id,{protocolVersion:1,agentInfo:{name:'orbit-acp-fixture',version:'1'},agentCapabilities:{},authMethods:[]});
     else if(request.method==='session/new') {cwd=request.params.cwd;response(request.id,{sessionId:'fixture-session',models:{currentModelId:'fixture-model-v1'}});}
     else if(request.method==='session/prompt') {
+      if(mode==='no-validation') { response(request.id,{stopReason:'end_turn'}); continue; }
       if(mode==='terminal-hang') {
         const sessionId='fixture-session';
         const {terminalId}=await call('terminal/create',{sessionId,command:'sh',args:['-c','sleep 60'],cwd});

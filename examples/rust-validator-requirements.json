@@ -1,0 +1,7 @@
+{
+  "validator_requirements": [
+    {"command_prefix": ["cargo"], "probes": [["cargo", "--version"], ["rustc", "--version"]]},
+    {"command_prefix": ["cargo", "fmt"], "probes": [["cargo", "fmt", "--version"]]},
+    {"command_prefix": ["cargo", "clippy"], "probes": [["cargo", "clippy", "--version"]]}
+  ]
+}

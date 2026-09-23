@@ -11,6 +11,8 @@ use std::{collections::BTreeMap, path::Path, time::Duration};
 
 #[path = "kernel/acp_accounting.rs"]
 mod acp_accounting;
+#[path = "kernel/acp_live_preflight.rs"]
+mod acp_live_preflight;
 #[path = "kernel/acp_workflow.rs"]
 mod acp_workflow;
 

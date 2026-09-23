@@ -83,6 +83,7 @@ async fn agent_execution_lifecycle_is_durable_before_report_and_replay_safe() ->
             evidence: orbit::continuation::AgentExecutionStart {
                 agent_type: "fixture-agent".into(),
                 requested_model: Some("requested-model".into()),
+                requested_reasoning_effort: Some("high".into()),
                 resolved_model: Some("resolved-model".into()),
                 runtime_image: Some("fixture-image".into()),
                 runtime_digest: Some("fixture-digest".into()),
@@ -99,6 +100,8 @@ async fn agent_execution_lifecycle_is_durable_before_report_and_replay_safe() ->
     assert_eq!(execution["execution_id"], execution_id);
     assert_eq!(execution["status"], "pending");
     assert_eq!(execution["actual_model"], Value::Null);
+    assert_eq!(execution["requested_reasoning_effort"], "high");
+    assert_eq!(execution["actual_reasoning_effort"], Value::Null);
 
     let mut duplicate_start = start.clone();
     duplicate_start.request_id = id();
@@ -125,6 +128,8 @@ async fn agent_execution_lifecycle_is_durable_before_report_and_replay_safe() ->
                 Action::UpdateExecution {
                     execution_id: execution_id.clone(),
                     actual_model: Some("confirmed-model".into()),
+                    resolved_reasoning_effort: Some("high".into()),
+                    actual_reasoning_effort: Some("high".into()),
                     turn_count: Some(1),
                     tool_call_count: Some(17),
                     tool_success_count: Some(16),
@@ -142,6 +147,14 @@ async fn agent_execution_lifecycle_is_durable_before_report_and_replay_safe() ->
     assert_eq!(
         running["tasks"][0]["attempts"][0]["agent_executions"][0]["actual_model"],
         "confirmed-model"
+    );
+    assert_eq!(
+        running["tasks"][0]["attempts"][0]["agent_executions"][0]["resolved_reasoning_effort"],
+        "high"
+    );
+    assert_eq!(
+        running["tasks"][0]["attempts"][0]["agent_executions"][0]["actual_reasoning_effort"],
+        "high"
     );
     assert_eq!(
         running["tasks"][0]["attempts"][0]["agent_executions"][0]["tool_call_count"],

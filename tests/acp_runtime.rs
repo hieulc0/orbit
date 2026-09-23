@@ -8,6 +8,22 @@ use orbit::{
 use serde_json::{Value, json};
 use std::os::unix::fs::PermissionsExt;
 
+#[tokio::test]
+#[ignore = "requires exact pinned Codex image in rootless Podman store"]
+async fn codex_declared_launch_preflight_rejects_stale_executable() -> Result<()> {
+    let raw: Value = serde_json::from_str(include_str!("../examples/acp-worker.json"))?;
+    let mut launch: orbit::acp_runtime::Launch =
+        serde_json::from_value(raw["acp_agents"][0]["launch"].clone())?;
+    launch.image = std::env::var("ORBIT_TEST_ACP_IMAGE")?;
+    orbit::acp_process::preflight_codex_launch(&launch).await?;
+    launch.command[0] = "/usr/local/bin/codex".into();
+    let error = orbit::acp_process::preflight_codex_launch(&launch)
+        .await
+        .expect_err("obsolete fixture path must fail closed");
+    assert!(error.to_string().contains("Codex launch preflight failed"));
+    Ok(())
+}
+
 fn runtime(path: &std::path::Path) -> Result<Runtime> {
     let raw: Value = serde_json::from_str(include_str!("fixtures/acp-contract.json"))?;
     let mut value = json!({"binding_name":"codex-fixture","binding":raw["binding"],
@@ -111,6 +127,7 @@ async fn acp_wire_bounds_frames_total_messages_and_protocol_envelopes() -> Resul
     for payload in [
         b"[]\n".to_vec(),
         b"{\"id\":1,\"result\":{}}\n".to_vec(),
+        b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{},\"error\":{}}\n".to_vec(),
         vec![b'x'; 1024 * 1024 + 1],
     ] {
         let (reader, mut writer) = tokio::io::duplex(2048);
@@ -128,6 +145,13 @@ async fn acp_wire_bounds_frames_total_messages_and_protocol_envelopes() -> Resul
     let mut wire = orbit::acp_wire::Wire::new(raw.as_slice(), tokio::io::sink(), 100).codex();
     let result = wire.read().await?;
     assert!(orbit::acp_wire::Wire::result(result, &json!("foreign")).is_err());
+    let mut closed = orbit::acp_wire::Wire::new(&b""[..], tokio::io::sink(), 100).codex();
+    let error = closed.read().await.unwrap_err();
+    assert!(
+        error
+            .downcast_ref::<orbit::acp_wire::StreamClosed>()
+            .is_some()
+    );
     Ok(())
 }
 #[test]
@@ -154,12 +178,72 @@ fn acp_cleanup_receipt_binds_request_and_attempt_and_terminal_utf8_is_bounded() 
     let diagnostic =
         orbit::acp_process::read_cleanup_diagnostic(&diagnostic_request, Some("attempt"))?.unwrap();
     assert!(diagnostic.contains("container_startup"));
-    assert!(diagnostic.contains("image not known"));
+    assert!(diagnostic.contains("diagnostic_present=true"));
+    assert!(!diagnostic.contains("image not known"));
     let output = orbit::acp_terminal::Output {
         bytes: vec![0xff, 0xfe, b'a'],
         ..Default::default()
     };
     assert!(output.text().len() <= 3);
+    Ok(())
+}
+
+#[test]
+fn cleanup_diagnostics_are_structural_and_bounded() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let request = root.path().join("request.json");
+    let secret =
+        "Authorization: Bearer ORBIT_SECRET_SENTINEL\nAPI_KEY=ORBIT_SECRET_SENTINEL\u{1b}[31m\n";
+    orbit::acp_process::write_cleanup_diagnostic(
+        &request,
+        "attempt",
+        0,
+        "container_process",
+        Some("pinned-image"),
+        Some(&format!("{}{}", secret, "x".repeat(100_000))),
+    )?;
+    let receipt = std::fs::read(request.with_extension("cleanup.json"))?;
+    assert!(receipt.len() < 4096);
+    assert!(!String::from_utf8_lossy(&receipt).contains("ORBIT_SECRET_SENTINEL"));
+    assert_eq!(
+        orbit::acp_process::read_cleanup(&request, Some("attempt"))?,
+        0
+    );
+    let diagnostic =
+        orbit::acp_process::read_cleanup_diagnostic(&request, Some("attempt"))?.unwrap();
+    assert!(diagnostic.contains("diagnostic_present=true"));
+    assert!(!diagnostic.contains("ORBIT_SECRET_SENTINEL"));
+    assert!(orbit::acp_process::read_cleanup(&request, Some("foreign")).is_err());
+    Ok(())
+}
+
+#[test]
+fn legacy_cleanup_receipts_remain_readable_without_being_rewritten() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let request = root.path().join("legacy.json");
+    let receipt = request.with_extension("cleanup.json");
+    std::fs::write(
+        &receipt,
+        serde_json::to_vec(&json!({
+            "format": "orbit-process-cleanup/v2",
+            "request": "legacy.json",
+            "attempt_id": "attempt",
+            "exit_code": 125,
+            "runtime": "podman",
+            "launch_stage": "container_startup",
+            "image": "pinned-image",
+            "diagnostic": "legacy diagnostic",
+        }))?,
+    )?;
+    std::fs::set_permissions(&receipt, std::fs::Permissions::from_mode(0o600))?;
+    assert_eq!(
+        orbit::acp_process::read_cleanup(&request, Some("attempt"))?,
+        125
+    );
+    let diagnostic =
+        orbit::acp_process::read_cleanup_diagnostic(&request, Some("attempt"))?.unwrap();
+    assert!(diagnostic.contains("diagnostic_present=true"));
+    assert!(!diagnostic.contains("legacy diagnostic"));
     Ok(())
 }
 

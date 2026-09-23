@@ -4,7 +4,7 @@
   "acp_agents": [{
     "binding_name":"codex-acp-v1",
     "binding": {
-      "model":"REPLACE_WITH_EXACT_MODEL",
+      "model":"gpt-6-luna",
       "runtime":"agent.acp-codex-v1",
       "tools":{"read_file":"orbit.acp.workspace.read_file/v1","write_file":"orbit.acp.workspace.write_file/v1","shell":"orbit.acp.workspace.shell/v1"},
       "permissions":["workspace.read","workspace.write","shell.execute"],
@@ -12,7 +12,7 @@
       "max_delegations":0,
       "acp": {
         "agent_id":"codex",
-        "agent_revision":"orbit-codex-acp-bridge-v1",
+        "agent_revision":"orbit-codex-acp-bridge-v2",
         "launch_digest":"REPLACE_WITH_ACP_LAUNCH_DIGEST",
         "protocol_version":1,
         "auth":{"source":"codex-local-session","owner":"approved-owner","account_class":"approved-account-class","mode":"local_session"},
@@ -27,14 +27,15 @@
     "launch": {
       "adapter":"codex",
       "image":"REPLACE_WITH_PINNED_AGENT_IMAGE",
-      "command":["/usr/local/bin/codex","app-server"],
+      "command":["/opt/codex/bin/codex","app-server"],
       "agent_name":"orbit-codex-acp",
       "agent_version":"1",
-      "binary_revision":"0.153.4",
+      "binary_revision":"0.156.0",
       "cpu_millis":1000,
       "memory_mib":512,
       "network":"host"
     },
+    "reasoning_effort":"high",
     "auth": {
       "path":"/absolute/private/orbit-codex-auth",
       "source":"codex-local-session",

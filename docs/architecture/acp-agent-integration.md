@@ -57,7 +57,7 @@ upgrade the established `trusted` isolation class or prove safety for hostile ag
 | [acp_runtime.rs](../../src/acp_runtime.rs), [execution.rs](../../src/execution.rs), [worker.rs](../../src/worker.rs) | Operator registry, exact assignment authorization, capability advertisement and session lifecycle |
 | [acp_wire.rs](../../src/acp_wire.rs) | Bounded JSON-RPC framing and correlation, without background queues or payload logging |
 | [acp_process.rs](../../src/acp_process.rs) | Independent agent OCI supervision, auth lock/refresh/quarantine and cleanup receipts |
-| [codex_session.rs](../../src/codex_session.rs), [codex_bridge.rs](../../src/codex_bridge.rs) | Codex 0.153.4 App Server translation and dynamic tools routed through ACP callbacks |
+| [codex_session.rs](../../src/codex_session.rs), [codex_bridge.rs](../../src/codex_bridge.rs) | Codex 0.156.0 App Server translation and dynamic tools routed through ACP callbacks; the latest offline broker compatibility gate is documented in the operations report |
 | [acp_broker.rs](../../src/acp_broker.rs) | Session-bound callbacks, reserve-before-effect, terminal ownership, record/receipt submission |
 | [acp_files.rs](../../src/acp_files.rs) | Linux directory-fd confinement, file bounds and atomic private auth replacement |
 | [acp_terminal.rs](../../src/acp_terminal.rs), [workspace.rs](../../src/workspace.rs), [container.rs](../../src/container.rs) | Asynchronous terminal handles over the existing workspace supervisor; repository lifecycle |

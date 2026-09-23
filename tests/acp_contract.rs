@@ -220,3 +220,41 @@ fn acp_charges_are_retained_bounded_nullable_and_replay_safe() -> Result<()> {
     assert_eq!(restored.reservations.len(), 5);
     Ok(())
 }
+
+#[test]
+fn exact_256_call_boundary_counts_reservations_not_provider_notifications() -> Result<()> {
+    let (_, _, mut spec) = fixture();
+    spec.budget.calls = 256;
+    let limits = spec.acp_limits.as_mut().unwrap();
+    limits.broker_calls = 255;
+    let mut usage = Usage::default();
+    let mut call: CallReservation = serde_json::from_value(json!({"call_id":"attempt-prompt",
+        "tool":null,"permissions":[],"request_digest":"b".repeat(64),"acp_charge":{"kind":"prompt"}}))?;
+    assert!(usage.reserve(&spec, &call)?);
+    call.tool = Some("read_file".into());
+    call.permissions = vec!["workspace.read".into()];
+    call.acp_charge = Some(orbit::acp_contract::Charge::Broker {
+        terminal_runtime_seconds: 0,
+    });
+    for n in 0..255 {
+        call.call_id = format!("attempt-read-{n}");
+        assert!(usage.reserve(&spec, &call)?);
+        assert!(!usage.reserve(&spec, &call)?);
+    }
+    let before = serde_json::to_value(&usage)?;
+    call.call_id = "attempt-rejected".into();
+    assert!(usage.reserve(&spec, &call).is_err());
+    assert_eq!(serde_json::to_value(&usage)?, before);
+    assert_eq!(usage.reservations.len(), 256);
+    assert_eq!(
+        usage
+            .reservations
+            .values()
+            .filter(|r| r.tool.is_none())
+            .count(),
+        1
+    );
+    assert!(usage.tokens.is_none());
+    assert!(usage.cost_microusd.is_none());
+    Ok(())
+}

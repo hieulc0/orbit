@@ -108,6 +108,8 @@ pub struct Broker<'a> {
     pub log: Vec<u8>,
     pub output_bytes: u64,
     pub reported_tools: u32,
+    /// Resolved callbacks (including rejections and terminal suboperations),
+    /// not accepted effect reservations. Successes + failures == calls.
     pub tool_calls: u64,
     pub tool_successes: u64,
     pub tool_failures: u64,
@@ -116,12 +118,13 @@ pub struct Broker<'a> {
     /// Bounded protocol state retained for diagnosing an uncertain ACP turn.
     /// These fields contain no prompt, tool argument, or credential material.
     pub last_activity_epoch_ms: Option<u64>,
-    pub last_activity_kind: Option<String>,
+    last_activity_kind: Option<&'static str>,
     pub turn_started_epoch_ms: Option<u64>,
     pub pending_model_call: bool,
     pub pending_tool_callbacks: u32,
     pending_model_call_id: Option<String>,
     pending_tool_call_ids: BTreeSet<String>,
+    callback_in_flight: bool,
     sequence: u32,
     terminals: BTreeMap<String, Handle>,
     seen_requests: BTreeSet<String>,
@@ -150,6 +153,7 @@ impl<'a> Broker<'a> {
             pending_tool_callbacks: 0,
             pending_model_call_id: None,
             pending_tool_call_ids: BTreeSet::new(),
+            callback_in_flight: false,
             sequence: 0,
             terminals: BTreeMap::new(),
             seen_requests: BTreeSet::new(),
@@ -165,23 +169,12 @@ impl<'a> Broker<'a> {
             .as_ref()
             .unwrap()
     }
-    fn touch(&mut self, kind: &str) {
+    fn touch(&mut self, kind: &'static str) {
         self.last_activity_epoch_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .ok()
             .and_then(|duration| u64::try_from(duration.as_millis()).ok());
-        self.last_activity_kind = Some(
-            kind.chars()
-                .take(64)
-                .map(|character| {
-                    if character.is_ascii_alphanumeric() || character == '_' || character == '/' {
-                        character
-                    } else {
-                        '_'
-                    }
-                })
-                .collect(),
-        );
+        self.last_activity_kind = Some(kind);
     }
     pub fn timeout_diagnostic(&self) -> String {
         let now = SystemTime::now()
@@ -193,18 +186,19 @@ impl<'a> Broker<'a> {
             .zip(now)
             .map(|(started, now)| now.saturating_sub(started));
         format!(
-            "session_id={} session_digest={} turn_elapsed_ms={:?} last_activity_epoch_ms={:?} last_activity_kind={} pending_model_call={} active_tool_callbacks={} broker_poisoned={} active_terminals={} runtime_process_state=running_at_timeout",
-            self.session_id.as_deref().unwrap_or("unknown"),
-            if self.session_digest.is_empty() {
-                "unknown"
-            } else {
-                &self.session_digest
-            },
+            "session_digest={} turn_elapsed_ms={:?} last_activity_epoch_ms={:?} last_activity_kind={} pending_model_call={} pending_tool_reservations={} active_tool_callbacks={} broker_poisoned={} active_terminals={} runtime_process_state=unknown",
+            self.session_id
+                .as_ref()
+                .map(|session_id| digest(
+                    format!("{}:{session_id}", self.session.assignment.attempt_id).as_bytes()
+                ))
+                .unwrap_or_else(|| "unknown".into()),
             elapsed,
             self.last_activity_epoch_ms,
-            self.last_activity_kind.as_deref().unwrap_or("none"),
+            self.last_activity_kind.unwrap_or("none"),
             self.pending_model_call,
             self.pending_tool_callbacks,
+            u8::from(self.callback_in_flight),
             self.poisoned,
             self.terminals.len(),
         )
@@ -311,27 +305,29 @@ impl<'a> Broker<'a> {
         let response = match response {
             Ok(response) => response,
             Err(error) => {
-                if is_model {
-                    self.pending_model_call = false;
-                    self.pending_model_call_id = None;
-                } else {
-                    self.pending_tool_callbacks = self.pending_tool_callbacks.saturating_sub(1);
-                    self.pending_tool_call_ids.remove(&call);
+                // A lost acknowledgement can hide an accepted reservation.
+                // Only a definite budget rejection proves no charge was made.
+                if matches!(
+                    error.downcast_ref::<crate::worker::ClientError>(),
+                    Some(crate::worker::ClientError::BudgetExhausted { .. })
+                ) {
+                    self.clear_pending_call(&call);
                 }
                 return Err(error);
             }
         };
         if response["replayed"] != false {
-            if is_model {
-                self.pending_model_call = false;
-                self.pending_model_call_id = None;
-            } else {
-                self.pending_tool_callbacks = self.pending_tool_callbacks.saturating_sub(1);
-                self.pending_tool_call_ids.remove(&call);
-            }
             anyhow::bail!("replayed call cannot dispatch");
         }
         Ok(call)
+    }
+    fn clear_pending_call(&mut self, call: &str) {
+        if self.pending_model_call_id.as_deref() == Some(call) {
+            self.pending_model_call = false;
+            self.pending_model_call_id = None;
+        } else if self.pending_tool_call_ids.remove(call) {
+            self.pending_tool_callbacks -= 1;
+        }
     }
     pub async fn finish(&mut self, call: &str, value: &Value) -> Result<()> {
         self.touch("call_finished");
@@ -351,13 +347,7 @@ impl<'a> Broker<'a> {
             )
             .await;
         if result.is_ok() {
-            if self.pending_model_call_id.as_deref() == Some(call) {
-                self.pending_model_call = false;
-                self.pending_model_call_id = None;
-            } else {
-                self.pending_tool_callbacks = self.pending_tool_callbacks.saturating_sub(1);
-                self.pending_tool_call_ids.remove(call);
-            }
+            self.clear_pending_call(call);
         }
         result.map(|_| ())
     }
@@ -381,9 +371,7 @@ impl<'a> Broker<'a> {
         self.touch(if value.get("id").is_some() {
             "agent_callback"
         } else {
-            value["params"]["update"]["sessionUpdate"]
-                .as_str()
-                .unwrap_or("session_notification")
+            "session_notification"
         });
         if let Some(id) = value.get("id") {
             let key = serde_json::to_string(id)?;
@@ -394,7 +382,23 @@ impl<'a> Broker<'a> {
                     && self.seen_requests.insert(key),
                 "duplicate or invalid ACP request ID"
             );
+            self.callback_in_flight = true;
             let result = self.callback(method, &value["params"]).await;
+            self.callback_in_flight = false;
+            // Count the same population for totals, outcomes and per-tool counts.
+            // A dropped callback remains in flight, with no invented outcome.
+            self.tool_calls += 1;
+            let tool = match method {
+                "fs/read_text_file" => "read_file",
+                "fs/write_text_file" => "write_file",
+                "terminal/create" => "shell",
+                "terminal/output" => "terminal/output",
+                "terminal/wait_for_exit" => "terminal/wait_for_exit",
+                "terminal/kill" => "terminal/kill",
+                "terminal/release" => "terminal/release",
+                _ => "unsupported",
+            };
+            *self.tool_counts.entry(tool.into()).or_default() += 1;
             match result {
                 Ok(val) => {
                     self.tool_successes += 1;
@@ -449,6 +453,7 @@ impl<'a> Broker<'a> {
                     return Err(ExecutionLimitError { reason, message }.into());
                 }
                 Err(BrokerError::Fatal(err)) => {
+                    self.tool_failures += 1;
                     self.poisoned = true;
                     let detail = format!("{err:#}");
                     let _ = wire.response_error(id.clone(), -32603, &detail).await;
@@ -458,7 +463,7 @@ impl<'a> Broker<'a> {
         } else {
             if method != "session/update" {
                 self.poisoned = true;
-                anyhow::bail!("unsupported ACP notification: {method}");
+                anyhow::bail!("unsupported ACP notification");
             }
             let params = &value["params"];
             if let Err(e) = self.owner(params) {
@@ -468,9 +473,9 @@ impl<'a> Broker<'a> {
             let _: agent_client_protocol::SessionNotification =
                 match serde_json::from_value(params.clone()) {
                     Ok(n) => n,
-                    Err(e) => {
+                    Err(_) => {
                         self.poisoned = true;
-                        anyhow::bail!("invalid ACP session update: {e}");
+                        anyhow::bail!("invalid ACP session update");
                     }
                 };
             let update = &params["update"];
@@ -535,9 +540,6 @@ impl<'a> Broker<'a> {
                 } else {
                     "write_file"
                 };
-                self.tool_calls += 1;
-                *self.tool_counts.entry(tool.to_string()).or_default() += 1;
-
                 let path = match self.path(&params["path"]) {
                     Ok(p) => p,
                     Err(err) => {
@@ -657,10 +659,10 @@ impl<'a> Broker<'a> {
                 let request: agent_client_protocol::CreateTerminalRequest =
                     match serde_json::from_value(params.clone()) {
                         Ok(req) => req,
-                        Err(err) => {
+                        Err(_) => {
                             return Err(BrokerError::recoverable(
                                 -32602,
-                                format!("invalid ACP terminal request: {err:#}"),
+                                "invalid ACP terminal request",
                             ));
                         }
                     };
@@ -705,8 +707,6 @@ impl<'a> Broker<'a> {
                         "empty ACP output allowance",
                     ));
                 }
-                self.tool_calls += 1;
-                *self.tool_counts.entry("shell".to_string()).or_default() += 1;
                 let call = self
                     .reserve(Some("shell"), params, command.timeout_seconds)
                     .await
@@ -837,7 +837,7 @@ impl<'a> Broker<'a> {
             // extensions, URL opening or delegated process execution is permitted.
             _ => Err(BrokerError::recoverable(
                 -32601,
-                format!("unsupported ACP client operation: {method}"),
+                "unsupported ACP client operation",
             )),
         }
     }
