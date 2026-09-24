@@ -74,6 +74,48 @@ fn acp_auth_lock_refresh_and_quarantine_are_private_and_fail_closed() -> Result<
     );
     Ok(())
 }
+
+#[test]
+fn status_auth_staging_uses_probe_marker_and_existing_quarantine() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let auth = root.path().join("auth");
+    std::fs::create_dir(&auth)?;
+    std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o700))?;
+    std::fs::write(auth.join("auth.json"), "fixture")?;
+    std::fs::set_permissions(
+        auth.join("auth.json"),
+        std::fs::Permissions::from_mode(0o600),
+    )?;
+    let runtime = runtime(&auth)?;
+    let lease = AuthLease::acquire(&runtime)?;
+    let control = tempfile::tempdir_in(root.path())?;
+    let home = control.path().join("status-home");
+    lease.stage_status(&home, "orbit-status-fixture", "probe-fixture")?;
+    let marker: Value =
+        serde_json::from_slice(&std::fs::read(auth.join(".orbit-acp-active.json"))?)?;
+    assert_eq!(marker["probe_id"], "probe-fixture");
+    assert!(marker.get("attempt_id").is_none());
+    // This is private runtime scaffolding, not an Attempt/repository checkout:
+    // the only staged children are the empty runtime workspace and auth data.
+    assert!(home.join("workspace").is_dir());
+    assert_eq!(std::fs::read_dir(home.join("workspace"))?.count(), 0);
+    let mut children = std::fs::read_dir(&home)?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    children.sort();
+    assert_eq!(children, [".agent", "workspace"]);
+    assert!(!home.join(".git").exists());
+    assert!(!home.join("workspace/.git").exists());
+    assert!(AuthLease::acquire(&runtime).is_err());
+    lease.finish(&home)?;
+    assert!(!auth.join(".orbit-acp-active.json").exists());
+    assert!(std::fs::read(home.join(".agent/auth.json"))?.is_empty());
+    let control_path = control.path().to_path_buf();
+    drop(control);
+    assert!(!control_path.exists());
+    assert!(auth.join("auth.json").exists());
+    Ok(())
+}
 #[test]
 fn acp_records_are_bounded_ordered_idempotent_and_cumulative() -> Result<()> {
     let raw: Value = serde_json::from_str(include_str!("fixtures/acp-contract.json"))?;

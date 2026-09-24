@@ -117,6 +117,15 @@ reviewed evidence determine acceptance.
 
 ## Conditional follow-up work
 
+The credential foundation now includes the registry, LocalPrivateSecretBackend,
+provider-scope state, and catalog-backed status/availability persistence for
+Codex and Antigravity. Codex device-code enrollment and Antigravity ACP/agy
+enrollment and quota-group normalization are qualified; provider status evidence
+is recorded in [provider status discovery](operations/provider-status-discovery.md).
+The system still does not inventory or select resources, lease provider
+capacity, or dispatch by role. Q7, resource-lease, role, review/repair, and
+self-development qualification gates remain open.
+
 4. Additional isolation backends when a defined threat model requires them:
    gVisor/runsc for sandboxed execution, Firecracker for untrusted execution.
 5. Physical GPU qualification and additional GPU runtime support.

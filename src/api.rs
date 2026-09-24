@@ -1,4 +1,5 @@
 use crate::{
+    credential_registry::CredentialStore,
     engine::Engine,
     governance::{Governance, Scope, SecretRef},
     model::*,
@@ -304,6 +305,8 @@ pub fn router(app: App) -> Router {
         )
         .route("/definitions/schema", get(definition_schema))
         .route("/identity", get(identity))
+        .route("/credentials", get(credentials))
+        .route("/credentials/{reference}", get(credential_inspect))
         .route("/projects", get(projects))
         .route("/protocol", get(protocol))
         .route("/audit", get(audit))
@@ -535,6 +538,29 @@ async fn identity(State(app): State<App>, headers: HeaderMap) -> ApiResult<Json<
         }
         Some(p) => json!({"id":id,"kind":p.kind,"grants":p.grants}),
     }))
+}
+async fn credentials(State(app): State<App>, headers: HeaderMap) -> ApiResult<Json<Value>> {
+    let (_, principal) = app.actor(&headers)?;
+    if principal.is_some() {
+        return Err(anyhow::anyhow!("unauthorized credential catalog").into());
+    }
+    let views = CredentialStore::new(&app.engine.pool).list().await?;
+    Ok(Json(json!(views)))
+}
+async fn credential_inspect(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Path(reference): Path<String>,
+) -> ApiResult<Json<Value>> {
+    let (_, principal) = app.actor(&headers)?;
+    if principal.is_some() {
+        return Err(anyhow::anyhow!("unauthorized credential catalog").into());
+    }
+    let inspection = CredentialStore::new(&app.engine.pool)
+        .inspect(&reference)
+        .await?
+        .context("credential not found")?;
+    Ok(Json(json!(inspection)))
 }
 async fn protocol() -> Json<Value> {
     Json(

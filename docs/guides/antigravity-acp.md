@@ -1,6 +1,72 @@
 # Google Antigravity ACP Adapter Guide
 
-This document provides a comprehensive guide for configuring, packaging, and operating the **Google Antigravity Agent Client Protocol (ACP) adapter** within Orbit. It details the runtime architecture, fixture packaging using `scripts/prepare-antigravity-fixture.sh`, environment configuration, and auth leasing mechanics.
+This document describes Orbit's **Google Antigravity Agent Client Protocol (ACP) adapter**, packaging, environment configuration, and credential staging. Operator-local personal OAuth enrollment and fresh-runtime ACP reuse are live-qualified. The same catalog credential also has a file-backed `agy-cli` representation and one qualified `/usage` status observation; see [provider status discovery](../operations/provider-status-discovery.md). The ACP↔agy provider-account binding remains UNVERIFIED.
+
+> Runtime packaging note (2026-09-24): the fixture instructions below describe
+> historical packaging and are not a reproducible build path. The new pinned
+> 1.1.1 runtime recipe is defined in
+> [Antigravity compatibility](../operations/acp-agent-compatibility.md#automated-packaging-pipeline).
+> The new image has been built and qualified for credential-free ACP initialize;
+> enrollment and execution qualification for that new image remain open.
+
+## Operator credential enrollment (Phase A)
+
+`orbit credential add antigravity` provides the operator-local
+`oauth-personal` adapter. It requires current catalog migrations in the durable
+PostgreSQL database, `ORBIT_DATABASE_URL_FILE`, and the exact
+local rootless Podman image
+`localhost/orbit-antigravity-runtime:agy_acp_server_1.1.1-orbit-terminal-v2@sha256:3e7415f6f732ae4168b98a6fb0e14e0fba965020cf5cc1fc5a3b35867b4cf830`.
+The adapter verifies the local digest and launches with `--pull=never`.
+
+The operator completes the real Google login in the terminal during enrollment:
+
+```sh
+ORBIT_DATABASE_URL_FILE=/path/to/private/control-plane-url \
+  cargo run --locked -- credential add antigravity \
+  --name antigravity-oauth-test --auth-method oauth-personal
+```
+
+The CLI does not use the API server or a worker. It first records a pending
+credential and `acp` representation. ACP `initialize` must advertise the
+agent-managed `oauth-personal` method; Orbit then sends ACP `authenticate` and
+displays the one-time Google URL only in the operator terminal. The pinned
+provider chooses a dynamic `127.0.0.1` callback port. Only this short-lived,
+operator-initiated enrollment profile uses rootless Podman host networking so
+the host browser reaches that loopback listener. It has a fresh owner-only
+HOME, no existing credential mounts, no repository/workspace, no broker, no
+agent tools, no ACP session or prompt, and bounded stdio. Normal agent runtime
+network policy is unchanged. The CLI does not open a browser itself.
+Ctrl-C during the authentication wait follows the same bounded container
+removal and disposable-HOME cleanup path as other enrollment failures.
+
+After provider authentication, the adapter captures only
+`.gemini/antigravity-acp/acp_token.json` and `settings.json` from the disposable
+HOME. Their bytes form one versioned opaque bundle under one
+`LocalPrivateSecretBackend` locator. No token, URL, locator, or physical path
+goes into PostgreSQL or user-facing output. A fresh runtime stages only those
+files and calls ACP `authenticate(oauth-personal)` again. A new login URL fails
+reuse validation; only successful noninteractive reuse lets the catalog move
+from pending to enrolled. This check may contact provider OAuth/onboarding
+endpoints but never starts a model session. The adapter does not invoke ACP
+`auth.logout`: local disable/revoke and provider logout are distinct. Provider
+logout remains unimplemented pending separate semantics review.
+
+If a secret write succeeds but validation or database finalization fails, the
+pending representation retains its opaque locator. It remains unusable and is
+an explicit reconciliation/GC candidate, not automatically deleted. Only
+unreferenced secrets older than an operator-reviewed retention threshold should
+be eligible for future explicit GC. Enrollment does not promote availability
+to READY. The registry catalog ID keeps new identity evidence distinct from
+pre-catalog credentials, even when provider/reference/generation coincide.
+
+Existing manual `~/.orbit/credentials/...` and worker AuthLease are unchanged
+and are not migrated. Gemini Enterprise, API key, Agent Platform, interactive
+agy OAuth enrollment/capture automation, and provider-specific logout are not
+implemented here. The `agy-cli` representation and one bounded `/usage`
+observation are qualified separately; its credential-scoped snapshot is
+UNKNOWN because no readiness threshold or exact-model scope is justified. The
+agy 1.2.9 artifact remains operator-supplied and is not officially
+artifact-verified. The Antigravity ACP↔agy account binding remains UNVERIFIED.
 
 ---
 
@@ -14,7 +80,7 @@ The Google Antigravity ACP adapter enables Orbit to run Google Antigravity agent
 +-------------------------------------------------------------------------+
 |                              Orbit Runner                               |
 |  - Task Dispatcher & Trajectory Coordinator                             |
-|  - Auth Lease Manager (OAuth / Service Token Provider)                  |
+|  - Private Auth-File Lease (lock, stage, write-back)                    |
 |  - Client Tool Handlers (File system, Terminal Execution)              |
 +-------------------------------------------------------------------------+
                                    |
@@ -88,58 +154,47 @@ When packaged, the container root filesystem contains the following layout:
         │   │   └── bin/
         │   └── antigravity-acp/
         │       ├── settings.json        # Adapter configuration
-        │       ├── acp_token.json       # Injected active auth lease token
+        │       ├── acp_token.json       # Operator-provisioned auth state, staged by Orbit
         │       └── conversations/       # SQLite session storage
         └── workspace/                   # Active user workspace mount
 ```
 
 ---
 
-## 3. Auth Leasing Mechanics
+## 3. Legacy manual authentication files and Orbit's local lease
 
-In automated and containerized environments, interactive browser logins are disabled (`NO_BROWSER=1`). Antigravity ACP relies on an **auth leasing** mechanism to securely obtain and maintain credentials.
+This section describes the pre-catalog `AuthLease` path only; it is not the
+production `orbit credential add antigravity` enrollment path above.
 
-### Authentication Configuration (`settings.json`)
+`NO_BROWSER=1` disables interactive browser launch; it does not authenticate
+the ACP process or obtain provider credentials. The legacy manual worker
+configuration does not implement Google login, OAuth/token issuance,
+credential conversion, or provider refresh. Its operator must provision the
+private source files configured in the worker's `auth.path` and `auth.files`
+mapping.
 
-The adapter configuration file is located at `/orbit/home/.gemini/antigravity-acp/settings.json`:
+For the current example, Orbit treats `acp_token.json` and `settings.json` as
+opaque files. `settings.json` is not validated as an authentication schema by
+Orbit. This repository does not establish whether the source token file was
+created by Antigravity desktop, `agy`, the ACP runtime, or another login
+workflow; do not infer its origin from its filename or directory.
 
-```json
-{
-  "auth": {
-    "type": "oauth-personal"
-  }
-}
-```
+`AuthLease` is a local mutual-exclusion and staging lease, not a provider auth
+lease. It locks the configured private store, copies mapped source files into
+the new control HOME with mode `0600`, and creates an active marker. After the
+runtime is confirmed stopped, cleanup copies the staged file contents back to
+the configured source store and removes the marker. If runtime cleanup or
+write-back is uncertain, the marker remains and the store is quarantined.
+Orbit does not independently refresh credentials; any mutation returned in a
+staged file is from the runtime and is copied back by cleanup. The control
+HOME is isolated from repository workspaces and is not a credential-origin
+boundary.
 
-Supported auth types include `oauth-personal` and service account / token delegation modes.
-
-### Lease Lifecycle and Provisioning
-
-```
-  +--------------+               +------------------+               +-------------------+
-  | Orbit Runner |               | Auth Lease Store |               |  Antigravity ACP  |
-  +--------------+               +------------------+               +-------------------+
-         |                                |                                   |
-         | 1. Request Auth Lease          |                                   |
-         |------------------------------->|                                   |
-         | 2. Issue Leased Token          |                                   |
-         |<-------------------------------|                                   |
-         |                                                                    |
-         | 3. Mount/Write /orbit/home/.gemini/antigravity-acp/acp_token.json  |
-         |------------------------------------------------------------------->|
-         |                                                                    |
-         | 4. Launch Container & Initialize ACP Session                       |
-         |------------------------------------------------------------------->|
-         |                                                                    |
-         | 5. Periodic Lease Check & Dynamic Token Refresh (before TTL end)   |
-         |------------------------------------------------------------------->|
-```
-
-### Key Auth Leasing Principles
-1. **Short-Lived Leases**: Tokens are issued with a finite Time-To-Live (TTL) to adhere to least-privilege security principles.
-2. **Headless Ingestion**: The token file (`acp_token.json`) is read by `agy_acp_server.par` at initialization and refreshed during runtime without requiring user intervention.
-3. **Automatic Renewal**: Orbit's auth lease manager monitors active sessions and writes updated credentials to the container's token path before expiration.
-4. **Sandbox Isolation**: Auth tokens remain constrained to the container sandbox, and ephemeral storage ensures no credentials persist post-run.
+The qualified `agy-cli` representation uses a separate file-backed token
+artifact, not these ACP files. The operator intentionally selected the same
+Google account for both enrollments, but no machine-verifiable common provider
+identity is available; provisioning either representation does not prove that
+the other uses the same account.
 
 ---
 
@@ -170,13 +225,11 @@ Build the container image using the fixture packaging script:
 ./scripts/prepare-antigravity-fixture.sh --base-image debian:bookworm-slim
 ```
 
-### Step 2: Inject Auth Lease
-Obtain an auth lease from Orbit and populate `/orbit/home/.gemini/antigravity-acp/acp_token.json`:
-```bash
-mkdir -p /orbit/home/.gemini/antigravity-acp
-echo '{"auth":{"type":"oauth-personal"}}' > /orbit/home/.gemini/antigravity-acp/settings.json
-# Auth lease manager injects acp_token.json here
-```
+### Step 2: Provision the configured private auth store
+Provision the operator-controlled credential files at the private source
+directory configured by `auth.path`. Orbit stages those files into the runtime
+HOME; it does not create or acquire them. Never put credential contents in a
+Definition, source-controlled example, or command history.
 
 ### Step 3: Run the ACP Adapter Server
 Start `agy_acp_server.par` inside the container:
@@ -196,7 +249,7 @@ Orbit connects to standard I/O of the ACP process, sending agent requests and ha
 
 ## 6. Troubleshooting and Verification
 
-- **Token Expired or Missing**: Verify that `/orbit/home/.gemini/antigravity-acp/acp_token.json` exists, is readable by the user, and has a valid unexpired lease.
+- **Legacy manual credential authentication error**: Verify the operator-provisioned `acp_token.json` exists and is readable. This applies only to the unchanged manual AuthLease path; the new registry enrollment validates a fresh ACP representation before marking it enrolled.
 - **Harness Path Not Found**: Ensure `ANTIGRAVITY_HARNESS_PATH` points directly to the executable binary at `/opt/antigravity/localharness_external`.
 - **Database Locks / Storage Issues**: Ensure `AGY_ACP_FORCE_FILE_STORAGE=1` is set and the directory `/orbit/home/.gemini/antigravity-acp/conversations/` has write permissions.
 - **TLS Handshake Failures**: Confirm `SSL_CERT_FILE` and `REQUESTS_CA_BUNDLE` correctly point to the system CA certificate bundle.

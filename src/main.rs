@@ -2,11 +2,21 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use orbit::{
     api::{self, App, Config, Submit},
+    availability::AvailabilityStore,
+    credential_registry::CredentialStore,
     engine::Engine,
     model::{Definition, Limits, Signal, id},
     worker::{self, Client},
 };
-use std::{path::PathBuf, time::Duration};
+use sqlx::Row;
+use std::{
+    fs::{self, OpenOptions},
+    io::Read,
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    path::{Path, PathBuf},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+use zeroize::Zeroizing;
 
 #[derive(Parser)]
 #[command(
@@ -85,8 +95,59 @@ struct RunSubmitArgs {
     parent_run_id: Option<String>,
 }
 
+#[derive(clap::Args)]
+struct CredentialArgs {
+    #[command(subcommand)]
+    action: CredentialAction,
+}
+
+#[derive(Subcommand)]
+enum CredentialAction {
+    /// Enroll an operator-owned provider credential through its native login flow.
+    Add {
+        provider: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        auth_method: Option<String>,
+        #[arg(long, env = "ORBIT_DATABASE_URL_FILE", hide_env_values = true)]
+        database_url_file: Option<PathBuf>,
+    },
+    /// Import one operator-qualified agy token and validate it from a fresh isolated process.
+    AddRepresentation {
+        reference: String,
+        #[arg(long, required = true)]
+        interface: String,
+        #[arg(long, default_value = "oauth-personal")]
+        auth_type: String,
+        /// Qualification-only source import; the path is never echoed or persisted.
+        #[arg(long, hide = true, required = true)]
+        source_file: PathBuf,
+        #[arg(long, env = "ORBIT_DATABASE_URL_FILE", hide_env_values = true)]
+        database_url_file: Option<PathBuf>,
+    },
+    /// Capture one Antigravity agy `/usage` response without retaining raw values.
+    CaptureAgyUsage {
+        reference: String,
+        #[arg(long, env = "ORBIT_DATABASE_URL_FILE", hide_env_values = true)]
+        database_url_file: Option<PathBuf>,
+    },
+    /// Run one catalog-backed, non-inference Codex account/status observation.
+    ProbeCodexStatus {
+        reference: String,
+        #[arg(long, env = "ORBIT_DATABASE_URL_FILE", hide_env_values = true)]
+        database_url_file: Option<PathBuf>,
+    },
+    /// List registered credential metadata (operator only; no secrets).
+    List,
+    /// Inspect one registered credential and its generations (operator only).
+    Inspect { reference: String },
+}
+
 #[derive(Subcommand)]
 enum Commands {
+    /// Operator credential registry and enrollment.
+    Credential(CredentialArgs),
     /// Validate an operator-owned ACP launch policy and print its canonical digest.
     AcpLaunchDigest {
         #[arg(long)]
@@ -298,6 +359,105 @@ enum Commands {
         output: PathBuf,
     },
 }
+
+async fn read_private_database_url(file: Option<&Path>) -> Result<Zeroizing<String>> {
+    let home = std::env::var_os("HOME").context("operator HOME unavailable")?;
+    let home = PathBuf::from(home).canonicalize()?;
+    let path = file
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::var_os("ORBIT_DATABASE_URL_FILE").map(PathBuf::from))
+        .unwrap_or_else(|| home.join(".orbit/private/database/control-plane-url"));
+    anyhow::ensure!(
+        path.is_absolute() && path.canonicalize()? == path,
+        "database URL file path is not canonical"
+    );
+    let private_root = home.join(".orbit/private");
+    anyhow::ensure!(
+        path.starts_with(&private_root),
+        "database URL must come from the Orbit private root"
+    );
+    let orbit_root = private_root.parent().context("Orbit root unavailable")?;
+    let mut directory = path.parent().context("database URL parent unavailable")?;
+    loop {
+        let metadata = fs::symlink_metadata(directory)?;
+        anyhow::ensure!(
+            metadata.is_dir()
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.mode() & 0o7777 == 0o700,
+            "database URL parent owner or mode invalid"
+        );
+        if directory == orbit_root {
+            break;
+        }
+        directory = directory
+            .parent()
+            .context("database URL is outside Orbit private root")?;
+        anyhow::ensure!(
+            directory.starts_with(&private_root) || directory == orbit_root,
+            "database URL parent escaped Orbit private root"
+        );
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)?;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file()
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.nlink() == 1
+            && metadata.mode() & 0o7777 == 0o600
+            && metadata.len() > 0
+            && metadata.len() <= 8192,
+        "database URL file owner, mode or size invalid"
+    );
+    let mut bytes = Zeroizing::new(Vec::with_capacity(metadata.len() as usize));
+    file.take(8193).read_to_end(&mut bytes)?;
+    let text = std::str::from_utf8(&bytes).context("database URL file is not UTF-8")?;
+    let url = text.trim();
+    anyhow::ensure!(!url.is_empty(), "database URL file is empty");
+    Ok(Zeroizing::new(url.to_owned()))
+}
+
+fn validate_durable_catalog_url(database_url: &str) -> Result<()> {
+    let options = database_url
+        .parse::<sqlx::postgres::PgConnectOptions>()
+        .map_err(|_| anyhow::anyhow!("durable catalog URL is invalid"))?;
+    anyhow::ensure!(
+        options.get_host() == "127.0.0.1"
+            && options.get_port() == 55442
+            && options.get_database() == Some("orbit_control_plane"),
+        "database target is not the configured durable Orbit control-plane catalog"
+    );
+    Ok(())
+}
+
+async fn connect_durable_catalog(database_url: &str) -> Result<sqlx::PgPool> {
+    validate_durable_catalog_url(database_url)?;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(database_url)
+        .await
+        .map_err(|_| anyhow::anyhow!("durable credential catalog connection failed"))?;
+    let identity = sqlx::query("SELECT current_database() AS database, current_schema() AS schema")
+        .fetch_one(&pool)
+        .await?;
+    let database: String = identity.get("database");
+    let schema: String = identity.get("schema");
+    anyhow::ensure!(
+        database == "orbit_control_plane" && schema == "public",
+        "connected database is not the durable Orbit control-plane catalog"
+    );
+    let schema_ready: bool = sqlx::query_scalar("SELECT to_regclass('orbit_credentials') IS NOT NULL AND to_regclass('orbit_credential_representations') IS NOT NULL AND to_regclass('orbit_availability_snapshots') IS NOT NULL AND to_regclass('orbit_provider_scope_bindings') IS NOT NULL")
+        .fetch_one(&pool)
+        .await?;
+    anyhow::ensure!(
+        schema_ready,
+        "durable Orbit catalog migrations are not current"
+    );
+    Ok(pool)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -349,6 +509,365 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
+    if let Commands::Credential(CredentialArgs {
+        action:
+            CredentialAction::Add {
+                provider,
+                name,
+                auth_method,
+                database_url_file,
+            },
+    }) = &cli.command
+    {
+        anyhow::ensure!(
+            matches!(provider.as_str(), "antigravity" | "codex"),
+            "provider enrollment is not implemented"
+        );
+        let reference = if let Some(name) = name {
+            name.clone()
+        } else {
+            use std::io::{self, Write};
+            eprint!("Credential name: ");
+            io::stderr().flush()?;
+            let mut input = String::new();
+            io::stdin().read_line(&mut input)?;
+            input.trim().to_owned()
+        };
+        anyhow::ensure!(
+            orbit::credential_registry::valid_reference(&reference),
+            "invalid credential name"
+        );
+        let chosen = if let Some(method) = auth_method {
+            method.clone()
+        } else if provider == "codex" {
+            orbit::codex_credential_enrollment::CODEX_AUTH_TYPE.to_owned()
+        } else {
+            use std::io::{self, Write};
+            eprintln!(
+                "Authentication:\n  1. Google Personal\n  2. Gemini Enterprise (not yet enabled)\n  3. Gemini API key (not yet enabled)\n  4. Agent Platform (not yet enabled)"
+            );
+            eprint!("> ");
+            io::stderr().flush()?;
+            let mut input = String::new();
+            io::stdin().read_line(&mut input)?;
+            match input.trim() {
+                "1" => "oauth-personal".to_string(),
+                _ => anyhow::bail!("authentication method not enabled"),
+            }
+        };
+        let expected_auth = if provider == "codex" {
+            orbit::codex_credential_enrollment::CODEX_AUTH_TYPE
+        } else {
+            "oauth-personal"
+        };
+        anyhow::ensure!(chosen == expected_auth, "authentication method not enabled");
+        let url = read_private_database_url(database_url_file.as_deref()).await?;
+        let pool = connect_durable_catalog(url.as_str()).await?;
+        let summary = if provider == "codex" {
+            eprintln!("Starting Codex device-code authentication...");
+            let enrolled =
+                orbit::codex_credential_enrollment::enroll_codex_chatgpt(&pool, &reference).await?;
+            serde_json::json!({
+                "reference": enrolled.reference,
+                "credential_id": enrolled.credential_id,
+                "provider": "codex",
+                "generation": enrolled.generation,
+                "auth_type": expected_auth,
+                "lifecycle": enrolled.credential_status,
+                "representation": {
+                    "interface": orbit::codex_credential_enrollment::CODEX_INTERFACE,
+                    "state": enrolled.representation_state,
+                    "validation": enrolled.validation,
+                },
+                "runtime": {
+                    "version": orbit::codex_credential_enrollment::CODEX_VERSION,
+                    "image_digest": orbit::codex_credential_enrollment::CODEX_IMAGE_DIGEST,
+                    "binary_sha256": orbit::codex_credential_enrollment::CODEX_BINARY_SHA256,
+                }
+            })
+        } else {
+            eprintln!("Starting Antigravity authentication...");
+            let enrolled =
+                orbit::credential_enrollment::enroll_antigravity_personal(&pool, &reference)
+                    .await?;
+            serde_json::json!({"reference":enrolled.reference,"provider":enrolled.provider,
+                "generation":enrolled.generation,"auth_type":enrolled.auth_type,"status":enrolled.status})
+        };
+        match output_format {
+            Output::Json | Output::Text => println!("{}", serde_json::to_string_pretty(&summary)?),
+            Output::Jsonl => println!("{}", serde_json::to_string(&summary)?),
+        }
+        return Ok(());
+    }
+    if let Commands::Credential(CredentialArgs {
+        action:
+            CredentialAction::AddRepresentation {
+                reference,
+                interface,
+                auth_type,
+                source_file,
+                database_url_file,
+            },
+    }) = &cli.command
+    {
+        anyhow::ensure!(
+            orbit::credential_registry::valid_reference(reference)
+                && interface == orbit::agy_cli_representation::AGY_CLI_INTERFACE
+                && auth_type == orbit::agy_cli_representation::AGY_CLI_AUTH_TYPE,
+            "only the qualified agy-cli oauth-personal representation is enabled"
+        );
+        let database_url = read_private_database_url(database_url_file.as_deref()).await?;
+        validate_durable_catalog_url(database_url.as_str())?;
+        let preflight_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(database_url.as_str())
+            .await
+            .map_err(|_| anyhow::anyhow!("durable credential catalog connection failed"))?;
+        let identity = sqlx::query("SELECT current_database() AS database, current_schema() AS schema, inet_server_addr()::text AS host, inet_server_port() AS port")
+            .fetch_one(&preflight_pool)
+            .await?;
+        let database: String = identity.get("database");
+        let schema: String = identity.get("schema");
+        let host: Option<String> = identity.get("host");
+        let port: Option<i32> = identity.get("port");
+        let lowered = database.to_ascii_lowercase();
+        anyhow::ensure!(
+            schema == "public"
+                && !["test", "qual", "disposable", "temp"]
+                    .iter()
+                    .any(|marker| lowered.contains(marker))
+                && port != Some(55439),
+            "connected database is not the durable Orbit control-plane catalog"
+        );
+        let _non_secret_database_identity = (database, schema, host, port);
+        preflight_pool.close().await;
+        let scratch = orbit::codex_status_probe::private_control_tempdir()?;
+        let engine = Engine::connect(database_url.as_str(), scratch.path().join("artifacts"), 30)
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("durable credential catalog connection or migration failed")
+            })?;
+        let backend = orbit::secret_backend::LocalPrivateSecretBackend::default_for_operator()?;
+        let result = orbit::agy_cli_representation::import_and_validate(
+            &engine.pool,
+            &backend,
+            reference,
+            source_file,
+        )
+        .await?;
+        let summary = serde_json::json!({
+            "credential": {
+                "id": result.credential_id,
+                "reference": result.reference,
+                "provider": "antigravity",
+                "generation": result.generation,
+                "lifecycle": result.credential_status,
+            },
+            "representation": {
+                "interface": "agy-cli",
+                "auth_type": result.auth_type,
+                "state": result.representation_state,
+                "validation": result.validation,
+            },
+            "runtime": {
+                "version": result.runtime_version,
+                "sha256": result.runtime_sha256,
+                "provenance": result.runtime_provenance,
+            },
+            "identity_binding": result.identity_binding,
+            "availability": "unknown",
+        });
+        match output_format {
+            Output::Json | Output::Text => println!("{}", serde_json::to_string_pretty(&summary)?),
+            Output::Jsonl => println!("{}", serde_json::to_string(&summary)?),
+        }
+        engine.pool.close().await;
+        return Ok(());
+    }
+    if let Commands::Credential(CredentialArgs {
+        action:
+            CredentialAction::CaptureAgyUsage {
+                reference,
+                database_url_file,
+            },
+    }) = &cli.command
+    {
+        let database_url = read_private_database_url(database_url_file.as_deref()).await?;
+        let pool = connect_durable_catalog(database_url.as_str()).await?;
+        let backend = orbit::secret_backend::LocalPrivateSecretBackend::default_for_operator()?;
+        let receipt = orbit::agy_cli_representation::capture_registered_usage_once(
+            &pool, &backend, reference,
+        )
+        .await?;
+        let persisted_snapshot = if receipt.status.normalization_ready
+            && receipt.status.group_metadata_ready
+        {
+            let credential = CredentialStore::new(&pool)
+                .get(reference)
+                .await?
+                .context("registered credential disappeared after status capture")?;
+            let observed_at_ms = i64::try_from(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .context("system clock is before Unix epoch")?
+                    .as_millis(),
+            )
+            .context("status observation timestamp is out of range")?;
+            // Match the existing local provider-status qualification freshness
+            // window. Provider reset timestamps remain independent evidence.
+            let expires_at_ms = observed_at_ms + 60_000;
+            let snapshot = receipt.status.availability_snapshot(
+                credential.identity(),
+                observed_at_ms,
+                expires_at_ms,
+            )?;
+            let snapshot_id = AvailabilityStore::new(&pool)
+                .record(&snapshot)
+                .await
+                .map_err(|_| anyhow::anyhow!("normalized provider status persistence failed"))?;
+            Some((snapshot_id, snapshot))
+        } else {
+            None
+        };
+        let summary = serde_json::json!({
+            "status_request_count": 1,
+            "command": "agy --print \"/usage\" --output-format json",
+            "authenticated": true,
+            "model_turn": false,
+            "raw_response_retained": false,
+            "response_bytes": receipt.response_bytes,
+            "schema_summary": receipt.status.summary,
+            "quota_buckets": receipt.status.quota_buckets,
+            "quota_groups": receipt.status.quota_groups,
+            "normalization_ready": receipt.status.normalization_ready,
+            "group_metadata_ready": receipt.status.group_metadata_ready,
+            "membership_ready": receipt.status.membership_ready,
+            "normalized_snapshot_stored": persisted_snapshot.is_some(),
+            "snapshot_id": persisted_snapshot.as_ref().map(|(id, _)| id),
+            "availability": persisted_snapshot.as_ref().map(|(_, snapshot)| serde_json::json!({
+                "scope": "credential",
+                "state": snapshot.state,
+                "observed_at_ms": snapshot.observed_at_ms,
+                "expires_at_ms": snapshot.expires_at_ms,
+            })),
+            "extraction_diagnostics": receipt.status.extraction_diagnostics,
+            "token_file_metadata_changed": receipt.token_metadata_changed,
+            "home_entries": receipt.created_or_changed_home_entries,
+        });
+        match output_format {
+            Output::Json | Output::Text => println!("{}", serde_json::to_string_pretty(&summary)?),
+            Output::Jsonl => println!("{}", serde_json::to_string(&summary)?),
+        }
+        pool.close().await;
+        return Ok(());
+    }
+    if let Commands::Credential(CredentialArgs {
+        action:
+            CredentialAction::ProbeCodexStatus {
+                reference,
+                database_url_file,
+            },
+    }) = &cli.command
+    {
+        anyhow::ensure!(
+            orbit::credential_registry::valid_reference(reference),
+            "invalid credential reference"
+        );
+        let database_url = read_private_database_url(database_url_file.as_deref()).await?;
+        let pool = connect_durable_catalog(database_url.as_str()).await?;
+        let credential = CredentialStore::new(&pool)
+            .get(reference)
+            .await?
+            .context("credential is missing from the durable catalog")?;
+        let (runtime, resource) = orbit::codex_status_probe::cataloged_codex_runtime(&credential)?;
+        let backend = orbit::secret_backend::LocalPrivateSecretBackend::default_for_operator()?;
+        let control = orbit::codex_status_probe::private_control_tempdir()?;
+        let outcome = orbit::codex_status_probe::probe_cataloged_once(
+            orbit::codex_status_probe::CatalogCredentialSource {
+                pool: &pool,
+                backend: &backend,
+                reference,
+            },
+            &runtime,
+            &resource,
+            orbit::codex_status_probe::ProbeBinding::Enroll,
+            control.path(),
+            Duration::from_secs(60),
+        )
+        .await
+        .map_err(|failure| anyhow::anyhow!("Codex catalog status probe failed: {failure}"))?;
+        anyhow::ensure!(
+            outcome.receipt.cleanup_confirmed
+                && outcome.receipt.authenticated_account_present
+                && outcome.receipt.correlated_status_response
+                && !outcome.receipt.model_thread_created
+                && !outcome.receipt.model_turn_started,
+            "Codex status qualification evidence incomplete"
+        );
+        let normalized_bucket_count = outcome.snapshot.quota_buckets.len();
+        let recorded = orbit::provider_scope::BindingStore::new(&pool)
+            .record_observation(
+                &credential.identity(),
+                outcome.provider_scope_fingerprint.as_deref(),
+                orbit::provider_scope::ObservationMode::Enrollment,
+                outcome.snapshot,
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("Codex status evidence persistence failed"))?;
+        anyhow::ensure!(
+            recorded.snapshot.state == orbit::availability::AvailabilityState::Unknown,
+            "unconfirmed Codex status observation promoted availability"
+        );
+        let provider_scope = recorded
+            .binding
+            .as_ref()
+            .map(|binding| format!("{:?}", binding.state).to_ascii_lowercase())
+            .unwrap_or_else(|| "none".into());
+        let summary = serde_json::json!({
+            "credential": {
+                "reference": credential.reference,
+                "id": credential.id,
+                "generation": credential.generation,
+                "lifecycle": "enrolled",
+            },
+            "representation": {
+                "interface": "codex",
+                "auth_type": orbit::codex_credential_enrollment::CODEX_AUTH_TYPE,
+                "validation": "valid",
+                "artifact": orbit::codex_credential_enrollment::CODEX_AUTH_RELATIVE,
+            },
+            "runtime": {
+                "app_server": orbit::codex_credential_enrollment::CODEX_VERSION,
+                "image_digest": orbit::codex_credential_enrollment::CODEX_IMAGE_DIGEST,
+                "binary_sha256": orbit::codex_credential_enrollment::CODEX_BINARY_SHA256,
+            },
+            "status": {
+                "request_count": 1,
+                "authenticated": outcome.receipt.authenticated_account_present,
+                "account_read": outcome.receipt.authenticated_account_present,
+                "rate_limits_read": outcome.receipt.correlated_status_response,
+                "fresh_backend_auth_staged": outcome.receipt.isolated_auth_staged,
+                "model_turn": false,
+                "normalized_quota_bucket_count": normalized_bucket_count,
+                "availability_snapshot_stored": true,
+                "snapshot_id": recorded.snapshot_id,
+                "availability": recorded.snapshot.state,
+                "availability_scope": "credential",
+                "observed_at_ms": recorded.snapshot.observed_at_ms,
+                "expires_at_ms": recorded.snapshot.expires_at_ms,
+                "persisted_quota_bucket_count": recorded.snapshot.quota_buckets.len(),
+                "provider_scope_identity_observed": outcome.provider_scope_fingerprint.is_some(),
+                "provider_scope": provider_scope,
+            }
+        });
+        match output_format {
+            Output::Json | Output::Text => println!("{}", serde_json::to_string_pretty(&summary)?),
+            Output::Jsonl => println!("{}", serde_json::to_string(&summary)?),
+        }
+        pool.close().await;
+        return Ok(());
+    }
+    let credential_command = matches!(&cli.command, Commands::Credential(_));
     let token = if let Some(path) = cli.token_file {
         anyhow::ensure!(
             cli.token.is_empty(),
@@ -360,6 +879,28 @@ async fn main() -> Result<()> {
     };
     let client = Client::new(cli.url, token)?;
     let value = match cli.command {
+        Commands::Credential(args) => match args.action {
+            CredentialAction::Add { .. } => {
+                unreachable!("local enrollment handled before API credential resolution")
+            }
+            CredentialAction::AddRepresentation { .. } => {
+                unreachable!("local representation import handled before API credential resolution")
+            }
+            CredentialAction::CaptureAgyUsage { .. } => {
+                unreachable!("local agy status capture handled before API credential resolution")
+            }
+            CredentialAction::ProbeCodexStatus { .. } => {
+                unreachable!("local Codex status probe handled before API credential resolution")
+            }
+            CredentialAction::List => client.get("/credentials").await?,
+            CredentialAction::Inspect { reference } => {
+                anyhow::ensure!(
+                    orbit::credential_registry::valid_reference(&reference),
+                    "invalid credential reference"
+                );
+                client.get(&format!("/credentials/{reference}")).await?
+            }
+        },
         Commands::AcpLaunchDigest { .. } => {
             unreachable!("local launch digest handled before credentials")
         }
@@ -817,6 +1358,7 @@ async fn main() -> Result<()> {
         }
     };
     match output_format {
+        Output::Text if credential_command => println!("{}", serde_json::to_string_pretty(&value)?),
         Output::Text => print!("{}", orbit::telemetry::format_inspect_human(&value)),
         Output::Json => println!("{}", serde_json::to_string_pretty(&value)?),
         Output::Jsonl => {
@@ -830,4 +1372,24 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod durable_catalog_target_tests {
+    use super::*;
+
+    #[test]
+    fn durable_catalog_connection_target_is_exact_and_errors_do_not_echo_url() {
+        let intended = "postgres://orbit:placeholder@127.0.0.1:55442/orbit_control_plane";
+        assert!(validate_durable_catalog_url(intended).is_ok());
+
+        for wrong in [
+            "postgres://orbit:placeholder@127.0.0.1:55439/orbit_control_plane",
+            "postgres://orbit:placeholder@127.0.0.1:55442/orbit_qualification",
+            "postgres://orbit:placeholder@localhost:55442/orbit_control_plane",
+        ] {
+            let error = validate_durable_catalog_url(wrong).unwrap_err().to_string();
+            assert!(!error.contains("placeholder"));
+        }
+    }
 }

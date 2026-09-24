@@ -148,6 +148,19 @@ pending-prompt intervention, not a launched Codex session. A real credential-fre
 initialization is described in [ACP preflight](../guides/acp-preflight.md). No
 fixture result qualifies a live account or separately hosted worker.
 
+Credential registry persistence and generation tests use only a disposable
+schema on the qualification database:
+
+```sh
+ORBIT_TEST_DATABASE_URL=postgres://orbit:orbit-local-test@127.0.0.1:55439/orbit \
+cargo test --locked --test credential_registry_pg -- --ignored
+
+ORBIT_TEST_DATABASE_URL=postgres://orbit:orbit-local-test@127.0.0.1:55439/orbit \
+cargo test --locked --test codex_enrollment_pg -- --ignored
+```
+
+Never point this variable at the durable Orbit control-plane catalog.
+
 After provisioning `ORBIT_TEST_ACP_IMAGE` above, run the workflow cases:
 
 ```sh

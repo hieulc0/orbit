@@ -15,6 +15,10 @@ mod acp_accounting;
 mod acp_live_preflight;
 #[path = "kernel/acp_workflow.rs"]
 mod acp_workflow;
+#[path = "kernel/availability.rs"]
+mod availability;
+#[path = "kernel/provider_scope.rs"]
+mod provider_scope;
 
 #[path = "kernel/command_agent.rs"]
 mod command_agent;

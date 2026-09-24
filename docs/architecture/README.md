@@ -43,6 +43,7 @@ independent boundaries, not interchangeable permission strings.
 | Module | Responsibility |
 | --- | --- |
 | `src/model.rs` | Strict definitions, immutable plans, durable run/task/attempt types |
+| `src/credential_registry.rs`, `src/secret_backend.rs` | Operator credential metadata/lifecycle and owner-only local secret storage; see [credential registry](credential-registry.md) |
 | `src/engine.rs`, `migrations/` | PostgreSQL transitions, coordination, deduplication, reconciliation |
 | `src/api.rs`, `src/governance.rs` | Authentication, scoped authorization, admission policy |
 | `src/worker.rs`, `src/container.rs` | Lease-bound execution, workspaces, process supervision |
@@ -52,7 +53,7 @@ independent boundaries, not interchangeable permission strings.
 | `src/acp.rs`, `src/acp_contract.rs` | Credential-free ACP preflight, pinned policy, execution-only limits/charges |
 | `src/acp_runtime.rs`, `src/acp_process.rs`, `src/acp_wire.rs` | Pinned registry, auth quarantine, agent supervision and bounded protocol sessions |
 | `src/acp_broker.rs`, `src/acp_files.rs`, `src/acp_terminal.rs` | Lease-fenced client callbacks, confined files and asynchronous supervised terminals |
-| `src/codex_bridge.rs`, `src/codex_session.rs` | Version-specific Codex App Server bridge and dynamic-tool-to-ACP routing |
+| `src/codex_bridge.rs`, `src/codex_session.rs`, `src/codex_credential_enrollment.rs`, `src/codex_status_probe.rs` | Version-specific Codex App Server bridge, isolated device-code enrollment, catalog-backed status probing, and dynamic-tool-to-ACP routing |
 | `src/artifacts.rs` | Local/S3 immutable publication and verified reads |
 | `src/registry.rs` | Signed immutable package metadata; no code loading |
 | `src/ops.rs`, `src/main.rs` | Lifecycle, probes, metrics, executable commands |

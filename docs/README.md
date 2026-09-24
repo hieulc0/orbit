@@ -25,8 +25,11 @@ not the source of current setup instructions.
 ## Architecture and reference
 
 - [Current architecture and code map](architecture/README.md)
+- [Credential registry and local secret backend](architecture/credential-registry.md) — operator-owned credential enrollment, metadata and private secret boundary
 - [ACP agent integration](architecture/acp-agent-integration.md) — implemented
   worker/broker boundaries and remaining qualification gates
+- [Self-development control plane](architecture/self-development-control-plane.md) —
+  phased design and first availability-model implementation
 - [Long-term vision](architecture/vision.md) — aspirational, not a support promise
 - [Core semantics](reference/engine-semantics.md), [state machines](reference/state-machines.md), [graphs](reference/graphs.md)
 - [API/CLI/SDK contract](reference/api-cli-sdk.md), [worker protocol](reference/worker-protocol.md)
@@ -43,6 +46,7 @@ not the source of current setup instructions.
 - [Antigravity and Claude compatibility](operations/acp-agent-compatibility.md)
 - [Post-Q6 coding runtime hardening and accounting](operations/post-q6-hardening.md)
 - [Cross-provider coding adapters and preflights](operations/cross-provider-coding.md)
+- [Provider status discovery and offline normalization](operations/provider-status-discovery.md)
 - [Current roadmap](ROADMAP.md), [alpha qualification](operations/qualification.md)
 - [Remote coding qualification](operations/remote-coding-qualification.md)
 - [Historical records](archive/README.md)

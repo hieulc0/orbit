@@ -1,0 +1,27 @@
+# New, unqualified Orbit Antigravity runtime. Do not replace this base with a
+# mutable tag or inherit qualification from the historical image.
+FROM gcr.io/distroless/base-nossl-debian13@sha256:792f51c506fc67f7eaa38093f6d4937a053cebb79ec0e7c3b7746f6bbba85606
+
+LABEL org.opencontainers.image.title="Orbit Antigravity ACP runtime"
+LABEL org.opencontainers.image.version="agy_acp_server_1.1.1-orbit-terminal-v2"
+LABEL io.orbit.runtime.provider="antigravity"
+LABEL io.orbit.runtime.protocol="acp"
+LABEL io.orbit.runtime.revision="agy_acp_server_1.1.1-orbit-terminal-v2"
+LABEL io.orbit.runtime.qualification="unqualified"
+
+# The upstream C++ initializer looks up the "nobody" group. Keep only the
+# root and required nobody entries; Orbit launches with an explicit keep-id
+# UID:GID, so no distro account database is used for workspace ownership.
+COPY --chmod=0644 runtime.group /etc/group
+COPY --chmod=0755 agy_acp_server.par /opt/antigravity/agy_acp_server.par
+COPY --chmod=0755 localharness_external /opt/antigravity/localharness_external
+
+ENV GEMINI_HOME=/orbit/home/.gemini \
+    AGY_ACP_FORCE_FILE_STORAGE=1 \
+    NO_BROWSER=1 \
+    ANTIGRAVITY_HARNESS_PATH=/opt/antigravity/localharness_external \
+    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+    REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+
+WORKDIR /orbit/home
+ENTRYPOINT ["/opt/antigravity/agy_acp_server.par"]

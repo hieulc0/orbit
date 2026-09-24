@@ -1,6 +1,40 @@
 # Orbit Self-Development Control Plane
 
-Status: proposed architecture draft, documentation-only.
+Status: proposed architecture, implemented incrementally. The credential and
+provider-status foundation is qualified for Codex and Antigravity. Antigravity
+ACP↔agy identity remains UNVERIFIED; the newly Orbit-owned `codex-main` provider
+scope remains UNCONFIRMED, and its current availability is UNKNOWN. Resource
+inventory, leases, scheduling, roles, and the self-development loop are not
+implemented or qualified.
+
+Implementation checkpoint (2026-09-25): the credential registry and
+`LocalPrivateSecretBackend` are implemented alongside `src/availability.rs`,
+which defines a
+versioned, secret-free logical resource identity, scoped availability
+snapshots, conservative freshness evaluation, immutable PostgreSQL evidence,
+provider quota buckets/windows/groups, and provider-scope enrollment and
+confirmation. Migrations `0007`–`0011` add availability, provider scopes,
+credentials, representation provenance, and explicit identity bindings. No
+resource inventory/lease, scheduler integration, role policy, review, repair,
+or Goal handling is present. Q7 readiness remains open.
+
+Credential-foundation closeout (2026-09-25): Antigravity ACP OAuth enrollment
+and fresh-runtime reuse, plus the `agy-cli` file-backed representation and
+fresh-process reuse, are qualified. One `/usage` request with pinned agy 1.2.9
+was safely normalized into two provider-reported quota groups, four existing
+`qb1` buckets/windows, and a durable credential-scoped snapshot whose
+availability state is UNKNOWN. The provider supplies group names and member
+labels in `description`; `qg1` group identities are Orbit-derived. No stable
+account identity connects ACP and agy, so that binding remains UNVERIFIED.
+
+Codex App Server 0.156.0 device-code enrollment, `.codex/auth.json` reuse, and
+the catalog-backed account/rate-limits status path are qualified for
+`codex-main`. Its first snapshot is UNKNOWN and provider scope UNCONFIRMED; a
+separate previously qualified Codex scope result applies only to its own
+credential. These status/enrollment checks used no model turn. Provider billing,
+quota cost, and status-call rate-limit cost remain UNKNOWN. See the
+[discovery and qualification record](../operations/provider-status-discovery.md)
+and [credential foundation](credential-registry.md).
 
 Repository baseline inspected for this draft: 833ffe7721be34780dc1b2f511c55f5bb0c11464
 (feat(runtime): harden agent execution and qualification). The baseline is the
@@ -99,7 +133,9 @@ general-purpose dynamic workflow language or a loop controller.
 | [src/worker.rs](../../src/worker.rs) | Registers a generic capability, claims an eligible task, starts a fenced Attempt, starts AgentExecution evidence when applicable, renews the Attempt lease independently, performs work, and publishes through the normal operation protocol. |
 | [src/artifacts.rs](../../src/artifacts.rs), [src/run_export.rs](../../src/run_export.rs), and [src/evidence.rs](../../src/evidence.rs) | Keep immutable, checksum-verified artifact bytes outside the run document and support bounded private review/export. |
 | [src/telemetry.rs](../../src/telemetry.rs) and [src/ops.rs](../../src/ops.rs) | Aggregate safe agent timing/tool/nullable usage data and expose bounded operational metrics. |
-| [src/api.rs](../../src/api.rs) and [src/main.rs](../../src/main.rs) | Expose authenticated run, artifact, worker, queue, approval, signal, package, health, inspection, event, and export interfaces. There is no current agents, roles, resources, or goal command. |
+| [src/api.rs](../../src/api.rs) and [src/main.rs](../../src/main.rs) | Expose run/worker interfaces plus operator credential list/inspect/enrollment and catalog-backed provider-status commands. There is no agents, roles, resource-pool, or goal command. |
+| [src/credential_registry.rs](../../src/credential_registry.rs), [src/secret_backend.rs](../../src/secret_backend.rs), [src/credential_enrollment.rs](../../src/credential_enrollment.rs), [src/codex_credential_enrollment.rs](../../src/codex_credential_enrollment.rs) | Own logical credentials, isolated generations/representations, private secret storage, and operator-driven ACP/Codex enrollment. These are not scheduler leases or automatic account selection. |
+| [src/provider_scope.rs](../../src/provider_scope.rs), [src/provider_status.rs](../../src/provider_status.rs), [src/availability.rs](../../src/availability.rs), [src/agy_usage_schema.rs](../../src/agy_usage_schema.rs) | Enforce explicit provider-scope confirmation and bounded provider status/quota normalization, including Antigravity quota groups/windows and conservative snapshot freshness. |
 
 ### 2.3 Current state and ownership
 
@@ -141,10 +177,12 @@ are pinned by operator configuration. File and terminal effects pass through
 the Orbit broker and workspace supervisor. The provider conversation is
 disposable; accepted state is the Run, workspace, artifacts, and journal.
 
-The current implementation has no first-class quota snapshot, native provider
-status probe, credential pool, role policy, read-only Reviewer activity, repair
-controller, or durable Goal aggregate. Those are design targets, not hidden
-assumptions.
+The current implementation now has a credential registry, private secret
+backend, catalog-backed provider status probes, provider-scope records, and
+first-class availability snapshots. It does not have a multi-credential
+resource inventory/pool, automatic credential selection, resource leases,
+role policy, read-only Reviewer activity, repair controller, or durable Goal
+aggregate. Those remain design targets, not hidden assumptions.
 
 ## 3. Existing Architecture to Preserve
 
@@ -580,7 +618,7 @@ effective result         capability match, availability unknown
 
 ### 9.2 Snapshot shape
 
-The future normalized snapshot should be conceptually equivalent to:
+The normalized snapshot contains:
 
 ~~~text
 AvailabilitySnapshot {
@@ -589,7 +627,8 @@ AvailabilitySnapshot {
     observed_at
     expires_at
     state
-    quota_windows[]
+    quota_buckets[]?   # explicit provider grouping when reported
+    quota_windows[]    # legacy flat compatibility projection
     source
     confidence
     evidence_digest
@@ -597,14 +636,30 @@ AvailabilitySnapshot {
     diagnostic_class?
 }
 
-QuotaWindow {
-    provider_window_id or provider_label
+QuotaBucket {
+    provider_bucket_fingerprint  # qb1: domain-separated opaque digest
+    scope?                       # only if provider defines a narrower scope
+    windows[]
+}
+
+QuotaBucketWindow {
+    provider_window_id           # e.g. primary / secondary, as reported
     used_percent?
     remaining_percent?
+    duration_minutes?
     resets_at?
     exhausted?
 }
 ~~~
+
+The relationship is provider → credential → quota bucket → quota windows.
+Raw provider bucket identifiers are not persisted; a domain-separated
+fingerprint preserves bucket identity separately from each window identity.
+The flat window list remains for backward compatibility, but new consumers
+must use the explicit bucket structure and must not parse display labels to
+reconstruct sibling relationships. A bucket may carry a narrower provider
+scope (for example, a model group) only when the provider establishes that
+scope. No such scope is inferred for current Codex evidence.
 
 All optional numerical and timestamp fields are absent/null when the provider
 did not report them. exhausted=true is recorded only when explicitly reported
@@ -744,16 +799,30 @@ rewrite the historical decision.
 
 ## 11. Native Provider Status Discovery
 
-This is an evidence-gathering phase, not a design assumption.
+Phase-A discovery is closed with the provider-specific results below. This is
+not a scheduler authorization and does not qualify Q7.
 
-The current repository has ACP initialization/model discovery and provider
-error normalization. It does not establish that Codex /status, Antigravity
-/usage or /quota, or equivalent commands are programmatically available
-through the installed ACP integrations. The credential-free ACP preflight
-explicitly does not authenticate or execute a model turn. No current code
-proves that a quota command is free, structured, or scoped per model.
+Codex 0.156.0 exposes the qualified structured `account/read` and
+`account/rateLimits/read` status path through Orbit's isolated pinned runtime
+and credential boundary. The provider scope was explicitly enrolled and
+confirmed, then matched by a subsequent independent status read. Its READY
+evidence is credential-scoped only; exact-model readiness remains UNKNOWN. The
+trace contained no model thread/turn or inference request. Whether the status
+operation is billable, consumes provider quota, or is provider-rate-limited
+remains UNKNOWN.
 
-Phase A must answer, separately for each selected runtime/version:
+Antigravity's qualified structured status interface is agy 1.2.9 `/usage`,
+separate from ACP execution. Its file-backed auth was reused from a fresh HOME,
+and one status response was normalized using bounded capture. The resulting
+credential-scoped snapshot is UNKNOWN because current policy defines no
+readiness threshold or exact-model scope; quota group membership is not model
+capability. No stable comparable identity joins ACP and agy, so their binding
+remains UNVERIFIED. The pinned CLI's provenance is operator-supplied, not
+official-artifact-verified. Do not infer availability from ACP execution
+success.
+
+For a newly selected provider or materially changed runtime, qualification
+must separately record:
 
 1. Is there a documented/native status mechanism?
 2. Can it be invoked programmatically from Orbit’s isolated runtime?
@@ -778,12 +847,22 @@ Scraping unstable terminal text is not a core contract. If a CLI parser is
 temporarily unavoidable, it is an adapter with a version pin, parser tests,
 bounded output, source digest, and an UNKNOWN fallback on any ambiguity.
 
-The proof that a probe does not consume a model turn requires provider/runtime
-evidence, not inference from a command name. A qualification experiment should
-use a disposable credential/account, compare provider-side or native usage
-before/after, capture the exact request class, and run the same operation
-against a no-network fixture. It must be explicitly authorized and must not be
-performed by this documentation task.
+The proof that a probe does not consume a model turn requires protocol/runtime
+evidence, not inference from a command name. Any future qualification must use
+an explicitly selected credential and bounded status-only lifecycle. A
+before/after usage comparison is supporting evidence only: an unchanged
+counter does not prove zero billing, quota cost, or provider rate limiting.
+Obtain separate authorization before any authenticated provider request.
+
+For providers whose authoritative account/workspace ID is not independently
+available to the operator, the first authenticated status read may only enroll
+an UNCONFIRMED, generation-scoped opaque provider-scope fingerprint. It must
+publish UNKNOWN availability. A separate durable operator confirmation is
+required; a subsequent probe must match the confirmed fingerprint before
+status evidence can be trusted. Mismatch publishes UNKNOWN and requires
+explicit re-enrollment and reconfirmation. The stronger independent expected-ID
+comparison remains available where the operator has an authoritative ID.
+Enrollment does not create a Task, Attempt, AgentExecution, or coding workspace.
 
 ## 12. Credential Pools
 
@@ -1679,75 +1758,58 @@ artifact, role policy, or Run state by writing directly to PostgreSQL.
 Delivery must be dependency-aware and must not attempt the entire vision in one
 change.
 
-### Phase A — Native availability discovery spike
+### Phase A — Native provider status discovery
 
-After the Q7 baseline/qualification checkpoint, experimentally determine
-Codex and Antigravity status semantics, structured fields, scope, cost, auth,
-and no-inference-turn behavior. Use credential-free fixtures first and obtain
-separate authority for any live account probe. Produce an adapter evidence
-record, not a scheduler feature.
+Credential lifecycle, provider scope, and native status discovery are
+qualified for the current Codex and Antigravity credentials. Antigravity
+quota-group/window evidence is persisted while effective availability remains
+UNKNOWN; ACP↔agy identity remains UNVERIFIED. `codex-main` is ENROLLED with a
+VALID representation and an UNKNOWN status snapshot while its provider scope
+is UNCONFIRMED. This phase does not implement scheduling or automatic
+credential selection.
 
-### Phase B — Availability model
+### Phase B — Execution-resource inventory and pools
 
-Add normalized resource identity, scoped snapshots, arbitrary quota windows,
-freshness, evidence provenance, unknown semantics, and execution-result
-updates. Persist cross-Run operational state with an additive migration. Keep
-probes and storage/provider I/O outside coordination locks.
+Add operator-controlled, secret-free concrete resources and compatible pools
+using the existing canonical resource identity. Keep runtime, credential,
+model, reasoning, capability, availability, and role distinct. This phase has
+not started.
 
-### Phase C — CLI status
+### Phase C — Durable resource leases
 
-Expose human-readable and JSON status, explicit refresh, health dimensions,
-unknown fields, snapshot age, and evidence source. Add tests for redaction,
-freshness, provider-window variability, and no fake zero values.
+Add fenced, generation-aware scheduler resource leases without replacing
+Attempt leases or worker-local auth-store locking/quarantine.
 
-### Phase D — Credential/resource pools
+### Phase D — Deterministic candidate scheduler
 
-Register operator-authorized resource inventory, add durable logical resource
-leases and concurrency limits, integrate worker capacity/draining, and
-preserve local ACP auth locks/quarantine. Prove that two workers cannot
-intentionally oversubscribe one pool entry and that lost cleanup does not
-silently reuse an auth store.
+Select candidates from immutable requirements, policy, inventory, availability,
+leases, and worker capacity; persist bounded explainable decisions. Do not let
+an LLM select a resource or silently downgrade a model/reasoning requirement.
 
-### Phase E — Execution roles and deterministic scheduler
+### Phase E — Versioned execution-role policy
 
-Add role policy resolution, role evidence on AgentExecution, candidate
-filtering/ranking, selection explanations, and additive protocol fields. Start
-with Implementer/continuation compatibility and a read-only Reviewer-compatible
-capability profile. Preserve legacy agent.run and repository plans without role
-fields.
+Add Planner, Implementer, Tester, and Reviewer intent/policy while preserving
+Task/Attempt/AgentExecution semantics.
 
-### Phase F — Reviewer qualification
+### Phase F — Role execution and read-only independence
 
-Implement a read-only Reviewer activity with an independent resource,
-structured findings, fresh/read-only materialization, and technical write
-denial. Qualify reviewer independence, artifact provenance, failure recovery,
-unknown provider outcome handling, and human approval behavior.
+Implement role-specific activities, deterministic validation, and technically
+enforced Tester/Reviewer read-only boundaries.
 
-### Phase G — Bounded repair loop
+### Phase G — Bounded Validate → Review → Repair control loop
 
-Add explicit Validator → Review → Repair → Revalidate state transitions,
-iteration identity, accepted evidence joins, and bounded repair/review/
-wall-clock/provider budgets. Begin with statically bounded graph expansion or
-one explicit controller; do not add an unbounded general loop language.
+Persist stable iteration identity and explicit execution, repair, review, and
+wall-clock budgets. Repair is a new authorized Task/Attempt, not continuation.
 
-### Phase H — Planner
+### Phase H — Self-development proving ground
 
-Add a structured, policy-constrained Planner. Compile its proposal only
-through Orbit validation and immutable plan creation. Prove that planner
-output cannot alter security policy, resources, credentials, mounts, network,
-budgets, or validator definitions.
+Run against a human-selected immutable Orbit SHA, retain exact patch and
+validation/review evidence, and leave commit/merge/release under human control.
 
-### Phase I — Goal/self-development orchestration
-
-Only after the earlier phases qualify should Orbit coordinate the complete
-goal-to-reviewed-patch loop and Orbit-on-Orbit proving tasks. Add a thin Goal
-aggregate only if multiple immutable Runs/plan revisions demonstrate the need.
-Add a human-controlled commit/release integration step.
-
-Dependencies are strict: resource identity precedes availability; availability
-and leases precede scheduler selection; role policy precedes reviewer/repair;
-independent review precedes self-development; bounded loops and approval
-precede autonomous Orbit changes.
+Dependencies remain strict: availability evidence does not itself select a
+resource; inventory and durable leases precede scheduling; role policy
+precedes role execution; independent verification and bounded repair precede
+self-development qualification.
 
 ## 29. Migration / Compatibility
 
@@ -1858,12 +1920,17 @@ semantics, or self-development safety.
 These questions require evidence or an explicit product decision before the
 corresponding phase is implemented:
 
-1. Which documented status mechanism does each selected Codex/Antigravity
-   runtime expose?
-2. Can each status mechanism be proven not to consume a model inference turn?
-3. Does each provider scope quota by credential, account, model, reasoning
-   setting, runtime, or another dimension?
-4. Which windows, reset timestamps, and exhaustion signals are structured?
+1. Antigravity ACP↔agy identity remains UNVERIFIED because no stable common
+   provider account identifier was exposed. The status response contains
+   provider quota groups, not account identity.
+2. Codex and Antigravity status probes used no model inference turn, but their
+   billing, quota-cost, and provider-side rate-limit effects remain UNKNOWN.
+3. Codex status evidence is credential/account scoped, not model scoped.
+   Antigravity's snapshot is credential scoped and UNKNOWN; its quota-group
+   membership does not prove runtime model readiness.
+4. Codex primary/secondary windows and Antigravity weekly/5h windows remain
+   nested within their provider quota resources/groups. Provider reset values
+   are separate from Orbit evidence freshness TTL.
 5. How should a provider-wide negative result interact with model-specific
    resources when scope is not reported?
 6. Which status probes may run automatically, and what probe budget/rate limit

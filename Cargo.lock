@@ -1431,6 +1431,7 @@ dependencies = [
  "tokio-util",
  "tower-http",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

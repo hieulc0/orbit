@@ -45,6 +45,27 @@ impl Engine {
         sqlx::raw_sql(include_str!("../migrations/0006_operations.sql"))
             .execute(&mut *migration)
             .await?;
+        sqlx::raw_sql(include_str!("../migrations/0007_availability.sql"))
+            .execute(&mut *migration)
+            .await?;
+        sqlx::raw_sql(include_str!(
+            "../migrations/0008_provider_scope_bindings.sql"
+        ))
+        .execute(&mut *migration)
+        .await?;
+        sqlx::raw_sql(include_str!("../migrations/0009_credentials.sql"))
+            .execute(&mut *migration)
+            .await?;
+        sqlx::raw_sql(include_str!(
+            "../migrations/0010_credential_representation_provenance.sql"
+        ))
+        .execute(&mut *migration)
+        .await?;
+        sqlx::raw_sql(include_str!(
+            "../migrations/0011_credential_identity_bindings.sql"
+        ))
+        .execute(&mut *migration)
+        .await?;
         migration.commit().await?;
         Ok(Self {
             pool,

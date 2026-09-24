@@ -10,6 +10,7 @@ older prerequisites: use [current testing instructions](../development/testing.m
 - [Phase 4–9 release qualification, 2026-09-12](release-qualification-2026-09-12.md)
 - [Implementation history](implementation-status-2026-09-12.md)
 - [Completed delivery roadmap](delivery-roadmap-2026-09-12.md)
+- [Role-agent source brief](role-agent.md) — design input only, not an implementation contract
 
 Local generated evidence is not shipped with this repository. Owner acceptance
 is a recorded decision, not a result inferred from automated tests.

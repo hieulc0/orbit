@@ -244,9 +244,18 @@ impl AuthLease {
         })
     }
     pub fn stage(&self, home: &Path, container: &str, attempt: &str) -> Result<()> {
+        self.stage_with_marker(home, container, "attempt_id", attempt)
+    }
+    /// A status probe shares auth staging/quarantine without claiming an Attempt.
+    pub fn stage_status(&self, home: &Path, container: &str, probe: &str) -> Result<()> {
+        self.stage_with_marker(home, container, "probe_id", probe)
+    }
+    fn stage_with_marker(&self, home: &Path, container: &str, key: &str, id: &str) -> Result<()> {
         ensure!(!home.exists(), "ACP control directory must be new");
         std::fs::create_dir(home)?;
         std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o700))?;
+        // The runtime expects this empty control-HOME directory even for a
+        // status probe. It is never an Attempt-owned repository workspace.
         std::fs::create_dir(home.join("workspace"))?;
         for (source, destination) in &self.files {
             let destination = home.join(destination);
@@ -266,7 +275,9 @@ impl AuthLease {
             .mode(0o600)
             .open(self.path.join(".orbit-acp-active.json"))?;
         use std::io::Write;
-        marker.write_all(&serde_json::to_vec(&serde_json::json!({"container":container,"attempt_id":attempt,"format":"orbit-acp-auth-lease/v1"}))?)?;
+        marker.write_all(&serde_json::to_vec(
+            &serde_json::json!({"container":container,key:id,"format":"orbit-acp-auth-lease/v1"}),
+        )?)?;
         marker.sync_all()?;
         Ok(())
     }
@@ -288,7 +299,29 @@ impl AuthLease {
 }
 
 pub fn command(request: &Request, home: &Path, name: &str, image: &str) -> Result<Command> {
-    request.runtime.validate()?;
+    command_for_runtime(
+        &request.runtime,
+        home,
+        name,
+        image,
+        "orbit.attempt",
+        &request.attempt_id,
+    )
+}
+
+pub(crate) fn command_for_runtime(
+    runtime: &Runtime,
+    home: &Path,
+    name: &str,
+    image: &str,
+    kind: &str,
+    id: &str,
+) -> Result<Command> {
+    runtime.validate()?;
+    ensure!(
+        matches!(kind, "orbit.attempt" | "orbit.status_probe"),
+        "invalid ACP launch kind"
+    );
     ensure!(
         unsafe { libc::getuid() } != 0,
         "ACP supervision requires rootless Podman"
@@ -297,7 +330,7 @@ pub fn command(request: &Request, home: &Path, name: &str, image: &str) -> Resul
         !home.to_string_lossy().contains(','),
         "ACP control path cannot contain commas"
     );
-    let launch = &request.runtime.launch;
+    let launch = &runtime.launch;
     let mut command = Command::new("podman");
     command
         .args([
@@ -310,9 +343,13 @@ pub fn command(request: &Request, home: &Path, name: &str, image: &str) -> Resul
             "--label",
             "orbit.managed=true",
             "--label",
-            &format!("orbit.attempt={}", request.attempt_id),
+            &format!("{kind}={id}"),
             "--label",
-            "orbit.agent=true",
+            if kind == "orbit.attempt" {
+                "orbit.agent=true"
+            } else {
+                "orbit.status_probe=true"
+            },
             "--read-only",
             "--cap-drop=ALL",
             "--security-opt=no-new-privileges",
