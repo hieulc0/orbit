@@ -1865,14 +1865,74 @@ async fn execute_real_acp_turn(
         tokio::fs::write(&auth_file, secret_bytes.expose()).await?;
         std::fs::set_permissions(&auth_file, std::fs::Permissions::from_mode(0o600))?;
 
-        let (mut rt, _res) = crate::codex_status_probe::cataloged_codex_runtime(&credential)?;
-        rt.auth.path = auth_store_dir.clone();
-        if let Some(m) = &target.resolved_model {
-            rt.binding.model = Some(m.clone());
-        }
-        if let Some(d) = &target.runtime_image_digest {
-            rt.launch.image = d.clone();
-        }
+        use crate::codex_credential_enrollment as enrolled;
+        let binding_name = "codex-role-v1";
+        let launch = Launch {
+            adapter: Adapter::Codex,
+            image: enrolled::CODEX_IMAGE.into(),
+            command: vec![enrolled::CODEX_BINARY.into(), "app-server".into()],
+            agent_name: "orbit-codex-acp".into(),
+            agent_version: "1".into(),
+            binary_revision: enrolled::CODEX_VERSION.into(),
+            cpu_millis: 1000,
+            memory_mib: 512,
+            network: AgentNetwork::Host,
+        };
+        let auth = Auth {
+            source: "codex".into(),
+            owner: credential.reference.clone(),
+            account_class: "chatgpt".into(),
+            mode: AuthMode::LocalSession,
+        };
+        let descriptor = Descriptor {
+            agent_id: "codex".into(),
+            agent_revision: crate::codex_bridge::REVISION.into(),
+            launch_digest: launch.digest()?,
+            protocol_version: 1,
+            auth: auth.clone(),
+            security_profile: SecurityProfile::Trusted,
+            filesystem_policy: FilesystemPolicy::AttemptWorkspace,
+            terminal_policy: TerminalPolicy::WorkspaceSupervisor,
+            model_policy: ModelPolicy::Exact,
+            accounting: Accounting::ExecutionOnly,
+            max_limits: AcpLimits {
+                prompt_turns: 1,
+                broker_calls: 32,
+                reported_tool_calls: 64,
+                turn_timeout_seconds: 300,
+                terminal_timeout_seconds: 30,
+                terminal_runtime_seconds: 0,
+                output_bytes: 524288,
+            },
+        };
+        let mut files = BTreeMap::new();
+        files.insert("auth.json".into(), "auth.json".into());
+        let rt = Runtime {
+            binding_name: binding_name.into(),
+            binding: Binding {
+                model: target.resolved_model.clone().or_else(|| Some("gpt-6-luna".into())),
+                runtime: "agent.codex-role-v1".into(),
+                tools: Default::default(),
+                permissions: Vec::new(),
+                max_budget: Budget {
+                    tokens: None,
+                    cost_microusd: None,
+                    calls: 1,
+                },
+                max_delegations: 0,
+                acp: Some(descriptor),
+            },
+            launch,
+            auth: AuthStore {
+                path: auth_store_dir.clone(),
+                source: auth.source,
+                owner: auth.owner,
+                account_class: auth.account_class,
+                files,
+                scopes: Vec::new(),
+            },
+            reasoning_effort: None,
+        };
         rt.validate()?;
         rt
     } else if target.provider == "antigravity" {
