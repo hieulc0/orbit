@@ -30,8 +30,8 @@ impl std::fmt::Display for StreamClosed {
 impl std::error::Error for StreamClosed {}
 
 pub struct Wire {
-    input: BufReader<Box<dyn AsyncRead + Unpin>>,
-    output: Box<dyn AsyncWrite + Unpin>,
+    input: BufReader<Box<dyn AsyncRead + Send + Unpin>>,
+    output: Box<dyn AsyncWrite + Send + Unpin>,
     next: u64,
     bytes: u64,
     messages: u64,
@@ -40,8 +40,8 @@ pub struct Wire {
 }
 impl Wire {
     pub fn new(
-        input: impl AsyncRead + Unpin + 'static,
-        output: impl AsyncWrite + Unpin + 'static,
+        input: impl AsyncRead + Send + Unpin + 'static,
+        output: impl AsyncWrite + Send + Unpin + 'static,
         limit: u64,
     ) -> Self {
         Self {

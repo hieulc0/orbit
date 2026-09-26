@@ -433,7 +433,16 @@ pub fn extract_structured_envelope<T: serde::de::DeserializeOwned>(
     let json_str = if let Some(start_idx) = raw_output.find(ORBIT_HANDOFF_START) {
         let after_start = &raw_output[start_idx + ORBIT_HANDOFF_START.len()..];
         if let Some(end_idx) = after_start.find(ORBIT_HANDOFF_END) {
-            after_start[..end_idx].trim()
+            let mut s = after_start[..end_idx].trim();
+            if s.starts_with("```json") {
+                s = s.strip_prefix("```json").unwrap_or(s).trim();
+            } else if s.starts_with("```") {
+                s = s.strip_prefix("```").unwrap_or(s).trim();
+            }
+            if s.ends_with("```") {
+                s = s.strip_suffix("```").unwrap_or(s).trim();
+            }
+            s
         } else {
             bail!(
                 "ROLE_OUTPUT_INVALID: missing end delimiter {} for schema {}",
@@ -442,7 +451,15 @@ pub fn extract_structured_envelope<T: serde::de::DeserializeOwned>(
             );
         }
     } else {
-        let trimmed = raw_output.trim();
+        let mut trimmed = raw_output.trim();
+        if trimmed.starts_with("```json") {
+            trimmed = trimmed.strip_prefix("```json").unwrap_or(trimmed).trim();
+        } else if trimmed.starts_with("```") {
+            trimmed = trimmed.strip_prefix("```").unwrap_or(trimmed).trim();
+        }
+        if trimmed.ends_with("```") {
+            trimmed = trimmed.strip_suffix("```").unwrap_or(trimmed).trim();
+        }
         if (trimmed.starts_with("{") && trimmed.ends_with("}"))
             || (trimmed.starts_with("[") && trimmed.ends_with("]"))
         {
@@ -1071,6 +1088,70 @@ impl WorkflowStore {
         .execute(&self.pool)
         .await
         .context("append agent_execution_id")?;
+        Ok(())
+    }
+
+    /// Insert durable agent execution record in orbit_agent_executions table.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_agent_execution(
+        &self,
+        id: &str,
+        role_execution_id: &str,
+        agent_type: &str,
+        provider: Option<&str>,
+        model: Option<&str>,
+        started_at_ms: i64,
+        finished_at_ms: Option<i64>,
+        status: &str,
+        termination_reason: Option<&str>,
+        exit_code: Option<i32>,
+        message: Option<&str>,
+        requested_model: Option<&str>,
+        resolved_model: Option<&str>,
+        actual_model: Option<&str>,
+        turn_count: i64,
+        tool_call_count: i64,
+        tool_success_count: i64,
+        tool_failure_count: i64,
+        tool_counts: &serde_json::Value,
+        metadata: &serde_json::Value,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO orbit_agent_executions (
+                id, role_execution_id, agent_type, provider, model,
+                started_at_ms, finished_at_ms, status, termination_reason,
+                exit_code, message, requested_model, resolved_model, actual_model,
+                turn_count, tool_call_count, tool_success_count, tool_failure_count,
+                tool_counts, metadata
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20
+            )
+            "#,
+        )
+        .bind(id)
+        .bind(role_execution_id)
+        .bind(agent_type)
+        .bind(provider)
+        .bind(model)
+        .bind(started_at_ms)
+        .bind(finished_at_ms)
+        .bind(status)
+        .bind(termination_reason)
+        .bind(exit_code)
+        .bind(message)
+        .bind(requested_model)
+        .bind(resolved_model)
+        .bind(actual_model)
+        .bind(turn_count)
+        .bind(tool_call_count)
+        .bind(tool_success_count)
+        .bind(tool_failure_count)
+        .bind(tool_counts)
+        .bind(metadata)
+        .execute(&self.pool)
+        .await
+        .context("insert orbit_agent_executions")?;
         Ok(())
     }
 

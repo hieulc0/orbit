@@ -27,7 +27,7 @@ use zeroize::{Zeroize, Zeroizing};
 pub const ANTIGRAVITY_IMAGE: &str = "localhost/orbit-antigravity-runtime:agy_acp_server_1.1.1-orbit-terminal-v2@sha256:3e7415f6f732ae4168b98a6fb0e14e0fba965020cf5cc1fc5a3b35867b4cf830";
 pub const ANTIGRAVITY_DIGEST: &str =
     "sha256:3e7415f6f732ae4168b98a6fb0e14e0fba965020cf5cc1fc5a3b35867b4cf830";
-const ACP_EXECUTABLE: &str = "/opt/antigravity/agy_acp_server.par";
+pub const ACP_EXECUTABLE: &str = "/opt/antigravity/agy_acp_server.par";
 const PERSONAL: &str = "oauth-personal";
 const TOKEN: &str = "acp_token.json";
 const SETTINGS: &str = "settings.json";
@@ -206,7 +206,7 @@ fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn decode_bundle(bundle: &SecretBytes) -> Result<(SecretBytes, SecretBytes)> {
+pub fn decode_bundle(bundle: &SecretBytes) -> Result<(SecretBytes, SecretBytes)> {
     let bytes = bundle.expose();
     ensure!(
         bytes.starts_with(BUNDLE_MAGIC),
