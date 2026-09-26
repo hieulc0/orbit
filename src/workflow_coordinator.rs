@@ -1654,7 +1654,11 @@ struct AcpTurnState<'a> {
 
 fn resolve_workspace_path(repo_path: &Path, requested: &str) -> PathBuf {
     let clean = requested.trim();
-    if let Some(stripped) = clean.strip_prefix("/orbit/home/") {
+    if let Some(stripped) = clean.strip_prefix("/orbit/home/workspace/") {
+        repo_path.join(stripped)
+    } else if clean == "/orbit/home/workspace" {
+        repo_path.to_path_buf()
+    } else if let Some(stripped) = clean.strip_prefix("/orbit/home/") {
         repo_path.join(stripped)
     } else if clean == "/orbit/home" {
         repo_path.to_path_buf()
@@ -2131,7 +2135,7 @@ async fn execute_real_acp_turn(
         &mut state,
         "session/new",
         serde_json::json!({
-            "cwd": "/orbit/home",
+            "cwd": crate::acp_runtime::WORKSPACE,
             "mcpServers": []
         }),
     ).await.context("ACP session/new failed")?;
