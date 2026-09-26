@@ -1790,7 +1790,7 @@ async fn handle_acp_message(
                     }
                     Err(e) => {
                         state.tool_failures += 1;
-                        wire.response_error(req_id, -32603, &format!("failed to read file: {e}"))
+                        wire.response_ok(req_id, serde_json::json!({ "content": format!("Error reading file: {e}") }))
                             .await?;
                     }
                 }
