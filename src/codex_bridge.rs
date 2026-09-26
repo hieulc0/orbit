@@ -37,7 +37,7 @@ pub fn thread_start(
         "private bridge control directory required"
     );
     ensure!(
-        names.len() <= 10 && names.iter().collect::<BTreeSet<_>>().len() == names.len(),
+        names.len() <= 32 && names.iter().collect::<BTreeSet<_>>().len() == names.len(),
         "invalid bridge tools"
     );
     let tools = crate::coding_agent::tool_definitions(names)?.into_iter().map(|tool|
@@ -111,6 +111,49 @@ pub trait OrbitAcpClient: acp::Client {
         let _ = (path, recursive);
         anyhow::bail!("delete_directory unsupported")
     }
+    async fn list_directory(&self, path: &Path, recursive: bool) -> Result<String> {
+        let _ = (path, recursive);
+        anyhow::bail!("list_directory unsupported")
+    }
+    async fn find_path(&self, pattern: &str, path: Option<&Path>) -> Result<String> {
+        let _ = (pattern, path);
+        anyhow::bail!("find_path unsupported")
+    }
+    async fn grep(&self, query: &str, path: Option<&Path>, case_sensitive: bool) -> Result<String> {
+        let _ = (query, path, case_sensitive);
+        anyhow::bail!("grep unsupported")
+    }
+    async fn edit_file(
+        &self,
+        path: &Path,
+        old_text: &str,
+        new_text: &str,
+        replace_all: bool,
+    ) -> Result<String> {
+        let _ = (path, old_text, new_text, replace_all);
+        anyhow::bail!("edit_file unsupported")
+    }
+    async fn copy_path(
+        &self,
+        source: &Path,
+        destination: &Path,
+        recursive: bool,
+    ) -> Result<String> {
+        let _ = (source, destination, recursive);
+        anyhow::bail!("copy unsupported")
+    }
+    async fn git_status(&self, path: Option<&Path>) -> Result<String> {
+        let _ = path;
+        anyhow::bail!("git_status unsupported")
+    }
+    async fn git_diff(&self, base: Option<&str>, path: Option<&Path>) -> Result<String> {
+        let _ = (base, path);
+        anyhow::bail!("git_diff unsupported")
+    }
+    async fn git_show(&self, revision: &str, path: Option<&Path>) -> Result<String> {
+        let _ = (revision, path);
+        anyhow::bail!("git_show unsupported")
+    }
 }
 
 pub struct ToolRouter {
@@ -148,7 +191,7 @@ impl ToolRouter {
             "absolute bridge workspace required"
         );
         ensure!(
-            max_calls <= 1024 && tools.len() <= 10,
+            max_calls <= 1024 && tools.len() <= 32,
             "bridge call limit invalid"
         );
         crate::coding_agent::tool_definitions(tools)?;
@@ -188,11 +231,24 @@ impl ToolRouter {
         let mut arguments = call.arguments;
         if matches!(
             tool,
-            "read_file" | "write_file" | "create_directory" | "delete_file" | "delete_directory"
+            "read_file"
+                | "write_file"
+                | "create_directory"
+                | "delete_file"
+                | "delete_directory"
+                | "edit_file"
+                | "list_directory"
         ) {
             let path = arguments["path"].as_str().context("tool path missing")?;
             arguments["path"] = json!(normalize_workspace_path(&self.workspace, path)?);
-        } else if tool == "move" {
+        } else if matches!(
+            tool,
+            "find_path" | "grep" | "git_status" | "git_diff" | "git_show"
+        ) {
+            if let Some(p) = arguments.get("path").and_then(|v| v.as_str()) {
+                arguments["path"] = json!(normalize_workspace_path(&self.workspace, p)?);
+            }
+        } else if matches!(tool, "move" | "copy") {
             let source = arguments["source"]
                 .as_str()
                 .context("tool source missing")?;
@@ -261,6 +317,80 @@ impl ToolRouter {
             "shell" => {
                 self.shell(client, arguments["command"].as_str().unwrap())
                     .await?
+            }
+            "list_directory" => {
+                let path = self.workspace.join(arguments["path"].as_str().unwrap());
+                let recursive = arguments
+                    .get("recursive")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                client.list_directory(&path, recursive).await?
+            }
+            "find_path" => {
+                let pattern = arguments["pattern"].as_str().unwrap();
+                let path = arguments
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .map(|p| self.workspace.join(p));
+                client.find_path(pattern, path.as_deref()).await?
+            }
+            "grep" => {
+                let query = arguments["query"].as_str().unwrap();
+                let path = arguments
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .map(|p| self.workspace.join(p));
+                let case_sensitive = arguments
+                    .get("case_sensitive")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                client.grep(query, path.as_deref(), case_sensitive).await?
+            }
+            "edit_file" => {
+                let path = self.workspace.join(arguments["path"].as_str().unwrap());
+                let old_text = arguments["old_text"].as_str().unwrap();
+                let new_text = arguments["new_text"].as_str().unwrap();
+                let replace_all = arguments
+                    .get("replace_all")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                client
+                    .edit_file(&path, old_text, new_text, replace_all)
+                    .await?
+            }
+            "copy" => {
+                let source = self.workspace.join(arguments["source"].as_str().unwrap());
+                let destination = self
+                    .workspace
+                    .join(arguments["destination"].as_str().unwrap());
+                let recursive = arguments
+                    .get("recursive")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                client.copy_path(&source, &destination, recursive).await?
+            }
+            "git_status" => {
+                let path = arguments
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .map(|p| self.workspace.join(p));
+                client.git_status(path.as_deref()).await?
+            }
+            "git_diff" => {
+                let base = arguments.get("base").and_then(|v| v.as_str());
+                let path = arguments
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .map(|p| self.workspace.join(p));
+                client.git_diff(base, path.as_deref()).await?
+            }
+            "git_show" => {
+                let revision = arguments["revision"].as_str().unwrap();
+                let path = arguments
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .map(|p| self.workspace.join(p));
+                client.git_show(revision, path.as_deref()).await?
             }
             _ => anyhow::bail!("unsupported bridge tool"),
         };

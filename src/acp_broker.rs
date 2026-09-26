@@ -397,6 +397,14 @@ impl<'a> Broker<'a> {
                 "fs/move" => "move",
                 "fs/delete_file" => "delete_file",
                 "fs/delete_directory" => "delete_directory",
+                "fs/list_directory" => "list_directory",
+                "fs/find_path" => "find_path",
+                "search/grep" => "grep",
+                "fs/edit_file" => "edit_file",
+                "fs/copy" => "copy",
+                "git/status" => "git_status",
+                "git/diff" => "git_diff",
+                "git/show" => "git_show",
                 "terminal/create" => "shell",
                 "terminal/output" => "terminal/output",
                 "terminal/wait_for_exit" => "terminal/wait_for_exit",
@@ -551,7 +559,15 @@ impl<'a> Broker<'a> {
             | "fs/create_directory"
             | "fs/move"
             | "fs/delete_file"
-            | "fs/delete_directory" => {
+            | "fs/delete_directory"
+            | "fs/list_directory"
+            | "fs/find_path"
+            | "search/grep"
+            | "fs/edit_file"
+            | "fs/copy"
+            | "git/status"
+            | "git/diff"
+            | "git/show" => {
                 if !self.terminals.is_empty() {
                     return Err(BrokerError::recoverable(
                         -32603,
@@ -565,11 +581,25 @@ impl<'a> Broker<'a> {
                     "fs/move" => "move",
                     "fs/delete_file" => "delete_file",
                     "fs/delete_directory" => "delete_directory",
+                    "fs/list_directory" => "list_directory",
+                    "fs/find_path" => "find_path",
+                    "search/grep" => "grep",
+                    "fs/edit_file" => "edit_file",
+                    "fs/copy" => "copy",
+                    "git/status" => "git_status",
+                    "git/diff" => "git_diff",
+                    "git/show" => "git_show",
                     _ => unreachable!(),
                 };
                 if matches!(
                     tool,
-                    "write_file" | "create_directory" | "move" | "delete_file" | "delete_directory"
+                    "write_file"
+                        | "edit_file"
+                        | "create_directory"
+                        | "move"
+                        | "copy"
+                        | "delete_file"
+                        | "delete_directory"
                 ) {
                     let write_allowed = self
                         .session
@@ -587,8 +617,16 @@ impl<'a> Broker<'a> {
                         ));
                     }
                 }
-                let path = if tool == "move" {
+                let path = if matches!(
+                    tool,
+                    "move" | "copy" | "git_status" | "git_diff" | "git_show"
+                ) {
                     String::new()
+                } else if matches!(tool, "find_path" | "grep") {
+                    params
+                        .get("path")
+                        .and_then(|v| self.path(v).ok())
+                        .unwrap_or_else(|| ".".into())
                 } else {
                     match self.path(&params["path"]) {
                         Ok(p) => p,
@@ -755,6 +793,219 @@ impl<'a> Broker<'a> {
                         recursive,
                     ) {
                         Ok(_) => json!({"success": true, "path": path}),
+                        Err(err) => {
+                            let err_msg = format!("{err:#}");
+                            let err_val = json!({"error": &err_msg});
+                            let _ = self.finish(&call, &err_val).await;
+                            return Err(BrokerError::recoverable(-32603, err_msg));
+                        }
+                    }
+                } else if tool == "list_directory" {
+                    let recursive = params
+                        .get("recursive")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let max_entries = params
+                        .get("max_entries")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(100) as usize;
+                    let include_hidden = params
+                        .get("include_hidden")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    match crate::tool_surface::list_directory(
+                        &self.session.workspace.path,
+                        &path,
+                        recursive,
+                        max_entries,
+                        include_hidden,
+                    ) {
+                        Ok(res) => serde_json::to_value(res).unwrap_or(json!({})),
+                        Err(err) => {
+                            let err_msg = format!("{err:#}");
+                            let err_val = json!({"error": &err_msg});
+                            let _ = self.finish(&call, &err_val).await;
+                            return Err(BrokerError::recoverable(-32603, err_msg));
+                        }
+                    }
+                } else if tool == "find_path" {
+                    let pattern = params
+                        .get("pattern")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("*");
+                    let max_results = params
+                        .get("max_results")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(100) as usize;
+                    match crate::tool_surface::find_path(
+                        &self.session.workspace.path,
+                        Some(&path),
+                        pattern,
+                        &[],
+                        &[],
+                        max_results,
+                    ) {
+                        Ok(res) => serde_json::to_value(res).unwrap_or(json!({})),
+                        Err(err) => {
+                            let err_msg = format!("{err:#}");
+                            let err_val = json!({"error": &err_msg});
+                            let _ = self.finish(&call, &err_val).await;
+                            return Err(BrokerError::recoverable(-32603, err_msg));
+                        }
+                    }
+                } else if tool == "grep" {
+                    let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                    let case_sensitive = params
+                        .get("case_sensitive")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    let is_regex = params
+                        .get("is_regex")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let max_matches = params
+                        .get("max_matches")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(100) as usize;
+                    match crate::tool_surface::search_grep(
+                        &self.session.workspace.path,
+                        Some(&path),
+                        query,
+                        case_sensitive,
+                        is_regex,
+                        &[],
+                        &[],
+                        max_matches,
+                        0,
+                    ) {
+                        Ok(res) => serde_json::to_value(res).unwrap_or(json!({})),
+                        Err(err) => {
+                            let err_msg = format!("{err:#}");
+                            let err_val = json!({"error": &err_msg});
+                            let _ = self.finish(&call, &err_val).await;
+                            return Err(BrokerError::recoverable(-32603, err_msg));
+                        }
+                    }
+                } else if tool == "edit_file" {
+                    let old_text = params
+                        .get("old_text")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let new_text = params
+                        .get("new_text")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let replace_all = params
+                        .get("replace_all")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    match crate::tool_surface::edit_file(
+                        &self.session.workspace.path,
+                        &path,
+                        old_text,
+                        new_text,
+                        replace_all,
+                    ) {
+                        Ok(res) => serde_json::to_value(res).unwrap_or(json!({})),
+                        Err(err) => {
+                            let err_msg = format!("{err:#}");
+                            let err_val = json!({"error": &err_msg});
+                            let _ = self.finish(&call, &err_val).await;
+                            return Err(BrokerError::recoverable(-32603, err_msg));
+                        }
+                    }
+                } else if tool == "copy" {
+                    let src = match self.path(&params["source"]) {
+                        Ok(p) => p,
+                        Err(err) => {
+                            return Err(BrokerError::recoverable(
+                                -32602,
+                                format!("invalid source: {err:#}"),
+                            ));
+                        }
+                    };
+                    let dst = match self.path(&params["destination"]) {
+                        Ok(p) => p,
+                        Err(err) => {
+                            return Err(BrokerError::recoverable(
+                                -32602,
+                                format!("invalid destination: {err:#}"),
+                            ));
+                        }
+                    };
+                    let recursive = params
+                        .get("recursive")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    match crate::tool_surface::copy_path(
+                        &self.session.workspace.path,
+                        &src,
+                        &dst,
+                        recursive,
+                    ) {
+                        Ok(res) => serde_json::to_value(res).unwrap_or(json!({})),
+                        Err(err) => {
+                            let err_msg = format!("{err:#}");
+                            let err_val = json!({"error": &err_msg});
+                            let _ = self.finish(&call, &err_val).await;
+                            return Err(BrokerError::recoverable(-32603, err_msg));
+                        }
+                    }
+                } else if tool == "git_status" {
+                    match crate::tool_surface::git_status(&self.session.workspace.path, None).await
+                    {
+                        Ok(res) => serde_json::to_value(res).unwrap_or(json!({})),
+                        Err(err) => {
+                            let err_msg = format!("{err:#}");
+                            let err_val = json!({"error": &err_msg});
+                            let _ = self.finish(&call, &err_val).await;
+                            return Err(BrokerError::recoverable(-32603, err_msg));
+                        }
+                    }
+                } else if tool == "git_diff" {
+                    let base = params.get("base").and_then(|v| v.as_str());
+                    let path_str = params.get("path").and_then(|v| v.as_str());
+                    let stat_only = params
+                        .get("stat_only")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let context_lines = params
+                        .get("context_lines")
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as u32);
+                    match crate::tool_surface::git_diff(
+                        &self.session.workspace.path,
+                        base,
+                        path_str,
+                        context_lines,
+                        stat_only,
+                        65536,
+                    )
+                    .await
+                    {
+                        Ok(res) => serde_json::to_value(res).unwrap_or(json!({})),
+                        Err(err) => {
+                            let err_msg = format!("{err:#}");
+                            let err_val = json!({"error": &err_msg});
+                            let _ = self.finish(&call, &err_val).await;
+                            return Err(BrokerError::recoverable(-32603, err_msg));
+                        }
+                    }
+                } else if tool == "git_show" {
+                    let revision = params
+                        .get("revision")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("HEAD");
+                    let path_str = params.get("path").and_then(|v| v.as_str());
+                    match crate::tool_surface::git_show(
+                        &self.session.workspace.path,
+                        revision,
+                        path_str,
+                        65536,
+                    )
+                    .await
+                    {
+                        Ok(res) => serde_json::to_value(res).unwrap_or(json!({})),
                         Err(err) => {
                             let err_msg = format!("{err:#}");
                             let err_val = json!({"error": &err_msg});

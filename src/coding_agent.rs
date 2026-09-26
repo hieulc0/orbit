@@ -418,12 +418,10 @@ fn durable_tool_result(
 
 pub fn tool_permissions(name: &str) -> Option<&'static [&'static str]> {
     match name {
-        "read_file" => Some(&["workspace.read"]),
-        "write_file" => Some(&["workspace.write"]),
-        "create_directory" => Some(&["workspace.write"]),
-        "move" => Some(&["workspace.write"]),
-        "delete_file" => Some(&["workspace.write"]),
-        "delete_directory" => Some(&["workspace.write"]),
+        "read_file" | "list_directory" | "find_path" | "grep" | "git_status" | "git_diff"
+        | "git_show" => Some(&["workspace.read"]),
+        "write_file" | "edit_file" | "create_directory" | "move" | "copy" | "delete_file"
+        | "delete_directory" => Some(&["workspace.write"]),
         "shell" => Some(&["workspace.read", "workspace.write", "shell.execute"]),
         _ => None,
     }
@@ -439,6 +437,14 @@ pub fn tool_definitions(names: &[String]) -> Result<Vec<Value>> {
             "delete_file" => ("Delete a single file inside the repository workspace.", json!({"path":{"type":"string"}}), vec!["path"]),
             "delete_directory" => ("Remove an empty directory, or recursively only when explicitly requested, inside the repository workspace.", json!({"path":{"type":"string"},"recursive":{"type":"boolean"}}), vec!["path"]),
             "shell" => ("Run a bounded shell command in the isolated workspace, including tests.", json!({"command":{"type":"string"}}), vec!["command"]),
+            "list_directory" => ("List entries in a workspace directory.", json!({"path":{"type":"string"},"recursive":{"type":"boolean"}}), vec!["path"]),
+            "find_path" => ("Discover paths matching a pattern.", json!({"pattern":{"type":"string"},"path":{"type":"string"}}), vec!["pattern"]),
+            "grep" => ("Search text across workspace files.", json!({"query":{"type":"string"},"path":{"type":"string"},"case_sensitive":{"type":"boolean"}}), vec!["query"]),
+            "edit_file" => ("Targeted file editing replacing exact match text.", json!({"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"},"replace_all":{"type":"boolean"}}), vec!["path","old_text","new_text"]),
+            "copy" => ("Copy a file or directory inside the repository workspace.", json!({"source":{"type":"string"},"destination":{"type":"string"},"recursive":{"type":"boolean"}}), vec!["source","destination"]),
+            "git_status" => ("Get git status of the repository workspace.", json!({"path":{"type":"string"}}), vec![]),
+            "git_diff" => ("Inspect git diff in the repository workspace.", json!({"base":{"type":"string"},"path":{"type":"string"}}), vec![]),
+            "git_show" => ("Show git commit details or object content.", json!({"revision":{"type":"string"},"path":{"type":"string"}}), vec!["revision"]),
             _ => anyhow::bail!("unsupported coding tool"),
         };
         Ok(json!({"type":"function","name":name,"description":description,"strict":true,
@@ -485,6 +491,62 @@ pub fn tool_command(name: &str, arguments: &Value, timeout: u64) -> Result<Comma
     #[serde(deny_unknown_fields)]
     struct Shell {
         command: String,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct ListDirectory {
+        path: String,
+        recursive: Option<bool>,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct FindPath {
+        pattern: String,
+        path: Option<String>,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct Grep {
+        query: String,
+        path: Option<String>,
+        case_sensitive: Option<bool>,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct EditFile {
+        path: String,
+        old_text: String,
+        new_text: String,
+        replace_all: Option<bool>,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct CopyArgs {
+        source: String,
+        destination: String,
+        recursive: Option<bool>,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct GitStatus {
+        path: Option<String>,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct GitDiff {
+        base: Option<String>,
+        path: Option<String>,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct GitShow {
+        revision: String,
+        path: Option<String>,
     }
     fn path(value: &str) -> Result<()> {
         ensure!(
@@ -566,6 +628,74 @@ pub fn tool_command(name: &str, arguments: &Value, timeout: u64) -> Result<Comma
                 "shell command exceeds bounds"
             );
             vec!["sh".into(), "-c".into(), args.command]
+        }
+        "list_directory" => {
+            let args: ListDirectory = serde_json::from_value(arguments.clone())?;
+            path(&args.path)?;
+            vec!["ls".into(), args.path]
+        }
+        "find_path" => {
+            let args: FindPath = serde_json::from_value(arguments.clone())?;
+            if let Some(p) = &args.path {
+                path(p)?;
+            }
+            ensure!(
+                !args.pattern.is_empty() && args.pattern.len() <= 1024,
+                "pattern invalid"
+            );
+            vec!["find".into(), args.pattern]
+        }
+        "grep" => {
+            let args: Grep = serde_json::from_value(arguments.clone())?;
+            if let Some(p) = &args.path {
+                path(p)?;
+            }
+            ensure!(
+                !args.query.is_empty() && args.query.len() <= 4096,
+                "query invalid"
+            );
+            vec!["grep".into(), args.query]
+        }
+        "edit_file" => {
+            let args: EditFile = serde_json::from_value(arguments.clone())?;
+            path(&args.path)?;
+            ensure!(
+                !args.old_text.is_empty() && args.old_text.len() <= 65536,
+                "old_text invalid"
+            );
+            ensure!(args.new_text.len() <= 65536, "new_text invalid");
+            vec!["orbit-edit".into(), args.path]
+        }
+        "copy" => {
+            let args: CopyArgs = serde_json::from_value(arguments.clone())?;
+            path(&args.source)?;
+            path(&args.destination)?;
+            vec!["cp".into(), args.source, args.destination]
+        }
+        "git_status" => {
+            let args: GitStatus = serde_json::from_value(arguments.clone())?;
+            if let Some(p) = &args.path {
+                path(p)?;
+            }
+            vec!["git".into(), "status".into()]
+        }
+        "git_diff" => {
+            let args: GitDiff = serde_json::from_value(arguments.clone())?;
+            if let Some(p) = &args.path {
+                path(p)?;
+            }
+            vec!["git".into(), "diff".into()]
+        }
+        "git_show" => {
+            let args: GitShow = serde_json::from_value(arguments.clone())?;
+            if let Some(p) = &args.path {
+                path(p)?;
+            }
+            ensure!(
+                !args.revision.is_empty() && !args.revision.starts_with('-'),
+                "invalid revision"
+            );
+            vec!["git".into(), "show".into(), args.revision]
         }
         _ => anyhow::bail!("unauthorized coding tool"),
     };

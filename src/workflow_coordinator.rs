@@ -30,9 +30,10 @@ use anyhow::{Context, Result, bail, ensure};
 use sqlx::PgPool;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::process::Stdio;
+use std::time::Duration;
 use std::{
     collections::BTreeMap,
-    path::{Path, PathBuf},
+    path::Path,
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -1640,7 +1641,7 @@ fn build_role_prompt(
 
     match role.role_id.as_str() {
         "planner" => format!(
-            "You are the PLANNER role in an Orbit automated software change workflow.\n            Your responsibility is to analyze the task, inspect the repository using read_file, and produce a clear, structured implementation plan.\n\n            TASK OBJECTIVE:\n{task_text}\n\n            REPOSITORY CONTEXT:\n            Repository Path: {repo_path}\n            Base Revision: {base_revision}{docs_manifest}\n            WORKSPACE PERMISSIONS:\n            You have READ-ONLY workspace access. You can inspect files using read_file.\n            You CANNOT write files. Any write requests will be rejected by the workspace broker.\n\n            INSTRUCTIONS:\n            1. Use read_file with workspace-relative file paths (e.g. docs/README.md) to inspect files.\n               Important: do NOT pass directory paths or root paths to read_file; read_file only reads text files.\n            2. Formulate a concrete step-by-step implementation plan.\n            3. You MUST end your response with a structured JSON plan handoff block inside the exact delimiters:\n            <<<ORBIT_HANDOFF_START>>>\n            {{\n              \"summary\": \"Concise summary of the plan\",\n              \"affected_areas\": [\"area1\", \"area2\"],\n              \"implementation_steps\": [\"step 1\", \"step 2\"],\n              \"expected_files\": [\"docs/file1.md\"],\n              \"risks\": [],\n              \"verification_notes\": [\"verification instructions\"],\n              \"open_questions\": []\n            }}\n            <<<ORBIT_HANDOFF_END>>>\n",
+            "You are the PLANNER role in an Orbit automated software change workflow.\n            Your responsibility is to analyze the task, inspect the repository using read-only tools, and produce a clear, structured implementation plan.\n\n            TASK OBJECTIVE:\n{task_text}\n\n            REPOSITORY CONTEXT:\n            Repository Path: {repo_path}\n            Base Revision: {base_revision}{docs_manifest}\n            WORKSPACE PERMISSIONS:\n            You have READ-ONLY workspace access. You can inspect the repository using:\n            - fs/read_text_file (or read_file): read file content\n            - fs/list_directory: inspect workspace directory entries\n            - fs/find_path: search for files matching patterns\n            - search/grep: regex or text search across files\n            - git/status, git/diff, git/show: inspect git working tree and commit history\n            You CANNOT write or edit files, and CANNOT create terminals.\n\n            INSTRUCTIONS:\n            1. Inspect existing files, search patterns, and repository structure using the read-only tools.\n            2. Formulate a concrete step-by-step implementation plan.\n            3. You MUST end your response with a structured JSON plan handoff block inside the exact delimiters:\n            <<<ORBIT_HANDOFF_START>>>\n            {{\n              \"summary\": \"Concise summary of the plan\",\n              \"affected_areas\": [\"area1\", \"area2\"],\n              \"implementation_steps\": [\"step 1\", \"step 2\"],\n              \"expected_files\": [\"docs/file1.md\"],\n              \"risks\": [],\n              \"verification_notes\": [\"verification instructions\"],\n              \"open_questions\": []\n            }}\n            <<<ORBIT_HANDOFF_END>>>\n",
             repo_path = repo_path.display(),
             base_revision = base_revision,
             task_text = task_text,
@@ -1651,7 +1652,7 @@ fn build_role_prompt(
                 .map(|h| h.structured_payload.to_string())
                 .unwrap_or_else(|| "No prior plan provided.".to_string());
             format!(
-                "You are the IMPLEMENTER role in an Orbit automated software change workflow.\n                Your responsibility is to execute the implementation plan by modifying project files and verifying your work.\n\n                TASK OBJECTIVE:\n{task_text}\n\n                PLANNER SPECIFICATION:\n{plan_summary}\n\n                REPOSITORY CONTEXT:\n                Repository Path: {repo_path}\n                Base Revision: {base_revision}{docs_manifest}\n                WORKSPACE PERMISSIONS:\n                You have READ-WRITE workspace access. You can read files using read_file, create/edit files using write_file, create directories using create_directory, move or rename files and directories using move, delete files using delete_file, and remove directories using delete_directory.\n\n                INSTRUCTIONS:\n                1. Workspace operations:\n                   - read_file: inspect file contents (workspace-relative path, e.g. docs/README.md).\n                   - write_file: create or update file contents (keep each under 64 KiB).\n                   - create_directory: create a directory (e.g. docs/archive).\n                   - move: move or rename a file or directory (e.g. source: docs/old.md, destination: docs/archive/old.md).\n                   - delete_file: delete a single file.\n                   - delete_directory: remove an empty directory (or recursive if specified).\n                   Important: Always use workspace-relative paths. Do NOT pass directory paths to read_file or write_file.\n                2. Implement all required changes and directory reorganization per the planner specification.\n                3. You MUST end your response with a structured JSON implementation handoff block inside the exact delimiters:\n                <<<ORBIT_HANDOFF_START>>>\n                {{\n                  \"summary\": \"Concise summary of changes implemented\",\n                  \"changed_files\": [\"docs/file1.md\"],\n                  \"tests_added_or_modified\": [],\n                  \"exploratory_commands\": [],\n                  \"known_limitations\": [],\n                  \"verification_notes\": [\"self-verification details\"]\n                }}\n                <<<ORBIT_HANDOFF_END>>>\n",
+                "You are the IMPLEMENTER role in an Orbit automated software change workflow.\n                Your responsibility is to execute the implementation plan by modifying project files and verifying your work.\n\n                TASK OBJECTIVE:\n{task_text}\n\n                PLANNER SPECIFICATION:\n{plan_summary}\n\n                REPOSITORY CONTEXT:\n                Repository Path: {repo_path}\n                Base Revision: {base_revision}{docs_manifest}\n                WORKSPACE PERMISSIONS:\n                You have FULL READ-WRITE coding agent workspace access. Tools available to you:\n                - fs/read_text_file: read file contents\n                - fs/write_text_file: write complete file contents\n                - fs/edit_file: perform targeted text replacements (old_text -> new_text, replace_all)\n                - fs/list_directory: list directory contents\n                - fs/find_path: search workspace file paths by pattern\n                - fs/create_directory: create a new directory\n                - fs/move: move or rename files/directories\n                - fs/copy: copy files or directories\n                - fs/delete_file: remove a single file\n                - fs/delete_directory: remove a directory\n                - search/grep: ripgrep workspace code\n                - git/status, git/diff, git/show: inspect git status, diffs, and commits\n                - terminal/create, terminal/output, terminal/wait_for_exit, terminal/kill, terminal/release: run tests or commands\n\n                INSTRUCTIONS:\n                1. Implement all required changes and directory reorganization per the planner specification.\n                2. Use fs/edit_file for surgical modifications and fs/write_text_file for new files.\n                3. You MUST end your response with a structured JSON implementation handoff block inside the exact delimiters:\n                <<<ORBIT_HANDOFF_START>>>\n                {{\n                  \"summary\": \"Concise summary of changes implemented\",\n                  \"changed_files\": [\"docs/file1.md\"],\n                  \"tests_added_or_modified\": [],\n                  \"exploratory_commands\": [],\n                  \"known_limitations\": [],\n                  \"verification_notes\": [\"self-verification details\"]\n                }}\n                <<<ORBIT_HANDOFF_END>>>\n",
                 repo_path = repo_path.display(),
                 base_revision = base_revision,
                 task_text = task_text,
@@ -1679,32 +1680,34 @@ fn build_role_prompt(
     }
 }
 
-struct AcpTurnState<'a> {
-    repo_path: &'a Path,
-    workspace_access: WorkspaceAccess,
-    agent_output: String,
-    tool_calls: u64,
-    tool_successes: u64,
-    tool_failures: u64,
-    tool_counts: BTreeMap<String, u64>,
+pub struct AcpTurnState<'a> {
+    pub repo_path: &'a Path,
+    pub workspace_access: WorkspaceAccess,
+    pub agent_output: String,
+    pub tool_calls: u64,
+    pub tool_successes: u64,
+    pub tool_failures: u64,
+    pub tool_counts: BTreeMap<String, u64>,
+    pub terminals: BTreeMap<String, std::sync::Arc<crate::tool_surface::AgentTerminal>>,
+    pub wf_attempt_id: Option<String>,
+    pub role_exec_id: Option<String>,
+    pub pool: Option<&'a PgPool>,
 }
 
-fn resolve_workspace_path(repo_path: &Path, requested: &str) -> PathBuf {
-    let clean = requested.trim();
-    if let Some(stripped) = clean.strip_prefix("/orbit/home/workspace/") {
-        repo_path.join(stripped)
-    } else if clean == "/orbit/home/workspace" {
-        repo_path.to_path_buf()
-    } else if let Some(stripped) = clean.strip_prefix("/orbit/home/") {
-        repo_path.join(stripped)
-    } else if clean == "/orbit/home" {
-        repo_path.to_path_buf()
-    } else {
-        let p = Path::new(clean);
-        if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            repo_path.join(p)
+impl<'a> AcpTurnState<'a> {
+    pub fn new(repo_path: &'a Path, workspace_access: WorkspaceAccess) -> Self {
+        Self {
+            repo_path,
+            workspace_access,
+            agent_output: String::new(),
+            tool_calls: 0,
+            tool_successes: 0,
+            tool_failures: 0,
+            tool_counts: BTreeMap::new(),
+            terminals: BTreeMap::new(),
+            wf_attempt_id: None,
+            role_exec_id: None,
+            pool: None,
         }
     }
 }
@@ -1732,53 +1735,112 @@ fn extract_text_from_json(val: &serde_json::Value, out: &mut String) {
     }
 }
 
-async fn handle_acp_message(
+pub async fn handle_acp_message(
     wire: &mut Wire,
     state: &mut AcpTurnState<'_>,
     message: serde_json::Value,
 ) -> Result<()> {
     if let Some(method) = message.get("method").and_then(|m| m.as_str()) {
-        match method {
-            "session/update" => {
-                if let Some(params) = message.get("params") {
-                    if let Some(update) = params.get("update") {
-                        extract_text_from_json(update, &mut state.agent_output);
-                    } else {
-                        extract_text_from_json(params, &mut state.agent_output);
-                    }
+        if method == "session/update" {
+            if let Some(params) = message.get("params") {
+                if let Some(update) = params.get("update") {
+                    extract_text_from_json(update, &mut state.agent_output);
+                } else {
+                    extract_text_from_json(params, &mut state.agent_output);
                 }
-                Ok(())
             }
-            "fs/read_text_file" => {
-                let req_id = message
-                    .get("id")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                state.tool_calls += 1;
-                *state.tool_counts.entry("read_file".into()).or_insert(0) += 1;
+            return Ok(());
+        }
 
-                let rel_path_str = message
-                    .get("params")
-                    .and_then(|p| p.get("path"))
-                    .and_then(|p| p.as_str())
-                    .unwrap_or("");
-                let full_path = resolve_workspace_path(state.repo_path, rel_path_str);
+        let req_id = message
+            .get("id")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
 
-                let canonical_repo = match state.repo_path.canonicalize() {
-                    Ok(c) => c,
-                    Err(_) => state.repo_path.to_path_buf(),
-                };
-                let canonical_full = match full_path.canonicalize() {
-                    Ok(c) => c,
-                    Err(_) => full_path.clone(),
-                };
+        let canonical = crate::tool_surface::CanonicalToolName::from_wire(method);
+        let Some(tool) = canonical else {
+            if let Some(id) = message.get("id").cloned() {
+                wire.response_error(
+                    id,
+                    -32601,
+                    &format!("{}: {method}", crate::tool_surface::ERR_UNSUPPORTED_TOOL),
+                )
+                .await?;
+            }
+            return Ok(());
+        };
 
-                if !canonical_full.starts_with(&canonical_repo) {
-                    state.tool_failures += 1;
-                    wire.response_error(req_id, -32603, "access denied: path outside workspace")
+        state.tool_calls += 1;
+        *state
+            .tool_counts
+            .entry(tool.legacy_name().into())
+            .or_insert(0) += 1;
+        *state.tool_counts.entry(tool.as_str().into()).or_insert(0) += 1;
+
+        let meta = crate::tool_surface::ToolMetadata::for_tool(tool);
+        let params = message
+            .get("params")
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
+
+        // Role & workspace access checks
+        if meta.mutating && state.workspace_access == WorkspaceAccess::ReadOnly {
+            state.tool_failures += 1;
+            wire.response_error(
+                req_id,
+                -32603,
+                &format!(
+                    "{}: workspace is read-only",
+                    crate::tool_surface::ERR_READ_ONLY_ROLE
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+
+        // Mutation lock enforcement for mutating operations
+        if meta.requires_mutation_lock
+            && let (Some(pool), Some(att_id), Some(role_id)) =
+                (state.pool, &state.wf_attempt_id, &state.role_exec_id)
+        {
+            let wf_store = WorkflowStore::new(pool.clone());
+            let lock_held = wf_store
+                .check_workspace_mutation_lock(att_id, role_id)
+                .await
+                .unwrap_or(false);
+            if !lock_held {
+                state.tool_failures += 1;
+                wire.response_error(
+                    req_id,
+                    -32603,
+                    crate::tool_surface::ERR_MUTATION_LOCK_REQUIRED,
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+
+        match tool {
+            crate::tool_surface::CanonicalToolName::FsReadTextFile => {
+                let rel_path_str = params.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                let full_path = match crate::fs_tools::confine_path(
+                    state.repo_path,
+                    rel_path_str,
+                    false,
+                    false,
+                ) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        state.tool_failures += 1;
+                        wire.response_error(
+                            req_id,
+                            -32603,
+                            &format!("{}: {e}", crate::tool_surface::ERR_PATH_OUTSIDE_WORKSPACE),
+                        )
                         .await?;
-                    return Ok(());
-                }
+                        return Ok(());
+                    }
+                };
 
                 match tokio::fs::read_to_string(&full_path).await {
                     Ok(content) => {
@@ -1804,66 +1866,29 @@ async fn handle_acp_message(
                         .await?;
                     }
                 }
-                Ok(())
             }
-            "fs/write_text_file" => {
-                let req_id = message
-                    .get("id")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                state.tool_calls += 1;
-                *state.tool_counts.entry("write_file".into()).or_insert(0) += 1;
+            crate::tool_surface::CanonicalToolName::FsWriteTextFile => {
+                let rel_path_str = params.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                let content = params.get("content").and_then(|p| p.as_str()).unwrap_or("");
 
-                if state.workspace_access == WorkspaceAccess::ReadOnly {
-                    state.tool_failures += 1;
-                    wire.response_error(
-                        req_id,
-                        -32603,
-                        "write operation denied: read-only role workspace",
-                    )
-                    .await?;
-                    return Ok(());
-                }
-
-                let rel_path_str = message
-                    .get("params")
-                    .and_then(|p| p.get("path"))
-                    .and_then(|p| p.as_str())
-                    .unwrap_or("");
-                let content = message
-                    .get("params")
-                    .and_then(|p| p.get("content"))
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("");
-
-                let full_path = resolve_workspace_path(state.repo_path, rel_path_str);
-
-                let canonical_repo = match state.repo_path.canonicalize() {
-                    Ok(c) => c,
-                    Err(_) => state.repo_path.to_path_buf(),
-                };
-                let is_safe = match full_path.parent().map(|p| p.canonicalize()) {
-                    Some(Ok(c)) => c.starts_with(&canonical_repo),
-                    _ => {
-                        let mut cur = full_path.parent();
-                        let mut safe = true;
-                        while let Some(p) = cur {
-                            if let Ok(c) = p.canonicalize() {
-                                safe = c.starts_with(&canonical_repo);
-                                break;
-                            }
-                            cur = p.parent();
-                        }
-                        safe
+                let full_path = match crate::fs_tools::confine_path(
+                    state.repo_path,
+                    rel_path_str,
+                    false,
+                    false,
+                ) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        state.tool_failures += 1;
+                        wire.response_error(
+                            req_id,
+                            -32603,
+                            &format!("{}: {e}", crate::tool_surface::ERR_PATH_OUTSIDE_WORKSPACE),
+                        )
+                        .await?;
+                        return Ok(());
                     }
                 };
-
-                if !is_safe {
-                    state.tool_failures += 1;
-                    wire.response_error(req_id, -32603, "access denied: path outside workspace")
-                        .await?;
-                    return Ok(());
-                }
 
                 if let Some(parent) = full_path.parent() {
                     let _ = tokio::fs::create_dir_all(parent).await;
@@ -1880,38 +1905,141 @@ async fn handle_acp_message(
                             .await?;
                     }
                 }
-                Ok(())
             }
-            "fs/create_directory" => {
-                let req_id = message
-                    .get("id")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                state.tool_calls += 1;
-                *state
-                    .tool_counts
-                    .entry("create_directory".into())
-                    .or_insert(0) += 1;
-
-                if state.workspace_access == WorkspaceAccess::ReadOnly {
-                    state.tool_failures += 1;
-                    wire.response_error(
-                        req_id,
-                        -32603,
-                        "write operation denied: read-only role workspace",
-                    )
-                    .await?;
-                    return Ok(());
-                }
-
-                let path_str = message
-                    .get("params")
-                    .and_then(|p| p.get("path"))
+            crate::tool_surface::CanonicalToolName::FsEditFile => {
+                let path_str = params.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                let old_text = params
+                    .get("old_text")
                     .and_then(|p| p.as_str())
                     .unwrap_or("");
-                let recursive = message
-                    .get("params")
-                    .and_then(|p| p.get("recursive"))
+                let new_text = params
+                    .get("new_text")
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("");
+                let replace_all = params
+                    .get("replace_all")
+                    .and_then(|p| p.as_bool())
+                    .unwrap_or(false);
+
+                match crate::tool_surface::edit_file(
+                    state.repo_path,
+                    path_str,
+                    old_text,
+                    new_text,
+                    replace_all,
+                ) {
+                    Ok(res) => {
+                        state.tool_successes += 1;
+                        wire.response_ok(req_id, serde_json::to_value(res)?).await?;
+                    }
+                    Err(e) => {
+                        state.tool_failures += 1;
+                        wire.response_error(req_id, -32603, &e.to_string()).await?;
+                    }
+                }
+            }
+            crate::tool_surface::CanonicalToolName::FsListDirectory => {
+                let path_str = params.get("path").and_then(|p| p.as_str()).unwrap_or(".");
+                let recursive = params
+                    .get("recursive")
+                    .and_then(|p| p.as_bool())
+                    .unwrap_or(false);
+                let max_entries = params
+                    .get("max_entries")
+                    .and_then(|p| p.as_u64())
+                    .unwrap_or(100) as usize;
+                let include_hidden = params
+                    .get("include_hidden")
+                    .and_then(|p| p.as_bool())
+                    .unwrap_or(false);
+
+                match crate::tool_surface::list_directory(
+                    state.repo_path,
+                    path_str,
+                    recursive,
+                    max_entries,
+                    include_hidden,
+                ) {
+                    Ok(res) => {
+                        state.tool_successes += 1;
+                        wire.response_ok(req_id, serde_json::to_value(res)?).await?;
+                    }
+                    Err(e) => {
+                        state.tool_failures += 1;
+                        wire.response_error(req_id, -32603, &e.to_string()).await?;
+                    }
+                }
+            }
+            crate::tool_surface::CanonicalToolName::FsFindPath => {
+                let pattern = params
+                    .get("pattern")
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("*");
+                let path_str = params.get("path").and_then(|p| p.as_str());
+                let max_results = params
+                    .get("max_results")
+                    .and_then(|p| p.as_u64())
+                    .unwrap_or(100) as usize;
+
+                match crate::tool_surface::find_path(
+                    state.repo_path,
+                    path_str,
+                    pattern,
+                    &[],
+                    &[],
+                    max_results,
+                ) {
+                    Ok(res) => {
+                        state.tool_successes += 1;
+                        wire.response_ok(req_id, serde_json::to_value(res)?).await?;
+                    }
+                    Err(e) => {
+                        state.tool_failures += 1;
+                        wire.response_error(req_id, -32603, &e.to_string()).await?;
+                    }
+                }
+            }
+            crate::tool_surface::CanonicalToolName::SearchGrep => {
+                let query = params.get("query").and_then(|p| p.as_str()).unwrap_or("");
+                let path_str = params.get("path").and_then(|p| p.as_str());
+                let case_sensitive = params
+                    .get("case_sensitive")
+                    .and_then(|p| p.as_bool())
+                    .unwrap_or(true);
+                let is_regex = params
+                    .get("is_regex")
+                    .and_then(|p| p.as_bool())
+                    .unwrap_or(false);
+                let max_matches = params
+                    .get("max_matches")
+                    .and_then(|p| p.as_u64())
+                    .unwrap_or(100) as usize;
+
+                match crate::tool_surface::search_grep(
+                    state.repo_path,
+                    path_str,
+                    query,
+                    case_sensitive,
+                    is_regex,
+                    &[],
+                    &[],
+                    max_matches,
+                    0,
+                ) {
+                    Ok(res) => {
+                        state.tool_successes += 1;
+                        wire.response_ok(req_id, serde_json::to_value(res)?).await?;
+                    }
+                    Err(e) => {
+                        state.tool_failures += 1;
+                        wire.response_error(req_id, -32603, &e.to_string()).await?;
+                    }
+                }
+            }
+            crate::tool_surface::CanonicalToolName::FsCreateDirectory => {
+                let path_str = params.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                let recursive = params
+                    .get("recursive")
                     .and_then(|p| p.as_bool())
                     .unwrap_or(true);
 
@@ -1941,35 +2069,11 @@ async fn handle_acp_message(
                         .await?;
                     }
                 }
-                Ok(())
             }
-            "fs/move" => {
-                let req_id = message
-                    .get("id")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                state.tool_calls += 1;
-                *state.tool_counts.entry("move".into()).or_insert(0) += 1;
-
-                if state.workspace_access == WorkspaceAccess::ReadOnly {
-                    state.tool_failures += 1;
-                    wire.response_error(
-                        req_id,
-                        -32603,
-                        "write operation denied: read-only role workspace",
-                    )
-                    .await?;
-                    return Ok(());
-                }
-
-                let source_str = message
-                    .get("params")
-                    .and_then(|p| p.get("source"))
-                    .and_then(|p| p.as_str())
-                    .unwrap_or("");
-                let destination_str = message
-                    .get("params")
-                    .and_then(|p| p.get("destination"))
+            crate::tool_surface::CanonicalToolName::FsMove => {
+                let source_str = params.get("source").and_then(|p| p.as_str()).unwrap_or("");
+                let destination_str = params
+                    .get("destination")
                     .and_then(|p| p.as_str())
                     .unwrap_or("");
 
@@ -1997,32 +2101,36 @@ async fn handle_acp_message(
                         .await?;
                     }
                 }
-                Ok(())
             }
-            "fs/delete_file" => {
-                let req_id = message
-                    .get("id")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                state.tool_calls += 1;
-                *state.tool_counts.entry("delete_file".into()).or_insert(0) += 1;
-
-                if state.workspace_access == WorkspaceAccess::ReadOnly {
-                    state.tool_failures += 1;
-                    wire.response_error(
-                        req_id,
-                        -32603,
-                        "write operation denied: read-only role workspace",
-                    )
-                    .await?;
-                    return Ok(());
-                }
-
-                let path_str = message
-                    .get("params")
-                    .and_then(|p| p.get("path"))
+            crate::tool_surface::CanonicalToolName::FsCopy => {
+                let source_str = params.get("source").and_then(|p| p.as_str()).unwrap_or("");
+                let destination_str = params
+                    .get("destination")
                     .and_then(|p| p.as_str())
                     .unwrap_or("");
+                let recursive = params
+                    .get("recursive")
+                    .and_then(|p| p.as_bool())
+                    .unwrap_or(false);
+
+                match crate::tool_surface::copy_path(
+                    state.repo_path,
+                    source_str,
+                    destination_str,
+                    recursive,
+                ) {
+                    Ok(res) => {
+                        state.tool_successes += 1;
+                        wire.response_ok(req_id, serde_json::to_value(res)?).await?;
+                    }
+                    Err(e) => {
+                        state.tool_failures += 1;
+                        wire.response_error(req_id, -32603, &e.to_string()).await?;
+                    }
+                }
+            }
+            crate::tool_surface::CanonicalToolName::FsDeleteFile => {
+                let path_str = params.get("path").and_then(|p| p.as_str()).unwrap_or("");
 
                 match crate::fs_tools::delete_file(state.repo_path, path_str) {
                     Ok(_) => {
@@ -2050,38 +2158,11 @@ async fn handle_acp_message(
                         .await?;
                     }
                 }
-                Ok(())
             }
-            "fs/delete_directory" => {
-                let req_id = message
-                    .get("id")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                state.tool_calls += 1;
-                *state
-                    .tool_counts
-                    .entry("delete_directory".into())
-                    .or_insert(0) += 1;
-
-                if state.workspace_access == WorkspaceAccess::ReadOnly {
-                    state.tool_failures += 1;
-                    wire.response_error(
-                        req_id,
-                        -32603,
-                        "write operation denied: read-only role workspace",
-                    )
-                    .await?;
-                    return Ok(());
-                }
-
-                let path_str = message
-                    .get("params")
-                    .and_then(|p| p.get("path"))
-                    .and_then(|p| p.as_str())
-                    .unwrap_or("");
-                let recursive = message
-                    .get("params")
-                    .and_then(|p| p.get("recursive"))
+            crate::tool_surface::CanonicalToolName::FsDeleteDirectory => {
+                let path_str = params.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                let recursive = params
+                    .get("recursive")
                     .and_then(|p| p.as_bool())
                     .unwrap_or(false);
 
@@ -2111,16 +2192,219 @@ async fn handle_acp_message(
                         .await?;
                     }
                 }
-                Ok(())
             }
-            other => {
-                if let Some(id) = message.get("id").cloned() {
-                    wire.response_error(id, -32601, &format!("unsupported ACP method: {other}"))
+            crate::tool_surface::CanonicalToolName::GitStatus => {
+                let path_str = params.get("path").and_then(|p| p.as_str());
+
+                match crate::tool_surface::git_status(state.repo_path, path_str).await {
+                    Ok(res) => {
+                        state.tool_successes += 1;
+                        wire.response_ok(req_id, serde_json::to_value(res)?).await?;
+                    }
+                    Err(e) => {
+                        state.tool_failures += 1;
+                        wire.response_error(req_id, -32603, &e.to_string()).await?;
+                    }
+                }
+            }
+            crate::tool_surface::CanonicalToolName::GitDiff => {
+                let base = params.get("base").and_then(|p| p.as_str());
+                let path_str = params.get("path").and_then(|p| p.as_str());
+                let stat_only = params
+                    .get("stat_only")
+                    .and_then(|p| p.as_bool())
+                    .unwrap_or(false);
+                let context_lines = params
+                    .get("context_lines")
+                    .and_then(|p| p.as_u64())
+                    .map(|v| v as u32);
+
+                match crate::tool_surface::git_diff(
+                    state.repo_path,
+                    base,
+                    path_str,
+                    context_lines,
+                    stat_only,
+                    65536,
+                )
+                .await
+                {
+                    Ok(res) => {
+                        state.tool_successes += 1;
+                        wire.response_ok(req_id, serde_json::to_value(res)?).await?;
+                    }
+                    Err(e) => {
+                        state.tool_failures += 1;
+                        wire.response_error(req_id, -32603, &e.to_string()).await?;
+                    }
+                }
+            }
+            crate::tool_surface::CanonicalToolName::GitShow => {
+                let revision = params
+                    .get("revision")
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("HEAD");
+                let path_str = params.get("path").and_then(|p| p.as_str());
+
+                match crate::tool_surface::git_show(state.repo_path, revision, path_str, 65536)
+                    .await
+                {
+                    Ok(res) => {
+                        state.tool_successes += 1;
+                        wire.response_ok(req_id, serde_json::to_value(res)?).await?;
+                    }
+                    Err(e) => {
+                        state.tool_failures += 1;
+                        wire.response_error(req_id, -32603, &e.to_string()).await?;
+                    }
+                }
+            }
+            crate::tool_surface::CanonicalToolName::TerminalCreate => {
+                let raw_cmd = params
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("sh");
+                let cwd_str = params.get("cwd").and_then(|v| v.as_str()).unwrap_or(".");
+                let cwd = match crate::fs_tools::confine_path(state.repo_path, cwd_str, true, true)
+                {
+                    Ok(p) => p,
+                    Err(e) => {
+                        state.tool_failures += 1;
+                        wire.response_error(
+                            req_id,
+                            -32603,
+                            &format!("{}: {e}", crate::tool_surface::ERR_PATH_OUTSIDE_WORKSPACE),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
+                let (cmd_bin, cmd_args) =
+                    if let Some(arr) = params.get("args").and_then(|v| v.as_array()) {
+                        let mut v = Vec::new();
+                        for a in arr {
+                            if let Some(s) = a.as_str() {
+                                v.push(s.to_string());
+                            }
+                        }
+                        (raw_cmd.to_string(), v)
+                    } else {
+                        (
+                            "sh".to_string(),
+                            vec!["-c".to_string(), raw_cmd.to_string()],
+                        )
+                    };
+                let output_byte_limit = params
+                    .get("output_byte_limit")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(65536)
+                    .min(65536) as usize;
+                match crate::tool_surface::AgentTerminal::spawn(
+                    &cwd,
+                    &cmd_bin,
+                    &cmd_args,
+                    output_byte_limit,
+                ) {
+                    Ok(term) => {
+                        let tid = format!("term-{}", crate::model::id());
+                        state
+                            .terminals
+                            .insert(tid.clone(), std::sync::Arc::new(term));
+                        state.tool_successes += 1;
+                        wire.response_ok(req_id, serde_json::json!({ "terminalId": tid }))
+                            .await?;
+                    }
+                    Err(e) => {
+                        state.tool_failures += 1;
+                        wire.response_error(req_id, -32603, &e.to_string()).await?;
+                    }
+                }
+            }
+            crate::tool_surface::CanonicalToolName::TerminalOutput => {
+                let tid = params
+                    .get("terminalId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if let Some(term) = state.terminals.get(tid) {
+                    let out = term.output();
+                    let exit_status = out.exit_code.map(|c| serde_json::json!({ "exitCode": c }));
+                    state.tool_successes += 1;
+                    wire.response_ok(
+                        req_id,
+                        serde_json::json!({
+                            "output": out.text(),
+                            "truncated": out.truncated,
+                            "exitStatus": exit_status,
+                        }),
+                    )
+                    .await?;
+                } else {
+                    state.tool_failures += 1;
+                    wire.response_error(req_id, -32603, crate::tool_surface::ERR_PROCESS_NOT_FOUND)
                         .await?;
                 }
-                Ok(())
+            }
+            crate::tool_surface::CanonicalToolName::TerminalWaitForExit => {
+                let tid = params
+                    .get("terminalId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let term_opt = state.terminals.get(tid).cloned();
+                if let Some(term) = term_opt {
+                    match term.wait_for_exit(Duration::from_secs(300)).await {
+                        Ok(code) => {
+                            state.tool_successes += 1;
+                            wire.response_ok(
+                                req_id,
+                                serde_json::json!({
+                                    "exitStatus": { "exitCode": code }
+                                }),
+                            )
+                            .await?;
+                        }
+                        Err(e) => {
+                            state.tool_failures += 1;
+                            wire.response_error(req_id, -32603, &e.to_string()).await?;
+                        }
+                    }
+                } else {
+                    state.tool_failures += 1;
+                    wire.response_error(req_id, -32603, crate::tool_surface::ERR_PROCESS_NOT_FOUND)
+                        .await?;
+                }
+            }
+            crate::tool_surface::CanonicalToolName::TerminalKill => {
+                let tid = params
+                    .get("terminalId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if let Some(term) = state.terminals.get(tid) {
+                    let _ = term.kill().await;
+                    state.tool_successes += 1;
+                    wire.response_ok(req_id, serde_json::json!({})).await?;
+                } else {
+                    state.tool_failures += 1;
+                    wire.response_error(req_id, -32603, crate::tool_surface::ERR_PROCESS_NOT_FOUND)
+                        .await?;
+                }
+            }
+            crate::tool_surface::CanonicalToolName::TerminalRelease => {
+                let tid = params
+                    .get("terminalId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if let Some(term) = state.terminals.remove(tid) {
+                    let _ = term.kill().await;
+                    state.tool_successes += 1;
+                    wire.response_ok(req_id, serde_json::json!({})).await?;
+                } else {
+                    state.tool_failures += 1;
+                    wire.response_error(req_id, -32603, crate::tool_surface::ERR_PROCESS_NOT_FOUND)
+                        .await?;
+                }
             }
         }
+        Ok(())
     } else {
         Ok(())
     }
@@ -2456,6 +2740,10 @@ async fn execute_real_acp_turn(
         tool_successes: 0,
         tool_failures: 0,
         tool_counts: BTreeMap::new(),
+        terminals: BTreeMap::new(),
+        wf_attempt_id: Some(wf_run.attempt_id.clone()),
+        role_exec_id: Some(role_exec.id.clone()),
+        pool: Some(pool),
     };
 
     let _init_res = acp_call(
@@ -2471,9 +2759,25 @@ async fn execute_real_acp_turn(
             "clientCapabilities": {
                 "fs": {
                     "readTextFile": true,
-                    "writeTextFile": role.workspace_access == WorkspaceAccess::ReadWrite
+                    "writeTextFile": role.workspace_access == WorkspaceAccess::ReadWrite,
+                    "listDirectory": true,
+                    "findPath": true,
+                    "editFile": role.workspace_access == WorkspaceAccess::ReadWrite,
+                    "copy": role.workspace_access == WorkspaceAccess::ReadWrite,
+                    "createDirectory": role.workspace_access == WorkspaceAccess::ReadWrite,
+                    "move": role.workspace_access == WorkspaceAccess::ReadWrite,
+                    "deleteFile": role.workspace_access == WorkspaceAccess::ReadWrite,
+                    "deleteDirectory": role.workspace_access == WorkspaceAccess::ReadWrite
                 },
-                "terminal": false
+                "search": {
+                    "grep": true
+                },
+                "git": {
+                    "status": true,
+                    "diff": true,
+                    "show": true
+                },
+                "terminal": role.workspace_access == WorkspaceAccess::ReadWrite
             }
         }),
     )
@@ -2561,6 +2865,10 @@ async fn execute_real_acp_turn(
     drop(wire);
     let status = child.wait().await?;
     let exit_code = status.code().unwrap_or(0);
+    for (_tid, term) in std::mem::take(&mut state.terminals) {
+        let _ = term.kill().await;
+    }
+
     let finished_at_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
 
     let store = WorkflowStore::new(pool.clone());
@@ -2718,15 +3026,7 @@ mod tests {
         let repo_path = repo.path();
         let (mut server_wire, mut client_wire) = make_test_wire();
 
-        let mut state = AcpTurnState {
-            repo_path,
-            workspace_access: WorkspaceAccess::ReadWrite,
-            agent_output: String::new(),
-            tool_calls: 0,
-            tool_successes: 0,
-            tool_failures: 0,
-            tool_counts: BTreeMap::new(),
-        };
+        let mut state = AcpTurnState::new(repo_path, WorkspaceAccess::ReadWrite);
 
         // 1. Create directory
         let msg = serde_json::json!({
@@ -2808,15 +3108,7 @@ mod tests {
         let repo_path = repo.path();
         let (mut server_wire, mut client_wire) = make_test_wire();
 
-        let mut state = AcpTurnState {
-            repo_path,
-            workspace_access: WorkspaceAccess::ReadOnly,
-            agent_output: String::new(),
-            tool_calls: 0,
-            tool_successes: 0,
-            tool_failures: 0,
-            tool_counts: BTreeMap::new(),
-        };
+        let mut state = AcpTurnState::new(repo_path, WorkspaceAccess::ReadOnly);
 
         // Try mutation under ReadOnly
         let methods = [

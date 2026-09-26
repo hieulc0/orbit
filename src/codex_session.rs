@@ -290,6 +290,148 @@ impl crate::codex_bridge::OrbitAcpClient for Client {
                 .to_string())
         }
     }
+
+    async fn list_directory(&self, path: &Path, recursive: bool) -> Result<String> {
+        let res: serde_json::Value = self
+            .call(
+                "fs/list_directory",
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "recursive": recursive,
+                }),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("ACP list_directory failed: {e}"))?;
+        Ok(serde_json::to_string_pretty(&res).unwrap_or_else(|_| "[]".into()))
+    }
+
+    async fn find_path(&self, pattern: &str, path: Option<&Path>) -> Result<String> {
+        let res: serde_json::Value = self
+            .call(
+                "fs/find_path",
+                serde_json::json!({
+                    "pattern": pattern,
+                    "path": path.map(|p| p.to_string_lossy().to_string()),
+                }),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("ACP find_path failed: {e}"))?;
+        Ok(serde_json::to_string_pretty(&res).unwrap_or_else(|_| "[]".into()))
+    }
+
+    async fn grep(&self, query: &str, path: Option<&Path>, case_sensitive: bool) -> Result<String> {
+        let res: serde_json::Value = self
+            .call(
+                "search/grep",
+                serde_json::json!({
+                    "query": query,
+                    "path": path.map(|p| p.to_string_lossy().to_string()),
+                    "case_sensitive": case_sensitive,
+                }),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("ACP grep failed: {e}"))?;
+        Ok(serde_json::to_string_pretty(&res).unwrap_or_else(|_| "[]".into()))
+    }
+
+    async fn edit_file(
+        &self,
+        path: &Path,
+        old_text: &str,
+        new_text: &str,
+        replace_all: bool,
+    ) -> Result<String> {
+        let res: serde_json::Value = self
+            .call(
+                "fs/edit_file",
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "old_text": old_text,
+                    "new_text": new_text,
+                    "replace_all": replace_all,
+                }),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("ACP edit_file failed: {e}"))?;
+        if let Some(err) = res.get("error").and_then(|e| e.as_str()) {
+            Ok(format!("Error: {err}"))
+        } else {
+            Ok("File edited successfully.".into())
+        }
+    }
+
+    async fn copy_path(
+        &self,
+        source: &Path,
+        destination: &Path,
+        recursive: bool,
+    ) -> Result<String> {
+        let res: serde_json::Value = self
+            .call(
+                "fs/copy",
+                serde_json::json!({
+                    "source": source.to_string_lossy(),
+                    "destination": destination.to_string_lossy(),
+                    "recursive": recursive,
+                }),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("ACP copy failed: {e}"))?;
+        if let Some(err) = res.get("error").and_then(|e| e.as_str()) {
+            Ok(format!("Error: {err}"))
+        } else {
+            Ok("Copied successfully.".into())
+        }
+    }
+
+    async fn git_status(&self, path: Option<&Path>) -> Result<String> {
+        let res: serde_json::Value = self
+            .call(
+                "git/status",
+                serde_json::json!({
+                    "path": path.map(|p| p.to_string_lossy().to_string()),
+                }),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("ACP git_status failed: {e}"))?;
+        Ok(serde_json::to_string_pretty(&res).unwrap_or_else(|_| "{}".into()))
+    }
+
+    async fn git_diff(&self, base: Option<&str>, path: Option<&Path>) -> Result<String> {
+        let res: serde_json::Value = self
+            .call(
+                "git/diff",
+                serde_json::json!({
+                    "base": base,
+                    "path": path.map(|p| p.to_string_lossy().to_string()),
+                }),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("ACP git_diff failed: {e}"))?;
+        if let Some(diff) = res.get("diff").and_then(|d| d.as_str()) {
+            Ok(diff.to_string())
+        } else {
+            Ok(serde_json::to_string_pretty(&res).unwrap_or_default())
+        }
+    }
+
+    async fn git_show(&self, revision: &str, path: Option<&Path>) -> Result<String> {
+        let res: serde_json::Value = self
+            .call(
+                "git/show",
+                serde_json::json!({
+                    "revision": revision,
+                    "path": path.map(|p| p.to_string_lossy().to_string()),
+                }),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("ACP git_show failed: {e}"))?;
+        if let Some(content) = res.get("content").and_then(|c| c.as_str()) {
+            Ok(content.to_string())
+        } else {
+            Ok(serde_json::to_string_pretty(&res).unwrap_or_default())
+        }
+    }
 }
 
 async fn control(

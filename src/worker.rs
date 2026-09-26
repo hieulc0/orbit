@@ -1,8 +1,23 @@
 pub fn current_executable() -> Result<std::path::PathBuf> {
+    if let Ok(bin) = std::env::var("ORBIT_BIN") {
+        let p = std::path::PathBuf::from(bin);
+        if p.exists() {
+            return Ok(p);
+        }
+    }
     let mut exe = std::env::current_exe()?;
     let s = exe.to_string_lossy();
     if let Some(stripped) = s.strip_suffix(" (deleted)") {
         exe = std::path::PathBuf::from(stripped);
+    }
+    if exe.to_string_lossy().contains("/deps/")
+        && let Some(cand) = exe
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("orbit"))
+        && cand.exists()
+    {
+        return Ok(cand);
     }
     Ok(exe)
 }

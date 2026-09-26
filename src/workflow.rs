@@ -952,6 +952,22 @@ impl WorkflowStore {
         Ok(())
     }
 
+    /// Check if the active workspace mutation lock is held by .
+    pub async fn check_workspace_mutation_lock(
+        &self,
+        attempt_id: &str,
+        role_execution_id: &str,
+    ) -> Result<bool> {
+        let row = sqlx::query_scalar::<_, String>(
+            "SELECT holder_role_execution_id FROM orbit_attempt_workspace_locks WHERE attempt_id = $1",
+        )
+        .bind(attempt_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.as_deref() == Some(role_execution_id))
+    }
+
     /// Create and persist a new RoleExecution.
     pub async fn create_role_execution(
         &self,
