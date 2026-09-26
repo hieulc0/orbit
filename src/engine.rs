@@ -92,6 +92,9 @@ impl Engine {
         sqlx::raw_sql(include_str!("../migrations/0017_verification_policy.sql"))
             .execute(&mut *migration)
             .await?;
+        sqlx::raw_sql(include_str!("../migrations/0018_role_agents_workflow.sql"))
+            .execute(&mut *migration)
+            .await?;
         migration.commit().await?;
         Ok(Self {
             pool,

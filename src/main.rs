@@ -249,12 +249,59 @@ enum VerificationAction {
     },
 }
 
+#[derive(Args)]
+struct WorkflowArgs {
+    #[command(subcommand)]
+    action: WorkflowAction,
+}
+
+#[derive(Subcommand)]
+enum WorkflowAction {
+    /// Start a new workflow run for a task and attempt.
+    Start {
+        task_id: String,
+        attempt_id: String,
+        #[arg(long, default_value = "software-change")]
+        kind: String,
+        #[arg(long, default_value = "3")]
+        max_iterations: u32,
+        /// Optional path to verification policy file
+        #[arg(long)]
+        policy: Option<PathBuf>,
+        #[arg(long, env = "ORBIT_DATABASE_URL_FILE", hide_env_values = true)]
+        database_url_file: Option<PathBuf>,
+    },
+    /// Show a workflow run and its role execution stages.
+    Show {
+        workflow_run_id: String,
+        #[arg(long, env = "ORBIT_DATABASE_URL_FILE", hide_env_values = true)]
+        database_url_file: Option<PathBuf>,
+    },
+    /// List workflow runs, optionally filtered by attempt.
+    List {
+        #[arg(long)]
+        attempt: Option<String>,
+        #[arg(long, env = "ORBIT_DATABASE_URL_FILE", hide_env_values = true)]
+        database_url_file: Option<PathBuf>,
+    },
+    /// Cancel an active workflow run.
+    Cancel {
+        workflow_run_id: String,
+        #[arg(long, default_value = "cancelled by operator")]
+        reason: String,
+        #[arg(long, env = "ORBIT_DATABASE_URL_FILE", hide_env_values = true)]
+        database_url_file: Option<PathBuf>,
+    },
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Operator credential registry and enrollment.
     Credential(CredentialArgs),
     /// Execute or inspect isolated verification evidence.
     Verification(VerificationArgs),
+    /// Manage and inspect verified multi-role workflow runs.
+    Workflow(WorkflowArgs),
     /// Validate an operator-owned ACP launch policy and print its canonical digest.
     AcpLaunchDigest {
         #[arg(long)]
@@ -1193,6 +1240,138 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
+    if let Commands::Workflow(WorkflowArgs { action }) = &cli.command {
+        match action {
+            WorkflowAction::Start {
+                task_id,
+                attempt_id,
+                kind: _,
+                max_iterations,
+                policy,
+                database_url_file,
+            } => {
+                let database_url = read_private_database_url(database_url_file.as_deref()).await?;
+                let (engine, scratch) =
+                    connect_durable_catalog_engine(database_url.as_str()).await?;
+                let store = orbit::workflow::WorkflowStore::new(engine.pool.clone());
+
+                let policy_def = if let Some(pol_path) = policy {
+                    let data = tokio::fs::read_to_string(pol_path)
+                        .await
+                        .context("reading verification policy file")?;
+                    let p: orbit::verification::VerificationPolicy =
+                        serde_json::from_str(&data).context("parsing verification policy")?;
+                    p.validate()?;
+                    store.verification_store().save_policy(&p).await?;
+                    Some(p)
+                } else {
+                    None
+                };
+
+                let wf = store
+                    .create_workflow_run(task_id, attempt_id, *max_iterations, policy_def.as_ref())
+                    .await?;
+
+                match output_format {
+                    Output::Text => {
+                        println!("{}", orbit::workflow::format_workflow_show(&wf, &[]));
+                    }
+                    Output::Json => println!("{}", serde_json::to_string_pretty(&wf)?),
+                    Output::Jsonl => println!("{}", serde_json::to_string(&wf)?),
+                }
+                engine.pool.close().await;
+                drop(scratch);
+                return Ok(());
+            }
+            WorkflowAction::Show {
+                workflow_run_id,
+                database_url_file,
+            } => {
+                let database_url = read_private_database_url(database_url_file.as_deref()).await?;
+                let (engine, scratch) =
+                    connect_durable_catalog_engine(database_url.as_str()).await?;
+                let store = orbit::workflow::WorkflowStore::new(engine.pool.clone());
+                let wf = store
+                    .get_workflow_run(workflow_run_id)
+                    .await?
+                    .context("workflow run not found")?;
+                let roles = store.list_role_executions(workflow_run_id).await?;
+
+                match output_format {
+                    Output::Text => {
+                        println!("{}", orbit::workflow::format_workflow_show(&wf, &roles));
+                    }
+                    Output::Json => println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "workflow": wf,
+                            "role_executions": roles,
+                        }))?
+                    ),
+                    Output::Jsonl => println!(
+                        "{}",
+                        serde_json::to_string(&serde_json::json!({
+                            "workflow": wf,
+                            "role_executions": roles,
+                        }))?
+                    ),
+                }
+                engine.pool.close().await;
+                drop(scratch);
+                return Ok(());
+            }
+            WorkflowAction::List {
+                attempt,
+                database_url_file,
+            } => {
+                let database_url = read_private_database_url(database_url_file.as_deref()).await?;
+                let (engine, scratch) =
+                    connect_durable_catalog_engine(database_url.as_str()).await?;
+                let store = orbit::workflow::WorkflowStore::new(engine.pool.clone());
+                let list = store.list_workflow_runs(attempt.as_deref()).await?;
+
+                match output_format {
+                    Output::Json | Output::Text => {
+                        println!("{}", serde_json::to_string_pretty(&list)?);
+                    }
+                    Output::Jsonl => println!("{}", serde_json::to_string(&list)?),
+                }
+                engine.pool.close().await;
+                drop(scratch);
+                return Ok(());
+            }
+            WorkflowAction::Cancel {
+                workflow_run_id,
+                reason,
+                database_url_file,
+            } => {
+                let database_url = read_private_database_url(database_url_file.as_deref()).await?;
+                let (engine, scratch) =
+                    connect_durable_catalog_engine(database_url.as_str()).await?;
+                let store = orbit::workflow::WorkflowStore::new(engine.pool.clone());
+                let cancelled = store
+                    .transition_workflow_stage(
+                        workflow_run_id,
+                        orbit::workflow::WorkflowStage::Cancelled,
+                        None,
+                        None,
+                        Some(reason),
+                    )
+                    .await?;
+
+                match output_format {
+                    Output::Text => {
+                        println!("Workflow {} CANCELLED: {}", cancelled.id, reason);
+                    }
+                    Output::Json => println!("{}", serde_json::to_string_pretty(&cancelled)?),
+                    Output::Jsonl => println!("{}", serde_json::to_string(&cancelled)?),
+                }
+                engine.pool.close().await;
+                drop(scratch);
+                return Ok(());
+            }
+        }
+    }
     if let Commands::Verification(VerificationArgs { action }) = &cli.command {
         match action {
             VerificationAction::Run {
@@ -2034,6 +2213,9 @@ async fn main() -> Result<()> {
     let value = match cli.command {
         Commands::Verification(_) => {
             unreachable!("local verification handled before API credential resolution")
+        }
+        Commands::Workflow(_) => {
+            unreachable!("local workflow handled before API credential resolution")
         }
         Commands::Credential(args) => match args.action {
             CredentialAction::Add { .. } => {

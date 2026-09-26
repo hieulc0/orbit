@@ -42,4 +42,5 @@ pub mod secret_backend;
 pub mod telemetry;
 pub mod verification;
 pub mod worker;
+pub mod workflow;
 pub mod workspace;
