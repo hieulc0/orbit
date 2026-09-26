@@ -46,4 +46,5 @@ pub mod telemetry;
 pub mod verification;
 pub mod worker;
 pub mod workflow;
+pub mod workflow_coordinator;
 pub mod workspace;

@@ -310,6 +310,17 @@ pub struct CredentialView {
     pub updated_at_ms: i64,
 }
 
+impl CredentialView {
+    pub fn identity(&self) -> CredentialIdentity {
+        CredentialIdentity {
+            provider: self.provider.clone(),
+            reference: self.reference.clone(),
+            generation: self.generation.to_string(),
+            catalog_id: Some(self.id.clone()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct RepresentationView {
     pub id: String,

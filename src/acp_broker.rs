@@ -108,6 +108,7 @@ pub struct Broker<'a> {
     pub log: Vec<u8>,
     pub output_bytes: u64,
     pub reported_tools: u32,
+    pub agent_output: String,
     /// Resolved callbacks (including rejections and terminal suboperations),
     /// not accepted effect reservations. Successes + failures == calls.
     pub tool_calls: u64,
@@ -141,6 +142,7 @@ impl<'a> Broker<'a> {
             log: vec![],
             output_bytes: 0,
             reported_tools: 0,
+            agent_output: String::new(),
             tool_calls: 0,
             tool_successes: 0,
             tool_failures: 0,
@@ -501,6 +503,18 @@ impl<'a> Broker<'a> {
                 }
                 tools = 1;
             }
+            if kind == "agent_message_chunk" {
+                let chunk_text = update
+                    .get("content")
+                    .and_then(|c| c.get("text"))
+                    .and_then(|t| t.as_str())
+                    .or_else(|| update.get("text").and_then(|t| t.as_str()));
+                if let Some(text) =
+                    chunk_text.filter(|t| self.agent_output.len() + t.len() <= 512 * 1024)
+                {
+                    self.agent_output.push_str(text);
+                }
+            }
             // Persist counts and digests only, never raw thoughts/auth/provider data.
             self.record(
                 RecordKind::Update,
@@ -540,6 +554,23 @@ impl<'a> Broker<'a> {
                 } else {
                     "write_file"
                 };
+                if tool == "write_file" {
+                    let write_allowed = self
+                        .session
+                        .assignment
+                        .plan
+                        .definition
+                        .steps
+                        .get(&self.session.assignment.step)
+                        .and_then(|s| s.agent.as_ref())
+                        .is_some_and(|a| a.tools.contains(&"write_file".to_string()));
+                    if !write_allowed {
+                        return Err(BrokerError::recoverable(
+                            -32603,
+                            "write operation denied: read-only role workspace",
+                        ));
+                    }
+                }
                 let path = match self.path(&params["path"]) {
                     Ok(p) => p,
                     Err(err) => {

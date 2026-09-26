@@ -106,6 +106,11 @@ impl Engine {
         sqlx::raw_sql(include_str!("../migrations/0021_regression_strategy.sql"))
             .execute(&mut *migration)
             .await?;
+        sqlx::raw_sql(include_str!(
+            "../migrations/0022_workflow_orchestration.sql"
+        ))
+        .execute(&mut *migration)
+        .await?;
         migration.commit().await?;
         Ok(Self {
             pool,

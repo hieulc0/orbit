@@ -113,6 +113,18 @@ pub struct WorkflowRun {
     pub regression_policy_version: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub regression_policy_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_policy_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_policy_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_policy_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_revision: Option<String>,
     pub failure_reason: Option<String>,
     pub cancellation_reason: Option<String>,
     pub started_at_ms: i64,
@@ -314,6 +326,9 @@ impl HandoffType {
     }
 }
 
+pub const ORBIT_HANDOFF_START: &str = "<<<ORBIT_HANDOFF_START>>>";
+pub const ORBIT_HANDOFF_END: &str = "<<<ORBIT_HANDOFF_END>>>";
+
 /// Structured plan handoff payload.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanHandoff {
@@ -377,6 +392,78 @@ pub struct FailureEvidenceHandoff {
     pub stderr_previews: BTreeMap<String, String>,
 }
 
+impl PlanHandoff {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.summary.trim().is_empty(),
+            "PlanHandoff summary must not be empty"
+        );
+        ensure!(
+            !self.implementation_steps.is_empty(),
+            "PlanHandoff must contain implementation steps"
+        );
+        Ok(())
+    }
+}
+
+impl ImplementationHandoff {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.summary.trim().is_empty(),
+            "ImplementationHandoff summary must not be empty"
+        );
+        Ok(())
+    }
+}
+
+impl ReviewDecision {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.summary.trim().is_empty(),
+            "ReviewDecision summary must not be empty"
+        );
+        Ok(())
+    }
+}
+
+pub fn extract_structured_envelope<T: serde::de::DeserializeOwned>(
+    raw_output: &str,
+    expected_schema: &str,
+) -> Result<T> {
+    let json_str = if let Some(start_idx) = raw_output.find(ORBIT_HANDOFF_START) {
+        let after_start = &raw_output[start_idx + ORBIT_HANDOFF_START.len()..];
+        if let Some(end_idx) = after_start.find(ORBIT_HANDOFF_END) {
+            after_start[..end_idx].trim()
+        } else {
+            bail!(
+                "ROLE_OUTPUT_INVALID: missing end delimiter {} for schema {}",
+                ORBIT_HANDOFF_END,
+                expected_schema
+            );
+        }
+    } else {
+        let trimmed = raw_output.trim();
+        if (trimmed.starts_with("{") && trimmed.ends_with("}"))
+            || (trimmed.starts_with("[") && trimmed.ends_with("]"))
+        {
+            trimmed
+        } else {
+            bail!(
+                "ROLE_OUTPUT_INVALID: expected envelope {} not found in agent output for schema {}",
+                ORBIT_HANDOFF_START,
+                expected_schema
+            );
+        }
+    };
+
+    serde_json::from_str::<T>(json_str).map_err(|e| {
+        anyhow::anyhow!(
+            "ROLE_OUTPUT_INVALID: failed to deserialize payload as {}: {e}",
+            expected_schema
+        )
+    })
+}
+
 /// Durable handoff artifact record.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HandoffArtifact {
@@ -435,6 +522,33 @@ impl WorkflowStore {
         policy: Option<&VerificationPolicy>,
         regression_policy: Option<&crate::regression_strategy::RegressionPolicy>,
     ) -> Result<WorkflowRun> {
+        self.create_workflow_run_full(
+            task_id,
+            attempt_id,
+            max_iterations,
+            policy,
+            regression_policy,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_workflow_run_full(
+        &self,
+        task_id: &str,
+        attempt_id: &str,
+        max_iterations: u32,
+        policy: Option<&VerificationPolicy>,
+        regression_policy: Option<&crate::regression_strategy::RegressionPolicy>,
+        selection_policy: Option<&crate::regression_strategy::SelectionPolicy>,
+        task_prompt: Option<&str>,
+        repository_path: Option<&str>,
+        base_revision: Option<&str>,
+    ) -> Result<WorkflowRun> {
         let wf_id = format!("wf-{}", id());
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
@@ -448,6 +562,10 @@ impl WorkflowStore {
         let reg_ver = regression_policy.map(|r| r.version as i32);
         let reg_dig = regression_policy.map(|r| r.digest());
 
+        let sel_id = selection_policy.map(|s| s.id.clone());
+        let sel_ver = selection_policy.map(|s| s.version as i32);
+        let sel_dig = selection_policy.map(|s| s.digest());
+
         sqlx::query(
             r#"
             INSERT INTO orbit_workflow_runs (
@@ -455,8 +573,10 @@ impl WorkflowStore {
                 status, current_stage, iteration, max_iterations,
                 verification_policy_id, verification_policy_version, verification_policy_digest,
                 regression_policy_id, regression_policy_version, regression_policy_digest,
+                selection_policy_id, selection_policy_version, selection_policy_digest,
+                task_prompt, repository_path, base_revision,
                 started_at_ms
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
             "#,
         )
         .bind(&wf_id)
@@ -474,6 +594,12 @@ impl WorkflowStore {
         .bind(reg_id.as_deref())
         .bind(reg_ver)
         .bind(reg_dig.as_deref())
+        .bind(sel_id.as_deref())
+        .bind(sel_ver)
+        .bind(sel_dig.as_deref())
+        .bind(task_prompt)
+        .bind(repository_path)
+        .bind(base_revision)
         .bind(now_ms)
         .execute(&self.pool)
         .await
@@ -492,6 +618,8 @@ impl WorkflowStore {
                    current_workspace_state_id, verification_policy_id,
                    verification_policy_version, verification_policy_digest,
                    regression_policy_id, regression_policy_version, regression_policy_digest,
+                   selection_policy_id, selection_policy_version, selection_policy_digest,
+                   task_prompt, repository_path, base_revision,
                    failure_reason, cancellation_reason, started_at_ms, finished_at_ms
             FROM orbit_workflow_runs WHERE id = $1
             "#,
@@ -506,6 +634,7 @@ impl WorkflowStore {
         let status = WorkflowStage::from_str_strict(&status_str)?;
         let pol_ver: Option<i32> = r.get("verification_policy_version");
         let reg_ver: Option<i32> = r.get("regression_policy_version");
+        let sel_ver: Option<i32> = r.try_get("selection_policy_version").ok().flatten();
 
         Ok(Some(WorkflowRun {
             id: r.get("id"),
@@ -524,6 +653,12 @@ impl WorkflowStore {
             regression_policy_id: r.get("regression_policy_id"),
             regression_policy_version: reg_ver.map(|v| v as u32),
             regression_policy_digest: r.get("regression_policy_digest"),
+            selection_policy_id: r.try_get("selection_policy_id").ok().flatten(),
+            selection_policy_version: sel_ver.map(|v| v as u32),
+            selection_policy_digest: r.try_get("selection_policy_digest").ok().flatten(),
+            task_prompt: r.try_get("task_prompt").ok().flatten(),
+            repository_path: r.try_get("repository_path").ok().flatten(),
+            base_revision: r.try_get("base_revision").ok().flatten(),
             failure_reason: r.get("failure_reason"),
             cancellation_reason: r.get("cancellation_reason"),
             started_at_ms: r.get("started_at_ms"),
@@ -540,6 +675,8 @@ impl WorkflowStore {
                        current_workspace_state_id, verification_policy_id,
                        verification_policy_version, verification_policy_digest,
                        regression_policy_id, regression_policy_version, regression_policy_digest,
+                       selection_policy_id, selection_policy_version, selection_policy_digest,
+                       task_prompt, repository_path, base_revision,
                        failure_reason, cancellation_reason, started_at_ms, finished_at_ms
                 FROM orbit_workflow_runs WHERE attempt_id = $1 ORDER BY created_at DESC
                 "#,
@@ -555,6 +692,8 @@ impl WorkflowStore {
                        current_workspace_state_id, verification_policy_id,
                        verification_policy_version, verification_policy_digest,
                        regression_policy_id, regression_policy_version, regression_policy_digest,
+                       selection_policy_id, selection_policy_version, selection_policy_digest,
+                       task_prompt, repository_path, base_revision,
                        failure_reason, cancellation_reason, started_at_ms, finished_at_ms
                 FROM orbit_workflow_runs ORDER BY created_at DESC
                 "#,
@@ -569,6 +708,7 @@ impl WorkflowStore {
             let status = WorkflowStage::from_str_strict(&status_str)?;
             let pol_ver: Option<i32> = r.get("verification_policy_version");
             let reg_ver: Option<i32> = r.get("regression_policy_version");
+            let sel_ver: Option<i32> = r.try_get("selection_policy_version").ok().flatten();
             out.push(WorkflowRun {
                 id: r.get("id"),
                 task_id: r.get("task_id"),
@@ -586,6 +726,12 @@ impl WorkflowStore {
                 regression_policy_id: r.get("regression_policy_id"),
                 regression_policy_version: reg_ver.map(|v| v as u32),
                 regression_policy_digest: r.get("regression_policy_digest"),
+                selection_policy_id: r.try_get("selection_policy_id").ok().flatten(),
+                selection_policy_version: sel_ver.map(|v| v as u32),
+                selection_policy_digest: r.try_get("selection_policy_digest").ok().flatten(),
+                task_prompt: r.try_get("task_prompt").ok().flatten(),
+                repository_path: r.try_get("repository_path").ok().flatten(),
+                base_revision: r.try_get("base_revision").ok().flatten(),
                 failure_reason: r.get("failure_reason"),
                 cancellation_reason: r.get("cancellation_reason"),
                 started_at_ms: r.get("started_at_ms"),
@@ -1189,6 +1335,102 @@ pub struct RoleRuntimeResolver;
 
 impl RoleRuntimeResolver {
     /// Resolves execution target based on role preferences and simulated or live provider availability.
+    pub async fn resolve_target_live(
+        pool: &sqlx::PgPool,
+        role: &RoleDefinition,
+        simulate_quota_exhausted_for: Option<&str>,
+    ) -> Result<ResolvedExecutionTarget> {
+        let cred_store = crate::credential_registry::CredentialStore::new(pool);
+        let credentials = cred_store.list().await?;
+
+        for pref in &role.runtime_preferences {
+            if simulate_quota_exhausted_for == Some(pref.as_str()) {
+                continue;
+            }
+
+            if pref.contains("codex") {
+                let avail_store = crate::availability::AvailabilityStore::new(pool);
+                for cred in credentials.iter().filter(|c| {
+                    c.provider == "codex"
+                        && c.status == crate::credential_registry::CredentialStatus::Enrolled
+                }) {
+                    let is_exhausted = matches!(
+                        avail_store.current_for_credential(&cred.identity()).await,
+                        Ok(Some(avail))
+                            if matches!(
+                                avail.state,
+                                crate::availability::AvailabilityState::QuotaExhausted
+                                    | crate::availability::AvailabilityState::RateLimited
+                                    | crate::availability::AvailabilityState::Cooldown
+                                    | crate::availability::AvailabilityState::RuntimeUnavailable
+                            )
+                    );
+                    if is_exhausted {
+                        continue;
+                    }
+
+                    return Ok(ResolvedExecutionTarget {
+                        provider: "codex".into(),
+                        runtime_interface: "codex-acp".into(),
+                        credential_id: Some(cred.reference.clone()),
+                        credential_generation: Some(cred.generation as u32),
+                        requested_model: Some("gpt-6-luna".into()),
+                        resolved_model: Some("gpt-6-luna".into()),
+                        runtime_image_digest: Some(
+                            crate::codex_credential_enrollment::CODEX_IMAGE_DIGEST.into(),
+                        ),
+                        resolution_reason: format!(
+                            "enrolled ready credential {} matching preference {}",
+                            cred.reference, pref
+                        ),
+                    });
+                }
+            } else if pref.contains("antigravity") {
+                let avail_store = crate::availability::AvailabilityStore::new(pool);
+                for cred in credentials.iter().filter(|c| {
+                    c.provider == "antigravity"
+                        && c.status == crate::credential_registry::CredentialStatus::Enrolled
+                }) {
+                    let is_exhausted = matches!(
+                        avail_store.current_for_credential(&cred.identity()).await,
+                        Ok(Some(avail))
+                            if matches!(
+                                avail.state,
+                                crate::availability::AvailabilityState::QuotaExhausted
+                                    | crate::availability::AvailabilityState::RateLimited
+                                    | crate::availability::AvailabilityState::Cooldown
+                                    | crate::availability::AvailabilityState::RuntimeUnavailable
+                            )
+                    );
+                    if is_exhausted {
+                        continue;
+                    }
+
+                    return Ok(ResolvedExecutionTarget {
+                        provider: "antigravity".into(),
+                        runtime_interface: "antigravity-acp".into(),
+                        credential_id: Some(cred.reference.clone()),
+                        credential_generation: Some(cred.generation as u32),
+                        requested_model: Some("gemini-3.8-flash".into()),
+                        resolved_model: Some("gemini-3.8-flash".into()),
+                        runtime_image_digest: Some(
+                            crate::credential_enrollment::ANTIGRAVITY_DIGEST.into(),
+                        ),
+                        resolution_reason: format!(
+                            "enrolled ready credential {} matching preference {}",
+                            cred.reference, pref
+                        ),
+                    });
+                }
+            }
+        }
+
+        bail!(
+            "failed to resolve live execution target for role {}: all preferences exhausted or no eligible credentials enrolled in CredentialStore",
+            role.role_id
+        )
+    }
+
     pub fn resolve_target(
         role: &RoleDefinition,
         simulate_quota_exhausted_for: Option<&str>,

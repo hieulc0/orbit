@@ -256,11 +256,30 @@ struct WorkflowArgs {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum WorkflowAction {
     /// Start a new workflow run for a task and attempt.
     Start {
-        task_id: String,
-        attempt_id: String,
+        #[arg(value_name = "TASK_ID")]
+        pos_task_id: Option<String>,
+        #[arg(value_name = "ATTEMPT_ID")]
+        pos_attempt_id: Option<String>,
+        #[arg(long)]
+        task_id: Option<String>,
+        #[arg(long)]
+        attempt_id: Option<String>,
+        /// Inline task description / prompt
+        #[arg(long)]
+        task: Option<String>,
+        /// Path to file containing task prompt
+        #[arg(long)]
+        task_file: Option<PathBuf>,
+        /// Target repository path (default: current directory ".")
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Base git revision (default: "HEAD")
+        #[arg(long)]
+        base_revision: Option<String>,
         #[arg(long, default_value = "software-change")]
         kind: String,
         #[arg(long, default_value = "3")]
@@ -268,6 +287,21 @@ enum WorkflowAction {
         /// Optional path to verification policy file
         #[arg(long)]
         policy: Option<PathBuf>,
+        /// Optional path to regression policy file
+        #[arg(long)]
+        regression_policy: Option<PathBuf>,
+        /// Optional path to selection policy file
+        #[arg(long)]
+        selection_policy: Option<PathBuf>,
+        /// Detach execution to background instead of waiting for completion
+        #[arg(long)]
+        detach: bool,
+        #[arg(long, env = "ORBIT_DATABASE_URL_FILE", hide_env_values = true)]
+        database_url_file: Option<PathBuf>,
+    },
+    /// Execute or resume an existing workflow run to completion.
+    Run {
+        workflow_run_id: String,
         #[arg(long, env = "ORBIT_DATABASE_URL_FILE", hide_env_values = true)]
         database_url_file: Option<PathBuf>,
     },
@@ -1243,17 +1277,50 @@ async fn main() -> Result<()> {
     if let Commands::Workflow(WorkflowArgs { action }) = &cli.command {
         match action {
             WorkflowAction::Start {
+                pos_task_id,
+                pos_attempt_id,
                 task_id,
                 attempt_id,
+                task,
+                task_file,
+                repo,
+                base_revision,
                 kind: _,
                 max_iterations,
                 policy,
+                regression_policy,
+                selection_policy,
+                detach,
                 database_url_file,
             } => {
                 let database_url = read_private_database_url(database_url_file.as_deref()).await?;
                 let (engine, scratch) =
                     connect_durable_catalog_engine(database_url.as_str()).await?;
                 let store = orbit::workflow::WorkflowStore::new(engine.pool.clone());
+                let ver_store = orbit::verification::VerificationStore::new(engine.pool.clone());
+                let reg_store =
+                    orbit::regression_strategy::RegressionStore::new(engine.pool.clone());
+
+                let task_id = task_id
+                    .clone()
+                    .or_else(|| pos_task_id.clone())
+                    .unwrap_or_else(|| format!("task-{}", orbit::model::id()));
+                let attempt_id = attempt_id
+                    .clone()
+                    .or_else(|| pos_attempt_id.clone())
+                    .unwrap_or_else(|| format!("att-{}", orbit::model::id()));
+
+                let task_prompt = if let Some(t) = task {
+                    Some(t.clone())
+                } else if let Some(tf) = task_file {
+                    Some(
+                        tokio::fs::read_to_string(tf)
+                            .await
+                            .context("reading task file")?,
+                    )
+                } else {
+                    None
+                };
 
                 let policy_def = if let Some(pol_path) = policy {
                     let data = tokio::fs::read_to_string(pol_path)
@@ -1262,25 +1329,167 @@ async fn main() -> Result<()> {
                     let p: orbit::verification::VerificationPolicy =
                         serde_json::from_str(&data).context("parsing verification policy")?;
                     p.validate()?;
-                    store.verification_store().save_policy(&p).await?;
+                    ver_store.save_policy(&p).await?;
                     Some(p)
                 } else {
                     None
                 };
 
+                let reg_policy_def = if let Some(reg_path) = regression_policy {
+                    let data = tokio::fs::read_to_string(reg_path)
+                        .await
+                        .context("reading regression policy file")?;
+                    let p: orbit::regression_strategy::RegressionPolicy =
+                        serde_json::from_str(&data).context("parsing regression policy")?;
+                    reg_store.insert_regression_policy(&p).await?;
+                    Some(p)
+                } else {
+                    None
+                };
+
+                let sel_policy_def = if let Some(sel_path) = selection_policy {
+                    let data = tokio::fs::read_to_string(sel_path)
+                        .await
+                        .context("reading selection policy file")?;
+                    let p: orbit::regression_strategy::SelectionPolicy =
+                        serde_json::from_str(&data).context("parsing selection policy")?;
+                    reg_store.insert_selection_policy(&p).await?;
+                    Some(p)
+                } else {
+                    None
+                };
+
+                let repo_path = repo
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|| ".".to_string());
+                let base_rev = base_revision.clone().unwrap_or_else(|| "HEAD".to_string());
+
                 let wf = store
-                    .create_workflow_run(task_id, attempt_id, *max_iterations, policy_def.as_ref())
+                    .create_workflow_run_full(
+                        &task_id,
+                        &attempt_id,
+                        *max_iterations,
+                        policy_def.as_ref(),
+                        reg_policy_def.as_ref(),
+                        sel_policy_def.as_ref(),
+                        task_prompt.as_deref(),
+                        Some(&repo_path),
+                        Some(&base_rev),
+                    )
                     .await?;
+
+                if *detach {
+                    match output_format {
+                        Output::Text => {
+                            println!("{}", orbit::workflow::format_workflow_show(&wf, &[]));
+                        }
+                        Output::Json => println!("{}", serde_json::to_string_pretty(&wf)?),
+                        Output::Jsonl => println!("{}", serde_json::to_string(&wf)?),
+                    }
+                    engine.pool.close().await;
+                    drop(scratch);
+                    return Ok(());
+                }
+
+                let executor =
+                    std::sync::Arc::new(orbit::workflow_coordinator::RealAcpRoleExecutor);
+                let coordinator = orbit::workflow_coordinator::WorkflowCoordinator::new(
+                    engine.pool.clone(),
+                    executor,
+                );
+                let final_stage = coordinator.run_to_completion(&wf.id).await?;
+                let wf_final = store
+                    .get_workflow_run(&wf.id)
+                    .await?
+                    .context("workflow run not found")?;
+                let roles = store.list_role_executions(&wf.id).await?;
 
                 match output_format {
                     Output::Text => {
-                        println!("{}", orbit::workflow::format_workflow_show(&wf, &[]));
+                        println!(
+                            "{}",
+                            orbit::workflow::format_workflow_show(&wf_final, &roles)
+                        );
                     }
-                    Output::Json => println!("{}", serde_json::to_string_pretty(&wf)?),
-                    Output::Jsonl => println!("{}", serde_json::to_string(&wf)?),
+                    Output::Json => println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "workflow": wf_final,
+                            "role_executions": roles,
+                        }))?
+                    ),
+                    Output::Jsonl => println!(
+                        "{}",
+                        serde_json::to_string(&serde_json::json!({
+                            "workflow": wf_final,
+                            "role_executions": roles,
+                        }))?
+                    ),
                 }
                 engine.pool.close().await;
                 drop(scratch);
+                if matches!(
+                    final_stage.status,
+                    orbit::workflow::WorkflowStage::Failed
+                        | orbit::workflow::WorkflowStage::Exhausted
+                ) {
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
+            WorkflowAction::Run {
+                workflow_run_id,
+                database_url_file,
+            } => {
+                let database_url = read_private_database_url(database_url_file.as_deref()).await?;
+                let (engine, scratch) =
+                    connect_durable_catalog_engine(database_url.as_str()).await?;
+                let store = orbit::workflow::WorkflowStore::new(engine.pool.clone());
+                let executor =
+                    std::sync::Arc::new(orbit::workflow_coordinator::RealAcpRoleExecutor);
+                let coordinator = orbit::workflow_coordinator::WorkflowCoordinator::new(
+                    engine.pool.clone(),
+                    executor,
+                );
+                let final_stage = coordinator.run_to_completion(workflow_run_id).await?;
+                let wf_final = store
+                    .get_workflow_run(workflow_run_id)
+                    .await?
+                    .context("workflow run not found")?;
+                let roles = store.list_role_executions(workflow_run_id).await?;
+
+                match output_format {
+                    Output::Text => {
+                        println!(
+                            "{}",
+                            orbit::workflow::format_workflow_show(&wf_final, &roles)
+                        );
+                    }
+                    Output::Json => println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "workflow": wf_final,
+                            "role_executions": roles,
+                        }))?
+                    ),
+                    Output::Jsonl => println!(
+                        "{}",
+                        serde_json::to_string(&serde_json::json!({
+                            "workflow": wf_final,
+                            "role_executions": roles,
+                        }))?
+                    ),
+                }
+                engine.pool.close().await;
+                drop(scratch);
+                if matches!(
+                    final_stage.status,
+                    orbit::workflow::WorkflowStage::Failed
+                        | orbit::workflow::WorkflowStage::Exhausted
+                ) {
+                    std::process::exit(1);
+                }
                 return Ok(());
             }
             WorkflowAction::Show {
@@ -1348,16 +1557,13 @@ async fn main() -> Result<()> {
                 let database_url = read_private_database_url(database_url_file.as_deref()).await?;
                 let (engine, scratch) =
                     connect_durable_catalog_engine(database_url.as_str()).await?;
-                let store = orbit::workflow::WorkflowStore::new(engine.pool.clone());
-                let cancelled = store
-                    .transition_workflow_stage(
-                        workflow_run_id,
-                        orbit::workflow::WorkflowStage::Cancelled,
-                        None,
-                        None,
-                        Some(reason),
-                    )
-                    .await?;
+                let executor =
+                    std::sync::Arc::new(orbit::workflow_coordinator::RealAcpRoleExecutor);
+                let coordinator = orbit::workflow_coordinator::WorkflowCoordinator::new(
+                    engine.pool.clone(),
+                    executor,
+                );
+                let cancelled = coordinator.cancel_workflow(workflow_run_id, reason).await?;
 
                 match output_format {
                     Output::Text => {

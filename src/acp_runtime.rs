@@ -546,7 +546,7 @@ impl Runtime {
         let report = crate::agent::AgentReport {
             attempt_id: a.attempt_id.clone(),
             binding_digest: a.agent_binding_digest.clone().unwrap(),
-            output: json!({"summary":"ACP turn completed; inspect the patch and independent verification.","acp":{
+            output: json!({"summary":"ACP turn completed; inspect the patch and independent verification.","agent_output": broker.agent_output, "acp":{
                 "session_digest":broker.session_digest,"agent":self.launch.agent_name,"version":self.launch.agent_version,
                 "launch_digest":self.launch.digest()?,"model":self.binding.model,
                 "model_attribution":if self.binding.model.is_some(){"agent_confirmed_exact"}else{"agent_configured_unverified"},
