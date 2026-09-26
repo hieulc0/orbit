@@ -1,6 +1,6 @@
 use agent_client_protocol as acp;
 use anyhow::Result;
-use orbit::codex_bridge::{CODEX_VERSION, ToolCall, ToolRouter, thread_start};
+use orbit::codex_bridge::{CODEX_VERSION, OrbitAcpClient, ToolCall, ToolRouter, thread_start};
 use serde_json::{Value, json};
 use std::{cell::RefCell, path::Path};
 
@@ -77,6 +77,32 @@ impl acp::Client for Client {
     }
 }
 
+#[async_trait::async_trait(?Send)]
+impl OrbitAcpClient for Client {
+    async fn create_directory(&self, path: &Path, recursive: bool) -> Result<String> {
+        self.record(
+            "create_directory",
+            json!({"path": path.to_string_lossy(), "recursive": recursive}),
+        );
+        Ok("Directory created.".into())
+    }
+    async fn move_path(&self, source: &Path, destination: &Path) -> Result<String> {
+        self.record("move", json!({"source": source.to_string_lossy(), "destination": destination.to_string_lossy()}));
+        Ok("Path moved.".into())
+    }
+    async fn delete_file(&self, path: &Path) -> Result<String> {
+        self.record("delete_file", json!({"path": path.to_string_lossy()}));
+        Ok("File deleted.".into())
+    }
+    async fn delete_directory(&self, path: &Path, recursive: bool) -> Result<String> {
+        self.record(
+            "delete_directory",
+            json!({"path": path.to_string_lossy(), "recursive": recursive}),
+        );
+        Ok("Directory deleted.".into())
+    }
+}
+
 #[tokio::test]
 async fn codex_nonzero_command_preserves_session_for_next_tool() -> Result<()> {
     let mut client = Client {
@@ -123,8 +149,16 @@ fn router() -> Result<ToolRouter> {
         "thread-1",
         "turn-1",
         Path::new("/workspace"),
-        &["read_file".into(), "write_file".into(), "shell".into()],
-        8,
+        &[
+            "read_file".into(),
+            "write_file".into(),
+            "create_directory".into(),
+            "move".into(),
+            "delete_file".into(),
+            "delete_directory".into(),
+            "shell".into(),
+        ],
+        16,
     )
 }
 fn call(id: &str, tool: &str, arguments: Value) -> ToolCall {
@@ -326,5 +360,72 @@ async fn codex_bridge_releases_terminal_after_error_without_leaking_payloads() -
             .await
             .is_err()
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn codex_bridge_routes_filesystem_mutation_tools() -> Result<()> {
+    let mut router = router()?;
+    let client = Client::default();
+
+    // 1. create_directory
+    let res = router
+        .dispatch(
+            &client,
+            call(
+                "mkdir-1",
+                "orbit_create_directory",
+                json!({"path": "docs/archive", "recursive": true}),
+            ),
+        )
+        .await?;
+    assert_eq!(res["success"], true);
+
+    // 2. move
+    let res = router
+        .dispatch(
+            &client,
+            call(
+                "mv-1",
+                "orbit_move",
+                json!({"source": "docs/old.md", "destination": "docs/archive/old.md"}),
+            ),
+        )
+        .await?;
+    assert_eq!(res["success"], true);
+
+    // 3. delete_file
+    let res = router
+        .dispatch(
+            &client,
+            call(
+                "del-file-1",
+                "orbit_delete_file",
+                json!({"path": "docs/obsolete.md"}),
+            ),
+        )
+        .await?;
+    assert_eq!(res["success"], true);
+
+    // 4. delete_directory
+    let res = router
+        .dispatch(
+            &client,
+            call(
+                "del-dir-1",
+                "orbit_delete_directory",
+                json!({"path": "docs/empty_dir", "recursive": false}),
+            ),
+        )
+        .await?;
+    assert_eq!(res["success"], true);
+
+    let calls = client.calls.borrow();
+    assert_eq!(calls.len(), 4);
+    assert_eq!(calls[0].0, "create_directory");
+    assert_eq!(calls[1].0, "move");
+    assert_eq!(calls[2].0, "delete_file");
+    assert_eq!(calls[3].0, "delete_directory");
+
     Ok(())
 }

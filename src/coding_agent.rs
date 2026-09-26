@@ -420,6 +420,10 @@ pub fn tool_permissions(name: &str) -> Option<&'static [&'static str]> {
     match name {
         "read_file" => Some(&["workspace.read"]),
         "write_file" => Some(&["workspace.write"]),
+        "create_directory" => Some(&["workspace.write"]),
+        "move" => Some(&["workspace.write"]),
+        "delete_file" => Some(&["workspace.write"]),
+        "delete_directory" => Some(&["workspace.write"]),
         "shell" => Some(&["workspace.read", "workspace.write", "shell.execute"]),
         _ => None,
     }
@@ -430,6 +434,10 @@ pub fn tool_definitions(names: &[String]) -> Result<Vec<Value>> {
         let (description, properties, required) = match name.as_str() {
             "read_file" => ("Read a workspace text file (up to 64 KiB).", json!({"path":{"type":"string"}}), vec!["path"]),
             "write_file" => ("Write a workspace text file (up to 64 KiB).", json!({"path":{"type":"string"},"content":{"type":"string"}}), vec!["path","content"]),
+            "create_directory" => ("Create a directory inside the repository workspace.", json!({"path":{"type":"string"},"recursive":{"type":"boolean"}}), vec!["path"]),
+            "move" => ("Move or rename a file or directory inside the repository workspace.", json!({"source":{"type":"string"},"destination":{"type":"string"}}), vec!["source","destination"]),
+            "delete_file" => ("Delete a single file inside the repository workspace.", json!({"path":{"type":"string"}}), vec!["path"]),
+            "delete_directory" => ("Remove an empty directory, or recursively only when explicitly requested, inside the repository workspace.", json!({"path":{"type":"string"},"recursive":{"type":"boolean"}}), vec!["path"]),
             "shell" => ("Run a bounded shell command in the isolated workspace, including tests.", json!({"command":{"type":"string"}}), vec!["command"]),
             _ => anyhow::bail!("unsupported coding tool"),
         };
@@ -449,6 +457,29 @@ pub fn tool_command(name: &str, arguments: &Value, timeout: u64) -> Result<Comma
     struct Write {
         path: String,
         content: String,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct CreateDirectory {
+        path: String,
+        recursive: Option<bool>,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Move {
+        source: String,
+        destination: String,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct DeleteFile {
+        path: String,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct DeleteDirectory {
+        path: String,
+        recursive: Option<bool>,
     }
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -492,6 +523,41 @@ pub fn tool_command(name: &str, arguments: &Value, timeout: u64) -> Result<Comma
                 args.path,
                 args.content,
             ]
+        }
+        "create_directory" => {
+            let args: CreateDirectory = serde_json::from_value(arguments.clone())?;
+            path(&args.path)?;
+            if args.recursive.unwrap_or(true) {
+                vec!["mkdir".into(), "-p".into(), "--".into(), args.path]
+            } else {
+                vec!["mkdir".into(), "--".into(), args.path]
+            }
+        }
+        "move" => {
+            let args: Move = serde_json::from_value(arguments.clone())?;
+            path(&args.source)?;
+            path(&args.destination)?;
+            vec![
+                "mv".into(),
+                "-n".into(),
+                "--".into(),
+                args.source,
+                args.destination,
+            ]
+        }
+        "delete_file" => {
+            let args: DeleteFile = serde_json::from_value(arguments.clone())?;
+            path(&args.path)?;
+            vec!["rm".into(), "--".into(), args.path]
+        }
+        "delete_directory" => {
+            let args: DeleteDirectory = serde_json::from_value(arguments.clone())?;
+            path(&args.path)?;
+            if args.recursive.unwrap_or(false) {
+                vec!["rm".into(), "-r".into(), "--".into(), args.path]
+            } else {
+                vec!["rmdir".into(), "--".into(), args.path]
+            }
         }
         "shell" => {
             let args: Shell = serde_json::from_value(arguments.clone())?;

@@ -9,6 +9,7 @@ use agent_client_protocol as acp;
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::path::Path;
 use tokio::sync::Mutex;
 
 /// Bounded protocol state for cleanup evidence. Every string is a fixed local
@@ -198,6 +199,96 @@ impl acp::Client for Client {
         p: acp::ReleaseTerminalRequest,
     ) -> acp::Result<acp::ReleaseTerminalResponse> {
         self.call("terminal/release", p).await
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl crate::codex_bridge::OrbitAcpClient for Client {
+    async fn create_directory(&self, path: &Path, recursive: bool) -> Result<String> {
+        let res: serde_json::Value = self
+            .call(
+                "fs/create_directory",
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "recursive": recursive,
+                }),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("ACP create_directory failed: {e}"))?;
+        if let Some(err) = res.get("error").and_then(|e| e.as_str()) {
+            Ok(format!("Error: {err}"))
+        } else {
+            Ok(res
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("Directory created successfully.")
+                .to_string())
+        }
+    }
+
+    async fn move_path(&self, source: &Path, destination: &Path) -> Result<String> {
+        let res: serde_json::Value = self
+            .call(
+                "fs/move",
+                serde_json::json!({
+                    "source": source.to_string_lossy(),
+                    "destination": destination.to_string_lossy(),
+                }),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("ACP move failed: {e}"))?;
+        if let Some(err) = res.get("error").and_then(|e| e.as_str()) {
+            Ok(format!("Error: {err}"))
+        } else {
+            Ok(res
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("Moved successfully.")
+                .to_string())
+        }
+    }
+
+    async fn delete_file(&self, path: &Path) -> Result<String> {
+        let res: serde_json::Value = self
+            .call(
+                "fs/delete_file",
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                }),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("ACP delete_file failed: {e}"))?;
+        if let Some(err) = res.get("error").and_then(|e| e.as_str()) {
+            Ok(format!("Error: {err}"))
+        } else {
+            Ok(res
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("File deleted successfully.")
+                .to_string())
+        }
+    }
+
+    async fn delete_directory(&self, path: &Path, recursive: bool) -> Result<String> {
+        let res: serde_json::Value = self
+            .call(
+                "fs/delete_directory",
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "recursive": recursive,
+                }),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("ACP delete_directory failed: {e}"))?;
+        if let Some(err) = res.get("error").and_then(|e| e.as_str()) {
+            Ok(format!("Error: {err}"))
+        } else {
+            Ok(res
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("Directory deleted successfully.")
+                .to_string())
+        }
     }
 }
 

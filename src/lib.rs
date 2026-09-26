@@ -29,6 +29,7 @@ pub mod credential_status_view;
 pub mod engine;
 pub mod evidence;
 pub mod execution;
+pub mod fs_tools;
 pub mod governance;
 pub mod integration_environment;
 pub mod mcp;

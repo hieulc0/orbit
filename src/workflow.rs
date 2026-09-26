@@ -412,7 +412,9 @@ impl<'de> serde::Deserialize<'de> for ReviewFinding {
                     requested_change: raw.requested_change,
                 })
             }
-            _ => Err(D::Error::custom("expected string or object for ReviewFinding")),
+            _ => Err(D::Error::custom(
+                "expected string or object for ReviewFinding",
+            )),
         }
     }
 }

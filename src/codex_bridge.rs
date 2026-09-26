@@ -93,6 +93,26 @@ pub struct ToolCall {
     pub arguments: Value,
 }
 
+#[async_trait::async_trait(?Send)]
+pub trait OrbitAcpClient: acp::Client {
+    async fn create_directory(&self, path: &Path, recursive: bool) -> Result<String> {
+        let _ = (path, recursive);
+        anyhow::bail!("create_directory unsupported")
+    }
+    async fn move_path(&self, source: &Path, destination: &Path) -> Result<String> {
+        let _ = (source, destination);
+        anyhow::bail!("move unsupported")
+    }
+    async fn delete_file(&self, path: &Path) -> Result<String> {
+        let _ = path;
+        anyhow::bail!("delete_file unsupported")
+    }
+    async fn delete_directory(&self, path: &Path, recursive: bool) -> Result<String> {
+        let _ = (path, recursive);
+        anyhow::bail!("delete_directory unsupported")
+    }
+}
+
 pub struct ToolRouter {
     session: acp::SessionId,
     thread: String,
@@ -128,7 +148,7 @@ impl ToolRouter {
             "absolute bridge workspace required"
         );
         ensure!(
-            max_calls <= 1024 && tools.len() <= 3,
+            max_calls <= 1024 && tools.len() <= 10,
             "bridge call limit invalid"
         );
         crate::coding_agent::tool_definitions(tools)?;
@@ -143,7 +163,11 @@ impl ToolRouter {
         })
     }
 
-    pub async fn dispatch(&mut self, client: &impl acp::Client, call: ToolCall) -> Result<Value> {
+    pub async fn dispatch(
+        &mut self,
+        client: &impl OrbitAcpClient,
+        call: ToolCall,
+    ) -> Result<Value> {
         ensure!(
             call.thread_id == self.thread && call.turn_id == self.turn && call.namespace.is_none(),
             "foreign bridge tool call"
@@ -162,9 +186,22 @@ impl ToolRouter {
         // Shared validator checks strict arguments and relative paths. The command
         // it builds is deliberately NOT executed here.
         let mut arguments = call.arguments;
-        if matches!(tool, "read_file" | "write_file") {
+        if matches!(
+            tool,
+            "read_file" | "write_file" | "create_directory" | "delete_file" | "delete_directory"
+        ) {
             let path = arguments["path"].as_str().context("tool path missing")?;
             arguments["path"] = json!(normalize_workspace_path(&self.workspace, path)?);
+        } else if tool == "move" {
+            let source = arguments["source"]
+                .as_str()
+                .context("tool source missing")?;
+            arguments["source"] = json!(normalize_workspace_path(&self.workspace, source)?);
+            let destination = arguments["destination"]
+                .as_str()
+                .context("tool destination missing")?;
+            arguments["destination"] =
+                json!(normalize_workspace_path(&self.workspace, destination)?);
         }
         crate::coding_agent::tool_command(tool, &arguments, 1)?;
         self.seen.insert(call.call_id);
@@ -193,6 +230,33 @@ impl ToolRouter {
                     .await
                     .map_err(|_| anyhow::anyhow!("ACP write failed"))?;
                 "File written through the workspace broker.".into()
+            }
+            "create_directory" => {
+                let path = self.workspace.join(arguments["path"].as_str().unwrap());
+                let recursive = arguments
+                    .get("recursive")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                client.create_directory(&path, recursive).await?
+            }
+            "move" => {
+                let source = self.workspace.join(arguments["source"].as_str().unwrap());
+                let destination = self
+                    .workspace
+                    .join(arguments["destination"].as_str().unwrap());
+                client.move_path(&source, &destination).await?
+            }
+            "delete_file" => {
+                let path = self.workspace.join(arguments["path"].as_str().unwrap());
+                client.delete_file(&path).await?
+            }
+            "delete_directory" => {
+                let path = self.workspace.join(arguments["path"].as_str().unwrap());
+                let recursive = arguments
+                    .get("recursive")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                client.delete_directory(&path, recursive).await?
             }
             "shell" => {
                 self.shell(client, arguments["command"].as_str().unwrap())

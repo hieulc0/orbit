@@ -12,7 +12,7 @@ use crate::{
     acp_wire::Wire,
     agent::{Binding, Budget},
     codex_credential_enrollment::registered_auth_diagnostic,
-    credential_enrollment::{decode_bundle, ACP_EXECUTABLE, ANTIGRAVITY_IMAGE},
+    credential_enrollment::{ACP_EXECUTABLE, ANTIGRAVITY_IMAGE, decode_bundle},
     credential_registry::CredentialStore,
     model::*,
     regression_strategy::{
@@ -26,10 +26,10 @@ use crate::{
     },
     workflow::*,
 };
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-use std::process::Stdio;
 use anyhow::{Context, Result, bail, ensure};
 use sqlx::PgPool;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::process::Stdio;
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -1237,7 +1237,10 @@ impl WorkflowCoordinator {
                 None,
             )
             .await
-        } else if repo_path.join(".orbit/definitions/docs-workflow.yaml").exists() {
+        } else if repo_path
+            .join(".orbit/definitions/docs-workflow.yaml")
+            .exists()
+        {
             let plan = VerificationPlan::new(
                 "tier-docs-plan",
                 format!("{:?} Tier Documentation Verification", tier),
@@ -1312,7 +1315,9 @@ impl WorkflowCoordinator {
             )
             .await
         } else {
-            bail!("VERIFICATION_POLICY_REQUIRED: no authoritative verification policy provided or resolved for workflow run");
+            bail!(
+                "VERIFICATION_POLICY_REQUIRED: no authoritative verification policy provided or resolved for workflow run"
+            );
         }
     }
 }
@@ -1603,10 +1608,9 @@ fn list_files_recursively(base: &Path, dir: &Path, acc: &mut Vec<String>) {
             let path = entry.path();
             if path.is_dir() {
                 list_files_recursively(base, &path, acc);
-            } else if path.is_file() {
-                if let Ok(rel) = path.strip_prefix(base) {
-                    acc.push(rel.to_string_lossy().into_owned());
-                }
+            } else if path.is_file() && path.strip_prefix(base).is_ok() {
+                let rel = path.strip_prefix(base).unwrap();
+                acc.push(rel.to_string_lossy().into_owned());
             }
         }
     }
@@ -1647,7 +1651,7 @@ fn build_role_prompt(
                 .map(|h| h.structured_payload.to_string())
                 .unwrap_or_else(|| "No prior plan provided.".to_string());
             format!(
-                "You are the IMPLEMENTER role in an Orbit automated software change workflow.\n                Your responsibility is to execute the implementation plan by modifying project files and verifying your work.\n\n                TASK OBJECTIVE:\n{task_text}\n\n                PLANNER SPECIFICATION:\n{plan_summary}\n\n                REPOSITORY CONTEXT:\n                Repository Path: {repo_path}\n                Base Revision: {base_revision}{docs_manifest}\n                WORKSPACE PERMISSIONS:\n                You have READ-WRITE workspace access. You can read files using read_file and create or edit files using write_file.\n\n                INSTRUCTIONS:\n                1. Inspect files using read_file and write files using write_file with workspace-relative paths (e.g. docs/README.md).\n                   Important: do NOT pass directory paths to read_file or write_file.\n                2. Implement all required changes using write_file. Keep each file under 64 KiB (broker limit).\n                3. You MUST end your response with a structured JSON implementation handoff block inside the exact delimiters:\n                <<<ORBIT_HANDOFF_START>>>\n                {{\n                  \"summary\": \"Concise summary of changes implemented\",\n                  \"changed_files\": [\"docs/file1.md\"],\n                  \"tests_added_or_modified\": [],\n                  \"exploratory_commands\": [],\n                  \"known_limitations\": [],\n                  \"verification_notes\": [\"self-verification details\"]\n                }}\n                <<<ORBIT_HANDOFF_END>>>\n",
+                "You are the IMPLEMENTER role in an Orbit automated software change workflow.\n                Your responsibility is to execute the implementation plan by modifying project files and verifying your work.\n\n                TASK OBJECTIVE:\n{task_text}\n\n                PLANNER SPECIFICATION:\n{plan_summary}\n\n                REPOSITORY CONTEXT:\n                Repository Path: {repo_path}\n                Base Revision: {base_revision}{docs_manifest}\n                WORKSPACE PERMISSIONS:\n                You have READ-WRITE workspace access. You can read files using read_file, create/edit files using write_file, create directories using create_directory, move or rename files and directories using move, delete files using delete_file, and remove directories using delete_directory.\n\n                INSTRUCTIONS:\n                1. Workspace operations:\n                   - read_file: inspect file contents (workspace-relative path, e.g. docs/README.md).\n                   - write_file: create or update file contents (keep each under 64 KiB).\n                   - create_directory: create a directory (e.g. docs/archive).\n                   - move: move or rename a file or directory (e.g. source: docs/old.md, destination: docs/archive/old.md).\n                   - delete_file: delete a single file.\n                   - delete_directory: remove an empty directory (or recursive if specified).\n                   Important: Always use workspace-relative paths. Do NOT pass directory paths to read_file or write_file.\n                2. Implement all required changes and directory reorganization per the planner specification.\n                3. You MUST end your response with a structured JSON implementation handoff block inside the exact delimiters:\n                <<<ORBIT_HANDOFF_START>>>\n                {{\n                  \"summary\": \"Concise summary of changes implemented\",\n                  \"changed_files\": [\"docs/file1.md\"],\n                  \"tests_added_or_modified\": [],\n                  \"exploratory_commands\": [],\n                  \"known_limitations\": [],\n                  \"verification_notes\": [\"self-verification details\"]\n                }}\n                <<<ORBIT_HANDOFF_END>>>\n",
                 repo_path = repo_path.display(),
                 base_revision = base_revision,
                 task_text = task_text,
@@ -1746,7 +1750,10 @@ async fn handle_acp_message(
                 Ok(())
             }
             "fs/read_text_file" => {
-                let req_id = message.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                let req_id = message
+                    .get("id")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
                 state.tool_calls += 1;
                 *state.tool_counts.entry("read_file".into()).or_insert(0) += 1;
 
@@ -1790,14 +1797,20 @@ async fn handle_acp_message(
                     }
                     Err(e) => {
                         state.tool_failures += 1;
-                        wire.response_ok(req_id, serde_json::json!({ "content": format!("Error reading file: {e}") }))
-                            .await?;
+                        wire.response_ok(
+                            req_id,
+                            serde_json::json!({ "content": format!("Error reading file: {e}") }),
+                        )
+                        .await?;
                     }
                 }
                 Ok(())
             }
             "fs/write_text_file" => {
-                let req_id = message.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                let req_id = message
+                    .get("id")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
                 state.tool_calls += 1;
                 *state.tool_counts.entry("write_file".into()).or_insert(0) += 1;
 
@@ -1869,6 +1882,237 @@ async fn handle_acp_message(
                 }
                 Ok(())
             }
+            "fs/create_directory" => {
+                let req_id = message
+                    .get("id")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                state.tool_calls += 1;
+                *state
+                    .tool_counts
+                    .entry("create_directory".into())
+                    .or_insert(0) += 1;
+
+                if state.workspace_access == WorkspaceAccess::ReadOnly {
+                    state.tool_failures += 1;
+                    wire.response_error(
+                        req_id,
+                        -32603,
+                        "write operation denied: read-only role workspace",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+
+                let path_str = message
+                    .get("params")
+                    .and_then(|p| p.get("path"))
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("");
+                let recursive = message
+                    .get("params")
+                    .and_then(|p| p.get("recursive"))
+                    .and_then(|p| p.as_bool())
+                    .unwrap_or(true);
+
+                match crate::fs_tools::create_directory(state.repo_path, path_str, recursive) {
+                    Ok(_) => {
+                        state.tool_successes += 1;
+                        wire.response_ok(
+                            req_id,
+                            serde_json::json!({
+                                "success": true,
+                                "path": path_str,
+                                "message": format!("Directory {} created successfully.", path_str),
+                            }),
+                        )
+                        .await?;
+                    }
+                    Err(e) => {
+                        state.tool_failures += 1;
+                        wire.response_ok(
+                            req_id,
+                            serde_json::json!({
+                                "success": false,
+                                "path": path_str,
+                                "error": format!("{e:#}"),
+                            }),
+                        )
+                        .await?;
+                    }
+                }
+                Ok(())
+            }
+            "fs/move" => {
+                let req_id = message
+                    .get("id")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                state.tool_calls += 1;
+                *state.tool_counts.entry("move".into()).or_insert(0) += 1;
+
+                if state.workspace_access == WorkspaceAccess::ReadOnly {
+                    state.tool_failures += 1;
+                    wire.response_error(
+                        req_id,
+                        -32603,
+                        "write operation denied: read-only role workspace",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+
+                let source_str = message
+                    .get("params")
+                    .and_then(|p| p.get("source"))
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("");
+                let destination_str = message
+                    .get("params")
+                    .and_then(|p| p.get("destination"))
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("");
+
+                match crate::fs_tools::move_path(state.repo_path, source_str, destination_str) {
+                    Ok(_) => {
+                        state.tool_successes += 1;
+                        wire.response_ok(req_id, serde_json::json!({
+                            "success": true,
+                            "source": source_str,
+                            "destination": destination_str,
+                            "message": format!("Moved {} to {} successfully.", source_str, destination_str),
+                        })).await?;
+                    }
+                    Err(e) => {
+                        state.tool_failures += 1;
+                        wire.response_ok(
+                            req_id,
+                            serde_json::json!({
+                                "success": false,
+                                "source": source_str,
+                                "destination": destination_str,
+                                "error": format!("{e:#}"),
+                            }),
+                        )
+                        .await?;
+                    }
+                }
+                Ok(())
+            }
+            "fs/delete_file" => {
+                let req_id = message
+                    .get("id")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                state.tool_calls += 1;
+                *state.tool_counts.entry("delete_file".into()).or_insert(0) += 1;
+
+                if state.workspace_access == WorkspaceAccess::ReadOnly {
+                    state.tool_failures += 1;
+                    wire.response_error(
+                        req_id,
+                        -32603,
+                        "write operation denied: read-only role workspace",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+
+                let path_str = message
+                    .get("params")
+                    .and_then(|p| p.get("path"))
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("");
+
+                match crate::fs_tools::delete_file(state.repo_path, path_str) {
+                    Ok(_) => {
+                        state.tool_successes += 1;
+                        wire.response_ok(
+                            req_id,
+                            serde_json::json!({
+                                "success": true,
+                                "path": path_str,
+                                "message": format!("File {} deleted successfully.", path_str),
+                            }),
+                        )
+                        .await?;
+                    }
+                    Err(e) => {
+                        state.tool_failures += 1;
+                        wire.response_ok(
+                            req_id,
+                            serde_json::json!({
+                                "success": false,
+                                "path": path_str,
+                                "error": format!("{e:#}"),
+                            }),
+                        )
+                        .await?;
+                    }
+                }
+                Ok(())
+            }
+            "fs/delete_directory" => {
+                let req_id = message
+                    .get("id")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                state.tool_calls += 1;
+                *state
+                    .tool_counts
+                    .entry("delete_directory".into())
+                    .or_insert(0) += 1;
+
+                if state.workspace_access == WorkspaceAccess::ReadOnly {
+                    state.tool_failures += 1;
+                    wire.response_error(
+                        req_id,
+                        -32603,
+                        "write operation denied: read-only role workspace",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+
+                let path_str = message
+                    .get("params")
+                    .and_then(|p| p.get("path"))
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("");
+                let recursive = message
+                    .get("params")
+                    .and_then(|p| p.get("recursive"))
+                    .and_then(|p| p.as_bool())
+                    .unwrap_or(false);
+
+                match crate::fs_tools::delete_directory(state.repo_path, path_str, recursive) {
+                    Ok(_) => {
+                        state.tool_successes += 1;
+                        wire.response_ok(
+                            req_id,
+                            serde_json::json!({
+                                "success": true,
+                                "path": path_str,
+                                "message": format!("Directory {} deleted successfully.", path_str),
+                            }),
+                        )
+                        .await?;
+                    }
+                    Err(e) => {
+                        state.tool_failures += 1;
+                        wire.response_ok(
+                            req_id,
+                            serde_json::json!({
+                                "success": false,
+                                "path": path_str,
+                                "error": format!("{e:#}"),
+                            }),
+                        )
+                        .await?;
+                    }
+                }
+                Ok(())
+            }
             other => {
                 if let Some(id) = message.get("id").cloned() {
                     wire.response_error(id, -32601, &format!("unsupported ACP method: {other}"))
@@ -1915,7 +2159,10 @@ async fn execute_real_acp_turn(
 
     let cred_store = CredentialStore::new(pool);
     let credential = if let Some(cid) = &target.credential_id {
-        cred_store.get(cid).await?.context("target credential not found")?
+        cred_store
+            .get(cid)
+            .await?
+            .context("target credential not found")?
     } else {
         let cred_view = cred_store
             .list()
@@ -1934,14 +2181,25 @@ async fn execute_real_acp_turn(
 
     let backend = LocalPrivateSecretBackend::default_for_operator()?;
 
-    let scratch_dir = tempfile::Builder::new().prefix("orbit-acp-role-").tempdir()?;
+    let scratch_dir = tempfile::Builder::new()
+        .prefix("orbit-acp-role-")
+        .tempdir()?;
     let auth_store_dir = scratch_dir.path().join("auth");
-    std::fs::DirBuilder::new().mode(0o700).create(&auth_store_dir)?;
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&auth_store_dir)?;
     let auth_store_dir = auth_store_dir.canonicalize()?;
 
     let runtime = if target.provider == "codex" {
-        let secret_bytes = registered_auth_diagnostic(pool, &backend, &credential.reference).await
-            .map_err(|e| anyhow::anyhow!("failed to stage Codex credentials for {}: {:?}", credential.reference, e))?;
+        let secret_bytes = registered_auth_diagnostic(pool, &backend, &credential.reference)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to stage Codex credentials for {}: {:?}",
+                    credential.reference,
+                    e
+                )
+            })?;
         let auth_file = auth_store_dir.join("auth.json");
         tokio::fs::write(&auth_file, secret_bytes.expose()).await?;
         std::fs::set_permissions(&auth_file, std::fs::Permissions::from_mode(0o600))?;
@@ -1991,7 +2249,10 @@ async fn execute_real_acp_turn(
         let rt = Runtime {
             binding_name: binding_name.into(),
             binding: Binding {
-                model: target.resolved_model.clone().or_else(|| Some("gpt-6-luna".into())),
+                model: target
+                    .resolved_model
+                    .clone()
+                    .or_else(|| Some("gpt-6-luna".into())),
                 runtime: "agent.codex-role-v1".into(),
                 tools: Default::default(),
                 permissions: Vec::new(),
@@ -2017,16 +2278,26 @@ async fn execute_real_acp_turn(
         rt.validate()?;
         rt
     } else if target.provider == "antigravity" {
-        let inspection = cred_store.inspect(&credential.reference).await?
+        let inspection = cred_store
+            .inspect(&credential.reference)
+            .await?
             .context("antigravity credential inspection missing")?;
-        let view = inspection.representations.iter().find(|r| {
-            r.interface == "acp"
-                && r.generation == credential.generation
-                && r.current_generation
-        }).context("antigravity acp representation missing")?;
-        let representation = cred_store.representation(&view.id).await?
+        let view = inspection
+            .representations
+            .iter()
+            .find(|r| {
+                r.interface == "acp"
+                    && r.generation == credential.generation
+                    && r.current_generation
+            })
+            .context("antigravity acp representation missing")?;
+        let representation = cred_store
+            .representation(&view.id)
+            .await?
             .context("antigravity acp representation entity missing")?;
-        let locator = representation.secret_locator.context("missing secret locator for antigravity acp")?;
+        let locator = representation
+            .secret_locator
+            .context("missing secret locator for antigravity acp")?;
         let bundle = backend.read(locator).await?;
         let (token, settings) = decode_bundle(&bundle)?;
 
@@ -2041,7 +2312,10 @@ async fn execute_real_acp_turn(
         let binding_name = "antigravity-role-v1";
         let launch = Launch {
             adapter: Adapter::Antigravity,
-            image: target.runtime_image_digest.clone().unwrap_or_else(|| ANTIGRAVITY_IMAGE.into()),
+            image: target
+                .runtime_image_digest
+                .clone()
+                .unwrap_or_else(|| ANTIGRAVITY_IMAGE.into()),
             command: vec![ACP_EXECUTABLE.into()],
             agent_name: "antigravity-acp".into(),
             agent_version: "agy_acp_server_1.1.1".into(),
@@ -2078,12 +2352,21 @@ async fn execute_real_acp_turn(
             },
         };
         let mut files = BTreeMap::new();
-        files.insert("acp_token.json".into(), ".gemini/antigravity-acp/acp_token.json".into());
-        files.insert("settings.json".into(), ".gemini/antigravity-acp/settings.json".into());
+        files.insert(
+            "acp_token.json".into(),
+            ".gemini/antigravity-acp/acp_token.json".into(),
+        );
+        files.insert(
+            "settings.json".into(),
+            ".gemini/antigravity-acp/settings.json".into(),
+        );
         let rt = Runtime {
             binding_name: binding_name.into(),
             binding: Binding {
-                model: target.resolved_model.clone().or_else(|| Some("gemini-3.8-flash".into())),
+                model: target
+                    .resolved_model
+                    .clone()
+                    .or_else(|| Some("gemini-3.8-flash".into())),
                 runtime: "agent.antigravity-role-v1".into(),
                 tools: Default::default(),
                 permissions: Vec::new(),
@@ -2115,7 +2398,14 @@ async fn execute_real_acp_turn(
     let allowed_tools = if role.workspace_access == WorkspaceAccess::ReadOnly {
         vec!["read_file".to_string()]
     } else {
-        vec!["read_file".to_string(), "write_file".to_string()]
+        vec![
+            "read_file".to_string(),
+            "write_file".to_string(),
+            "create_directory".to_string(),
+            "move".to_string(),
+            "delete_file".to_string(),
+            "delete_directory".to_string(),
+        ]
     };
 
     let request_path = scratch_dir.path().join("request.json");
@@ -2135,8 +2425,14 @@ async fn execute_real_acp_turn(
         .arg(&request_path)
         .current_dir(scratch_dir.path())
         .env_clear()
-        .env("PATH", std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()))
-        .env("HOME", std::env::var_os("HOME").context("rootless runtime HOME missing")?)
+        .env(
+            "PATH",
+            std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
+        )
+        .env(
+            "HOME",
+            std::env::var_os("HOME").context("rootless runtime HOME missing")?,
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -2180,7 +2476,9 @@ async fn execute_real_acp_turn(
                 "terminal": false
             }
         }),
-    ).await.context("ACP initialize failed")?;
+    )
+    .await
+    .context("ACP initialize failed")?;
 
     let new_res = acp_call(
         &mut wire,
@@ -2190,7 +2488,9 @@ async fn execute_real_acp_turn(
             "cwd": crate::acp_runtime::WORKSPACE,
             "mcpServers": []
         }),
-    ).await.context("ACP session/new failed")?;
+    )
+    .await
+    .context("ACP session/new failed")?;
 
     let session_id = new_res
         .get("sessionId")
@@ -2207,7 +2507,8 @@ async fn execute_real_acp_turn(
                 "sessionId": session_id,
                 "modeId": "yolo"
             }),
-        ).await;
+        )
+        .await;
     }
 
     let git_diff = if role.role_id == "reviewer" {
@@ -2249,7 +2550,9 @@ async fn execute_real_acp_turn(
                 }
             ]
         }),
-    ).await.context("ACP session/prompt failed")?;
+    )
+    .await
+    .context("ACP session/prompt failed")?;
 
     if !state.agent_output.contains(ORBIT_HANDOFF_START) {
         extract_text_from_json(&prompt_res, &mut state.agent_output);
@@ -2262,8 +2565,43 @@ async fn execute_real_acp_turn(
 
     let store = WorkflowStore::new(pool.clone());
 
-    if !state.agent_output.contains(ORBIT_HANDOFF_START) || !state.agent_output.contains(ORBIT_HANDOFF_END) {
-        let _ = store.insert_agent_execution(
+    if !state.agent_output.contains(ORBIT_HANDOFF_START)
+        || !state.agent_output.contains(ORBIT_HANDOFF_END)
+    {
+        let _ = store
+            .insert_agent_execution(
+                &agent_exec_id,
+                &role_exec.id,
+                &format!("{}-acp", target.provider),
+                Some(&target.provider),
+                target.resolved_model.as_deref(),
+                started_at_ms,
+                Some(finished_at_ms),
+                "FAILED",
+                Some("ROLE_OUTPUT_INVALID"),
+                Some(exit_code),
+                Some("Missing structured handoff block in agent output"),
+                target.resolved_model.as_deref(),
+                target.resolved_model.as_deref(),
+                target.resolved_model.as_deref(),
+                1,
+                state.tool_calls as i64,
+                state.tool_successes as i64,
+                state.tool_failures as i64,
+                &serde_json::to_value(&state.tool_counts)?,
+                &serde_json::json!({ "provider": target.provider }),
+            )
+            .await;
+        let _ = store
+            .record_agent_execution(&role_exec.id, &agent_exec_id)
+            .await;
+        bail!(
+            "ROLE_OUTPUT_INVALID: missing structured handoff block <<<ORBIT_HANDOFF_START>>> in ACP agent output"
+        );
+    }
+
+    store
+        .insert_agent_execution(
             &agent_exec_id,
             &role_exec.id,
             &format!("{}-acp", target.provider),
@@ -2271,10 +2609,10 @@ async fn execute_real_acp_turn(
             target.resolved_model.as_deref(),
             started_at_ms,
             Some(finished_at_ms),
-            "FAILED",
-            Some("ROLE_OUTPUT_INVALID"),
+            "SUCCEEDED",
+            Some("completed"),
             Some(exit_code),
-            Some("Missing structured handoff block in agent output"),
+            None,
             target.resolved_model.as_deref(),
             target.resolved_model.as_deref(),
             target.resolved_model.as_deref(),
@@ -2284,34 +2622,11 @@ async fn execute_real_acp_turn(
             state.tool_failures as i64,
             &serde_json::to_value(&state.tool_counts)?,
             &serde_json::json!({ "provider": target.provider }),
-        ).await;
-        let _ = store.record_agent_execution(&role_exec.id, &agent_exec_id).await;
-        bail!("ROLE_OUTPUT_INVALID: missing structured handoff block <<<ORBIT_HANDOFF_START>>> in ACP agent output");
-    }
-
-    store.insert_agent_execution(
-        &agent_exec_id,
-        &role_exec.id,
-        &format!("{}-acp", target.provider),
-        Some(&target.provider),
-        target.resolved_model.as_deref(),
-        started_at_ms,
-        Some(finished_at_ms),
-        "SUCCEEDED",
-        Some("completed"),
-        Some(exit_code),
-        None,
-        target.resolved_model.as_deref(),
-        target.resolved_model.as_deref(),
-        target.resolved_model.as_deref(),
-        1,
-        state.tool_calls as i64,
-        state.tool_successes as i64,
-        state.tool_failures as i64,
-        &serde_json::to_value(&state.tool_counts)?,
-        &serde_json::json!({ "provider": target.provider }),
-    ).await?;
-    store.record_agent_execution(&role_exec.id, &agent_exec_id).await?;
+        )
+        .await?;
+    store
+        .record_agent_execution(&role_exec.id, &agent_exec_id)
+        .await?;
 
     Ok(RoleExecutionOutcome {
         raw_output: state.agent_output,
@@ -2338,11 +2653,18 @@ impl RoleAgentExecutor for RealAcpRoleExecutor {
     ) -> Result<RoleExecutionOutcome> {
         // Enforce role permissions and capabilities:
         // Planner & Reviewer: read-only, only read_file tool.
-        // Implementer: read-write, read_file + write_file tools.
+        // Implementer: read-write, full filesystem tools.
         let _allowed_tools = if role.workspace_access == WorkspaceAccess::ReadOnly {
             vec!["read_file".to_string()]
         } else {
-            vec!["read_file".to_string(), "write_file".to_string()]
+            vec![
+                "read_file".to_string(),
+                "write_file".to_string(),
+                "create_directory".to_string(),
+                "move".to_string(),
+                "delete_file".to_string(),
+                "delete_directory".to_string(),
+            ]
         };
 
         // Check if mock mode is requested via env or if we run directly
@@ -2373,5 +2695,160 @@ impl RoleAgentExecutor for RealAcpRoleExecutor {
             input_handoff,
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn make_test_wire() -> (Wire, Wire) {
+        let (client_r, server_w) = tokio::io::duplex(65536);
+        let (server_r, client_w) = tokio::io::duplex(65536);
+        let server_wire = Wire::new(server_r, server_w, 65536);
+        let client_wire = Wire::new(client_r, client_w, 65536);
+        (server_wire, client_wire)
+    }
+
+    #[tokio::test]
+    async fn test_handle_acp_message_filesystem_mutations() -> Result<()> {
+        let repo = tempdir()?;
+        let repo_path = repo.path();
+        let (mut server_wire, mut client_wire) = make_test_wire();
+
+        let mut state = AcpTurnState {
+            repo_path,
+            workspace_access: WorkspaceAccess::ReadWrite,
+            agent_output: String::new(),
+            tool_calls: 0,
+            tool_successes: 0,
+            tool_failures: 0,
+            tool_counts: BTreeMap::new(),
+        };
+
+        // 1. Create directory
+        let msg = serde_json::json!({
+            "id": 1,
+            "method": "fs/create_directory",
+            "params": {
+                "path": "docs/archive",
+                "recursive": true
+            }
+        });
+        handle_acp_message(&mut server_wire, &mut state, msg).await?;
+        let resp = client_wire.read().await?;
+        assert_eq!(resp["id"], 1);
+        assert_eq!(resp["result"]["success"], true);
+        assert!(repo_path.join("docs/archive").is_dir());
+
+        // 2. Create file to move
+        fs::write(repo_path.join("docs/old.md"), "content")?;
+
+        // 3. Move file
+        let msg = serde_json::json!({
+            "id": 2,
+            "method": "fs/move",
+            "params": {
+                "source": "docs/old.md",
+                "destination": "docs/archive/old.md"
+            }
+        });
+        handle_acp_message(&mut server_wire, &mut state, msg).await?;
+        let resp = client_wire.read().await?;
+        assert_eq!(resp["id"], 2);
+        assert_eq!(resp["result"]["success"], true);
+        assert!(repo_path.join("docs/archive/old.md").is_file());
+        assert!(!repo_path.join("docs/old.md").exists());
+
+        // 4. Delete file
+        let msg = serde_json::json!({
+            "id": 3,
+            "method": "fs/delete_file",
+            "params": {
+                "path": "docs/archive/old.md"
+            }
+        });
+        handle_acp_message(&mut server_wire, &mut state, msg).await?;
+        let resp = client_wire.read().await?;
+        assert_eq!(resp["id"], 3);
+        assert_eq!(resp["result"]["success"], true);
+        assert!(!repo_path.join("docs/archive/old.md").exists());
+
+        // 5. Delete directory
+        let msg = serde_json::json!({
+            "id": 4,
+            "method": "fs/delete_directory",
+            "params": {
+                "path": "docs/archive",
+                "recursive": false
+            }
+        });
+        handle_acp_message(&mut server_wire, &mut state, msg).await?;
+        let resp = client_wire.read().await?;
+        assert_eq!(resp["id"], 4);
+        assert_eq!(resp["result"]["success"], true);
+        assert!(!repo_path.join("docs/archive").exists());
+
+        assert_eq!(state.tool_calls, 4);
+        assert_eq!(state.tool_successes, 4);
+        assert_eq!(state.tool_failures, 0);
+        assert_eq!(state.tool_counts["create_directory"], 1);
+        assert_eq!(state.tool_counts["move"], 1);
+        assert_eq!(state.tool_counts["delete_file"], 1);
+        assert_eq!(state.tool_counts["delete_directory"], 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_handle_acp_message_read_only_denial() -> Result<()> {
+        let repo = tempdir()?;
+        let repo_path = repo.path();
+        let (mut server_wire, mut client_wire) = make_test_wire();
+
+        let mut state = AcpTurnState {
+            repo_path,
+            workspace_access: WorkspaceAccess::ReadOnly,
+            agent_output: String::new(),
+            tool_calls: 0,
+            tool_successes: 0,
+            tool_failures: 0,
+            tool_counts: BTreeMap::new(),
+        };
+
+        // Try mutation under ReadOnly
+        let methods = [
+            "fs/create_directory",
+            "fs/move",
+            "fs/delete_file",
+            "fs/delete_directory",
+            "fs/write_text_file",
+        ];
+        for (i, method) in methods.iter().enumerate() {
+            let msg = serde_json::json!({
+                "id": i + 1,
+                "method": method,
+                "params": {
+                    "path": "docs/test.md"
+                }
+            });
+            handle_acp_message(&mut server_wire, &mut state, msg).await?;
+            let resp = client_wire.read().await?;
+            assert!(resp.get("error").is_some());
+            assert!(
+                resp["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("read-only")
+            );
+        }
+
+        assert_eq!(state.tool_calls, 5);
+        assert_eq!(state.tool_failures, 5);
+        assert_eq!(state.tool_successes, 0);
+
+        Ok(())
     }
 }

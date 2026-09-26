@@ -393,6 +393,10 @@ impl<'a> Broker<'a> {
             let tool = match method {
                 "fs/read_text_file" => "read_file",
                 "fs/write_text_file" => "write_file",
+                "fs/create_directory" => "create_directory",
+                "fs/move" => "move",
+                "fs/delete_file" => "delete_file",
+                "fs/delete_directory" => "delete_directory",
                 "terminal/create" => "shell",
                 "terminal/output" => "terminal/output",
                 "terminal/wait_for_exit" => "terminal/wait_for_exit",
@@ -542,19 +546,31 @@ impl<'a> Broker<'a> {
             )));
         }
         match method {
-            "fs/read_text_file" | "fs/write_text_file" => {
+            "fs/read_text_file"
+            | "fs/write_text_file"
+            | "fs/create_directory"
+            | "fs/move"
+            | "fs/delete_file"
+            | "fs/delete_directory" => {
                 if !self.terminals.is_empty() {
                     return Err(BrokerError::recoverable(
                         -32603,
                         "file callbacks require released terminals",
                     ));
                 }
-                let tool = if method == "fs/read_text_file" {
-                    "read_file"
-                } else {
-                    "write_file"
+                let tool = match method {
+                    "fs/read_text_file" => "read_file",
+                    "fs/write_text_file" => "write_file",
+                    "fs/create_directory" => "create_directory",
+                    "fs/move" => "move",
+                    "fs/delete_file" => "delete_file",
+                    "fs/delete_directory" => "delete_directory",
+                    _ => unreachable!(),
                 };
-                if tool == "write_file" {
+                if matches!(
+                    tool,
+                    "write_file" | "create_directory" | "move" | "delete_file" | "delete_directory"
+                ) {
                     let write_allowed = self
                         .session
                         .assignment
@@ -563,7 +579,7 @@ impl<'a> Broker<'a> {
                         .steps
                         .get(&self.session.assignment.step)
                         .and_then(|s| s.agent.as_ref())
-                        .is_some_and(|a| a.tools.contains(&"write_file".to_string()));
+                        .is_some_and(|a| a.tools.contains(&tool.to_string()));
                     if !write_allowed {
                         return Err(BrokerError::recoverable(
                             -32603,
@@ -571,13 +587,17 @@ impl<'a> Broker<'a> {
                         ));
                     }
                 }
-                let path = match self.path(&params["path"]) {
-                    Ok(p) => p,
-                    Err(err) => {
-                        return Err(BrokerError::recoverable(
-                            -32602,
-                            format!("invalid ACP path: {err:#}"),
-                        ));
+                let path = if tool == "move" {
+                    String::new()
+                } else {
+                    match self.path(&params["path"]) {
+                        Ok(p) => p,
+                        Err(err) => {
+                            return Err(BrokerError::recoverable(
+                                -32602,
+                                format!("invalid ACP path: {err:#}"),
+                            ));
+                        }
                     }
                 };
 
@@ -638,7 +658,7 @@ impl<'a> Broker<'a> {
                             return Err(BrokerError::recoverable(-32603, err_msg));
                         }
                     }
-                } else {
+                } else if tool == "write_file" {
                     let content = match params.get("content").and_then(|v| v.as_str()) {
                         Some(s) if s.len() <= 65536 => s,
                         Some(_) => {
@@ -668,6 +688,82 @@ impl<'a> Broker<'a> {
                             return Err(BrokerError::recoverable(-32603, err_msg));
                         }
                     }
+                } else if tool == "create_directory" {
+                    let recursive = params
+                        .get("recursive")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    match crate::fs_tools::create_directory(
+                        &self.session.workspace.path,
+                        &path,
+                        recursive,
+                    ) {
+                        Ok(_) => json!({"success": true, "path": path}),
+                        Err(err) => {
+                            let err_msg = format!("{err:#}");
+                            let err_val = json!({"error": &err_msg});
+                            let _ = self.finish(&call, &err_val).await;
+                            return Err(BrokerError::recoverable(-32603, err_msg));
+                        }
+                    }
+                } else if tool == "move" {
+                    let src = match self.path(&params["source"]) {
+                        Ok(p) => p,
+                        Err(err) => {
+                            return Err(BrokerError::recoverable(
+                                -32602,
+                                format!("invalid source: {err:#}"),
+                            ));
+                        }
+                    };
+                    let dst = match self.path(&params["destination"]) {
+                        Ok(p) => p,
+                        Err(err) => {
+                            return Err(BrokerError::recoverable(
+                                -32602,
+                                format!("invalid destination: {err:#}"),
+                            ));
+                        }
+                    };
+                    match crate::fs_tools::move_path(&self.session.workspace.path, &src, &dst) {
+                        Ok(_) => json!({"success": true, "source": src, "destination": dst}),
+                        Err(err) => {
+                            let err_msg = format!("{err:#}");
+                            let err_val = json!({"error": &err_msg});
+                            let _ = self.finish(&call, &err_val).await;
+                            return Err(BrokerError::recoverable(-32603, err_msg));
+                        }
+                    }
+                } else if tool == "delete_file" {
+                    match crate::fs_tools::delete_file(&self.session.workspace.path, &path) {
+                        Ok(_) => json!({"success": true, "path": path}),
+                        Err(err) => {
+                            let err_msg = format!("{err:#}");
+                            let err_val = json!({"error": &err_msg});
+                            let _ = self.finish(&call, &err_val).await;
+                            return Err(BrokerError::recoverable(-32603, err_msg));
+                        }
+                    }
+                } else if tool == "delete_directory" {
+                    let recursive = params
+                        .get("recursive")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    match crate::fs_tools::delete_directory(
+                        &self.session.workspace.path,
+                        &path,
+                        recursive,
+                    ) {
+                        Ok(_) => json!({"success": true, "path": path}),
+                        Err(err) => {
+                            let err_msg = format!("{err:#}");
+                            let err_val = json!({"error": &err_msg});
+                            let _ = self.finish(&call, &err_val).await;
+                            return Err(BrokerError::recoverable(-32603, err_msg));
+                        }
+                    }
+                } else {
+                    unreachable!()
                 };
 
                 self.record(
