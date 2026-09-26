@@ -2040,7 +2040,7 @@ async fn execute_real_acp_turn(
     let request_path = scratch_dir.path().join("request.json");
     let req = crate::acp_process::Request {
         runtime,
-        attempt_id: format!("{}-{}", wf_run.attempt_id, role_exec.id),
+        attempt_id: id(),
         timeout_seconds: 600,
         tools: allowed_tools.clone(),
     };
