@@ -603,7 +603,7 @@ async fn turn(
                 "error" => {
                     diagnostics.outcome = "app_server_error_notification";
                     diagnostics.turn_outcome = "app_server_error_notification";
-                    anyhow::bail!("Codex turn failed")
+                    anyhow::bail!("Codex turn failed: {params:?}")
                 }
                 _ => {} // bounded control telemetry; never raw-reasoning persistence
             }

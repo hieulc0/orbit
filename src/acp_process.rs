@@ -646,7 +646,10 @@ pub async fn supervise(path: &Path) -> Result<i32> {
                     &mut session_diagnostics,
                 )
                 .await
-                .map_err(|_| std::io::Error::other("Codex ACP session ended"))?;
+                .map_err(|e| {
+                    eprintln!("Codex session run error: {e:#}");
+                    std::io::Error::other("Codex ACP session ended")
+                })?;
                 return Ok(());
             }
             let to_agent = async {
@@ -690,6 +693,9 @@ pub async fn supervise(path: &Path) -> Result<i32> {
             read_error: true,
             truncated: false,
         });
+        if !captured_stderr.text.trim().is_empty() {
+            eprintln!("Codex App Server stderr: {}", captured_stderr.text.trim());
+        }
         let stage = if codex && trigger == "bridge_error" {
             "app_server_protocol"
         } else if trigger == "peer_eof_after_end_turn" {

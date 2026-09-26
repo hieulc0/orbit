@@ -1692,19 +1692,23 @@ async fn handle_acp_message(
                     .and_then(|p| p.get("path"))
                     .and_then(|p| p.as_str())
                     .unwrap_or("");
-                let rel_path = Path::new(rel_path_str.trim_start_matches('/'));
-                let full_path = state.repo_path.join(rel_path);
+                let raw_path = Path::new(rel_path_str);
+                let full_path = if raw_path.is_absolute() {
+                    raw_path.to_path_buf()
+                } else {
+                    state.repo_path.join(raw_path)
+                };
 
                 let canonical_repo = match state.repo_path.canonicalize() {
                     Ok(c) => c,
                     Err(_) => state.repo_path.to_path_buf(),
                 };
-                let is_safe = match full_path.canonicalize() {
-                    Ok(c) => c.starts_with(&canonical_repo),
-                    Err(_) => true,
+                let canonical_full = match full_path.canonicalize() {
+                    Ok(c) => c,
+                    Err(_) => full_path.clone(),
                 };
 
-                if !is_safe {
+                if !canonical_full.starts_with(&canonical_repo) {
                     state.tool_failures += 1;
                     wire.response_error(req_id, -32603, "access denied: path outside workspace")
                         .await?;
@@ -1752,8 +1756,12 @@ async fn handle_acp_message(
                     .and_then(|c| c.as_str())
                     .unwrap_or("");
 
-                let rel_path = Path::new(rel_path_str.trim_start_matches('/'));
-                let full_path = state.repo_path.join(rel_path);
+                let raw_path = Path::new(rel_path_str);
+                let full_path = if raw_path.is_absolute() {
+                    raw_path.to_path_buf()
+                } else {
+                    state.repo_path.join(raw_path)
+                };
 
                 let canonical_repo = match state.repo_path.canonicalize() {
                     Ok(c) => c,
@@ -1761,7 +1769,18 @@ async fn handle_acp_message(
                 };
                 let is_safe = match full_path.parent().map(|p| p.canonicalize()) {
                     Some(Ok(c)) => c.starts_with(&canonical_repo),
-                    _ => true,
+                    _ => {
+                        let mut cur = full_path.parent();
+                        let mut safe = true;
+                        while let Some(p) = cur {
+                            if let Ok(c) = p.canonicalize() {
+                                safe = c.starts_with(&canonical_repo);
+                                break;
+                            }
+                            cur = p.parent();
+                        }
+                        safe
+                    }
                 };
 
                 if !is_safe {
