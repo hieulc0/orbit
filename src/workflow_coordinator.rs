@@ -1595,6 +1595,23 @@ impl RoleAgentExecutor for SimulatedRoleExecutor {
     }
 }
 
+fn list_files_recursively(base: &Path, dir: &Path, acc: &mut Vec<String>) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+        entries.sort_by_key(|e| e.path());
+        for entry in entries {
+            let path = entry.path();
+            if path.is_dir() {
+                list_files_recursively(base, &path, acc);
+            } else if path.is_file() {
+                if let Ok(rel) = path.strip_prefix(base) {
+                    acc.push(rel.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+}
+
 fn build_role_prompt(
     role: &RoleDefinition,
     task_text: &str,
@@ -1603,23 +1620,39 @@ fn build_role_prompt(
     input_handoff: Option<&HandoffArtifact>,
     git_diff: Option<&str>,
 ) -> String {
+    let mut doc_files = Vec::new();
+    let docs_dir = repo_path.join("docs");
+    if docs_dir.is_dir() {
+        list_files_recursively(repo_path, &docs_dir, &mut doc_files);
+    }
+    let docs_manifest = if doc_files.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n            EXISTING DOCUMENTATION FILES:\n            {}\n",
+            doc_files.join("\n            ")
+        )
+    };
+
     match role.role_id.as_str() {
         "planner" => format!(
-            "You are the PLANNER role in an Orbit automated software change workflow.\n            Your responsibility is to analyze the task, inspect the repository using fs/read_text_file, and produce a clear, structured implementation plan.\n\n            TASK OBJECTIVE:\n{task_text}\n\n            REPOSITORY CONTEXT:\n            Repository Path: {repo_path}\n            Base Revision: {base_revision}\n\n            WORKSPACE PERMISSIONS:\n            You have READ-ONLY workspace access. You can inspect files using fs/read_text_file.\n            You CANNOT write files. Any write requests will be rejected by the workspace broker.\n\n            INSTRUCTIONS:\n            1. Use fs/read_text_file to examine existing files, project structure, and documentation.\n            2. Formulate a concrete step-by-step implementation plan.\n            3. You MUST end your response with a structured JSON plan handoff block inside the exact delimiters:\n            <<<ORBIT_HANDOFF_START>>>\n            {{\n              \"summary\": \"Concise summary of the plan\",\n              \"affected_areas\": [\"area1\", \"area2\"],\n              \"implementation_steps\": [\"step 1\", \"step 2\"],\n              \"expected_files\": [\"docs/file1.md\"],\n              \"risks\": [],\n              \"verification_notes\": [\"verification instructions\"],\n              \"open_questions\": []\n            }}\n            <<<ORBIT_HANDOFF_END>>>\n",
+            "You are the PLANNER role in an Orbit automated software change workflow.\n            Your responsibility is to analyze the task, inspect the repository using read_file, and produce a clear, structured implementation plan.\n\n            TASK OBJECTIVE:\n{task_text}\n\n            REPOSITORY CONTEXT:\n            Repository Path: {repo_path}\n            Base Revision: {base_revision}{docs_manifest}\n            WORKSPACE PERMISSIONS:\n            You have READ-ONLY workspace access. You can inspect files using read_file.\n            You CANNOT write files. Any write requests will be rejected by the workspace broker.\n\n            INSTRUCTIONS:\n            1. Use read_file with workspace-relative file paths (e.g. docs/README.md) to inspect files.\n               Important: do NOT pass directory paths or root paths to read_file; read_file only reads text files.\n            2. Formulate a concrete step-by-step implementation plan.\n            3. You MUST end your response with a structured JSON plan handoff block inside the exact delimiters:\n            <<<ORBIT_HANDOFF_START>>>\n            {{\n              \"summary\": \"Concise summary of the plan\",\n              \"affected_areas\": [\"area1\", \"area2\"],\n              \"implementation_steps\": [\"step 1\", \"step 2\"],\n              \"expected_files\": [\"docs/file1.md\"],\n              \"risks\": [],\n              \"verification_notes\": [\"verification instructions\"],\n              \"open_questions\": []\n            }}\n            <<<ORBIT_HANDOFF_END>>>\n",
             repo_path = repo_path.display(),
             base_revision = base_revision,
             task_text = task_text,
+            docs_manifest = docs_manifest,
         ),
         "implementer" => {
             let plan_summary = input_handoff
                 .map(|h| h.structured_payload.to_string())
                 .unwrap_or_else(|| "No prior plan provided.".to_string());
             format!(
-                "You are the IMPLEMENTER role in an Orbit automated software change workflow.\n                Your responsibility is to execute the implementation plan by modifying project files and verifying your work.\n\n                TASK OBJECTIVE:\n{task_text}\n\n                PLANNER SPECIFICATION:\n{plan_summary}\n\n                REPOSITORY CONTEXT:\n                Repository Path: {repo_path}\n                Base Revision: {base_revision}\n\n                WORKSPACE PERMISSIONS:\n                You have READ-WRITE workspace access. You can read files using fs/read_text_file and create or edit files using fs/write_text_file.\n\n                INSTRUCTIONS:\n                1. Inspect the codebase using fs/read_text_file.\n                2. Implement all required changes using fs/write_text_file.\n                3. You MUST end your response with a structured JSON implementation handoff block inside the exact delimiters:\n                <<<ORBIT_HANDOFF_START>>>\n                {{\n                  \"summary\": \"Concise summary of changes implemented\",\n                  \"changed_files\": [\"docs/file1.md\"],\n                  \"tests_added_or_modified\": [],\n                  \"exploratory_commands\": [],\n                  \"known_limitations\": [],\n                  \"verification_notes\": [\"self-verification details\"]\n                }}\n                <<<ORBIT_HANDOFF_END>>>\n",
+                "You are the IMPLEMENTER role in an Orbit automated software change workflow.\n                Your responsibility is to execute the implementation plan by modifying project files and verifying your work.\n\n                TASK OBJECTIVE:\n{task_text}\n\n                PLANNER SPECIFICATION:\n{plan_summary}\n\n                REPOSITORY CONTEXT:\n                Repository Path: {repo_path}\n                Base Revision: {base_revision}{docs_manifest}\n                WORKSPACE PERMISSIONS:\n                You have READ-WRITE workspace access. You can read files using read_file and create or edit files using write_file.\n\n                INSTRUCTIONS:\n                1. Inspect files using read_file and write files using write_file with workspace-relative paths (e.g. docs/README.md).\n                   Important: do NOT pass directory paths to read_file or write_file.\n                2. Implement all required changes using write_file.\n                3. You MUST end your response with a structured JSON implementation handoff block inside the exact delimiters:\n                <<<ORBIT_HANDOFF_START>>>\n                {{\n                  \"summary\": \"Concise summary of changes implemented\",\n                  \"changed_files\": [\"docs/file1.md\"],\n                  \"tests_added_or_modified\": [],\n                  \"exploratory_commands\": [],\n                  \"known_limitations\": [],\n                  \"verification_notes\": [\"self-verification details\"]\n                }}\n                <<<ORBIT_HANDOFF_END>>>\n",
                 repo_path = repo_path.display(),
                 base_revision = base_revision,
                 task_text = task_text,
                 plan_summary = plan_summary,
+                docs_manifest = docs_manifest,
             )
         }
         "reviewer" => {
@@ -1732,8 +1765,17 @@ async fn handle_acp_message(
 
                 match tokio::fs::read_to_string(&full_path).await {
                     Ok(content) => {
+                        let bounded_content = if content.len() > 65536 {
+                            let mut end = 65536;
+                            while end > 0 && !content.is_char_boundary(end) {
+                                end -= 1;
+                            }
+                            &content[..end]
+                        } else {
+                            &content
+                        };
                         state.tool_successes += 1;
-                        wire.response_ok(req_id, serde_json::json!({ "content": content }))
+                        wire.response_ok(req_id, serde_json::json!({ "content": bounded_content }))
                             .await?;
                     }
                     Err(e) => {
