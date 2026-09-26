@@ -29,6 +29,7 @@ pub mod engine;
 pub mod evidence;
 pub mod execution;
 pub mod governance;
+pub mod integration_environment;
 pub mod mcp;
 pub mod model;
 pub mod ops;

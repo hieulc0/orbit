@@ -77,6 +77,7 @@ fn sample_policy() -> VerificationPolicy {
         },
         network_policy: VerificationNetworkPolicy::None,
         cache_policy: VerificationCachePolicy::Clean,
+        integration_environment_spec: None,
     }
 }
 
@@ -90,6 +91,7 @@ fn sample_environment() -> EnvironmentIdentity {
         network_policy: VerificationNetworkPolicy::None,
         cache_policy: VerificationCachePolicy::Clean,
         environment_policy_digest: None,
+        integration_environment_digest: None,
         architecture: std::env::consts::ARCH.into(),
         os: std::env::consts::OS.into(),
         orbit_version: "0.1.0".into(),

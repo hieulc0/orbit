@@ -1463,19 +1463,22 @@ async fn main() -> Result<()> {
                         None
                     };
 
-                let (net_pol, cache_pol, env_pol_digest) = if let Some(p) = &policy_def {
-                    (
-                        p.network_policy,
-                        p.cache_policy,
-                        Some(p.environment_policy.digest()),
-                    )
-                } else {
-                    (
-                        orbit::verification::VerificationNetworkPolicy::None,
-                        orbit::verification::VerificationCachePolicy::Clean,
-                        None,
-                    )
-                };
+                let (net_pol, cache_pol, env_pol_digest, int_env_digest) =
+                    if let Some(p) = &policy_def {
+                        (
+                            p.network_policy,
+                            p.cache_policy,
+                            Some(p.environment_policy.digest()),
+                            p.integration_environment_spec.as_ref().map(|s| s.digest()),
+                        )
+                    } else {
+                        (
+                            orbit::verification::VerificationNetworkPolicy::None,
+                            orbit::verification::VerificationCachePolicy::Clean,
+                            None,
+                            None,
+                        )
+                    };
 
                 let env = orbit::verification::EnvironmentIdentity {
                     execution_profile: profile_name,
@@ -1490,6 +1493,7 @@ async fn main() -> Result<()> {
                     network_policy: net_pol,
                     cache_policy: cache_pol,
                     environment_policy_digest: env_pol_digest,
+                    integration_environment_digest: int_env_digest,
                     architecture: std::env::consts::ARCH.into(),
                     os: std::env::consts::OS.into(),
                     orbit_version: env!("CARGO_PKG_VERSION").into(),

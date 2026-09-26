@@ -169,12 +169,14 @@ impl VerificationPlan {
 pub enum VerificationNetworkPolicy {
     #[default]
     None,
+    Isolated,
 }
 
 impl std::fmt::Display for VerificationNetworkPolicy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::None => write!(f, "none"),
+            Self::Isolated => write!(f, "isolated"),
         }
     }
 }
@@ -298,6 +300,9 @@ pub struct VerificationPolicy {
     pub network_policy: VerificationNetworkPolicy,
     #[serde(default)]
     pub cache_policy: VerificationCachePolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration_environment_spec:
+        Option<crate::integration_environment::IntegrationEnvironmentSpec>,
 }
 
 impl VerificationPolicy {
@@ -311,6 +316,7 @@ impl VerificationPolicy {
             environment_policy: VerificationEnvironmentPolicy::clean(),
             network_policy: VerificationNetworkPolicy::None,
             cache_policy: VerificationCachePolicy::Clean,
+            integration_environment_spec: None,
         }
     }
 
@@ -430,6 +436,8 @@ pub struct EnvironmentIdentity {
     pub cache_policy: VerificationCachePolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment_policy_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration_environment_digest: Option<String>,
     pub architecture: String,
     pub os: String,
     pub orbit_version: String,
@@ -483,7 +491,7 @@ pub struct VerificationRun {
     pub step_runs: Vec<VerificationStepRun>,
 }
 
-fn now_millis() -> i64 {
+pub fn now_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -539,9 +547,30 @@ pub async fn execute_verification_command_isolated(
     step: &VerificationStep,
     workspace_dir: &Path,
     timeout_override: Option<Duration>,
+    cancellation_token: Option<tokio::sync::watch::Receiver<bool>>,
+    isolation_image: Option<&str>,
+    environment_policy: Option<&VerificationEnvironmentPolicy>,
+) -> Result<CommandOutputCapture> {
+    execute_verification_command_isolated_with_network(
+        step,
+        workspace_dir,
+        timeout_override,
+        cancellation_token,
+        isolation_image,
+        environment_policy,
+        None,
+    )
+    .await
+}
+
+pub async fn execute_verification_command_isolated_with_network(
+    step: &VerificationStep,
+    workspace_dir: &Path,
+    timeout_override: Option<Duration>,
     mut cancellation_token: Option<tokio::sync::watch::Receiver<bool>>,
     isolation_image: Option<&str>,
     environment_policy: Option<&VerificationEnvironmentPolicy>,
+    network_name: Option<&str>,
 ) -> Result<CommandOutputCapture> {
     use std::process::Stdio;
     use tokio::{io::AsyncReadExt, process::Command};
@@ -614,30 +643,37 @@ pub async fn execute_verification_command_isolated(
             env_map.insert(k.clone(), v.clone());
         }
 
-        c.args([
-            "--remote=false",
-            "--cgroup-manager=cgroupfs",
-            "run",
-            "--rm",
-            "--name",
-            name,
-            "--network=none",
-            "--read-only",
-            "--cap-drop=ALL",
-            "--security-opt=no-new-privileges",
-            "--pids-limit=128",
-            "--init",
-            "--log-driver=none",
-            "--tmpfs",
-            "/tmp:rw,nosuid,nodev,size=67108864",
-            "--mount",
-            &format!(
+        let mut run_args = vec![
+            "--remote=false".to_string(),
+            "--cgroup-manager=cgroupfs".to_string(),
+            "run".to_string(),
+            "--rm".to_string(),
+            "--name".to_string(),
+            name.to_string(),
+        ];
+        if let Some(net) = network_name {
+            run_args.push(format!("--network={}", net));
+        } else {
+            run_args.push("--network=none".to_string());
+        }
+        run_args.extend([
+            "--read-only".to_string(),
+            "--cap-drop=ALL".to_string(),
+            "--security-opt=no-new-privileges".to_string(),
+            "--pids-limit=128".to_string(),
+            "--init".to_string(),
+            "--log-driver=none".to_string(),
+            "--tmpfs".to_string(),
+            "/tmp:rw,nosuid,nodev,size=67108864".to_string(),
+            "--mount".to_string(),
+            format!(
                 "type=bind,src={},dst=/workspace",
                 canonical_workspace.display()
             ),
-            "--workdir",
-            &cont_cwd,
+            "--workdir".to_string(),
+            cont_cwd.to_string(),
         ]);
+        c.args(&run_args);
 
         for (k, v) in &env_map {
             c.arg("--env").arg(format!("{}={}", k, v));
@@ -854,6 +890,10 @@ pub struct VerificationStore {
 impl VerificationStore {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
     }
 
     /// Save or update a verification plan.
@@ -1366,6 +1406,12 @@ impl VerificationStore {
                     if req_env.cache_policy != run.environment_identity.cache_policy {
                         continue;
                     }
+                    if req_env.integration_environment_digest.is_some()
+                        && req_env.integration_environment_digest
+                            != run.environment_identity.integration_environment_digest
+                    {
+                        continue;
+                    }
                 }
 
                 // Ensure all required steps in the policy actually ran and passed
@@ -1444,139 +1490,237 @@ pub async fn execute_verification_plan_with_policy(
         .create_run_with_policy(attempt_id, workspace_state, plan, environment, policy)
         .await?;
 
-    let mut overall_result = VerificationRunResult::Passed;
+    let overall_result;
     let mut step_runs = Vec::new();
 
-    for step in &plan.steps {
-        if cancellation_token
-            .as_ref()
-            .is_some_and(|token| *token.borrow())
-        {
-            overall_result = VerificationRunResult::Cancelled;
-            break;
-        }
+    // Check if policy specifies an integration environment spec
+    let env_spec = policy.and_then(|p| p.integration_environment_spec.as_ref());
+    let env_manager = crate::integration_environment::EnvironmentManager::new(
+        crate::integration_environment::EnvironmentStore::new(store.pool().clone()),
+    );
 
-        let step_run_id = format!("vstep-{}", crate::model::id());
-        let step_started_at_ms = now_millis();
+    let run_id = run.id.clone();
+    let runtime_image = run.environment_identity.runtime_image.clone();
 
-        let image_opt = run.environment_identity.runtime_image.as_deref();
-        let env_pol = policy.map(|p| &p.environment_policy);
-        let capture_res = execute_verification_command_isolated(
-            step,
-            workspace_dir,
-            None,
-            cancellation_token.clone(),
-            image_opt,
-            env_pol,
-        )
-        .await;
+    // Helper executing the steps given a network_name
+    let execute_steps =
+        |network_name: Option<String>, cancel_tok: Option<tokio::sync::watch::Receiver<bool>>| {
+            let run_id = run_id.clone();
+            let runtime_image = runtime_image.clone();
+            async move {
+                let mut inner_steps = Vec::new();
+                let mut inner_overall = VerificationRunResult::Passed;
 
-        let finished_at_ms = now_millis();
-        let duration_ms = finished_at_ms - step_started_at_ms;
+                for step in &plan.steps {
+                    if cancel_tok.as_ref().is_some_and(|token| *token.borrow()) {
+                        inner_overall = VerificationRunResult::Cancelled;
+                        break;
+                    }
 
-        let (
-            status,
-            exit_code,
-            stdout_preview,
-            stdout_bytes,
-            stdout_trunc,
-            stderr_preview,
-            stderr_bytes,
-            stderr_trunc,
-            error_msg,
-        ) = match capture_res {
-            Ok(capture) => {
-                let st = if capture.timed_out {
-                    VerificationStepStatus::TimedOut
-                } else if capture.exit_code == Some(0) {
-                    VerificationStepStatus::Passed
-                } else {
-                    VerificationStepStatus::Failed
-                };
+                    let step_run_id = format!("vstep-{}", crate::model::id());
+                    let step_started_at_ms = now_millis();
 
-                let out_preview = String::from_utf8_lossy(
-                    &capture.stdout_bytes
-                        [..capture.stdout_bytes.len().min(MAX_INLINE_OUTPUT_BYTES)],
-                )
-                .to_string();
+                    let image_opt = runtime_image.as_deref();
+                    let env_pol = policy.map(|p| &p.environment_policy);
+                    let capture_res = execute_verification_command_isolated_with_network(
+                        step,
+                        workspace_dir,
+                        None,
+                        cancel_tok.clone(),
+                        image_opt,
+                        env_pol,
+                        network_name.as_deref(),
+                    )
+                    .await;
 
-                let err_preview = String::from_utf8_lossy(
-                    &capture.stderr_bytes
-                        [..capture.stderr_bytes.len().min(MAX_INLINE_OUTPUT_BYTES)],
-                )
-                .to_string();
+                    let finished_at_ms = now_millis();
+                    let duration_ms = finished_at_ms - step_started_at_ms;
 
-                (
-                    st,
-                    capture.exit_code,
-                    Some(out_preview),
-                    capture.stdout_total_len,
-                    capture.stdout_truncated
-                        || capture.stdout_total_len > MAX_INLINE_OUTPUT_BYTES as u64,
-                    Some(err_preview),
-                    capture.stderr_total_len,
-                    capture.stderr_truncated
-                        || capture.stderr_total_len > MAX_INLINE_OUTPUT_BYTES as u64,
-                    None,
-                )
-            }
-            Err(err) => {
-                let is_cancel = err.to_string().contains("cancelled");
-                let st = if is_cancel {
-                    VerificationStepStatus::Cancelled
-                } else {
-                    VerificationStepStatus::Error
-                };
-                (
-                    st,
-                    None,
-                    None,
-                    0,
-                    false,
-                    None,
-                    0,
-                    false,
-                    Some(err.to_string()),
-                )
+                    let (
+                        status,
+                        exit_code,
+                        stdout_preview,
+                        stdout_bytes,
+                        stdout_trunc,
+                        stderr_preview,
+                        stderr_bytes,
+                        stderr_trunc,
+                        error_msg,
+                    ) = match capture_res {
+                        Ok(capture) => {
+                            let st = if capture.timed_out {
+                                VerificationStepStatus::TimedOut
+                            } else if capture.exit_code == Some(0) {
+                                VerificationStepStatus::Passed
+                            } else {
+                                VerificationStepStatus::Failed
+                            };
+
+                            let out_preview = String::from_utf8_lossy(
+                                &capture.stdout_bytes
+                                    [..capture.stdout_bytes.len().min(MAX_INLINE_OUTPUT_BYTES)],
+                            )
+                            .to_string();
+
+                            let err_preview = String::from_utf8_lossy(
+                                &capture.stderr_bytes
+                                    [..capture.stderr_bytes.len().min(MAX_INLINE_OUTPUT_BYTES)],
+                            )
+                            .to_string();
+
+                            (
+                                st,
+                                capture.exit_code,
+                                Some(out_preview),
+                                capture.stdout_total_len,
+                                capture.stdout_truncated
+                                    || capture.stdout_total_len > MAX_INLINE_OUTPUT_BYTES as u64,
+                                Some(err_preview),
+                                capture.stderr_total_len,
+                                capture.stderr_truncated
+                                    || capture.stderr_total_len > MAX_INLINE_OUTPUT_BYTES as u64,
+                                None,
+                            )
+                        }
+                        Err(err) => {
+                            let is_cancel = err.to_string().contains("cancelled");
+                            let st = if is_cancel {
+                                VerificationStepStatus::Cancelled
+                            } else {
+                                VerificationStepStatus::Error
+                            };
+                            (
+                                st,
+                                None,
+                                None,
+                                0,
+                                false,
+                                None,
+                                0,
+                                false,
+                                Some(err.to_string()),
+                            )
+                        }
+                    };
+
+                    let step_record = VerificationStepRun {
+                        id: step_run_id,
+                        verification_run_id: run_id.clone(),
+                        step_id: step.id.clone(),
+                        step_name: step.name.clone(),
+                        status,
+                        required: step.required,
+                        exit_code,
+                        started_at_ms: step_started_at_ms,
+                        finished_at_ms: Some(finished_at_ms),
+                        duration_ms: Some(duration_ms),
+                        stdout_preview,
+                        stdout_truncated: stdout_trunc,
+                        stdout_bytes,
+                        stdout_artifact_id: None,
+                        stderr_preview,
+                        stderr_truncated: stderr_trunc,
+                        stderr_bytes,
+                        stderr_artifact_id: None,
+                        artifacts: Vec::new(),
+                        error_message: error_msg,
+                    };
+
+                    store.record_step_run(&step_record).await.ok();
+                    inner_steps.push(step_record);
+
+                    if status != VerificationStepStatus::Passed && step.required {
+                        inner_overall = match status {
+                            VerificationStepStatus::TimedOut => VerificationRunResult::TimedOut,
+                            VerificationStepStatus::Cancelled => VerificationRunResult::Cancelled,
+                            VerificationStepStatus::Error => VerificationRunResult::Error,
+                            _ => VerificationRunResult::Failed,
+                        };
+                        break;
+                    }
+                }
+                (inner_overall, inner_steps)
             }
         };
 
-        let step_record = VerificationStepRun {
-            id: step_run_id,
-            verification_run_id: run.id.clone(),
-            step_id: step.id.clone(),
-            step_name: step.name.clone(),
-            status,
-            required: step.required,
-            exit_code,
-            started_at_ms: step_started_at_ms,
-            finished_at_ms: Some(finished_at_ms),
-            duration_ms: Some(duration_ms),
-            stdout_preview,
-            stdout_truncated: stdout_trunc,
-            stdout_bytes,
-            stdout_artifact_id: None,
-            stderr_preview,
-            stderr_truncated: stderr_trunc,
-            stderr_bytes,
-            stderr_artifact_id: None,
-            artifacts: Vec::new(),
-            error_message: error_msg,
-        };
+    if let Some(spec) = env_spec {
+        let cancel_clone = cancellation_token.clone();
+        let (_env_run, lifecycle_res) = env_manager
+            .run_environment_lifecycle(
+                &run.id,
+                &workspace_state.state_id,
+                spec,
+                workspace_dir,
+                runtime_image.as_deref(),
+                cancellation_token,
+                |net_name| {
+                    let cancel_inner = cancel_clone.clone();
+                    async move {
+                        let (res, steps) = execute_steps(net_name, cancel_inner).await;
+                        Ok((res, steps))
+                    }
+                },
+            )
+            .await?;
 
-        store.record_step_run(&step_record).await?;
-        step_runs.push(step_record);
-
-        if status != VerificationStepStatus::Passed && step.required {
-            overall_result = match status {
-                VerificationStepStatus::TimedOut => VerificationRunResult::TimedOut,
-                VerificationStepStatus::Cancelled => VerificationRunResult::Cancelled,
-                VerificationStepStatus::Error => VerificationRunResult::Error,
-                _ => VerificationRunResult::Failed,
-            };
-            // Stop execution on first required failure (fail-fast per section 13)
-            break;
+        match lifecycle_res {
+            Ok((res, steps)) => {
+                overall_result = res;
+                step_runs = steps;
+            }
+            Err((env_status, err_msg)) => {
+                overall_result = match env_status {
+                    crate::integration_environment::EnvironmentRunStatus::TimedOut => {
+                        VerificationRunResult::TimedOut
+                    }
+                    crate::integration_environment::EnvironmentRunStatus::Cancelled => {
+                        VerificationRunResult::Cancelled
+                    }
+                    crate::integration_environment::EnvironmentRunStatus::Error => {
+                        VerificationRunResult::Error
+                    }
+                    _ => VerificationRunResult::Failed,
+                };
+                // If no steps ran, create an informative step or record error message
+                if step_runs.is_empty() {
+                    let step_run_id = format!("vstep-env-{}", crate::model::id());
+                    let now = now_millis();
+                    let step_record = VerificationStepRun {
+                        id: step_run_id,
+                        verification_run_id: run.id.clone(),
+                        step_id: "environment_lifecycle".into(),
+                        step_name: "Integration Environment".into(),
+                        status: match overall_result {
+                            VerificationRunResult::TimedOut => VerificationStepStatus::TimedOut,
+                            VerificationRunResult::Cancelled => VerificationStepStatus::Cancelled,
+                            VerificationRunResult::Error => VerificationStepStatus::Error,
+                            _ => VerificationStepStatus::Failed,
+                        },
+                        required: true,
+                        exit_code: Some(1),
+                        started_at_ms: now,
+                        finished_at_ms: Some(now),
+                        duration_ms: Some(0),
+                        stdout_preview: None,
+                        stdout_truncated: false,
+                        stdout_bytes: 0,
+                        stdout_artifact_id: None,
+                        stderr_preview: Some(err_msg.clone()),
+                        stderr_truncated: false,
+                        stderr_bytes: err_msg.len() as u64,
+                        stderr_artifact_id: None,
+                        artifacts: Vec::new(),
+                        error_message: Some(err_msg),
+                    };
+                    store.record_step_run(&step_record).await.ok();
+                    step_runs.push(step_record);
+                }
+            }
         }
+    } else {
+        let (res, steps) = execute_steps(None, cancellation_token).await;
+        overall_result = res;
+        step_runs = steps;
     }
 
     store.finalize_run(&run.id, overall_result).await?;
@@ -1618,6 +1762,9 @@ pub fn format_verification_show(run: &VerificationRun) -> String {
         "Cache Policy  {}\n",
         run.environment_identity.cache_policy
     ));
+    if let Some(int_dig) = &run.environment_identity.integration_environment_digest {
+        out.push_str(&format!("Env Digest    {}\n", int_dig));
+    }
     let res_str = run
         .overall_result
         .map(|r| r.to_string())

@@ -58,6 +58,7 @@ async fn verification_evidence_lifecycle_and_mutation_invalidation() -> Result<(
         network_policy: orbit::verification::VerificationNetworkPolicy::None,
         cache_policy: orbit::verification::VerificationCachePolicy::Clean,
         environment_policy_digest: None,
+        integration_environment_digest: None,
         architecture: "x86_64".into(),
         os: "linux".into(),
         orbit_version: "0.1.0".into(),
