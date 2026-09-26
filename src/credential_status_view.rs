@@ -86,6 +86,26 @@ pub fn civil_from_epoch_ms(ms: i64) -> (i32, u32, u32, u32, u32, u32) {
     (y as i32, m, d, hour, minute, second)
 }
 
+pub fn local_civil_from_epoch_ms(ms: i64) -> (i32, u32, u32, u32, u32, u32) {
+    let secs = ms.div_euclid(1000);
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let time_val: libc::time_t = secs as libc::time_t;
+    let res = unsafe { libc::localtime_r(&time_val, &mut tm) };
+    if !res.is_null() {
+        (
+            tm.tm_year + 1900,
+            (tm.tm_mon + 1) as u32,
+            tm.tm_mday as u32,
+            tm.tm_hour as u32,
+            tm.tm_min as u32,
+            tm.tm_sec as u32,
+        )
+    } else {
+        // Fallback to UTC civil conversion if localtime_r fails
+        civil_from_epoch_ms(ms)
+    }
+}
+
 const MONTH_NAMES: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
@@ -94,8 +114,8 @@ const MONTH_NAMES: [&str; 12] = [
 /// - Same year as display/now: "MMM D HH:MM" (e.g. "Sep 26 05:07", "Sep 29 14:32", "Oct 3 00:11")
 /// - Different year than display/now: "MMM D HH:MM YYYY" (e.g. "Dec 31 23:45 2027")
 pub fn format_reset_time(ms: i64, now_ms: i64) -> String {
-    let (reset_year, month, day, hour, minute, _second) = civil_from_epoch_ms(ms);
-    let (current_year, _, _, _, _, _) = civil_from_epoch_ms(now_ms);
+    let (reset_year, month, day, hour, minute, _second) = local_civil_from_epoch_ms(ms);
+    let (current_year, _, _, _, _, _) = local_civil_from_epoch_ms(now_ms);
 
     let month_str = if (1..=12).contains(&month) {
         MONTH_NAMES[(month - 1) as usize]
@@ -108,6 +128,11 @@ pub fn format_reset_time(ms: i64, now_ms: i64) -> String {
     } else {
         format!("{month_str} {day} {hour:02}:{minute:02}")
     }
+}
+
+/// Shared human reset time formatter converting UTC epoch ms to local timezone.
+pub fn format_human_reset_time(ms: i64, now_ms: i64) -> String {
+    format_reset_time(ms, now_ms)
 }
 
 /// Backward-compatible alias for `format_reset_time`.
@@ -1180,6 +1205,37 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    unsafe extern "C" {
+        fn tzset();
+    }
+
+    static TEST_TZ_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_test_timezone<F, R>(tz: &str, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let _guard = TEST_TZ_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old_tz = std::env::var("TZ").ok();
+        unsafe {
+            std::env::set_var("TZ", tz);
+            tzset();
+        }
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        unsafe {
+            if let Some(ref old) = old_tz {
+                std::env::set_var("TZ", old);
+            } else {
+                std::env::remove_var("TZ");
+            }
+            tzset();
+        }
+        match res {
+            Ok(v) => v,
+            Err(e) => std::panic::resume_unwind(e),
+        }
+    }
+
     #[test]
     fn test_progress_bar_all_test_cases() {
         assert_eq!(format_progress_bar(100.0), "██████████");
@@ -1207,119 +1263,123 @@ mod tests {
 
     #[test]
     fn test_shared_reset_time_formatter_all_cases() {
-        // Base now_ms: Sep 26 2026 08:00 UTC
-        let now_ms = 1790409600000i64;
+        with_test_timezone("UTC", || {
+            // Base now_ms: Sep 26 2026 08:00 UTC
+            let now_ms = 1790409600000i64;
 
-        // 1. Codex 5h: Sep 26 06:01
-        assert_eq!(format_reset_time(1790402460000, now_ms), "Sep 26 06:01");
+            // 1. Codex 5h: Sep 26 06:01
+            assert_eq!(format_reset_time(1790402460000, now_ms), "Sep 26 06:01");
 
-        // 2. Codex 7d: Sep 29 22:22
-        assert_eq!(format_reset_time(1790720520000, now_ms), "Sep 29 22:22");
+            // 2. Codex 7d: Sep 29 22:22
+            assert_eq!(format_reset_time(1790720520000, now_ms), "Sep 29 22:22");
 
-        // 3. Antigravity 5h: Sep 26 05:07
-        assert_eq!(format_reset_time(1790399220000, now_ms), "Sep 26 05:07");
+            // 3. Antigravity 5h: Sep 26 05:07
+            assert_eq!(format_reset_time(1790399220000, now_ms), "Sep 26 05:07");
 
-        // 4. Antigravity weekly: Oct 2 01:52
-        assert_eq!(format_reset_time(1790905920000, now_ms), "Oct 2 01:52");
+            // 4. Antigravity weekly: Oct 2 01:52
+            assert_eq!(format_reset_time(1790905920000, now_ms), "Oct 2 01:52");
 
-        // 5. Midnight / single-digit day: Oct 3 00:11
-        assert_eq!(format_reset_time(1790986260000, now_ms), "Oct 3 00:11");
+            // 5. Midnight / single-digit day: Oct 3 00:11
+            assert_eq!(format_reset_time(1790986260000, now_ms), "Oct 3 00:11");
 
-        // 6. Stale timestamp retains HH:MM: Sep 25 18:42
-        assert_eq!(format_reset_time(1790361720000, now_ms), "Sep 25 18:42");
+            // 6. Stale timestamp retains HH:MM: Sep 25 18:42
+            assert_eq!(format_reset_time(1790361720000, now_ms), "Sep 25 18:42");
 
-        // 7. Different year includes YYYY: Dec 31 23:45 2027
-        assert_eq!(
-            format_reset_time(1830296700000, now_ms),
-            "Dec 31 23:45 2027"
-        );
+            // 7. Different year includes YYYY: Dec 31 23:45 2027
+            assert_eq!(
+                format_reset_time(1830296700000, now_ms),
+                "Dec 31 23:45 2027"
+            );
 
-        // 8. format_reset_timestamp alias behaves identically
-        assert_eq!(
-            format_reset_timestamp(1790402460000, now_ms),
-            "Sep 26 06:01"
-        );
-        assert_eq!(
-            format_reset_timestamp(1830296700000, now_ms),
-            "Dec 31 23:45 2027"
-        );
+            // 8. format_reset_timestamp alias behaves identically
+            assert_eq!(
+                format_reset_timestamp(1790402460000, now_ms),
+                "Sep 26 06:01"
+            );
+            assert_eq!(
+                format_reset_timestamp(1830296700000, now_ms),
+                "Dec 31 23:45 2027"
+            );
+        });
     }
 
     #[test]
     fn test_single_codex_confirmed_ready_2buckets_3windows() {
-        let now_ms = 1790380000000i64; // Sep 26 2026
-        let report = json!({
-            "credential": {
-                "reference": "codex-main",
-                "provider": "codex",
-                "generation": 1,
-                "lifecycle": "enrolled"
-            },
-            "representations": {
-                "codex": { "validation": "valid" }
-            },
-            "health": {
-                "runtime": { "state": "healthy" }
-            },
-            "status": {
-                "state": "observed",
-                "provider_scope": "confirmed",
-                "quota_promoted": true
-            },
-            "availability": {
-                "state": "ready",
-                "fresh": true,
-                "observed_at_ms": now_ms,
-                "quota_buckets": [
-                    {
-                        "provider_label": "gpt-reserve",
-                        "windows": [
-                            {
-                                "provider_window_id": "secondary",
-                                "duration_minutes": 10080,
-                                "remaining_percent": 74.0,
-                                "resets_at_ms": 1790692320000i64 // Sep 29 14:32
-                            }
-                        ]
-                    },
-                    {
-                        // Unlabeled bucket: tests Orbit UI fallback "default"
-                        "windows": [
-                            {
-                                "provider_window_id": "primary",
-                                "duration_minutes": 300,
-                                "remaining_percent": 100.0,
-                                "resets_at_ms": 1790402460000i64 // Sep 26 06:01
-                            },
-                            {
-                                "provider_window_id": "secondary",
-                                "duration_minutes": 10080,
-                                "remaining_percent": 1.0,
-                                "resets_at_ms": 1790720520000i64 // Sep 29 22:22
-                            }
-                        ]
-                    }
-                ]
-            }
-        });
+        with_test_timezone("UTC", || {
+            let now_ms = 1790380000000i64; // Sep 26 2026
+            let report = json!({
+                "credential": {
+                    "reference": "codex-main",
+                    "provider": "codex",
+                    "generation": 1,
+                    "lifecycle": "enrolled"
+                },
+                "representations": {
+                    "codex": { "validation": "valid" }
+                },
+                "health": {
+                    "runtime": { "state": "healthy" }
+                },
+                "status": {
+                    "state": "observed",
+                    "provider_scope": "confirmed",
+                    "quota_promoted": true
+                },
+                "availability": {
+                    "state": "ready",
+                    "fresh": true,
+                    "observed_at_ms": now_ms,
+                    "quota_buckets": [
+                        {
+                            "provider_label": "gpt-reserve",
+                            "windows": [
+                                {
+                                    "provider_window_id": "secondary",
+                                    "duration_minutes": 10080,
+                                    "remaining_percent": 74.0,
+                                    "resets_at_ms": 1790692320000i64 // Sep 29 14:32
+                                }
+                            ]
+                        },
+                        {
+                            // Unlabeled bucket: tests Orbit UI fallback "default"
+                            "windows": [
+                                {
+                                    "provider_window_id": "primary",
+                                    "duration_minutes": 300,
+                                    "remaining_percent": 100.0,
+                                    "resets_at_ms": 1790402460000i64 // Sep 26 06:01
+                                },
+                                {
+                                    "provider_window_id": "secondary",
+                                    "duration_minutes": 10080,
+                                    "remaining_percent": 1.0,
+                                    "resets_at_ms": 1790720520000i64 // Sep 29 22:22
+                                }
+                            ]
+                        }
+                    ]
+                }
+            });
 
-        let rendered = format_single_credential(&report, now_ms);
-        assert!(rendered.contains("codex-main  [codex]"));
-        assert!(rendered.contains("Lifecycle      ENROLLED"));
-        assert!(rendered.contains("Auth           VALID"));
-        assert!(rendered.contains("Runtime        HEALTHY"));
-        assert!(rendered.contains("Scope          CONFIRMED"));
-        assert!(rendered.contains("Availability   READY"));
-        assert!(rendered.contains("Observed       just now"));
-        assert!(rendered.contains("  Quota"));
-        assert!(rendered.contains("    gpt-reserve"));
-        assert!(rendered.contains("7d      74%  ███████░░░   resets Sep 29 14:32"));
-        assert!(rendered.contains("    default"));
-        assert!(rendered.contains("5h     100%  ██████████   resets Sep 26 06:01"));
-        assert!(rendered.contains("7d       1%  ▏░░░░░░░░░   resets Sep 29 22:22"));
-        // Does NOT show primary/secondary in human output
-        assert!(!rendered.contains("primary"));
-        assert!(!rendered.contains("secondary"));
+            let rendered = format_single_credential(&report, now_ms);
+            assert!(rendered.contains("codex-main  [codex]"));
+            assert!(rendered.contains("Lifecycle      ENROLLED"));
+            assert!(rendered.contains("Auth           VALID"));
+            assert!(rendered.contains("Runtime        HEALTHY"));
+            assert!(rendered.contains("Scope          CONFIRMED"));
+            assert!(rendered.contains("Availability   READY"));
+            assert!(rendered.contains("Observed       just now"));
+            assert!(rendered.contains("  Quota"));
+            assert!(rendered.contains("    gpt-reserve"));
+            assert!(rendered.contains("7d      74%  ███████░░░   resets Sep 29 14:32"));
+            assert!(rendered.contains("    default"));
+            assert!(rendered.contains("5h     100%  ██████████   resets Sep 26 06:01"));
+            assert!(rendered.contains("7d       1%  ▏░░░░░░░░░   resets Sep 29 22:22"));
+            // Does NOT show primary/secondary in human output
+            assert!(!rendered.contains("primary"));
+            assert!(!rendered.contains("secondary"));
+        });
     }
 
     #[test]
@@ -1367,42 +1427,44 @@ mod tests {
 
     #[test]
     fn test_single_codex_stale_observation() {
-        let now_ms = 1790380000000i64;
-        let report = json!({
-            "credential": {
-                "reference": "codex-stale",
-                "provider": "codex",
-                "lifecycle": "enrolled"
-            },
-            "representations": { "codex": { "validation": "valid" } },
-            "health": { "runtime": { "state": "healthy" } },
-            "status": {
-                "state": "observed",
-                "provider_scope": "confirmed",
-                "quota_promoted": true
-            },
-            "availability": {
-                "state": "ready",
-                "fresh": false,
-                "observed_at_ms": now_ms - 240_000, // 4m ago
-                "quota_buckets": [
-                    {
-                        "provider_label": "default",
-                        "windows": [
-                            {
-                                "duration_minutes": 300,
-                                "remaining_percent": 100.0,
-                                "resets_at_ms": 1790402460000i64
-                            }
-                        ]
-                    }
-                ]
-            }
-        });
+        with_test_timezone("UTC", || {
+            let now_ms = 1790380000000i64;
+            let report = json!({
+                "credential": {
+                    "reference": "codex-stale",
+                    "provider": "codex",
+                    "lifecycle": "enrolled"
+                },
+                "representations": { "codex": { "validation": "valid" } },
+                "health": { "runtime": { "state": "healthy" } },
+                "status": {
+                    "state": "observed",
+                    "provider_scope": "confirmed",
+                    "quota_promoted": true
+                },
+                "availability": {
+                    "state": "ready",
+                    "fresh": false,
+                    "observed_at_ms": now_ms - 240_000, // 4m ago
+                    "quota_buckets": [
+                        {
+                            "provider_label": "default",
+                            "windows": [
+                                {
+                                    "duration_minutes": 300,
+                                    "remaining_percent": 100.0,
+                                    "resets_at_ms": 1790402460000i64
+                                }
+                            ]
+                        }
+                    ]
+                }
+            });
 
-        let rendered = format_single_credential(&report, now_ms);
-        assert!(rendered.contains("Observed       4m ago (stale)"));
-        assert!(rendered.contains("100% [stale]  ██████████   resets Sep 26 06:01"));
+            let rendered = format_single_credential(&report, now_ms);
+            assert!(rendered.contains("Observed       4m ago (stale)"));
+            assert!(rendered.contains("100% [stale]  ██████████   resets Sep 26 06:01"));
+        });
     }
 
     #[test]
@@ -1449,93 +1511,95 @@ mod tests {
 
     #[test]
     fn test_single_antigravity_valid() {
-        let now_ms = 1790380000000i64;
-        let report = json!({
-            "credential": {
-                "reference": "antigravity-jc",
-                "provider": "antigravity",
-                "lifecycle": "enrolled"
-            },
-            "representations": {
-                "acp": { "validation": "valid" },
-                "agy-cli": { "validation": "valid" }
-            },
-            "health": {
-                "runtime": { "state": "healthy" }
-            },
-            "status": {
-                "state": "observed"
-            },
-            "availability": {
-                "state": "unknown",
-                "fresh": true,
-                "observed_at_ms": now_ms,
-                "quota_groups": [
-                    {
-                        "provider_display_name": "Gemini Models",
-                        "members": [
-                            { "provider_label": "Gemini Flash" },
-                            { "provider_label": "Gemini Pro" }
-                        ],
-                        "bucket_fingerprints": ["fp-gemini"]
-                    },
-                    {
-                        "provider_display_name": "Claude and GPT models",
-                        "members": [
-                            { "provider_label": "Claude Opus" },
-                            { "provider_label": "Claude Sonnet" },
-                            { "provider_label": "GPT-OSS" }
-                        ],
-                        "bucket_fingerprints": ["fp-claude"]
-                    }
-                ],
-                "quota_buckets": [
-                    {
-                        "provider_bucket_fingerprint": "fp-gemini",
-                        "windows": [
-                            {
-                                "provider_window_id": "5h",
-                                "remaining_percent": 84.8,
-                                "resets_at_ms": 1790399220000i64 // Sep 26 05:07
-                            },
-                            {
-                                "provider_window_id": "weekly",
-                                "remaining_percent": 86.9,
-                                "resets_at_ms": 1790905920000i64 // Oct 2 01:52
-                            }
-                        ]
-                    },
-                    {
-                        "provider_bucket_fingerprint": "fp-claude",
-                        "windows": [
-                            {
-                                "provider_window_id": "5h",
-                                "remaining_percent": 100.0,
-                                "resets_at_ms": 1790399460000i64 // Sep 26 05:11
-                            },
-                            {
-                                "provider_window_id": "weekly",
-                                "remaining_percent": 100.0,
-                                "resets_at_ms": 1790986260000i64 // Oct 3 00:11
-                            }
-                        ]
-                    }
-                ]
-            }
-        });
+        with_test_timezone("UTC", || {
+            let now_ms = 1790380000000i64;
+            let report = json!({
+                "credential": {
+                    "reference": "antigravity-jc",
+                    "provider": "antigravity",
+                    "lifecycle": "enrolled"
+                },
+                "representations": {
+                    "acp": { "validation": "valid" },
+                    "agy-cli": { "validation": "valid" }
+                },
+                "health": {
+                    "runtime": { "state": "healthy" }
+                },
+                "status": {
+                    "state": "observed"
+                },
+                "availability": {
+                    "state": "unknown",
+                    "fresh": true,
+                    "observed_at_ms": now_ms,
+                    "quota_groups": [
+                        {
+                            "provider_display_name": "Gemini Models",
+                            "members": [
+                                { "provider_label": "Gemini Flash" },
+                                { "provider_label": "Gemini Pro" }
+                            ],
+                            "bucket_fingerprints": ["fp-gemini"]
+                        },
+                        {
+                            "provider_display_name": "Claude and GPT models",
+                            "members": [
+                                { "provider_label": "Claude Opus" },
+                                { "provider_label": "Claude Sonnet" },
+                                { "provider_label": "GPT-OSS" }
+                            ],
+                            "bucket_fingerprints": ["fp-claude"]
+                        }
+                    ],
+                    "quota_buckets": [
+                        {
+                            "provider_bucket_fingerprint": "fp-gemini",
+                            "windows": [
+                                {
+                                    "provider_window_id": "5h",
+                                    "remaining_percent": 84.8,
+                                    "resets_at_ms": 1790399220000i64 // Sep 26 05:07
+                                },
+                                {
+                                    "provider_window_id": "weekly",
+                                    "remaining_percent": 86.9,
+                                    "resets_at_ms": 1790905920000i64 // Oct 2 01:52
+                                }
+                            ]
+                        },
+                        {
+                            "provider_bucket_fingerprint": "fp-claude",
+                            "windows": [
+                                {
+                                    "provider_window_id": "5h",
+                                    "remaining_percent": 100.0,
+                                    "resets_at_ms": 1790399460000i64 // Sep 26 05:11
+                                },
+                                {
+                                    "provider_window_id": "weekly",
+                                    "remaining_percent": 100.0,
+                                    "resets_at_ms": 1790986260000i64 // Oct 3 00:11
+                                }
+                            ]
+                        }
+                    ]
+                }
+            });
 
-        let rendered = format_single_credential(&report, now_ms);
-        assert!(rendered.contains("antigravity-jc  [antigravity]"));
-        assert!(rendered.contains("ACP            VALID"));
-        assert!(rendered.contains("agy-cli        VALID"));
-        assert!(rendered.contains("Gemini Models"));
-        assert!(rendered.contains("Gemini Flash, Gemini Pro"));
-        assert!(rendered.contains("5h       84.8%  ████████░░   resets Sep 26 05:07"));
-        assert!(rendered.contains("weekly   86.9%  █████████░   resets Oct 2 01:52"));
-        assert!(rendered.contains("Claude and GPT models"));
-        assert!(rendered.contains("Claude Opus, Claude Sonnet, GPT-OSS"));
-        assert!(rendered.contains("5h        100%  ██████████   resets Sep 26 05:11"));
-        assert!(rendered.contains("weekly    100%  ██████████   resets Oct 3 00:11"));
+            let rendered = format_single_credential(&report, now_ms);
+            assert!(rendered.contains("antigravity-jc  [antigravity]"));
+            assert!(rendered.contains("ACP            VALID"));
+            assert!(rendered.contains("agy-cli        VALID"));
+            assert!(rendered.contains("Gemini Models"));
+            assert!(rendered.contains("Gemini Flash, Gemini Pro"));
+            assert!(rendered.contains("5h       84.8%  ████████░░   resets Sep 26 05:07"));
+            assert!(rendered.contains("weekly   86.9%  █████████░   resets Oct 2 01:52"));
+            assert!(rendered.contains("Claude and GPT models"));
+            assert!(rendered.contains("Claude Opus, Claude Sonnet, GPT-OSS"));
+            assert!(rendered.contains("5h        100%  ██████████   resets Sep 26 05:11"));
+            assert!(rendered.contains("weekly    100%  ██████████   resets Oct 3 00:11"));
+        });
     }
 
     #[test]
@@ -1646,270 +1710,245 @@ mod tests {
 
     #[test]
     fn test_all_quota_wide() {
-        let now_ms = 1790409600000i64; // Sep 26 2026 08:00 UTC
-        let reports = vec![
-            json!({
-                "credential": { "reference": "codex-main", "provider": "codex" },
-                "representations": { "codex": { "validation": "valid" } },
-                "status": { "provider_scope": "confirmed" },
-                "availability": {
-                    "state": "ready",
-                    "fresh": true,
-                    "observed_at_ms": now_ms,
-                    "quota_buckets": [
-                        {
-                            "provider_label": "gpt-reserve",
-                            "windows": [
-                                { "provider_window_id": "secondary", "duration_minutes": 10080, "remaining_percent": 74.0, "resets_at_ms": 1790692320000i64 } // Sep 29 14:32
-                            ]
-                        },
-                        {
-                            "windows": [
-                                { "provider_window_id": "primary", "duration_minutes": 300, "remaining_percent": 100.0, "resets_at_ms": 1790402460000i64 }, // Sep 26 06:01
-                                { "provider_window_id": "secondary", "duration_minutes": 10080, "remaining_percent": 1.0, "resets_at_ms": 1790720520000i64 }  // Sep 29 22:22
-                            ]
-                        }
-                    ]
-                }
-            }),
-            json!({
-                "credential": { "reference": "antigravity-jc", "provider": "antigravity" },
-                "representations": { "acp": { "validation": "valid" }, "agy-cli": { "validation": "valid" } },
-                "availability": {
-                    "state": "unknown",
-                    "fresh": true,
-                    "observed_at_ms": now_ms,
-                    "quota_groups": [
-                        {
-                            "provider_display_name": "Gemini Models",
-                            "members": [ { "provider_label": "Gemini Flash" }, { "provider_label": "Gemini Pro" } ],
-                            "bucket_fingerprints": ["fp-jc-gemini"]
-                        },
-                        {
-                            "provider_display_name": "Claude and GPT models",
-                            "members": [ { "provider_label": "Claude Opus" }, { "provider_label": "Claude Sonnet" }, { "provider_label": "GPT-OSS" } ],
-                            "bucket_fingerprints": ["fp-jc-claude"]
-                        }
-                    ],
-                    "quota_buckets": [
-                        {
-                            "provider_bucket_fingerprint": "fp-jc-gemini",
-                            "windows": [
-                                { "provider_window_id": "5h", "remaining_percent": 84.8, "resets_at_ms": 1790399220000i64 }, // Sep 26 05:07
-                                { "provider_window_id": "weekly", "remaining_percent": 86.9, "resets_at_ms": 1790905920000i64 } // Oct 2 01:52
-                            ]
-                        },
-                        {
-                            "provider_bucket_fingerprint": "fp-jc-claude",
-                            "windows": [
-                                { "provider_window_id": "5h", "remaining_percent": 100.0, "resets_at_ms": 1790399460000i64 }, // Sep 26 05:11
-                                { "provider_window_id": "weekly", "remaining_percent": 100.0, "resets_at_ms": 1790986260000i64 } // Oct 3 00:11
-                            ]
-                        }
-                    ]
-                }
-            }),
-        ];
+        with_test_timezone("UTC", || {
+            let now_ms = 1790409600000i64; // Sep 26 2026 08:00 UTC
+            let reports = vec![
+                json!({
+                    "credential": { "reference": "codex-main", "provider": "codex" },
+                    "representations": { "codex": { "validation": "valid" } },
+                    "status": { "provider_scope": "confirmed" },
+                    "availability": {
+                        "state": "ready",
+                        "fresh": true,
+                        "observed_at_ms": now_ms,
+                        "quota_buckets": [
+                            {
+                                "provider_label": "gpt-reserve",
+                                "windows": [
+                                    { "provider_window_id": "secondary", "duration_minutes": 10080, "remaining_percent": 74.0, "resets_at_ms": 1790692320000i64 } // Sep 29 14:32
+                                ]
+                            },
+                            {
+                                "windows": [
+                                    { "provider_window_id": "primary", "duration_minutes": 300, "remaining_percent": 100.0, "resets_at_ms": 1790402460000i64 }, // Sep 26 06:01
+                                    { "provider_window_id": "secondary", "duration_minutes": 10080, "remaining_percent": 1.0, "resets_at_ms": 1790720520000i64 }  // Sep 29 22:22
+                                ]
+                            }
+                        ]
+                    }
+                }),
+                json!({
+                    "credential": { "reference": "antigravity-jc", "provider": "antigravity" },
+                    "representations": { "acp": { "validation": "valid" }, "agy-cli": { "validation": "valid" } },
+                    "availability": {
+                        "state": "unknown",
+                        "fresh": true,
+                        "observed_at_ms": now_ms,
+                        "quota_groups": [
+                            {
+                                "provider_display_name": "Gemini Models",
+                                "members": [ { "provider_label": "Gemini Flash" }, { "provider_label": "Gemini Pro" } ],
+                                "bucket_fingerprints": ["fp-jc-gemini"]
+                            },
+                            {
+                                "provider_display_name": "Claude and GPT models",
+                                "members": [ { "provider_label": "Claude Opus" }, { "provider_label": "Claude Sonnet" }, { "provider_label": "GPT-OSS" } ],
+                                "bucket_fingerprints": ["fp-jc-claude"]
+                            }
+                        ],
+                        "quota_buckets": [
+                            {
+                                "provider_bucket_fingerprint": "fp-jc-gemini",
+                                "windows": [
+                                    { "provider_window_id": "5h", "remaining_percent": 84.8, "resets_at_ms": 1790399220000i64 }, // Sep 26 05:07
+                                    { "provider_window_id": "weekly", "remaining_percent": 86.9, "resets_at_ms": 1790905920000i64 } // Oct 2 01:52
+                                ]
+                            },
+                            {
+                                "provider_bucket_fingerprint": "fp-jc-claude",
+                                "windows": [
+                                    { "provider_window_id": "5h", "remaining_percent": 100.0, "resets_at_ms": 1790399460000i64 }, // Sep 26 05:11
+                                    { "provider_window_id": "weekly", "remaining_percent": 100.0, "resets_at_ms": 1790986260000i64 } // Oct 3 00:11
+                                ]
+                            }
+                        ]
+                    }
+                }),
+            ];
 
-        let out = format_all_quota(&reports, now_ms, Some(100));
+            let out = format_all_quota(&reports, now_ms, Some(100));
 
-        // Verify Codex Section
-        assert!(out.contains("CODEX"));
-        assert!(out.contains("ACCOUNT       AUTH    SCOPE       AVAILABILITY   OBSERVED"));
-        assert!(out.contains("codex-main    VALID   CONFIRMED   READY          just now"));
-        assert!(out.contains("ACCOUNT"));
-        assert!(out.contains("BUCKET"));
-        assert!(out.contains("5H"));
-        assert!(out.contains("7D"));
+            // Verify Codex Section
+            assert!(out.contains("CODEX"));
+            assert!(out.contains("ACCOUNT       AUTH    SCOPE       AVAILABILITY   OBSERVED"));
+            assert!(out.contains("codex-main    VALID   CONFIRMED   READY          just now"));
+            assert!(out.contains("ACCOUNT"));
+            assert!(out.contains("BUCKET"));
+            assert!(out.contains("5H"));
+            assert!(out.contains("7D"));
 
-        // Single row check for default bucket: has 5h AND 7d on the same line
-        let default_line = out
-            .lines()
-            .find(|l| l.contains("codex-main") && l.contains("default"))
-            .unwrap();
-        assert!(default_line.contains("100% ██████████ Sep 26 06:01"));
-        assert!(default_line.contains("1% ▏░░░░░░░░░ Sep 29 22:22"));
+            // Single row check for default bucket: has 5h AND 7d on the same line
+            let default_line = out
+                .lines()
+                .find(|l| l.contains("codex-main") && l.contains("default"))
+                .unwrap();
+            assert!(default_line.contains("100% ██████████ Sep 26 06:01"));
+            assert!(default_line.contains("1% ▏░░░░░░░░░ Sep 29 22:22"));
 
-        // Missing window in gpt-reserve rendered as — on the same line as 7d
-        let gpt_line = out
-            .lines()
-            .find(|l| l.contains("codex-main") && l.contains("gpt-reserve"))
-            .unwrap();
-        assert!(gpt_line.contains("—"));
-        assert!(gpt_line.contains("74% ███████░░░ Sep 29 14:32"));
+            // Missing window in gpt-reserve rendered as — on the same line as 7d
+            let gpt_line = out
+                .lines()
+                .find(|l| l.contains("codex-main") && l.contains("gpt-reserve"))
+                .unwrap();
+            assert!(gpt_line.contains("—"));
+            assert!(gpt_line.contains("74% ███████░░░ Sep 29 14:32"));
 
-        // Protocol IDs hidden from human output
-        assert!(!out.contains("primary"));
-        assert!(!out.contains("secondary"));
+            // Protocol IDs hidden from human output
+            assert!(!out.contains("primary"));
+            assert!(!out.contains("secondary"));
 
-        // Verify Antigravity Section
-        assert!(out.contains("ANTIGRAVITY"));
-        assert!(out.contains("ACCOUNT              ACP     AGY-CLI   AVAILABILITY   OBSERVED"));
-        assert!(out.contains("antigravity-jc       VALID   VALID     UNKNOWN        just now"));
-        // Legend printed once
-        assert!(out.contains("Groups"));
-        assert!(out.contains("Gemini Models            Gemini Flash, Gemini Pro"));
-        assert!(out.contains("Claude and GPT models    Claude Opus, Claude Sonnet, GPT-OSS"));
-        // Same group check: has 5h AND weekly on the same line with unified MMM D HH:MM format
-        let gemini_line = out
-            .lines()
-            .find(|l| l.contains("antigravity-jc") && l.contains("Gemini Models"))
-            .unwrap();
-        assert!(gemini_line.contains("84.8% ████████░░ Sep 26 05:07"));
-        assert!(gemini_line.contains("86.9% █████████░ Oct 2 01:52"));
+            // Verify Antigravity Section
+            assert!(out.contains("ANTIGRAVITY"));
+            assert!(out.contains("ACCOUNT              ACP     AGY-CLI   AVAILABILITY   OBSERVED"));
+            assert!(out.contains("antigravity-jc       VALID   VALID     UNKNOWN        just now"));
+            // Legend printed once
+            assert!(out.contains("Groups"));
+            assert!(out.contains("Gemini Models            Gemini Flash, Gemini Pro"));
+            assert!(out.contains("Claude and GPT models    Claude Opus, Claude Sonnet, GPT-OSS"));
+            // Same group check: has 5h AND weekly on the same line with unified MMM D HH:MM format
+            let gemini_line = out
+                .lines()
+                .find(|l| l.contains("antigravity-jc") && l.contains("Gemini Models"))
+                .unwrap();
+            assert!(gemini_line.contains("84.8% ████████░░ Sep 26 05:07"));
+            assert!(gemini_line.contains("86.9% █████████░ Oct 2 01:52"));
 
-        let claude_line = out
-            .lines()
-            .find(|l| l.contains("antigravity-jc") && l.contains("Claude and GPT models"))
-            .unwrap();
-        assert!(claude_line.contains("100% ██████████ Sep 26 05:11"));
-        assert!(claude_line.contains("100% ██████████ Oct 3 00:11"));
+            let claude_line = out
+                .lines()
+                .find(|l| l.contains("antigravity-jc") && l.contains("Claude and GPT models"))
+                .unwrap();
+            assert!(claude_line.contains("100% ██████████ Sep 26 05:11"));
+            assert!(claude_line.contains("100% ██████████ Oct 3 00:11"));
+        });
     }
 
     #[test]
     fn test_antigravity_stale_spacing_and_stable_columns() {
-        let now_ms = 1790409600000i64; // Sep 26 2026 08:00 UTC
-        let reports = vec![
-            // Row 1: Stale 5h and stale weekly
-            json!({
-                "credential": { "reference": "antigravity-ch9b2013", "provider": "antigravity" },
-                "representations": { "acp": { "validation": "valid" }, "agy-cli": { "validation": "valid" } },
-                "health": { "runtime": { "state": "healthy" } },
-                "status": { "state": "observed" },
-                "availability": {
-                    "state": "unknown",
-                    "fresh": false,
-                    "observed_at_ms": now_ms - 36_000_000,
-                    "quota_groups": [
-                        { "provider_display_name": "Gemini Models", "bucket_fingerprints": ["fp-gemini"] }
-                    ],
-                    "quota_buckets": [
-                        {
-                            "provider_bucket_fingerprint": "fp-gemini",
-                            "windows": [
-                                { "provider_window_id": "5h", "remaining_percent": 99.9, "resets_at_ms": 1790362620000i64 }, // Sep 25 18:57
-                                { "provider_window_id": "weekly", "remaining_percent": 100.0, "resets_at_ms": 1790673720000i64 } // Sep 29 09:22
-                            ]
-                        }
-                    ]
-                }
-            }),
-            // Row 2: Fresh 5h and fresh weekly
-            json!({
-                "credential": { "reference": "antigravity-jc", "provider": "antigravity" },
-                "representations": { "acp": { "validation": "valid" }, "agy-cli": { "validation": "valid" } },
-                "health": { "runtime": { "state": "healthy" } },
-                "status": { "state": "observed" },
-                "availability": {
-                    "state": "unknown",
-                    "fresh": true,
-                    "observed_at_ms": now_ms,
-                    "quota_groups": [
-                        { "provider_display_name": "Gemini Models", "bucket_fingerprints": ["fp-jc-gemini"] }
-                    ],
-                    "quota_buckets": [
-                        {
-                            "provider_bucket_fingerprint": "fp-jc-gemini",
-                            "windows": [
-                                { "provider_window_id": "5h", "remaining_percent": 75.3, "resets_at_ms": 1790399220000i64 }, // Sep 26 05:07
-                                { "provider_window_id": "weekly", "remaining_percent": 85.0, "resets_at_ms": 1790905920000i64 } // Oct 2 01:52
-                            ]
-                        }
-                    ]
-                }
-            }),
-        ];
+        with_test_timezone("UTC", || {
+            let now_ms = 1790409600000i64; // Sep 26 2026 08:00 UTC
+            let reports = vec![
+                // Row 1: Stale 5h and stale weekly
+                json!({
+                    "credential": { "reference": "antigravity-ch9b2013", "provider": "antigravity" },
+                    "representations": { "acp": { "validation": "valid" }, "agy-cli": { "validation": "valid" } },
+                    "health": { "runtime": { "state": "healthy" } },
+                    "status": { "state": "observed" },
+                    "availability": {
+                        "state": "unknown",
+                        "fresh": false,
+                        "observed_at_ms": now_ms - 36_000_000,
+                        "quota_groups": [
+                            { "provider_display_name": "Gemini Models", "bucket_fingerprints": ["fp-gemini"] }
+                        ],
+                        "quota_buckets": [
+                            {
+                                "provider_bucket_fingerprint": "fp-gemini",
+                                "windows": [
+                                    { "provider_window_id": "5h", "remaining_percent": 99.9, "resets_at_ms": 1790362620000i64 }, // Sep 25 18:57
+                                    { "provider_window_id": "weekly", "remaining_percent": 100.0, "resets_at_ms": 1790673720000i64 } // Sep 29 09:22
+                                ]
+                            }
+                        ]
+                    }
+                }),
+                // Row 2: Fresh 5h and fresh weekly
+                json!({
+                    "credential": { "reference": "antigravity-jc", "provider": "antigravity" },
+                    "representations": { "acp": { "validation": "valid" }, "agy-cli": { "validation": "valid" } },
+                    "health": { "runtime": { "state": "healthy" } },
+                    "status": { "state": "observed" },
+                    "availability": {
+                        "state": "unknown",
+                        "fresh": true,
+                        "observed_at_ms": now_ms,
+                        "quota_groups": [
+                            { "provider_display_name": "Gemini Models", "bucket_fingerprints": ["fp-jc-gemini"] }
+                        ],
+                        "quota_buckets": [
+                            {
+                                "provider_bucket_fingerprint": "fp-jc-gemini",
+                                "windows": [
+                                    { "provider_window_id": "5h", "remaining_percent": 75.3, "resets_at_ms": 1790399220000i64 }, // Sep 26 05:07
+                                    { "provider_window_id": "weekly", "remaining_percent": 85.0, "resets_at_ms": 1790905920000i64 } // Oct 2 01:52
+                                ]
+                            }
+                        ]
+                    }
+                }),
+            ];
 
-        let out = format_all_quota(&reports, now_ms, Some(140));
+            let out = format_all_quota(&reports, now_ms, Some(140));
 
-        // Spacing must NEVER collapse into "18:57100%"
-        assert!(!out.contains("18:57100%"));
+            // Spacing must NEVER collapse into "18:57100%"
+            assert!(!out.contains("18:57100%"));
 
-        // Row 1 contains stale markers with structural separation (at least 2 spaces between 5H and WEEKLY)
-        assert!(out.contains(
-            "99.9% [stale] ██████████ Sep 25 18:57  100% [stale] ██████████ Sep 29 09:22"
-        ));
+            // Row 1 contains stale markers with structural separation (at least 2 spaces between 5H and WEEKLY)
+            assert!(out.contains(
+                "99.9% [stale] ██████████ Sep 25 18:57  100% [stale] ██████████ Sep 29 09:22"
+            ));
 
-        // Check stable column alignment: find the byte/char offset of WEEKLY in both lines
-        let lines: Vec<&str> = out.lines().collect();
-        let r1 = lines
-            .iter()
-            .find(|l| l.contains("antigravity-ch9b2013") && l.contains("Gemini Models"))
-            .unwrap();
-        let r2 = lines
-            .iter()
-            .find(|l| l.contains("antigravity-jc") && l.contains("Gemini Models"))
-            .unwrap();
+            // Check stable column alignment: find the byte/char offset of WEEKLY in both lines
+            let lines: Vec<&str> = out.lines().collect();
+            let r1 = lines
+                .iter()
+                .find(|l| l.contains("antigravity-ch9b2013") && l.contains("Gemini Models"))
+                .unwrap();
+            let r2 = lines
+                .iter()
+                .find(|l| l.contains("antigravity-jc") && l.contains("Gemini Models"))
+                .unwrap();
 
-        // Row 2: Fresh window is padded to match the expanded 5H column (participating in width calculation)
-        assert!(r2.contains("75.3% ████████░░ Sep 26 05:07"));
-        assert!(r2.contains("85% █████████░ Oct 2 01:52"));
+            // Row 2: Fresh window is padded to match the expanded 5H column (participating in width calculation)
+            assert!(r2.contains("75.3% ████████░░ Sep 26 05:07"));
+            assert!(r2.contains("85% █████████░ Oct 2 01:52"));
 
-        let r1_col2_char_idx = r1[..r1.find("100% [stale]").unwrap()].chars().count();
-        let r2_col2_char_idx = r2[..r2.find("85%").unwrap()].chars().count();
-        // Both rows start their second column at the exact same visual boundary:
-        // "  85%" has 2 leading spaces to right-align in the 5-char percent field, so its "8" is at col2 + 2
-        assert_eq!(r2_col2_char_idx, r1_col2_char_idx + 2);
+            let r1_col2_char_idx = r1[..r1.find("100% [stale]").unwrap()].chars().count();
+            let r2_col2_char_idx = r2[..r2.find("85%").unwrap()].chars().count();
+            // Both rows start their second column at the exact same visual boundary:
+            // "  85%" has 2 leading spaces to right-align in the 5-char percent field, so its "8" is at col2 + 2
+            assert_eq!(r2_col2_char_idx, r1_col2_char_idx + 2);
+        });
     }
 
     #[test]
     fn test_window_width_percentages() {
-        // Test different percentage values: 100%, 99.9%, 6.8%, 1%
-        let now_ms = 1790409600000i64;
-        let test_cases = vec![
-            (100.0, " 100% ██████████ Sep 26 06:01"),
-            (99.9, "99.9% ██████████ Sep 26 06:01"),
-            (6.8, " 6.8% █░░░░░░░░░ Sep 26 06:01"),
-            (1.0, "   1% ▏░░░░░░░░░ Sep 26 06:01"),
-        ];
+        with_test_timezone("UTC", || {
+            // Test different percentage values: 100%, 99.9%, 6.8%, 1%
+            let now_ms = 1790409600000i64;
+            let test_cases = vec![
+                (100.0, " 100% ██████████ Sep 26 06:01"),
+                (99.9, "99.9% ██████████ Sep 26 06:01"),
+                (6.8, " 6.8% █░░░░░░░░░ Sep 26 06:01"),
+                (1.0, "   1% ▏░░░░░░░░░ Sep 26 06:01"),
+            ];
 
-        for (pct, expected_snippet) in test_cases {
-            let win = json!({
-                "duration_minutes": 300,
-                "remaining_percent": pct,
-                "resets_at_ms": 1790402460000i64
-            });
-            let formatted = format_window_cell(Some(&win), true, now_ms);
-            assert_eq!(formatted, expected_snippet);
-        }
+            for (pct, expected_snippet) in test_cases {
+                let win = json!({
+                    "duration_minutes": 300,
+                    "remaining_percent": pct,
+                    "resets_at_ms": 1790402460000i64
+                });
+                let formatted = format_window_cell(Some(&win), true, now_ms);
+                assert_eq!(formatted, expected_snippet);
+            }
+        });
     }
 
     #[test]
     fn test_all_quota_unexpected_3rd_window_fallback() {
-        let now_ms = 1790409600000i64;
-        let reports = vec![json!({
-            "credential": { "reference": "codex-main", "provider": "codex" },
-            "representations": { "codex": { "validation": "valid" } },
-            "status": { "provider_scope": "confirmed" },
-            "availability": {
-                "state": "ready",
-                "fresh": true,
-                "observed_at_ms": now_ms,
-                "quota_buckets": [
-                    {
-                        "provider_label": "special-bucket",
-                        "windows": [
-                            { "duration_minutes": 60, "remaining_percent": 50.0, "resets_at_ms": 1790402460000i64 },
-                            { "duration_minutes": 300, "remaining_percent": 100.0, "resets_at_ms": 1790402460000i64 },
-                            { "duration_minutes": 10080, "remaining_percent": 74.0, "resets_at_ms": 1790692320000i64 }
-                        ]
-                    }
-                ]
-            }
-        })];
-
-        let out = format_all_quota(&reports, now_ms, Some(100));
-        assert!(out.contains("codex-main  special-bucket"));
-        assert!(out.contains("1h     50% █████░░░░░  Sep 26 06:01"));
-        assert!(out.contains("5h    100% ██████████  Sep 26 06:01"));
-        assert!(out.contains("7d     74% ███████░░░  Sep 29 14:32"));
-    }
-
-    #[test]
-    fn test_all_quota_narrow_terminal() {
-        let now_ms = 1790409600000i64;
-        let reports = vec![
-            json!({
+        with_test_timezone("UTC", || {
+            let now_ms = 1790409600000i64;
+            let reports = vec![json!({
                 "credential": { "reference": "codex-main", "provider": "codex" },
                 "representations": { "codex": { "validation": "valid" } },
                 "status": { "provider_scope": "confirmed" },
@@ -1919,50 +1958,85 @@ mod tests {
                     "observed_at_ms": now_ms,
                     "quota_buckets": [
                         {
+                            "provider_label": "special-bucket",
                             "windows": [
-                                { "duration_minutes": 300, "remaining_percent": 100.0, "resets_at_ms": 1790402460000i64 }, // Sep 26 06:01
-                                { "duration_minutes": 10080, "remaining_percent": 1.0, "resets_at_ms": 1790720520000i64 }  // Sep 29 22:22
+                                { "duration_minutes": 60, "remaining_percent": 50.0, "resets_at_ms": 1790402460000i64 },
+                                { "duration_minutes": 300, "remaining_percent": 100.0, "resets_at_ms": 1790402460000i64 },
+                                { "duration_minutes": 10080, "remaining_percent": 74.0, "resets_at_ms": 1790692320000i64 }
                             ]
                         }
                     ]
                 }
-            }),
-            json!({
-                "credential": { "reference": "antigravity-jc", "provider": "antigravity" },
-                "representations": { "acp": { "validation": "valid" }, "agy-cli": { "validation": "valid" } },
-                "availability": {
-                    "state": "unknown",
-                    "fresh": true,
-                    "observed_at_ms": now_ms,
-                    "quota_groups": [
-                        {
-                            "provider_display_name": "Gemini Models",
-                            "bucket_fingerprints": ["fp-jc-gemini"]
-                        }
-                    ],
-                    "quota_buckets": [
-                        {
-                            "provider_bucket_fingerprint": "fp-jc-gemini",
-                            "windows": [
-                                { "provider_window_id": "5h", "duration_minutes": 300, "remaining_percent": 75.3, "resets_at_ms": 1790399220000i64 },
-                                { "provider_window_id": "weekly", "duration_minutes": 10080, "remaining_percent": 85.0, "resets_at_ms": 1790905920000i64 }
-                            ]
-                        }
-                    ]
-                }
-            }),
-        ];
+            })];
 
-        let out = format_all_quota(&reports, now_ms, Some(70));
-        // Codex narrow layout
-        assert!(out.contains("codex-main  default"));
-        assert!(out.contains("5h    100% ██████████  Sep 26 06:01"));
-        assert!(out.contains("7d      1% ▏░░░░░░░░░  Sep 29 22:22"));
+            let out = format_all_quota(&reports, now_ms, Some(100));
+            assert!(out.contains("codex-main  special-bucket"));
+            assert!(out.contains("1h     50% █████░░░░░  Sep 26 06:01"));
+            assert!(out.contains("5h    100% ██████████  Sep 26 06:01"));
+            assert!(out.contains("7d     74% ███████░░░  Sep 29 14:32"));
+        });
+    }
 
-        // Antigravity narrow layout
-        assert!(out.contains("antigravity-jc  Gemini Models"));
-        assert!(out.contains("5h       75.3% ████████░░  Sep 26 05:07"));
-        assert!(out.contains("weekly     85% █████████░  Oct 2 01:52"));
+    #[test]
+    fn test_all_quota_narrow_terminal() {
+        with_test_timezone("UTC", || {
+            let now_ms = 1790409600000i64;
+            let reports = vec![
+                json!({
+                    "credential": { "reference": "codex-main", "provider": "codex" },
+                    "representations": { "codex": { "validation": "valid" } },
+                    "status": { "provider_scope": "confirmed" },
+                    "availability": {
+                        "state": "ready",
+                        "fresh": true,
+                        "observed_at_ms": now_ms,
+                        "quota_buckets": [
+                            {
+                                "windows": [
+                                    { "duration_minutes": 300, "remaining_percent": 100.0, "resets_at_ms": 1790402460000i64 }, // Sep 26 06:01
+                                    { "duration_minutes": 10080, "remaining_percent": 1.0, "resets_at_ms": 1790720520000i64 }  // Sep 29 22:22
+                                ]
+                            }
+                        ]
+                    }
+                }),
+                json!({
+                    "credential": { "reference": "antigravity-jc", "provider": "antigravity" },
+                    "representations": { "acp": { "validation": "valid" }, "agy-cli": { "validation": "valid" } },
+                    "availability": {
+                        "state": "unknown",
+                        "fresh": true,
+                        "observed_at_ms": now_ms,
+                        "quota_groups": [
+                            {
+                                "provider_display_name": "Gemini Models",
+                                "bucket_fingerprints": ["fp-jc-gemini"]
+                            }
+                        ],
+                        "quota_buckets": [
+                            {
+                                "provider_bucket_fingerprint": "fp-jc-gemini",
+                                "windows": [
+                                    { "provider_window_id": "5h", "duration_minutes": 300, "remaining_percent": 75.3, "resets_at_ms": 1790399220000i64 },
+                                    { "provider_window_id": "weekly", "duration_minutes": 10080, "remaining_percent": 85.0, "resets_at_ms": 1790905920000i64 }
+                                ]
+                            }
+                        ]
+                    }
+                }),
+            ];
+
+            let out = format_all_quota(&reports, now_ms, Some(70));
+            // Codex narrow layout
+            assert!(out.contains("codex-main  default"));
+            assert!(out.contains("5h    100% ██████████  Sep 26 06:01"));
+            assert!(out.contains("7d      1% ▏░░░░░░░░░  Sep 29 22:22"));
+
+            // Antigravity narrow layout
+            assert!(out.contains("antigravity-jc  Gemini Models"));
+            assert!(out.contains("5h       75.3% ████████░░  Sep 26 05:07"));
+            assert!(out.contains("weekly     85% █████████░  Oct 2 01:52"));
+        });
     }
 
     #[test]
@@ -2056,5 +2130,280 @@ mod tests {
         assert!(rendered.contains("primary"));
         assert!(!rendered.contains("credential://"));
         assert!(!rendered.contains("token"));
+    }
+
+    #[test]
+    fn test_local_timezone_conversion_all_cases() {
+        with_test_timezone("Asia/Ho_Chi_Minh", || {
+            let now_ms = 1790409600000i64; // Sep 26 2026 08:00 UTC = Sep 26 2026 15:00 UTC+07
+
+            // 1. UTC -> UTC+07: Sep 26 07:27 UTC -> Sep 26 14:27
+            assert_eq!(format_reset_time(1790407620000, now_ms), "Sep 26 14:27");
+
+            // 2. Date rollover: Sep 29 22:22 UTC -> Sep 30 05:22
+            assert_eq!(format_reset_time(1790720520000, now_ms), "Sep 30 05:22");
+
+            // 3. Midnight / date rollover: Sep 25 18:57 UTC -> Sep 26 01:57
+            assert_eq!(format_reset_time(1790362620000, now_ms), "Sep 26 01:57");
+
+            // 4. Year rollover: Dec 31 20:00 UTC -> Jan 1 03:00 next year (2027)
+            assert_eq!(format_reset_time(1798747200000, now_ms), "Jan 1 03:00 2027");
+
+            // Same year rollover (when display now_ms is in 2027 local time)
+            assert_eq!(
+                format_reset_time(1798747200000, 1798747200000),
+                "Jan 1 03:00"
+            );
+
+            // 5. Codex 5h and 7d from Section 6 example
+            // gpt-reserve 7d: Sep 29 14:32 UTC -> Sep 29 21:32
+            assert_eq!(format_reset_time(1790692320000, now_ms), "Sep 29 21:32");
+            // default 5h: Sep 26 07:27 UTC -> Sep 26 14:27
+            assert_eq!(format_reset_time(1790407620000, now_ms), "Sep 26 14:27");
+            // default 7d: Sep 29 22:22 UTC -> Sep 30 05:22
+            assert_eq!(format_reset_time(1790720520000, now_ms), "Sep 30 05:22");
+
+            // 6. Antigravity 5h and weekly from Section 7 example
+            // Gemini Models 5h: Sep 26 05:07 UTC -> Sep 26 12:07
+            assert_eq!(format_reset_time(1790399220000, now_ms), "Sep 26 12:07");
+            // Gemini Models weekly: Oct 2 01:52 UTC -> Oct 2 08:52
+            assert_eq!(format_reset_time(1790905920000, now_ms), "Oct 2 08:52");
+        });
+    }
+
+    #[test]
+    fn test_local_timezone_non_utc_plus_7() {
+        with_test_timezone("America/New_York", || {
+            let now_ms = 1790409600000i64; // Sep 26 2026 08:00 UTC = Sep 26 2026 04:00 EDT
+
+            // Sep 26 07:27 UTC in America/New_York (EDT, UTC-4) is Sep 26 03:27
+            assert_eq!(format_reset_time(1790407620000, now_ms), "Sep 26 03:27");
+
+            // Sep 29 22:22 UTC in America/New_York is Sep 29 18:22
+            assert_eq!(format_reset_time(1790720520000, now_ms), "Sep 29 18:22");
+
+            // Sep 25 18:57 UTC in America/New_York is Sep 25 14:57
+            assert_eq!(format_reset_time(1790362620000, now_ms), "Sep 25 14:57");
+        });
+    }
+
+    #[test]
+    fn test_local_timezone_codex_single_and_wide_quota() {
+        with_test_timezone("Asia/Ho_Chi_Minh", || {
+            let now_ms = 1790409600000i64; // Sep 26 2026 08:00 UTC = Sep 26 2026 15:00 UTC+07
+            let codex_report = json!({
+                "credential": {
+                    "reference": "codex-main",
+                    "provider": "codex",
+                    "generation": 1,
+                    "lifecycle": "enrolled"
+                },
+                "representations": {
+                    "codex": { "validation": "valid" }
+                },
+                "health": {
+                    "runtime": { "state": "healthy" }
+                },
+                "status": {
+                    "state": "observed",
+                    "provider_scope": "confirmed",
+                    "quota_promoted": true
+                },
+                "availability": {
+                    "state": "ready",
+                    "fresh": true,
+                    "observed_at_ms": now_ms,
+                    "quota_buckets": [
+                        {
+                            "provider_label": "gpt-reserve",
+                            "windows": [
+                                {
+                                    "provider_window_id": "secondary",
+                                    "duration_minutes": 10080,
+                                    "remaining_percent": 74.0,
+                                    "resets_at_ms": 1790692320000i64 // Sep 29 14:32 UTC -> Sep 29 21:32 local
+                                }
+                            ]
+                        },
+                        {
+                            "windows": [
+                                {
+                                    "provider_window_id": "primary",
+                                    "duration_minutes": 300,
+                                    "remaining_percent": 100.0,
+                                    "resets_at_ms": 1790407620000i64 // Sep 26 07:27 UTC -> Sep 26 14:27 local
+                                },
+                                {
+                                    "provider_window_id": "secondary",
+                                    "duration_minutes": 10080,
+                                    "remaining_percent": 1.0,
+                                    "resets_at_ms": 1790720520000i64 // Sep 29 22:22 UTC -> Sep 30 05:22 local
+                                }
+                            ]
+                        }
+                    ]
+                }
+            });
+
+            // Single-account view:
+            let single_out = format_single_credential(&codex_report, now_ms);
+            assert!(single_out.contains("5h     100%  ██████████   resets Sep 26 14:27"));
+            assert!(single_out.contains("7d       1%  ▏░░░░░░░░░   resets Sep 30 05:22"));
+            assert!(single_out.contains("7d      74%  ███████░░░   resets Sep 29 21:32"));
+
+            // Wide quota view:
+            let wide_out = format_all_quota(&[codex_report], now_ms, Some(120));
+            assert!(wide_out.contains("Sep 29 21:32"));
+            assert!(wide_out.contains("Sep 26 14:27"));
+            assert!(wide_out.contains("Sep 30 05:22"));
+        });
+    }
+
+    #[test]
+    fn test_local_timezone_antigravity_single_wide_and_stale() {
+        with_test_timezone("Asia/Ho_Chi_Minh", || {
+            let now_ms = 1790409600000i64; // Sep 26 2026 08:00 UTC
+            let stale_report = json!({
+                "credential": {
+                    "reference": "antigravity-ch9b2013",
+                    "provider": "antigravity",
+                    "generation": 1,
+                    "lifecycle": "enrolled"
+                },
+                "representations": {
+                    "acp": { "state": "valid" },
+                    "agy-cli": { "state": "valid" }
+                },
+                "health": { "runtime": { "state": "healthy" } },
+                "status": { "state": "observed" },
+                "availability": {
+                    "state": "unknown",
+                    "fresh": false,
+                    "observed_at_ms": now_ms - 240_000,
+                    "quota_groups": [
+                        {
+                            "provider_display_name": "Gemini Models",
+                            "members": [{ "provider_label": "Gemini Flash" }],
+                            "bucket_fingerprints": ["fp-gemini"]
+                        }
+                    ],
+                    "quota_buckets": [
+                        {
+                            "provider_bucket_fingerprint": "fp-gemini",
+                            "provider_label": "Gemini Models",
+                            "windows": [
+                                {
+                                    "provider_window_id": "5h",
+                                    "duration_minutes": 300,
+                                    "remaining_percent": 99.9,
+                                    "resets_at_ms": 1790362620000i64 // Sep 25 18:57 UTC -> Sep 26 01:57 local
+                                },
+                                {
+                                    "provider_window_id": "weekly",
+                                    "duration_minutes": 10080,
+                                    "remaining_percent": 100.0,
+                                    "resets_at_ms": 1790673720000i64 // Sep 29 09:22 UTC -> Sep 29 16:22 local
+                                }
+                            ]
+                        }
+                    ]
+                }
+            });
+
+            let fresh_report = json!({
+                "credential": {
+                    "reference": "antigravity-jc",
+                    "provider": "antigravity",
+                    "generation": 1,
+                    "lifecycle": "enrolled"
+                },
+                "representations": {
+                    "acp": { "validation": "valid" },
+                    "agy-cli": { "validation": "valid" }
+                },
+                "health": { "runtime": { "state": "healthy" } },
+                "status": { "state": "observed" },
+                "availability": {
+                    "state": "unknown",
+                    "fresh": true,
+                    "observed_at_ms": now_ms,
+                    "quota_groups": [
+                        {
+                            "provider_display_name": "Gemini Models",
+                            "members": [{ "provider_label": "Gemini Flash" }],
+                            "bucket_fingerprints": ["fp-jc"]
+                        }
+                    ],
+                    "quota_buckets": [
+                        {
+                            "provider_bucket_fingerprint": "fp-jc",
+                            "provider_label": "Gemini Models",
+                            "windows": [
+                                {
+                                    "provider_window_id": "5h",
+                                    "duration_minutes": 300,
+                                    "remaining_percent": 64.2,
+                                    "resets_at_ms": 1790399220000i64 // Sep 26 05:07 UTC -> Sep 26 12:07 local
+                                },
+                                {
+                                    "provider_window_id": "weekly",
+                                    "duration_minutes": 10080,
+                                    "remaining_percent": 83.5,
+                                    "resets_at_ms": 1790905920000i64 // Oct 2 01:52 UTC -> Oct 2 08:52 local
+                                }
+                            ]
+                        }
+                    ]
+                }
+            });
+
+            // Single-account fresh:
+            let single_fresh = format_single_credential(&fresh_report, now_ms);
+            assert!(single_fresh.contains("5h       64.2%  ██████░░░░   resets Sep 26 12:07"));
+            assert!(single_fresh.contains("weekly   83.5%  ████████░░   resets Oct 2 08:52"));
+
+            // Wide quota with both stale and fresh accounts:
+            let wide_out = format_all_quota(&[stale_report, fresh_report], now_ms, Some(120));
+            assert!(wide_out.contains("Sep 26 01:57"));
+            assert!(wide_out.contains("Sep 29 16:22"));
+            assert!(wide_out.contains("Sep 26 12:07"));
+            assert!(wide_out.contains("Oct 2 08:52"));
+        });
+    }
+
+    #[test]
+    fn test_canonical_json_and_debug_timestamps_unchanged() {
+        let raw_report = json!({
+            "credential": {
+                "reference": "codex-main",
+                "provider": "codex"
+            },
+            "availability": {
+                "quota_buckets": [
+                    {
+                        "windows": [
+                            {
+                                "duration_minutes": 300,
+                                "remaining_percent": 100.0,
+                                "resets_at_ms": 1790407620000i64,
+                                "resets_at": "2026-09-26T07:27:00Z"
+                            }
+                        ]
+                    }
+                ]
+            }
+        });
+
+        // JSON must retain exact raw values (resets_at_ms canonical epoch, UTC resets_at string)
+        let cleaned = clean_structured_json(raw_report.clone());
+        let window = &cleaned["availability"]["quota_buckets"][0]["windows"][0];
+        assert_eq!(window["resets_at_ms"], 1790407620000i64);
+        assert_eq!(window["resets_at"], "2026-09-26T07:27:00Z");
+
+        // Verify JSON serialization does not introduce local offsets
+        let json_str = serde_json::to_string(&cleaned).unwrap();
+        assert!(json_str.contains(r#""resets_at_ms":1790407620000"#));
+        assert!(json_str.contains(r#""resets_at":"2026-09-26T07:27:00Z""#));
+        assert!(!json_str.contains("+07:00"));
     }
 }

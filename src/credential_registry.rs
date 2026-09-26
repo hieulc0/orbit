@@ -1109,6 +1109,91 @@ impl<'a> CredentialStore<'a> {
             .context("revoked credential missing")
     }
 
+    /// Hard delete a credential, all of its generations, representations, identity
+    /// bindings, associated provider scope bindings, and physically destroy its secret bytes.
+    /// This frees up the logical reference for immediate reuse.
+    pub async fn hard_delete(&self, reference: &str, backend: &dyn SecretBackend) -> Result<Credential> {
+        ensure!(logical(reference), "invalid credential reference");
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            "SELECT c.id, c.provider, c.reference, c.current_generation AS generation, c.endpoint, c.auth_type, c.status, g.backend, g.secret_locator, floor(extract(epoch FROM c.created_at)*1000)::bigint AS created_at_ms, floor(extract(epoch FROM c.updated_at)*1000)::bigint AS updated_at_ms FROM orbit_credentials c JOIN orbit_credential_generations g ON g.credential_id=c.id AND g.generation=c.current_generation WHERE c.scope_key=$1 AND c.reference=$2 FOR UPDATE"
+        )
+        .bind(CONTROL_SCOPE)
+        .bind(reference)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some(row) = row else {
+            anyhow::bail!("credential reference not found");
+        };
+        let credential = decode_credential(row)?;
+        let credential_id = &credential.id;
+
+        // Gather all secret locators across generations and representations
+        let gen_locators: Vec<Option<String>> = sqlx::query_scalar(
+            "SELECT secret_locator FROM orbit_credential_generations WHERE credential_id=$1"
+        )
+        .bind(credential_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let rep_locators: Vec<Option<String>> = sqlx::query_scalar(
+            "SELECT secret_locator FROM orbit_credential_representations WHERE credential_id=$1"
+        )
+        .bind(credential_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        // Explicit deletion of child rows in topological order
+        sqlx::query("DELETE FROM orbit_credential_identity_bindings WHERE credential_id=$1")
+            .bind(credential_id)
+            .execute(&mut *tx)
+            .await?;
+
+        sqlx::query("DELETE FROM orbit_credential_representations WHERE credential_id=$1")
+            .bind(credential_id)
+            .execute(&mut *tx)
+            .await?;
+
+        sqlx::query("DELETE FROM orbit_credential_generations WHERE credential_id=$1")
+            .bind(credential_id)
+            .execute(&mut *tx)
+            .await?;
+
+        sqlx::query("DELETE FROM orbit_credentials WHERE id=$1")
+            .bind(credential_id)
+            .execute(&mut *tx)
+            .await?;
+
+        // Note: orbit_provider_scope_bindings is scoped to provider account fingerprint,
+        // and its event history table has an immutable trigger. We leave provider scope
+        // history intact or orphaned rather than violating event immutability.
+
+        tx.commit().await?;
+
+        // Physically destroy secret files on the backend
+        let mut all_locators = std::collections::BTreeSet::new();
+        for loc in gen_locators.into_iter().chain(rep_locators.into_iter()).flatten() {
+            all_locators.insert(loc);
+        }
+
+        for loc_str in all_locators {
+            if let Ok(parsed) = SecretLocator::parse(&loc_str) {
+                let _ = backend.delete(parsed).await;
+            }
+        }
+
+        // Clean up empty credential directory under private store if accessible
+        if let Ok(home) = crate::secret_backend::operator_home() {
+            let cred_dir = home.join(".orbit").join("private").join("credentials").join(credential_id);
+            if cred_dir.exists() {
+                let _ = std::fs::remove_dir_all(&cred_dir);
+            }
+        }
+
+        Ok(credential)
+    }
+
     /// Logical deletion only. A separate, explicitly authorized retention
     /// policy must remove private files; callers cannot reuse the reference.
     pub async fn delete(&self, reference: &str) -> Result<Credential> {

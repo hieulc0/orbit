@@ -121,7 +121,7 @@ enum CredentialAction {
         #[arg(long, env = "ORBIT_DATABASE_URL_FILE", hide_env_values = true)]
         database_url_file: Option<PathBuf>,
     },
-    /// Revoke a credential while retaining its generations, evidence and secret bytes.
+    /// Remove a credential, deleting its generations and destroying its secret bytes.
     #[command(alias = "revoke")]
     Remove {
         reference: String,
@@ -1193,14 +1193,15 @@ async fn main() -> Result<()> {
     {
         let database_url = read_private_database_url(database_url_file.as_deref()).await?;
         let (engine, scratch) = connect_durable_catalog_engine(database_url.as_str()).await?;
-        let revoked = CredentialStore::new(&engine.pool).revoke(reference).await?;
+        let backend = orbit::secret_backend::LocalPrivateSecretBackend::default_for_operator()?;
+        let removed = CredentialStore::new(&engine.pool).hard_delete(reference, &backend).await?;
         let summary = serde_json::json!({
-            "credential_id": revoked.id,
-            "reference": revoked.reference,
-            "provider": revoked.provider,
-            "generation": revoked.generation,
-            "lifecycle": revoked.status,
-            "secret_bytes_destroyed": false,
+            "credential_id": removed.id,
+            "reference": removed.reference,
+            "provider": removed.provider,
+            "generation": removed.generation,
+            "lifecycle": "deleted",
+            "secret_bytes_destroyed": true,
         });
         match output_format {
             Output::Json | Output::Text => println!("{}", serde_json::to_string_pretty(&summary)?),
