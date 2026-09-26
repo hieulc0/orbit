@@ -1906,7 +1906,7 @@ async fn execute_real_acp_turn(
             },
         };
         let mut files = BTreeMap::new();
-        files.insert("auth.json".into(), "auth.json".into());
+        files.insert("auth.json".into(), enrolled::CODEX_AUTH_RELATIVE.into());
         let rt = Runtime {
             binding_name: binding_name.into(),
             binding: Binding {
