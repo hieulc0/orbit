@@ -32,6 +32,12 @@ Provider
 
 `orbit_credentials` has a stable UUID ID, globally unique operator reference,
 provider, optional endpoint, auth type, current generation and lifecycle state.
+The UUID and provider are identity; `reference` is a mutable operator-facing
+name. `orbit credential rename <old> <new>` updates only that name in one
+transaction. It does not create a generation, touch a representation or secret,
+or rewrite provider/quota evidence. Catalog availability and provider-scope
+lookups use the UUID and generation as the stable identity, while retaining
+compatibility with older reference-derived evidence keys.
 This is a single-control-plane catalog (`scope_key=operator`), not a new tenant
 hierarchy. `orbit_credential_generations` retains the backend and primary opaque
 locator for each generation. `orbit_credential_representations` binds an opaque
@@ -47,21 +53,33 @@ available. `invalid`, `disabled` and `revoked` are lifecycle terms. Availability
 states such as READY and QUOTA_EXHAUSTED, runtime health, provider-scope
 confirmation, and representation validation are separate axes. Metadata CRUD
 does not promote availability or import historical evidence; explicit
-enrollment and status paths update their own state machines. Provider-scope
-identity retains `(provider, reference, generation)` and adds the stable
-catalog UUID for registry-owned credentials. Legacy identities omit that
-optional component and keep their original scope/fingerprint keys. A catalog
-entry cannot inherit availability or provider-scope evidence from a
-pre-catalog/manual credential with a coincident logical tuple. Catalog-backed
-status probes persist new snapshots for the exact credential UUID/generation.
-This is an identity boundary, not a scheduling change.
+enrollment and status paths update their own state machines. Legacy
+provider-scope identities retain `(provider, reference, generation)` and keep
+their original scope/fingerprint keys. Catalog-owned identities use credential
+UUID plus generation as their stable key; the reference remains descriptive and
+may change. A catalog entry cannot inherit availability or provider-scope
+evidence from a pre-catalog/manual credential with a coincident logical tuple.
+Catalog-backed status probes persist new snapshots for the exact credential
+UUID/generation. This is an identity boundary, not a scheduling change.
 
 Rotation advances the current generation by exactly one, creates a new pending
 generation, and retires the old one. No old locator, validation, binding or
 availability is inherited. Old generation secrets remain retained and inactive;
 deletion/garbage collection requires a future explicit operator policy. Logical
-removal is a durable revoked tombstone, also without secret deletion. References
-cannot be reused implicitly after revocation.
+removal is a durable revoked tombstone, also without secret deletion. Use
+`orbit credential remove <reference>` (also accepted as `revoke`) to revoke.
+This marks the credential and generations revoked; it preserves representation
+rows, validation evidence, provider-scope history, availability history and
+SecretBackend bytes. Revoked credentials remain inspectable but cannot accept a
+representation, rotate, enroll, or pass the catalog-backed status/execution
+eligibility checks. Their current reference remains reserved; there is no
+implicit restore, hard-delete, secret purge, or alias behavior.
+
+Lifecycle commands connect directly to the configured durable catalog through
+`ORBIT_DATABASE_URL_FILE`; they do not require the API server. `list` and
+`inspect` continue to use the operator read API. Renames release the old name
+because aliases are not modeled; historical evidence remains attached through
+the unchanged credential UUID and generation.
 
 ## Local private backend
 
@@ -78,7 +96,12 @@ generation aliases. Secret publication writes a random private staging file,
 fsyncs it, renames without replacement for create (or atomically over an
 existing checked file for replace), then fsyncs the containing directory.
 Secret bytes are zeroized on drop and have redacted `Debug`; error messages
-contain no secret payload. Other backends may implement the same trait later.
+contain no secret payload. The operator root is resolved from the effective
+user's account record rather than the caller's mutable `HOME`; installations
+with an intentional alternate root may set the private `ORBIT_HOME` override.
+The database URL file and LocalPrivateSecretBackend use the same root, so a
+different shell/service `HOME` cannot silently select another credential store.
+Other backends may implement the same trait later.
 
 ## Crash consistency and authority
 
@@ -152,9 +175,38 @@ Qualification used an Orbit-private pinned copy of agy 1.2.9 with SHA-256
 provenance remains operator-supplied and is not officially artifact-verified.
 The mutable host executable is only an import/discovery source, not runtime
 identity. A dedicated immutable `orbit-antigravity-cli` image remains future
-work. The qualification-only `credential add-representation` import accepts
-only the retained operator-approved token source; interactive agy
-login/capture automation is not implemented here.
+work. The production command `orbit credential add-representation <reference>
+--interface agy-cli` launches the pinned agy 1.2.9 artifact in a fresh private
+HOME, with the host HOME hidden, D-Bus/Secret Service unavailable,
+`AGY_CLI_DISABLE_AUTO_UPDATE=true`, and only the provider login interaction.
+It captures only `.gemini/antigravity-cli/antigravity-oauth-token`, publishes
+it through LocalPrivateSecretBackend, then stages only that backend file into a
+second fresh HOME and runs `agy models` before marking the representation valid.
+A failed or cancelled login leaves an inert pending representation; ACP and
+the logical credential remain unchanged. A hidden qualification-only import
+accepts only the retained approved source artifact.
+
+The agy representation records a bounded last-completed enrollment stage
+(`prepared`, `login_started`, `login_completed`, `token_captured`,
+`secret_persisted`, `validation_started`, `validation_succeeded`, `validated`,
+or `legacy_unknown`). These are progress diagnostics, not auth claims.
+`login_completed` is recorded only after the isolated process exits and the
+approved token file passes capture validation; cancellation or an exit without
+that file leaves the stage resumable.
+Re-running `add-representation` on a pending/unvalidated row first checks its
+existing opaque SecretBackend artifact: if present, Orbit skips login and
+validates it in a new HOME; if absent, Orbit starts a new isolated login using
+the same credential UUID, generation, representation row and locator. No
+second representation or generation is created. A valid stored representation
+is idempotent. Normal `credential status` reports the last completed stage and
+a bounded reason; `--diagnostics` is required for structural HOME inventory.
+
+An additive migration converts earlier bounded `binary` provenance to a
+logical artifact label only for the reviewed pinned Codex and agy version/digest
+pairs; those old executable paths are removed from catalog metadata. New writes
+use the path-free form. The database constraint remains backward-compatible
+with other bounded historical rows, while unknown legacy runtime identities
+fail closed in the domain decoder.
 
 Representation publication state and validation remain separate. A backend
 write first creates a pending row; fresh-process reuse then sets
@@ -196,8 +248,9 @@ interactive or noninteractive enrollment, validate representations and perform
 provider logout. They must not assume OAuth: browser flow, pasted PAT/API key,
 SSH key or external secret reference may all fit. The intended operator UX is
 `orbit credential add antigravity`, `add codex`, and `add github`; ACP personal
-OAuth and Codex account enrollment exist, while agy login/capture automation
-and GitHub enrollment remain future work. The GitHub PAT case can use
+OAuth and Codex account enrollment exist, and agy login is available through
+`add-representation` for an existing Antigravity credential. GitHub enrollment
+remains future work. The GitHub PAT case can use
 `provider=github`, an endpoint
 such as `https://github.com`, `auth_type=pat`, and an `api` representation; the
 PAT remains in the backend, never PostgreSQL.
@@ -239,17 +292,53 @@ login leaves the generation pending. The live `codex-main` browser/device
 qualification completed on 2026-09-25 with generation 1 enrolled and the
 fresh-runtime reuse check passing.
 
-The existing Codex status implementation has a catalog-backed entry point that
+The existing Codex status adapter has a catalog-backed entry point that
 loads the current validated `codex` representation, checks its catalog UUID and
 generation against the requested resource, stages only `auth.json`, and then
 uses the already-qualified `account/read` plus `account/rateLimits/read`
 protocol. It does not copy runtime auth refreshes back; that awaits an explicit
-refresh policy. `orbit credential probe-codex-status <reference>` performs one
-catalog-backed, non-inference status observation through the durable catalog.
+refresh policy. The production `orbit credential status <reference>` command
+dispatches to this adapter for Codex or the pinned agy `/usage` adapter for
+Antigravity. `orbit credential status --all` processes each credential
+independently, up to 32 entries; each eligible account gets its own backend
+lookup, isolated staging, provider request and credential-scoped evidence.
+Missing/invalid representations, revoked credentials, backend failures and
+staging failures use bounded actionable categories without exposing a physical
+path or secret locator. ACP-only Antigravity credentials are reported as
+status-unavailable because agy-cli is missing, not as broken credentials.
+Status is a provider read, not a model turn. The old
+`probe-codex-status`/`capture-agy-usage` commands remain hidden qualification
+entry points.
+
+Codex provider-scope observations have an explicit operator workflow:
+`orbit credential scope show <reference>` (also available as
+`provider-scope inspect`) displays the credential-bound `ps1` fingerprint,
+latest observation time, safe identity-value comparison and promotion state
+without showing provider account material. Confirmation uses the exact current
+fingerprint: `orbit credential scope confirm <reference> --fingerprint <ps1>`.
+The transaction rejects a replaced fingerprint and requires the latest fresh
+status observation to show exact in-memory equality between
+`account/read.workspaceRouting.chatgptAccountId` and
+`account/rateLimits/read.accountId`. Raw IDs are never retained. This exact
+value comparison is a consistency check, not a provider guarantee about
+lifetime identity semantics; the operator still explicitly confirms the
+fingerprint. Confirmation does not itself probe the provider; run
+`credential status <reference>` afterward.
+
+Before confirmation, Orbit persists reviewed quota buckets/windows,
+`ordinaryUsageAllowed`, the scope state, and the exact-value comparison inside
+the credential-scoped status snapshot. It marks the evidence OBSERVED but
+UNCONFIRMED, sets availability/confidence to UNKNOWN, and does not erase quota
+values. Those values are visible for status/audit but are not promoted for
+scheduling. After explicit confirmation, a fresh matching status read may
+promote the same safe quota evidence according to existing availability
+policy. Raw provider JSON, email, raw account IDs, and raw limit IDs are not
+persisted.
+
 The first observation for `codex-main` was authenticated and persisted as an
-UNKNOWN snapshot with provider scope UNCONFIRMED. Quota evidence is not promoted
-until the existing provider-scope confirmation rules are satisfied. Provider
-scope is never bound by email or auth-file identity.
+UNKNOWN snapshot with provider scope UNCONFIRMED. The status command reports
+safe observed quota values separately from promotion and scheduling
+availability. Provider scope is never bound by email or auth-file identity.
 
 The registry is multi-account: references are globally unique logical names,
 not provider singletons. Each Codex or Antigravity account receives its own

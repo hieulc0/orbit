@@ -25,6 +25,35 @@ fn resource() -> ExecutionResourceIdentity {
     }
 }
 
+#[test]
+fn catalog_identity_and_scope_keys_survive_reference_rename() {
+    let mut before = resource();
+    before.credential.catalog_id = Some("00000000-0000-4000-8000-000000000001".into());
+    let mut after = before.clone();
+    after.credential.reference = "antigravity-weedy".into();
+    assert_eq!(
+        AvailabilityScope::Credential(before.credential.clone())
+            .key()
+            .unwrap(),
+        AvailabilityScope::Credential(after.credential.clone())
+            .key()
+            .unwrap()
+    );
+    assert!(AvailabilityScope::Credential(before.credential.clone()).matches(&after));
+
+    let mut another_generation = after.clone();
+    another_generation.credential.generation = "3".into();
+    assert_ne!(
+        AvailabilityScope::Credential(before.credential.clone())
+            .key()
+            .unwrap(),
+        AvailabilityScope::Credential(another_generation.credential.clone())
+            .key()
+            .unwrap()
+    );
+    assert!(!AvailabilityScope::Credential(before.credential).matches(&another_generation));
+}
+
 fn snapshot(
     scope: AvailabilityScope,
     state: AvailabilityState,
@@ -44,6 +73,7 @@ fn snapshot(
         source_revision: "adapter-v1".into(),
         evidence_digest: format!("sha256:{}", "b".repeat(64)),
         provider_observed_at_ms: None,
+        provider_status_observation: None,
     }
 }
 
@@ -134,6 +164,7 @@ fn bucket_can_carry_a_provider_defined_narrower_scope() {
     );
     evidence.quota_buckets.push(QuotaBucket {
         provider_bucket_fingerprint: format!("qb1:{}", "a".repeat(64)),
+        provider_label: None,
         scope: Some(QuotaBucketScope::ModelGroup {
             fingerprint: format!("mg1:{}", "b".repeat(64)),
         }),

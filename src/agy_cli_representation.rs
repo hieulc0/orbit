@@ -13,7 +13,7 @@ use sqlx::PgPool;
 use std::{
     ffi::CString,
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::{IsTerminal, Read, Write},
     os::{
         fd::{AsRawFd, FromRawFd},
         unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
@@ -43,6 +43,9 @@ const TOKEN_RELATIVE: &str = ".gemini/antigravity-cli/antigravity-oauth-token";
 const ISOLATED_HOME: &str = "/home/orbit";
 const ISOLATED_BINARY: &str = "/run/orbit/agy";
 const MAX_CAPTURED_OUTPUT: usize = 64 * 1024;
+const MAX_LOGIN_DIAGNOSTIC_ENTRIES: usize = 128;
+const MAX_LOGIN_DIAGNOSTIC_DEPTH: usize = 5;
+const MAX_LOGIN_DIAGNOSTIC_CANDIDATES: usize = 8;
 const STARTUP_OBSERVATION: Duration = Duration::from_secs(20);
 const USAGE_TIMEOUT: Duration = Duration::from_secs(60);
 const AGY_STATUS_REFERENCE: &str = "antigravity-oauth-test";
@@ -52,20 +55,7 @@ const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
 const RESOLVE_NO_SYMLINKS: u64 = 0x04;
 
 fn operator_home() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME").context("operator HOME unavailable")?;
-    let home = PathBuf::from(home);
-    ensure!(
-        home.is_absolute() && home.canonicalize()? == home,
-        "operator HOME must be canonical"
-    );
-    let metadata = fs::symlink_metadata(&home)?;
-    ensure!(
-        metadata.is_dir()
-            && metadata.uid() == unsafe { libc::geteuid() }
-            && metadata.mode() & 0o022 == 0,
-        "operator HOME owner or mode invalid"
-    );
-    Ok(home)
+    crate::secret_backend::operator_home()
 }
 
 fn source_binary_path() -> Result<PathBuf> {
@@ -122,6 +112,39 @@ pub struct AgyCliRepresentationResult {
     pub runtime_sha256: &'static str,
     pub runtime_provenance: &'static str,
     pub identity_binding: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgyEnrollmentRecovery {
+    AlreadyValid,
+    ValidateStoredArtifact,
+    StartProviderLogin,
+}
+
+fn agy_enrollment_recovery(
+    state: RepresentationState,
+    validated: bool,
+    artifact_present: bool,
+) -> Result<AgyEnrollmentRecovery> {
+    if state == RepresentationState::Stored && validated {
+        ensure!(
+            artifact_present,
+            "agy representation is marked valid but its SecretBackend artifact is unavailable"
+        );
+        return Ok(AgyEnrollmentRecovery::AlreadyValid);
+    }
+    ensure!(
+        matches!(
+            state,
+            RepresentationState::Pending | RepresentationState::Stored
+        ) && !validated,
+        "agy representation is not in a resumable state"
+    );
+    Ok(if artifact_present {
+        AgyEnrollmentRecovery::ValidateStoredArtifact
+    } else {
+        AgyEnrollmentRecovery::StartProviderLogin
+    })
 }
 
 /// Import the operator-qualified token into a PENDING representation, then
@@ -320,6 +343,693 @@ pub async fn import_and_validate(
     })
 }
 
+/// Attach a provider-native agy OAuth representation to an existing logical
+/// Antigravity credential. Login occurs in a fresh isolated HOME; only the
+/// qualified token artifact is captured, then the SecretBackend copy is
+/// validated from a second fresh HOME before activation.
+pub async fn enroll_existing_agy_cli(
+    pool: &PgPool,
+    backend: &LocalPrivateSecretBackend,
+    reference: &str,
+) -> Result<AgyCliRepresentationResult> {
+    ensure!(
+        backend.backend_id() == LOCAL_PRIVATE_ID,
+        "unexpected secret backend"
+    );
+    let pinned_binary = pinned_binary_path()?;
+    verify_pinned_binary_identity(&pinned_binary)
+        .await
+        .map_err(|_| {
+            enrollment_error(
+                "runtime_preflight",
+                "pinned agy runtime verification failed",
+            )
+        })?;
+    let store = CredentialStore::new(pool);
+    let credential = store
+        .get(reference)
+        .await?
+        .context("credential not found")?;
+    ensure!(
+        credential.provider == "antigravity"
+            && credential.status == CredentialStatus::Enrolled
+            && credential.secret_backend == LOCAL_PRIVATE_ID,
+        "credential is not an enrolled Antigravity credential in the local private backend"
+    );
+    let inspection = store
+        .inspect(reference)
+        .await?
+        .context("credential inspection unavailable")?;
+    let acp = inspection
+        .representations
+        .iter()
+        .find(|representation| {
+            representation.interface == "acp"
+                && representation.generation == credential.generation
+                && representation.current_generation
+        })
+        .context("current ACP representation missing")?
+        .clone();
+    ensure!(
+        acp.state == RepresentationState::Stored
+            && acp.validation == "valid"
+            && acp.auth_type == AGY_CLI_AUTH_TYPE,
+        "current ACP representation is not valid"
+    );
+
+    let provenance = RuntimeProvenance {
+        artifact: AGY_CLI_ARTIFACT.to_owned(),
+        version: AGY_CLI_VERSION.to_owned(),
+        sha256: AGY_CLI_SHA256.to_owned(),
+        provenance: "operator-supplied".to_owned(),
+    };
+    let existing = inspection.representations.iter().find(|representation| {
+        representation.interface == AGY_CLI_INTERFACE
+            && representation.generation == credential.generation
+    });
+    let prepared = if let Some(view) = existing {
+        let representation = store
+            .representation(&view.id)
+            .await?
+            .context("existing agy-cli representation disappeared")?;
+        ensure!(
+            representation.auth_type == AGY_CLI_AUTH_TYPE
+                && representation.runtime_provenance.as_ref() == Some(&provenance),
+            "existing agy-cli representation metadata does not match the pinned enrollment"
+        );
+        representation
+    } else {
+        store
+            .prepare_representation_with_metadata(
+                reference,
+                AGY_CLI_INTERFACE,
+                AGY_CLI_AUTH_TYPE,
+                &[],
+                backend.backend_id(),
+                Some(&provenance),
+            )
+            .await?
+    };
+    let locator = prepared
+        .secret_locator
+        .context("pending agy-cli representation has no locator")?;
+
+    let artifact_present = backend.exists(locator).await.map_err(|_| {
+        enrollment_error(
+            "secret_backend_check",
+            "stored agy artifact could not be checked",
+        )
+    })?;
+    let recovery = agy_enrollment_recovery(
+        prepared.state,
+        prepared.last_validated_at_ms.is_some(),
+        artifact_present,
+    )?;
+    if recovery == AgyEnrollmentRecovery::AlreadyValid {
+        let binding = store
+            .record_operator_intended_identity_binding(reference, "acp", AGY_CLI_INTERFACE)
+            .await
+            .map_err(|_| {
+                enrollment_error(
+                    "identity_binding",
+                    "operator identity metadata could not be recorded",
+                )
+            })?;
+        ensure!(
+            binding.state == "unverified" && binding.basis == "operator-intent",
+            "unexpected ACP/ag y identity binding state"
+        );
+        return Ok(agy_result(&credential));
+    }
+    let stored_secret = if recovery == AgyEnrollmentRecovery::ValidateStoredArtifact {
+        store
+            .set_agy_enrollment_stage(&prepared.id, "secret_persisted")
+            .await
+            .map_err(|_| {
+                enrollment_error(
+                    "catalog_stage",
+                    "stored representation recovery state could not be recorded",
+                )
+            })?;
+        backend.read(locator).await.map_err(|_| {
+            enrollment_error(
+                "secret_backend_read",
+                "stored agy artifact could not be loaded",
+            )
+        })?
+    } else {
+        store
+            .set_agy_enrollment_stage(&prepared.id, "login_started")
+            .await
+            .map_err(|_| {
+                enrollment_error(
+                    "catalog_stage",
+                    "provider login stage could not be recorded",
+                )
+            })?;
+        eprintln!(
+            "Starting isolated agy OAuth login. Complete the provider login in the opened browser or with the URL/code shown by agy. When agy reaches its chat prompt, exit immediately with /exit or /quit (or Ctrl+D twice); do not enter a prompt."
+        );
+        let (login_root, login_home) = new_private_home().map_err(|_| {
+            enrollment_error(
+                "login_environment",
+                "private agy login environment could not be created",
+            )
+        })?;
+        run_interactive_login(&login_root, &login_home, &pinned_binary)
+            .await
+            .map_err(|_| {
+                enrollment_error("provider_login", "agy provider login did not complete")
+            })?;
+        verify_pinned_binary_identity(&pinned_binary)
+            .await
+            .map_err(|_| {
+                enrollment_error(
+                    "runtime_postflight",
+                    "pinned agy runtime changed during login",
+                )
+            })?;
+        let source_secret = match read_login_token(&login_home) {
+            Ok(secret) => secret,
+            Err(_) => {
+                let diagnostic = login_capture_diagnostic(&login_home);
+                let diagnostic = serde_json::to_string(&diagnostic)
+                    .unwrap_or_else(|_| "{\"diagnostic\":\"unavailable\"}".to_owned());
+                return Err(enrollment_error(
+                    "token_capture",
+                    &format!(
+                        "agy exited without a valid approved token artifact; no credential bytes were stored; safe filesystem diagnostic={diagnostic}"
+                    ),
+                ));
+            }
+        };
+        store
+            .set_agy_enrollment_stage(&prepared.id, "login_completed")
+            .await
+            .map_err(|_| {
+                enrollment_error(
+                    "catalog_stage",
+                    "completed provider login could not be recorded",
+                )
+            })?;
+        store
+            .set_agy_enrollment_stage(&prepared.id, "token_captured")
+            .await
+            .map_err(|_| {
+                enrollment_error(
+                    "catalog_stage",
+                    "captured-token stage could not be recorded",
+                )
+            })?;
+        drop(login_root);
+        backend.create(locator, source_secret).await.map_err(|_| {
+            enrollment_error(
+                "secret_backend_write",
+                "captured agy token could not be stored privately",
+            )
+        })?;
+        store
+            .set_agy_enrollment_stage(&prepared.id, "secret_persisted")
+            .await
+            .map_err(|_| {
+                enrollment_error(
+                    "catalog_stage",
+                    "SecretBackend persistence stage could not be recorded",
+                )
+            })?;
+        backend.read(locator).await.map_err(|_| {
+            enrollment_error(
+                "secret_backend_read",
+                "newly stored agy artifact could not be loaded",
+            )
+        })?
+    };
+
+    store
+        .set_agy_enrollment_stage(&prepared.id, "validation_started")
+        .await
+        .map_err(|_| {
+            enrollment_error(
+                "catalog_stage",
+                "fresh-runtime validation stage could not be recorded",
+            )
+        })?;
+    let (validation_root, fresh_home) = new_private_home().map_err(|_| {
+        enrollment_error(
+            "validation_environment",
+            "fresh private agy validation environment could not be created",
+        )
+    })?;
+    stage_only_token(&fresh_home, &stored_secret).map_err(|_| {
+        enrollment_error(
+            "validation_staging",
+            "SecretBackend token could not be staged into a fresh HOME",
+        )
+    })?;
+    ensure!(
+        home_contains_only_candidate(&fresh_home).map_err(|_| enrollment_error(
+            "validation_staging",
+            "fresh agy HOME contains unexpected staged files"
+        ))?,
+        "fresh agy validation HOME contains unexpected staged files"
+    );
+    let validation = run_isolated(
+        &validation_root,
+        &fresh_home,
+        IsolatedInvocation::Models,
+        true,
+        &pinned_binary,
+    )
+    .await
+    .map_err(|_| {
+        enrollment_error(
+            "fresh_runtime_validation",
+            "fresh SecretBackend-staged agy process could not be run",
+        )
+    })?;
+    ensure!(
+        validation.success,
+        "agy enrollment stage `fresh_runtime_validation` failed: fresh SecretBackend-staged agy reuse failed"
+    );
+    let observation = observe_startup(&validation.stdout, &validation.stderr);
+    ensure!(
+        !observation.login_prompt && !observation.network_error && observation.stdout_nonempty,
+        "agy enrollment stage `fresh_runtime_validation` failed: stored representation was not accepted (login_prompt={}, network_error={}, stdout_bytes={}, stderr_bytes={})",
+        observation.login_prompt,
+        observation.network_error,
+        validation.stdout.len(),
+        validation.stderr.len()
+    );
+    drop(validation);
+    verify_pinned_binary_identity(&pinned_binary)
+        .await
+        .map_err(|_| {
+            enrollment_error(
+                "runtime_postflight",
+                "pinned agy runtime changed during validation",
+            )
+        })?;
+    store
+        .set_agy_enrollment_stage(&prepared.id, "validation_succeeded")
+        .await
+        .map_err(|_| {
+            enrollment_error(
+                "catalog_stage",
+                "successful fresh-runtime validation could not be recorded",
+            )
+        })?;
+
+    let finalized = store
+        .finalize_validated_representation(backend, &prepared.id)
+        .await
+        .map_err(|_| {
+            enrollment_error(
+                "registry_finalization",
+                "validated agy representation could not be activated in the catalog",
+            )
+        })?;
+    let binding = store
+        .record_operator_intended_identity_binding(reference, "acp", AGY_CLI_INTERFACE)
+        .await
+        .map_err(|_| {
+            enrollment_error(
+                "identity_binding",
+                "operator identity metadata could not be recorded",
+            )
+        })?;
+    ensure!(
+        binding.state == "unverified" && binding.basis == "operator-intent",
+        "unexpected ACP/ag y identity binding state"
+    );
+    let after = store
+        .get(reference)
+        .await?
+        .context("credential disappeared after agy-cli enrollment")?;
+    let after_inspection = store
+        .inspect(reference)
+        .await?
+        .context("credential inspection unavailable after enrollment")?;
+    let acp_after = after_inspection
+        .representations
+        .iter()
+        .find(|representation| representation.interface == "acp")
+        .context("ACP representation disappeared")?;
+    ensure!(
+        after.id == credential.id
+            && after.generation == credential.generation
+            && after.status == CredentialStatus::Enrolled
+            && acp_after == &acp,
+        "credential identity, generation, lifecycle or ACP representation changed"
+    );
+    ensure!(
+        finalized.state == RepresentationState::Stored && finalized.last_validated_at_ms.is_some(),
+        "agy-cli fresh-runtime validation was not recorded"
+    );
+    ensure!(
+        finalized.enrollment_stage.as_deref() == Some("validated"),
+        "agy enrollment stage `registry_finalization` did not mark validation complete"
+    );
+
+    Ok(AgyCliRepresentationResult {
+        credential_id: after.id,
+        reference: after.reference,
+        generation: after.generation,
+        credential_status: after.status,
+        representation_state: finalized.state,
+        validation: "valid",
+        auth_type: AGY_CLI_AUTH_TYPE,
+        runtime_version: AGY_CLI_VERSION,
+        runtime_sha256: AGY_CLI_SHA256,
+        runtime_provenance: "operator-supplied",
+        identity_binding: "unverified",
+    })
+}
+
+fn enrollment_error(stage: &str, message: &str) -> anyhow::Error {
+    anyhow::anyhow!("agy enrollment stage `{stage}` failed: {message}")
+}
+
+fn agy_result(credential: &crate::credential_registry::Credential) -> AgyCliRepresentationResult {
+    AgyCliRepresentationResult {
+        credential_id: credential.id.clone(),
+        reference: credential.reference.clone(),
+        generation: credential.generation,
+        credential_status: credential.status,
+        representation_state: RepresentationState::Stored,
+        validation: "valid",
+        auth_type: AGY_CLI_AUTH_TYPE,
+        runtime_version: AGY_CLI_VERSION,
+        runtime_sha256: AGY_CLI_SHA256,
+        runtime_provenance: "operator-supplied",
+        identity_binding: "unverified",
+    }
+}
+
+fn read_login_token(home: &Path) -> Result<SecretBytes> {
+    validate_private_directory(home)?;
+    let token_path = home.join(TOKEN_RELATIVE);
+    for directory in [home.join(".gemini"), home.join(".gemini/antigravity-cli")] {
+        validate_login_artifact_directory(home, &directory)?;
+    }
+    let mut file = open_beneath(&token_path)?;
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.is_file()
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.nlink() == 1
+            && metadata.mode() & 0o7777 == 0o600
+            && metadata.len() > 0
+            && metadata.len() <= 1024 * 1024,
+        "agy login token artifact has unsafe metadata"
+    );
+    let mut bytes = Zeroizing::new(Vec::with_capacity(metadata.len() as usize));
+    Read::by_ref(&mut file)
+        .take(1024 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
+    SecretBytes::new(std::mem::take(&mut *bytes))
+}
+
+/// agy 1.2.9 creates its config directories as 0755. They remain inaccessible
+/// to other users because the enclosing temporary HOME is 0700. Accept only
+/// owner-controlled real directories without group/world write or special
+/// permission bits; the token itself still must be owner-only 0600.
+fn validate_login_artifact_directory(home: &Path, directory: &Path) -> Result<()> {
+    ensure!(
+        directory == home.join(".gemini") || directory == home.join(".gemini/antigravity-cli"),
+        "agy login artifact directory is outside the approved path"
+    );
+    let metadata = fs::symlink_metadata(directory)?;
+    ensure!(
+        metadata.is_dir()
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.mode() & 0o7022 == 0,
+        "agy login artifact directory owner or permissions invalid"
+    );
+    Ok(())
+}
+
+/// Produce bounded metadata-only diagnostics after token capture fails. This
+/// never opens or reads a candidate file and never emits arbitrary filenames.
+fn login_capture_diagnostic(home: &Path) -> Value {
+    let expected = home.join(TOKEN_RELATIVE);
+    let gemini = home.join(".gemini");
+    let mut scan = LoginArtifactScan::default();
+    if safe_directory_exists(&gemini) {
+        scan_login_artifact_names(home, &gemini, 0, &mut scan);
+    }
+    serde_json::json!({
+        "contents_read": false,
+        "home": private_directory_summary(home, home),
+        "gemini_directory": private_directory_summary(&gemini, home),
+        "agy_cli_directory": private_directory_summary(&gemini.join("antigravity-cli"), home),
+        "expected_artifact": capture_file_summary(&expected),
+        "approved_filename_matches_under_gemini": scan.matches,
+        "candidate_list_truncated": scan.candidate_list_truncated,
+        "entry_scan_truncated": scan.entry_scan_truncated,
+        "directory_read_failed": scan.directory_read_failed,
+        "entries_examined": scan.entries_examined,
+        "bounds": {
+            "maximum_entries": MAX_LOGIN_DIAGNOSTIC_ENTRIES,
+            "maximum_depth": MAX_LOGIN_DIAGNOSTIC_DEPTH,
+            "maximum_candidates": MAX_LOGIN_DIAGNOSTIC_CANDIDATES,
+        }
+    })
+}
+
+#[derive(Default)]
+struct LoginArtifactScan {
+    matches: Vec<Value>,
+    entries_examined: usize,
+    candidate_list_truncated: bool,
+    entry_scan_truncated: bool,
+    directory_read_failed: bool,
+}
+
+fn safe_directory_exists(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+}
+
+fn private_directory_summary(path: &Path, private_home: &Path) -> Value {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let directory = metadata.is_dir();
+            let owner_matches = metadata.uid() == unsafe { libc::geteuid() };
+            let mode = metadata.mode() & 0o7777;
+            let home_is_private = fs::symlink_metadata(private_home).is_ok_and(|home_metadata| {
+                home_metadata.is_dir()
+                    && home_metadata.uid() == unsafe { libc::geteuid() }
+                    && home_metadata.mode() & 0o7777 == 0o700
+            });
+            let owner_nonwritable = directory && owner_matches && mode & 0o7022 == 0;
+            serde_json::json!({
+                "state": "present",
+                "directory": directory,
+                "symlink": metadata.file_type().is_symlink(),
+                "owner_matches": owner_matches,
+                "mode_octal": format!("{mode:04o}"),
+                "private_mode_0700": directory && owner_matches && mode == 0o700,
+                "owner_nonwritable_no_special_bits": owner_nonwritable,
+                "capture_safe_under_private_home": if path == private_home {
+                    directory && owner_matches && mode == 0o700
+                } else {
+                    home_is_private && owner_nonwritable
+                },
+            })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            serde_json::json!({"state":"missing"})
+        }
+        Err(_) => serde_json::json!({"state":"unavailable"}),
+    }
+}
+
+fn capture_file_summary(path: &Path) -> Value {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let regular = metadata.is_file();
+            let owner_matches = metadata.uid() == unsafe { libc::geteuid() };
+            let single_link = metadata.nlink() == 1;
+            let private_mode = metadata.mode() & 0o7777 == 0o600;
+            let nonempty = metadata.len() > 0;
+            let bounded_size = metadata.len() <= 1024 * 1024;
+            serde_json::json!({
+                "state": "present",
+                "regular_file": regular,
+                "symlink": metadata.file_type().is_symlink(),
+                "owner_matches": owner_matches,
+                "single_link": single_link,
+                "mode_octal": format!("{:04o}", metadata.mode() & 0o7777),
+                "private_mode_0600": private_mode,
+                "size_bytes": metadata.len(),
+                "nonempty": nonempty,
+                "within_1_mib": bounded_size,
+                "approved_metadata": regular && owner_matches && single_link
+                    && private_mode && nonempty && bounded_size,
+            })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            serde_json::json!({"state":"missing"})
+        }
+        Err(_) => serde_json::json!({"state":"unavailable"}),
+    }
+}
+
+fn scan_login_artifact_names(
+    home: &Path,
+    directory: &Path,
+    depth: usize,
+    scan: &mut LoginArtifactScan,
+) {
+    if depth > MAX_LOGIN_DIAGNOSTIC_DEPTH {
+        scan.entry_scan_truncated = true;
+        return;
+    }
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(_) => {
+            scan.directory_read_failed = true;
+            return;
+        }
+    };
+    for entry in entries {
+        if scan.entries_examined >= MAX_LOGIN_DIAGNOSTIC_ENTRIES {
+            scan.entry_scan_truncated = true;
+            return;
+        }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                scan.directory_read_failed = true;
+                continue;
+            }
+        };
+        scan.entries_examined += 1;
+        let path = entry.path();
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                scan.directory_read_failed = true;
+                continue;
+            }
+        };
+        if entry.file_name() == "antigravity-oauth-token" {
+            if scan.matches.len() < MAX_LOGIN_DIAGNOSTIC_CANDIDATES {
+                let relative = path.strip_prefix(home).unwrap_or(Path::new(""));
+                let safe_path = safe_diagnostic_relative_path(relative);
+                scan.matches.push(serde_json::json!({
+                    "relative_path": safe_path,
+                    "metadata": capture_file_summary(&path),
+                }));
+            } else {
+                scan.candidate_list_truncated = true;
+            }
+        }
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            scan_login_artifact_names(home, &path, depth + 1, scan);
+        }
+    }
+}
+
+fn safe_diagnostic_relative_path(path: &Path) -> String {
+    let components = path
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .map(|component| match component {
+            ".gemini" | "antigravity-cli" | "config" | "antigravity-oauth-token" => component,
+            _ => "<other>",
+        })
+        .collect::<Vec<_>>();
+    if components.is_empty() {
+        "<unknown>".to_owned()
+    } else {
+        components.join("/")
+    }
+}
+
+async fn run_interactive_login(root: &TempDir, home: &Path, binary_path: &Path) -> Result<()> {
+    ensure!(
+        std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
+        "agy login requires an interactive terminal"
+    );
+    let mut command = Command::new("bwrap");
+    command.args([
+        "--die-with-parent",
+        "--new-session",
+        "--unshare-user",
+        "--unshare-pid",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--ro-bind",
+        "/",
+        "/",
+        "--tmpfs",
+        "/run",
+        "--dir",
+        "/run/orbit",
+        "--ro-bind",
+    ]);
+    command.arg(binary_path).args([
+        ISOLATED_BINARY,
+        "--tmpfs",
+        "/home",
+        "--dir",
+        ISOLATED_HOME,
+        "--bind",
+    ]);
+    command.arg(home).args([
+        ISOLATED_HOME,
+        "--tmpfs",
+        "/tmp",
+        "--tmpfs",
+        "/var/tmp",
+        "--dev",
+        "/dev",
+        "--proc",
+        "/proc",
+        "--clearenv",
+        "--setenv",
+        "HOME",
+        ISOLATED_HOME,
+        "--setenv",
+        "PATH",
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "--setenv",
+        "AGY_CLI_DISABLE_AUTO_UPDATE",
+        "true",
+        "--setenv",
+        "TERM",
+        "xterm-256color",
+        "--chdir",
+        ISOLATED_HOME,
+        "--",
+        "/usr/bin/script",
+        "-qefc",
+        ISOLATED_BINARY,
+        "/dev/null",
+    ]);
+    command
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .context("isolated agy login runtime could not start")?;
+    match tokio::time::timeout(Duration::from_secs(900), child.wait()).await {
+        Ok(Ok(status)) if status.success() => {
+            let _ = root;
+            Ok(())
+        }
+        Ok(Ok(_)) => anyhow::bail!("agy OAuth login did not complete successfully"),
+        Ok(Err(_)) => anyhow::bail!("isolated agy login process could not be observed"),
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            anyhow::bail!("agy OAuth login timed out")
+        }
+    }
+}
+
 /// Perform the single authorized status operation from the current registered
 /// agy-cli representation. Provider JSON is parsed in memory, converted to
 /// bounded value-free schema diagnostics, and discarded without raw retention.
@@ -332,6 +1042,25 @@ pub async fn capture_registered_usage_once(
         reference == AGY_STATUS_REFERENCE,
         "status qualification is restricted to the authorized credential"
     );
+    let credential = CredentialStore::new(pool)
+        .get(reference)
+        .await?
+        .context("registered credential unavailable")?;
+    ensure!(
+        credential.generation == 1,
+        "authorized qualification generation changed"
+    );
+    capture_usage_for_credential(pool, backend, reference).await
+}
+
+/// Production status adapter for any enrolled Antigravity credential with a
+/// valid current agy-cli representation. Qualification retains its own narrow
+/// reference/generation wrapper above.
+pub async fn capture_usage_for_credential(
+    pool: &PgPool,
+    backend: &LocalPrivateSecretBackend,
+    reference: &str,
+) -> Result<AgyUsageCaptureReceipt> {
     ensure!(
         backend.backend_id() == LOCAL_PRIVATE_ID,
         "unexpected credential secret backend"
@@ -345,11 +1074,9 @@ pub async fn capture_registered_usage_once(
         .context("registered credential unavailable")?;
     ensure!(
         credential.provider == "antigravity"
-            && credential.reference == AGY_STATUS_REFERENCE
-            && credential.generation == 1
             && credential.status == CredentialStatus::Enrolled
             && credential.secret_backend == LOCAL_PRIVATE_ID,
-        "registered Antigravity credential is not in the authorized state"
+        "Antigravity credential is not enrolled in the selected backend"
     );
     let inspection = store
         .inspect(reference)
@@ -360,15 +1087,15 @@ pub async fn capture_registered_usage_once(
         .iter()
         .find(|representation| {
             representation.interface == AGY_CLI_INTERFACE
-                && representation.generation == 1
+                && representation.generation == credential.generation
                 && representation.current_generation
         })
-        .context("registered agy-cli representation unavailable")?;
+        .context("current agy-cli representation unavailable")?;
     ensure!(
         agy_view.state == RepresentationState::Stored
             && agy_view.validation == "valid"
             && agy_view.auth_type == AGY_CLI_AUTH_TYPE,
-        "registered agy-cli representation is not valid"
+        "current agy-cli representation is not valid"
     );
     let representation = store
         .representation(&agy_view.id)
@@ -389,7 +1116,7 @@ pub async fn capture_registered_usage_once(
             && provenance.version == AGY_CLI_VERSION
             && provenance.sha256 == AGY_CLI_SHA256
             && provenance.provenance == "operator-supplied",
-        "registered agy-cli representation does not match the qualified artifact"
+        "current agy-cli representation does not match the pinned runtime artifact"
     );
     let locator = representation
         .secret_locator
@@ -573,8 +1300,10 @@ fn new_private_home() -> Result<(TempDir, PathBuf)> {
         .prefix("orbit-agy-reuse-")
         .permissions(fs::Permissions::from_mode(0o700));
     let root = builder.tempdir()?;
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))?;
     let home = root.path().join("home");
     fs::DirBuilder::new().mode(0o700).create(&home)?;
+    fs::set_permissions(&home, fs::Permissions::from_mode(0o700))?;
     validate_private_directory(root.path())?;
     validate_private_directory(&home)?;
     Ok((root, home))
@@ -1263,6 +1992,148 @@ mod tests {
     }
 
     #[test]
+    fn agy_recovery_validates_stored_artifacts_without_starting_login() {
+        assert_eq!(
+            agy_enrollment_recovery(RepresentationState::Pending, false, true).unwrap(),
+            AgyEnrollmentRecovery::ValidateStoredArtifact
+        );
+        assert_eq!(
+            agy_enrollment_recovery(RepresentationState::Stored, false, true).unwrap(),
+            AgyEnrollmentRecovery::ValidateStoredArtifact
+        );
+        assert_eq!(
+            agy_enrollment_recovery(RepresentationState::Pending, false, false).unwrap(),
+            AgyEnrollmentRecovery::StartProviderLogin
+        );
+        assert_eq!(
+            agy_enrollment_recovery(RepresentationState::Stored, true, true).unwrap(),
+            AgyEnrollmentRecovery::AlreadyValid
+        );
+        assert!(agy_enrollment_recovery(RepresentationState::Stored, true, false).is_err());
+        assert!(agy_enrollment_recovery(RepresentationState::Invalid, false, true).is_err());
+    }
+
+    #[test]
+    fn login_capture_diagnostic_reports_only_bounded_metadata() -> Result<()> {
+        let root = crate::codex_status_probe::private_control_tempdir()?;
+        let home = root.path().join("home");
+        fs::DirBuilder::new().mode(0o700).create(&home)?;
+        let expected_path = home.join(TOKEN_RELATIVE);
+        let missing = login_capture_diagnostic(&home);
+        assert_eq!(missing["contents_read"], false);
+        assert_eq!(missing["expected_artifact"]["state"], "missing");
+
+        let cli = expected_path.parent().context("token parent missing")?;
+        fs::create_dir_all(cli)?;
+        fs::set_permissions(home.join(".gemini"), fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(cli, fs::Permissions::from_mode(0o700))?;
+        fs::write(&expected_path, b"synthetic-secret-marker")?;
+        fs::set_permissions(&expected_path, fs::Permissions::from_mode(0o644))?;
+
+        let invalid = login_capture_diagnostic(&home);
+        assert_eq!(invalid["expected_artifact"]["state"], "present");
+        assert_eq!(invalid["expected_artifact"]["regular_file"], true);
+        assert_eq!(invalid["expected_artifact"]["private_mode_0600"], false);
+        assert_eq!(invalid["expected_artifact"]["approved_metadata"], false);
+        let rendered = serde_json::to_string(&invalid)?;
+        assert!(!rendered.contains("synthetic-secret-marker"));
+        assert!(!rendered.contains(home.to_string_lossy().as_ref()));
+        Ok(())
+    }
+
+    #[test]
+    fn login_capture_diagnostic_masks_unknown_candidate_directories() -> Result<()> {
+        let root = crate::codex_status_probe::private_control_tempdir()?;
+        let home = root.path().join("home");
+        fs::DirBuilder::new().mode(0o700).create(&home)?;
+        let other_dir = home.join(".gemini").join("operator-private-name");
+        fs::create_dir_all(&other_dir)?;
+        let candidate = other_dir.join("antigravity-oauth-token");
+        fs::write(&candidate, b"synthetic-secret-marker")?;
+        fs::set_permissions(&candidate, fs::Permissions::from_mode(0o600))?;
+
+        let diagnostic = login_capture_diagnostic(&home);
+        assert_eq!(diagnostic["expected_artifact"]["state"], "missing");
+        let matches = diagnostic["approved_filename_matches_under_gemini"]
+            .as_array()
+            .context("candidate diagnostics missing")?;
+        assert_eq!(matches.len(), 1);
+        assert_eq!(
+            matches[0]["relative_path"],
+            ".gemini/<other>/antigravity-oauth-token"
+        );
+        let rendered = serde_json::to_string(&diagnostic)?;
+        assert!(!rendered.contains("operator-private-name"));
+        assert!(!rendered.contains("synthetic-secret-marker"));
+        Ok(())
+    }
+
+    #[test]
+    fn login_capture_diagnostic_scan_is_bounded() -> Result<()> {
+        let root = crate::codex_status_probe::private_control_tempdir()?;
+        let home = root.path().join("home");
+        let gemini = home.join(".gemini");
+        fs::create_dir_all(&gemini)?;
+        for index in 0..(MAX_LOGIN_DIAGNOSTIC_ENTRIES + 20) {
+            fs::write(gemini.join(format!("entry-{index}")), b"synthetic")?;
+        }
+
+        let diagnostic = login_capture_diagnostic(&home);
+        assert_eq!(diagnostic["entries_examined"], MAX_LOGIN_DIAGNOSTIC_ENTRIES);
+        assert_eq!(diagnostic["entry_scan_truncated"], true);
+        assert!(serde_json::to_string(&diagnostic)?.len() < 16 * 1024);
+        Ok(())
+    }
+
+    #[test]
+    fn login_capture_accepts_provider_0755_dirs_under_private_home() -> Result<()> {
+        let root = crate::codex_status_probe::private_control_tempdir()?;
+        let home = root.path().join("home");
+        fs::DirBuilder::new().mode(0o700).create(&home)?;
+        let gemini = home.join(".gemini");
+        let cli = gemini.join("antigravity-cli");
+        fs::create_dir_all(&cli)?;
+        fs::set_permissions(&gemini, fs::Permissions::from_mode(0o755))?;
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o755))?;
+        let token = cli.join("antigravity-oauth-token");
+        fs::write(&token, b"synthetic-token")?;
+        fs::set_permissions(&token, fs::Permissions::from_mode(0o600))?;
+
+        let captured = read_login_token(&home)?;
+        assert_eq!(captured.expose().len(), b"synthetic-token".len());
+        let diagnostic = login_capture_diagnostic(&home);
+        assert_eq!(diagnostic["gemini_directory"]["private_mode_0700"], false);
+        assert_eq!(
+            diagnostic["gemini_directory"]["capture_safe_under_private_home"],
+            true
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn login_capture_rejects_group_or_world_writable_parent_dirs() -> Result<()> {
+        let root = crate::codex_status_probe::private_control_tempdir()?;
+        let home = root.path().join("home");
+        fs::DirBuilder::new().mode(0o700).create(&home)?;
+        let gemini = home.join(".gemini");
+        let cli = gemini.join("antigravity-cli");
+        fs::create_dir_all(&cli)?;
+        fs::set_permissions(&gemini, fs::Permissions::from_mode(0o775))?;
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o700))?;
+        let token = cli.join("antigravity-oauth-token");
+        fs::write(&token, b"synthetic-token")?;
+        fs::set_permissions(&token, fs::Permissions::from_mode(0o600))?;
+
+        assert!(read_login_token(&home).is_err());
+        let diagnostic = login_capture_diagnostic(&home);
+        assert_eq!(
+            diagnostic["gemini_directory"]["capture_safe_under_private_home"],
+            false
+        );
+        Ok(())
+    }
+
+    #[test]
     fn staging_contains_only_one_private_token_file() -> Result<()> {
         let root = crate::codex_status_probe::private_control_tempdir()?;
         let home = root.path().join("home");
@@ -1279,6 +2150,20 @@ mod tests {
     fn fresh_validation_home_is_private() -> Result<()> {
         let (_root, home) = new_private_home()?;
         validate_private_directory(&home)
+    }
+
+    #[test]
+    fn repeated_private_home_creation_enforces_exact_owner_only_modes() -> Result<()> {
+        for _ in 0..16 {
+            let (root, home) = new_private_home()?;
+            for path in [root.path(), home.as_path()] {
+                let metadata = fs::symlink_metadata(path)?;
+                assert!(metadata.is_dir());
+                assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+                assert_eq!(metadata.mode() & 0o7777, 0o700);
+            }
+        }
+        Ok(())
     }
 
     #[test]

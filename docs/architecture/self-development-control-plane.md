@@ -13,8 +13,9 @@ which defines a
 versioned, secret-free logical resource identity, scoped availability
 snapshots, conservative freshness evaluation, immutable PostgreSQL evidence,
 provider quota buckets/windows/groups, and provider-scope enrollment and
-confirmation. Migrations `0007`–`0011` add availability, provider scopes,
-credentials, representation provenance, and explicit identity bindings. No
+confirmation. Migrations `0007`–`0012` add availability, provider scopes,
+credentials, representation provenance, explicit identity bindings and safe
+logical-reference rename support. No
 resource inventory/lease, scheduler integration, role policy, review, repair,
 or Goal handling is present. Q7 readiness remains open.
 

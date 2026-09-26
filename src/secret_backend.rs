@@ -3,7 +3,7 @@
 use anyhow::{Result, ensure};
 use async_trait::async_trait;
 use std::{
-    ffi::CString,
+    ffi::{CStr, CString},
     fs::File,
     io::{Read, Write},
     os::{
@@ -251,8 +251,7 @@ pub struct LocalPrivateSecretBackend {
 
 impl LocalPrivateSecretBackend {
     pub fn default_for_operator() -> Result<Self> {
-        let home = std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME unavailable"))?;
-        Self::under_home(&PathBuf::from(home))
+        Self::under_home(&operator_home()?)
     }
 
     pub fn under_home(home: &Path) -> Result<Self> {
@@ -352,6 +351,64 @@ impl LocalPrivateSecretBackend {
         };
         Ok(checked_secret_file(&directory, &locator.secret_id.to_string())?.is_some())
     }
+}
+
+/// Resolve Orbit's operator home independently of a caller-provided `HOME`.
+/// Services and shells for the same uid therefore address the same private
+/// credential store. `ORBIT_HOME` is the explicit installation override for
+/// deployments whose private Orbit state intentionally lives elsewhere.
+pub fn operator_home() -> Result<PathBuf> {
+    let home = if let Some(configured) = std::env::var_os("ORBIT_HOME") {
+        PathBuf::from(configured)
+    } else {
+        account_home()?
+    };
+    ensure!(
+        home.is_absolute() && home.canonicalize()? == home,
+        "Orbit home must be absolute and canonical"
+    );
+    let metadata = std::fs::symlink_metadata(&home)?;
+    ensure!(
+        metadata.is_dir()
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.mode() & 0o022 == 0,
+        "Orbit home owner or mode invalid"
+    );
+    Ok(home)
+}
+
+fn account_home() -> Result<PathBuf> {
+    let suggested = unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) };
+    let buffer_len = if suggested > 0 {
+        usize::try_from(suggested)
+            .unwrap_or(16 * 1024)
+            .clamp(1024, 1024 * 1024)
+    } else {
+        16 * 1024
+    };
+    let mut buffer = vec![0_u8; buffer_len];
+    let mut record = std::mem::MaybeUninit::<libc::passwd>::uninit();
+    let mut result = std::ptr::null_mut();
+    let status = unsafe {
+        libc::getpwuid_r(
+            libc::geteuid(),
+            record.as_mut_ptr(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    ensure!(
+        status == 0 && !result.is_null(),
+        "Orbit account home unavailable"
+    );
+    let record = unsafe { record.assume_init() };
+    ensure!(!record.pw_dir.is_null(), "Orbit account home unavailable");
+    let home = unsafe { CStr::from_ptr(record.pw_dir) }
+        .to_str()
+        .map_err(|_| anyhow::anyhow!("Orbit account home is not UTF-8"))?;
+    ensure!(!home.is_empty(), "Orbit account home unavailable");
+    Ok(PathBuf::from(home))
 }
 
 #[async_trait]

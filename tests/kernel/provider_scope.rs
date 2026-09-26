@@ -45,6 +45,7 @@ fn snapshot(resource: &ExecutionResourceIdentity, observed: i64) -> Availability
         }],
         quota_buckets: vec![QuotaBucket {
             provider_bucket_fingerprint: format!("qb1:{}", "c".repeat(64)),
+            provider_label: None,
             scope: None,
             windows: vec![QuotaBucketWindow {
                 provider_window_id: "primary".into(),
@@ -63,6 +64,13 @@ fn snapshot(resource: &ExecutionResourceIdentity, observed: i64) -> Availability
         source_revision: "codex-app-server-0.156.0".into(),
         evidence_digest: format!("sha256:{}", "b".repeat(64)),
         provider_observed_at_ms: None,
+        provider_status_observation: Some(orbit::availability::ProviderStatusObservation {
+            scope_state: orbit::availability::ProviderScopeEvidenceState::Unconfirmed,
+            identity_value_comparison:
+                orbit::availability::ProviderIdentityValueComparison::ExactValueMatch,
+            quota_promotion: orbit::availability::QuotaEvidencePromotion::ObservedUnconfirmed,
+            ordinary_usage_allowed: Some(true),
+        }),
     }
 }
 
@@ -88,8 +96,17 @@ async fn provider_scope_enrollment_confirmation_mismatch_and_generation_are_dura
         BindingState::Unconfirmed
     );
     assert_eq!(observed.snapshot.state, AvailabilityState::Unknown);
-    assert!(observed.snapshot.quota_windows.is_empty());
-    assert!(observed.snapshot.quota_buckets.is_empty());
+    assert_eq!(observed.snapshot.quota_windows.len(), 1);
+    assert_eq!(observed.snapshot.quota_buckets.len(), 1);
+    assert_eq!(
+        observed
+            .snapshot
+            .provider_status_observation
+            .as_ref()
+            .unwrap()
+            .quota_promotion,
+        orbit::availability::QuotaEvidencePromotion::ObservedUnconfirmed
+    );
     assert_eq!(
         AvailabilityStore::new(&f.engine.pool)
             .current_for(&r)
@@ -161,6 +178,15 @@ async fn provider_scope_enrollment_confirmation_mismatch_and_generation_are_dura
         .await?;
     assert_eq!(later.snapshot.state, AvailabilityState::Ready);
     assert_eq!(later.snapshot.quota_buckets.len(), 1);
+    assert_eq!(
+        later
+            .snapshot
+            .provider_status_observation
+            .as_ref()
+            .unwrap()
+            .quota_promotion,
+        orbit::availability::QuotaEvidencePromotion::Promoted
+    );
     let mismatch = store
         .record_observation(
             &r.credential,
@@ -170,8 +196,8 @@ async fn provider_scope_enrollment_confirmation_mismatch_and_generation_are_dura
         )
         .await?;
     assert_eq!(mismatch.snapshot.state, AvailabilityState::Unknown);
-    assert!(mismatch.snapshot.quota_windows.is_empty());
-    assert!(mismatch.snapshot.quota_buckets.is_empty());
+    assert_eq!(mismatch.snapshot.quota_windows.len(), 1);
+    assert_eq!(mismatch.snapshot.quota_buckets.len(), 1);
     assert!(mismatch.snapshot.observed_at_ms > later.snapshot.observed_at_ms);
     assert_eq!(
         mismatch.binding.as_ref().unwrap().state,
@@ -238,7 +264,145 @@ async fn provider_scope_enrollment_confirmation_mismatch_and_generation_are_dura
             .state,
         BindingState::Confirmed
     );
-    assert_eq!(store.history(&r.credential).await?.len(), 5);
+    assert_eq!(store.history(&r.credential).await?.len(), 7);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL; set ORBIT_TEST_DATABASE_URL"]
+async fn provider_scope_confirmation_rejects_inconsistent_identity_values() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let resource = resource("1");
+    let store = BindingStore::new(&fixture.engine.pool);
+    let observed_scope = fingerprint("openai", "synthetic-codex-scope").unwrap();
+    let mut contradictory = snapshot(&resource, 10);
+    let evidence = contradictory
+        .provider_status_observation
+        .as_mut()
+        .expect("synthetic status metadata");
+    evidence.identity_value_comparison =
+        orbit::availability::ProviderIdentityValueComparison::ExactValueMismatch;
+    evidence.quota_promotion =
+        orbit::availability::QuotaEvidencePromotion::WithheldIdentityMismatch;
+
+    let recorded = store
+        .record_observation(
+            &resource.credential,
+            Some(&observed_scope),
+            ObservationMode::Enrollment,
+            contradictory,
+        )
+        .await?;
+    assert_eq!(recorded.snapshot.state, AvailabilityState::Unknown);
+    assert_eq!(recorded.snapshot.quota_buckets.len(), 1);
+    assert_eq!(
+        recorded
+            .snapshot
+            .provider_status_observation
+            .as_ref()
+            .unwrap()
+            .quota_promotion,
+        orbit::availability::QuotaEvidencePromotion::WithheldIdentityMismatch
+    );
+    assert!(
+        store
+            .confirm(&resource.credential, &observed_scope, "operator")
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store.inspect(&resource.credential).await?.unwrap().state,
+        BindingState::Unconfirmed
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL; set ORBIT_TEST_DATABASE_URL"]
+async fn unconfirmed_codex_quota_is_durable_without_raw_provider_ids() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let resource = resource("1");
+    let account_id = "synthetic-codex-account-id";
+    let limit_id = "synthetic-codex-limit-id";
+    let result = serde_json::json!({
+        "accountId": account_id,
+        "ordinaryUsageAllowed": true,
+        "rateLimits": {"primary": null, "secondary": null},
+        "rateLimitsByLimitId": {
+            (limit_id): {
+                "limitId": limit_id,
+                "limitName": "synthetic-codex-plan",
+                "primary": {
+                    "usedPercent": 31,
+                    "windowDurationMins": 300,
+                    "resetsAt": 1_730_947_200_i64
+                },
+                "secondary": {
+                    "usedPercent": 46,
+                    "windowDurationMins": 10_080,
+                    "resetsAt": 1_731_542_400_i64
+                }
+            }
+        }
+    });
+    let mut observation = orbit::provider_status::codex_rate_limits_snapshot(
+        &resource,
+        "",
+        &serde_json::to_vec(&result)?,
+        10,
+        110,
+    )?;
+    observation
+        .provider_status_observation
+        .as_mut()
+        .expect("Codex status metadata")
+        .identity_value_comparison =
+        orbit::availability::ProviderIdentityValueComparison::ExactValueMatch;
+    let scope_fingerprint = fingerprint(&resource.credential.provider, account_id).unwrap();
+    let recorded = BindingStore::new(&fixture.engine.pool)
+        .record_observation(
+            &resource.credential,
+            Some(&scope_fingerprint),
+            ObservationMode::Enrollment,
+            observation,
+        )
+        .await?;
+
+    assert_eq!(recorded.snapshot.state, AvailabilityState::Unknown);
+    assert_eq!(recorded.snapshot.quota_buckets.len(), 1);
+    assert_eq!(recorded.snapshot.quota_buckets[0].windows.len(), 2);
+    assert_eq!(
+        recorded
+            .snapshot
+            .provider_status_observation
+            .as_ref()
+            .unwrap()
+            .quota_promotion,
+        orbit::availability::QuotaEvidencePromotion::ObservedUnconfirmed
+    );
+
+    let evidence: serde_json::Value =
+        sqlx::query_scalar("SELECT evidence FROM orbit_availability_snapshots WHERE id=$1")
+            .bind(&recorded.snapshot_id)
+            .fetch_one(&fixture.engine.pool)
+            .await?;
+    let binding: serde_json::Value = sqlx::query_scalar(
+        "SELECT to_jsonb(b) FROM orbit_provider_scope_bindings b WHERE credential->>'reference'=$1",
+    )
+    .bind(&resource.credential.reference)
+    .fetch_one(&fixture.engine.pool)
+    .await?;
+    let events: Vec<serde_json::Value> = sqlx::query_scalar(
+        "SELECT to_jsonb(e) FROM orbit_provider_scope_binding_events e JOIN orbit_provider_scope_bindings b USING (credential_key) WHERE b.credential->>'reference'=$1",
+    )
+    .bind(&resource.credential.reference)
+    .fetch_all(&fixture.engine.pool)
+    .await?;
+    let durable = serde_json::to_string(&(&evidence, &binding, &events))?;
+    assert!(durable.contains("synthetic-codex-plan"));
+    assert!(durable.contains("used_percent"));
+    assert!(!durable.contains(account_id));
+    assert!(!durable.contains(limit_id));
     Ok(())
 }
 

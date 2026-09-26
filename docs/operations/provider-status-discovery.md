@@ -173,16 +173,25 @@ docker exec orbit-postgres dropdb -U orbit orbit_status_gate_a
 
 `src/provider_status.rs` accepts only a bounded `account/rateLimits/read`
 *result* for the exact Codex bridge revision. It never invokes Codex itself.
-The expected account ID is supplied by trusted operator context and is not
-persisted. Missing or mismatched identity, malformed JSON, oversized output,
-ambiguous bucket identity, unexpected response version markers, invalid percentages or timestamps all produce an
-UNKNOWN snapshot without quota windows. The source payload is reduced to a
-SHA-256 digest; arbitrary provider text and account IDs are not copied into
-the snapshot.
+The production adapter compares the reviewed account IDs in memory, then
+discards them; no raw ID is passed into persisted status metadata. Malformed
+JSON, oversized output, ambiguous bucket identity, unexpected response version
+markers, invalid percentages or timestamps fail closed. For an authenticated
+but unconfirmed scope, reviewed quota buckets and windows are retained as
+observed evidence, with promotion explicitly withheld and
+availability/confidence UNKNOWN. Missing or mismatched identity never erases
+otherwise safely normalized quota values. The source payload is reduced to a
+SHA-256 digest; arbitrary provider text and raw account/limit IDs are not copied
+into the snapshot. Catalog status emits a bounded type/path schema and a
+count-only observation summary independently of scope confirmation.
+`rateLimitsByLimitId` map keys are masked in schema diagnostics.
 
 On a verified response, the normalizer preserves each reported window's
-used percentage, duration and reset time. It leaves remaining percentage and
-`exhausted` null unless reported. `ordinaryUsageAllowed=true` becomes a
+used percentage, duration and Unix-second reset time (converted exactly to
+Orbit's millisecond timestamp representation). It derives remaining percent
+and fraction only when `usedPercent` is finite and in the inclusive 0–100
+range; it never clamps malformed values. `exhausted` remains absent unless
+reported. `ordinaryUsageAllowed=true` becomes a
 credential-scoped READY observation; the availability evaluator does not
 treat a broad READY as exact model readiness. `false` becomes LIMITED rather
 than a model-specific quota-exhausted claim. A missing value remains UNKNOWN.
@@ -201,6 +210,40 @@ Empty `quota_buckets` is omitted during serialization, preserving legacy
 snapshot decoding and IDs. Snapshots are already stored as JSONB, so this model
 addition requires no migration; enrollment uses migration 0008 without
 changing legacy Run or availability schema.
+
+### Codex 0.156.0 catalog status schema observation
+
+A single non-inference `codex-main` status sequence on 2026-09-25 returned both
+`account/read` and `account/rateLimits/read` successfully. The value-redacted
+schema showed `account.email`, `account.planType`, and `account.type` as strings;
+`requiresOpenaiAuth` as boolean; and `workspaceRouting` with string fields
+`accountRoutingOverride`, `backendOrigin`, and `chatgptAccountId`. No account
+values were retained in the schema evidence.
+
+The rate-limit result contained `accountId` (string), `ordinaryUsageAllowed`
+(boolean), `rateLimits` (object), and `rateLimitsByLimitId` (object with two
+opaque entries). Both the legacy object and map entries exposed `primary`
+window objects with numeric `usedPercent`, `windowDurationMins`, and `resetsAt`.
+The legacy `secondary` was an object with those same numeric fields; map-entry
+`secondary` was null or an object. Map entries also exposed `limitId` (string),
+`limitName` (null/string), `planType` (string), `normalModelSlug` (null/string),
+and status/credit metadata. The response additionally contained
+`rateLimitResetCredits` (object with an array of credit metadata) and
+`rateLimitUpsell` (null). Values—including account IDs, map keys, percentages,
+timestamps, and credit metadata—were not retained.
+
+This shape matches the supported parser structure, including the map-only
+variant. Synthetic fixtures parse into two quota buckets and three windows,
+without retaining opaque IDs. The production status path now keeps the safe
+quota values in a credential-scoped UNKNOWN snapshot while scope is
+UNCONFIRMED; a separate promotion marker prevents those values from becoming
+trusted scheduling availability. Confirmation is fenced to the latest status
+fingerprint and requires exact in-memory equality of the two reviewed account
+identity values. Codex 0.156.0 describes `account/read.workspaceRouting` as
+experimental workspace routing and `account/rateLimits/read.accountId` as the
+account associated with that usage snapshot; their exact equality is recorded
+as a consistency check, not as a lifetime-stability guarantee. The raw IDs and
+values are not included in the comparison diagnostic.
 
 ## Qualification status
 

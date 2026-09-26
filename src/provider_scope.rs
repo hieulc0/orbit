@@ -3,7 +3,8 @@
 use crate::{
     availability::{
         AvailabilitySnapshot, AvailabilityState, AvailabilityStore, CredentialIdentity,
-        EvidenceConfidence,
+        EvidenceConfidence, ProviderIdentityValueComparison, ProviderScopeEvidenceState,
+        QuotaEvidencePromotion,
     },
     model::{digest, id},
 };
@@ -38,13 +39,94 @@ fn valid_fingerprint(value: &str) -> bool {
 
 fn credential_key(credential: &CredentialIdentity) -> Result<String> {
     credential.validate()?;
-    Ok(format!(
-        "pcb1:{}",
-        digest(&serde_json::to_vec(&(
-            "orbit.provider_scope_credential.v1",
-            credential
-        ))?)
-    ))
+    if let Some(catalog_id) = &credential.catalog_id {
+        Ok(format!(
+            "pcb2:{}",
+            digest(&serde_json::to_vec(&(
+                "orbit.provider_scope_catalog_credential.v2",
+                &credential.provider,
+                catalog_id,
+                &credential.generation
+            ))?)
+        ))
+    } else {
+        Ok(format!(
+            "pcb1:{}",
+            digest(&serde_json::to_vec(&(
+                "orbit.provider_scope_credential.v1",
+                credential
+            ))?)
+        ))
+    }
+}
+
+async fn existing_catalog_key(
+    pool: &PgPool,
+    credential: &CredentialIdentity,
+) -> Result<Option<String>> {
+    let Some(catalog_id) = &credential.catalog_id else {
+        return Ok(None);
+    };
+    let rows: Vec<String> = sqlx::query_scalar("SELECT credential_key FROM orbit_provider_scope_bindings WHERE credential->>'catalog_id'=$1 AND credential->>'provider'=$2 AND credential->>'generation'=$3 LIMIT 2")
+        .bind(catalog_id)
+        .bind(&credential.provider)
+        .bind(&credential.generation)
+        .fetch_all(pool)
+        .await?;
+    ensure!(
+        rows.len() <= 1,
+        "duplicate provider-scope binding for credential identity"
+    );
+    Ok(rows.into_iter().next())
+}
+
+async fn existing_catalog_key_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    credential: &CredentialIdentity,
+) -> Result<Option<String>> {
+    let Some(catalog_id) = &credential.catalog_id else {
+        return Ok(None);
+    };
+    let rows: Vec<String> = sqlx::query_scalar("SELECT credential_key FROM orbit_provider_scope_bindings WHERE credential->>'catalog_id'=$1 AND credential->>'provider'=$2 AND credential->>'generation'=$3 LIMIT 2")
+        .bind(catalog_id)
+        .bind(&credential.provider)
+        .bind(&credential.generation)
+        .fetch_all(&mut **tx)
+        .await?;
+    ensure!(
+        rows.len() <= 1,
+        "duplicate provider-scope binding for credential identity"
+    );
+    Ok(rows.into_iter().next())
+}
+
+async fn resolved_key(pool: &PgPool, credential: &CredentialIdentity) -> Result<String> {
+    if let Some(key) = existing_catalog_key(pool, credential).await? {
+        return Ok(key);
+    }
+    credential_key(credential)
+}
+
+async fn resolved_key_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    credential: &CredentialIdentity,
+) -> Result<String> {
+    if let Some(key) = existing_catalog_key_in_tx(tx, credential).await? {
+        return Ok(key);
+    }
+    credential_key(credential)
+}
+
+fn credential_identity_matches(left: &CredentialIdentity, right: &CredentialIdentity) -> bool {
+    match (&left.catalog_id, &right.catalog_id) {
+        (Some(left_id), Some(right_id)) => {
+            left_id == right_id
+                && left.provider == right.provider
+                && left.generation == right.generation
+        }
+        (None, None) => left == right,
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +163,7 @@ pub struct BindingEvent {
     pub fingerprint: String,
     pub actor: String,
     pub snapshot_id: Option<String>,
+    pub recorded_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,15 +188,15 @@ impl<'a> BindingStore<'a> {
     }
 
     pub async fn inspect(&self, credential: &CredentialIdentity) -> Result<Option<BindingView>> {
-        let key = credential_key(credential)?;
+        let key = resolved_key(self.pool, credential).await?;
         let row = sqlx::query("SELECT credential, fingerprint, state, mismatch_fingerprint FROM orbit_provider_scope_bindings WHERE credential_key=$1")
             .bind(key).fetch_optional(self.pool).await?;
         row.map(|row| decode(row, credential)).transpose()
     }
 
     pub async fn history(&self, credential: &CredentialIdentity) -> Result<Vec<BindingEvent>> {
-        let key = credential_key(credential)?;
-        let rows = sqlx::query("SELECT id, event_kind, fingerprint, actor, snapshot_id FROM orbit_provider_scope_binding_events WHERE credential_key=$1 ORDER BY recorded_at DESC, id DESC LIMIT 128")
+        let key = resolved_key(self.pool, credential).await?;
+        let rows = sqlx::query("SELECT id, event_kind, fingerprint, actor, snapshot_id, floor(extract(epoch FROM recorded_at)*1000)::bigint AS recorded_at_ms FROM orbit_provider_scope_binding_events WHERE credential_key=$1 ORDER BY recorded_at DESC, id DESC LIMIT 128")
             .bind(key).fetch_all(self.pool).await?;
         rows.into_iter()
             .map(|row| {
@@ -128,6 +211,7 @@ impl<'a> BindingStore<'a> {
                     fingerprint,
                     actor: row.get("actor"),
                     snapshot_id: row.get("snapshot_id"),
+                    recorded_at_ms: row.get("recorded_at_ms"),
                 })
             })
             .collect()
@@ -143,7 +227,6 @@ impl<'a> BindingStore<'a> {
         mode: ObservationMode,
         mut snapshot: AvailabilitySnapshot,
     ) -> Result<RecordedObservation> {
-        let key = credential_key(credential)?;
         ensure!(
             matches!(&snapshot.applies_to, crate::availability::AvailabilityScope::Credential(c) if c == credential),
             "status snapshot credential scope mismatch"
@@ -154,6 +237,7 @@ impl<'a> BindingStore<'a> {
             "invalid observed fingerprint"
         );
         let mut tx = self.pool.begin().await?;
+        let key = resolved_key_in_tx(&mut tx, credential).await?;
         let mut transition: Option<(&str, &str)> = None;
         if mode == ObservationMode::Enrollment
             && let Some(value) = observed
@@ -178,13 +262,43 @@ impl<'a> BindingStore<'a> {
             view.state = BindingState::Mismatch;
             view.mismatch_fingerprint = Some(value.to_owned());
         }
+        let identity_comparison = snapshot
+            .provider_status_observation
+            .as_ref()
+            .map(|evidence| evidence.identity_value_comparison)
+            .unwrap_or(ProviderIdentityValueComparison::NotComparable);
         let trusted = mode == ObservationMode::Confirmed
+            && identity_comparison == ProviderIdentityValueComparison::ExactValueMatch
             && matches!((&binding, observed), (Some(view), Some(value)) if view.state == BindingState::Confirmed && view.fingerprint == value);
+        let scope_state = match binding.as_ref().map(|view| view.state) {
+            Some(BindingState::Unconfirmed) => ProviderScopeEvidenceState::Unconfirmed,
+            Some(BindingState::Confirmed) => ProviderScopeEvidenceState::Confirmed,
+            Some(BindingState::Mismatch) => ProviderScopeEvidenceState::Mismatch,
+            None => ProviderScopeEvidenceState::Unbound,
+        };
+        let has_quota = !snapshot.quota_buckets.is_empty() || !snapshot.quota_windows.is_empty();
+        let promotion = if !has_quota {
+            QuotaEvidencePromotion::NoUsableQuota
+        } else if identity_comparison == ProviderIdentityValueComparison::ExactValueMismatch {
+            QuotaEvidencePromotion::WithheldIdentityMismatch
+        } else if scope_state == ProviderScopeEvidenceState::Mismatch {
+            QuotaEvidencePromotion::WithheldScopeMismatch
+        } else if scope_state == ProviderScopeEvidenceState::Confirmed
+            && identity_comparison == ProviderIdentityValueComparison::NotComparable
+        {
+            QuotaEvidencePromotion::WithheldIdentityUnverified
+        } else if trusted {
+            QuotaEvidencePromotion::Promoted
+        } else {
+            QuotaEvidencePromotion::ObservedUnconfirmed
+        };
+        if let Some(evidence) = &mut snapshot.provider_status_observation {
+            evidence.scope_state = scope_state;
+            evidence.quota_promotion = promotion;
+        }
         if !trusted {
             snapshot.state = AvailabilityState::Unknown;
             snapshot.confidence = EvidenceConfidence::Unknown;
-            snapshot.quota_windows.clear();
-            snapshot.quota_buckets.clear();
         }
         // The availability pointer orders by observed_at and ID. Two status
         // reads can share one clock millisecond; a later UNKNOWN must not lose
@@ -210,12 +324,28 @@ impl<'a> BindingStore<'a> {
                 .checked_add(shift)
                 .ok_or_else(|| anyhow::anyhow!("status expiry time exhausted"))?;
         }
+        snapshot.validate()?;
         let snapshot_id = AvailabilityStore::record_in_tx(&mut tx, &snapshot).await?;
-        if let Some((kind, value)) = transition {
+        if let Some((kind, value)) = transition
+            && kind != "observed"
+        {
             event(
                 &mut tx,
                 &key,
                 kind,
+                value,
+                "status_probe",
+                Some(&snapshot_id),
+            )
+            .await?;
+        }
+        if binding.is_some()
+            && let Some(value) = observed
+        {
+            event(
+                &mut tx,
+                &key,
+                "observed",
                 value,
                 "status_probe",
                 Some(&snapshot_id),
@@ -240,8 +370,8 @@ impl<'a> BindingStore<'a> {
     ) -> Result<BindingView> {
         ensure!(valid_fingerprint(fingerprint), "invalid fingerprint");
         validate_actor(actor)?;
-        let key = credential_key(credential)?;
         let mut tx = self.pool.begin().await?;
+        let key = resolved_key_in_tx(&mut tx, credential).await?;
         let row = sqlx::query("SELECT credential, fingerprint, state, mismatch_fingerprint FROM orbit_provider_scope_bindings WHERE credential_key=$1 FOR UPDATE")
             .bind(&key).fetch_optional(&mut *tx).await?;
         let mut view = decode(
@@ -257,6 +387,26 @@ impl<'a> BindingStore<'a> {
             "re-enrollment required after mismatch"
         );
         if view.state == BindingState::Unconfirmed {
+            let latest_observation = sqlx::query(
+                "SELECT e.fingerprint, s.evidence FROM orbit_provider_scope_binding_events e JOIN orbit_availability_snapshots s ON s.id=e.snapshot_id WHERE e.credential_key=$1 AND e.event_kind='observed' ORDER BY e.recorded_at DESC, e.id DESC LIMIT 1",
+            )
+            .bind(&key)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let observation = latest_observation.ok_or_else(|| {
+                anyhow::anyhow!("a fresh status observation is required before confirmation")
+            })?;
+            let observed_fingerprint: String = observation.get("fingerprint");
+            let evidence: serde_json::Value = observation.get("evidence");
+            ensure!(
+                observed_fingerprint == fingerprint,
+                "provider scope observation changed; inspect and confirm the latest fingerprint"
+            );
+            ensure!(
+                evidence.pointer("/provider_status_observation/identity_value_comparison")
+                    == Some(&serde_json::Value::String("exact_value_match".into())),
+                "account/read and rateLimits/read identities were not exactly comparable; confirmation withheld"
+            );
             sqlx::query("UPDATE orbit_provider_scope_bindings SET state='confirmed', updated_at=clock_timestamp() WHERE credential_key=$1")
                 .bind(&key).execute(&mut *tx).await?;
             event(&mut tx, &key, "confirmed", fingerprint, actor, None).await?;
@@ -276,8 +426,8 @@ impl<'a> BindingStore<'a> {
     ) -> Result<BindingView> {
         ensure!(valid_fingerprint(fingerprint), "invalid fingerprint");
         validate_actor(actor)?;
-        let key = credential_key(credential)?;
         let mut tx = self.pool.begin().await?;
+        let key = resolved_key_in_tx(&mut tx, credential).await?;
         let row = sqlx::query("SELECT credential, fingerprint, state, mismatch_fingerprint FROM orbit_provider_scope_bindings WHERE credential_key=$1 FOR UPDATE")
             .bind(&key).fetch_optional(&mut *tx).await?;
         let mut view = decode(
@@ -315,7 +465,7 @@ fn validate_actor(actor: &str) -> Result<()> {
 fn decode(row: sqlx::postgres::PgRow, expected: &CredentialIdentity) -> Result<BindingView> {
     let credential: CredentialIdentity = serde_json::from_value(row.get("credential"))?;
     ensure!(
-        &credential == expected,
+        credential_identity_matches(&credential, expected),
         "persisted credential identity mismatch"
     );
     let fingerprint: String = row.get("fingerprint");
@@ -333,7 +483,7 @@ fn decode(row: sqlx::postgres::PgRow, expected: &CredentialIdentity) -> Result<B
         "invalid persisted binding state"
     );
     Ok(BindingView {
-        credential,
+        credential: expected.clone(),
         fingerprint,
         state,
         mismatch_fingerprint,

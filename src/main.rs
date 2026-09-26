@@ -6,6 +6,7 @@ use orbit::{
     credential_registry::CredentialStore,
     engine::Engine,
     model::{Definition, Limits, Signal, id},
+    secret_backend::SecretBackend,
     worker::{self, Client},
 };
 use sqlx::Row;
@@ -113,7 +114,27 @@ enum CredentialAction {
         #[arg(long, env = "ORBIT_DATABASE_URL_FILE", hide_env_values = true)]
         database_url_file: Option<PathBuf>,
     },
-    /// Import one operator-qualified agy token and validate it from a fresh isolated process.
+    /// Rename a logical credential reference without changing its identity or evidence.
+    Rename {
+        old_reference: String,
+        new_reference: String,
+        #[arg(long, env = "ORBIT_DATABASE_URL_FILE", hide_env_values = true)]
+        database_url_file: Option<PathBuf>,
+    },
+    /// Revoke a credential while retaining its generations, evidence and secret bytes.
+    #[command(alias = "revoke")]
+    Remove {
+        reference: String,
+        #[arg(long, env = "ORBIT_DATABASE_URL_FILE", hide_env_values = true)]
+        database_url_file: Option<PathBuf>,
+    },
+    /// Inspect or explicitly confirm the observed provider account scope for one credential.
+    #[command(alias = "scope")]
+    ProviderScope {
+        #[command(subcommand)]
+        action: ProviderScopeAction,
+    },
+    /// Attach an agy OAuth representation to an existing Antigravity credential.
     AddRepresentation {
         reference: String,
         #[arg(long, required = true)]
@@ -121,18 +142,45 @@ enum CredentialAction {
         #[arg(long, default_value = "oauth-personal")]
         auth_type: String,
         /// Qualification-only source import; the path is never echoed or persisted.
-        #[arg(long, hide = true, required = true)]
-        source_file: PathBuf,
+        #[arg(long, hide = true)]
+        source_file: Option<PathBuf>,
         #[arg(long, env = "ORBIT_DATABASE_URL_FILE", hide_env_values = true)]
         database_url_file: Option<PathBuf>,
     },
-    /// Capture one Antigravity agy `/usage` response without retaining raw values.
+    /// Refresh and display safe provider status for one credential or all credentials.
+    Status {
+        #[arg(
+            value_name = "REFERENCE",
+            required_unless_present = "all",
+            conflicts_with = "all"
+        )]
+        reference: Option<String>,
+        #[arg(long)]
+        all: bool,
+        /// Provider-grouped detailed quota view for all credentials.
+        #[arg(long)]
+        quota: bool,
+        /// Machine-readable structured JSON output.
+        #[arg(long)]
+        json: bool,
+        /// Full diagnostic and qualification debug output.
+        #[arg(long)]
+        debug: bool,
+        /// Include bounded structural details about files created in the isolated runtime HOME.
+        #[arg(long, hide = true)]
+        diagnostics: bool,
+        #[arg(long, env = "ORBIT_DATABASE_URL_FILE", hide_env_values = true)]
+        database_url_file: Option<PathBuf>,
+    },
+    /// Qualification-only: capture the authorized Antigravity agy `/usage` response.
+    #[command(hide = true)]
     CaptureAgyUsage {
         reference: String,
         #[arg(long, env = "ORBIT_DATABASE_URL_FILE", hide_env_values = true)]
         database_url_file: Option<PathBuf>,
     },
-    /// Run one catalog-backed, non-inference Codex account/status observation.
+    /// Qualification-only: run one catalog-backed Codex status observation.
+    #[command(hide = true)]
     ProbeCodexStatus {
         reference: String,
         #[arg(long, env = "ORBIT_DATABASE_URL_FILE", hide_env_values = true)]
@@ -142,6 +190,25 @@ enum CredentialAction {
     List,
     /// Inspect one registered credential and its generations (operator only).
     Inspect { reference: String },
+}
+
+#[derive(Subcommand)]
+enum ProviderScopeAction {
+    /// Show the redacted scope fingerprint and enrollment state without a provider call.
+    #[command(alias = "show")]
+    Inspect {
+        reference: String,
+        #[arg(long, env = "ORBIT_DATABASE_URL_FILE", hide_env_values = true)]
+        database_url_file: Option<PathBuf>,
+    },
+    /// Confirm that the exact observed fingerprint belongs to this logical credential.
+    Confirm {
+        reference: String,
+        #[arg(long)]
+        fingerprint: String,
+        #[arg(long, env = "ORBIT_DATABASE_URL_FILE", hide_env_values = true)]
+        database_url_file: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -361,8 +428,7 @@ enum Commands {
 }
 
 async fn read_private_database_url(file: Option<&Path>) -> Result<Zeroizing<String>> {
-    let home = std::env::var_os("HOME").context("operator HOME unavailable")?;
-    let home = PathBuf::from(home).canonicalize()?;
+    let home = orbit::secret_backend::operator_home()?;
     let path = file
         .map(Path::to_path_buf)
         .or_else(|| std::env::var_os("ORBIT_DATABASE_URL_FILE").map(PathBuf::from))
@@ -458,6 +524,584 @@ async fn connect_durable_catalog(database_url: &str) -> Result<sqlx::PgPool> {
     Ok(pool)
 }
 
+async fn connect_durable_catalog_engine(database_url: &str) -> Result<(Engine, tempfile::TempDir)> {
+    let preflight = connect_durable_catalog(database_url).await?;
+    preflight.close().await;
+    let scratch = orbit::codex_status_probe::private_control_tempdir()?;
+    let engine = Engine::connect(database_url, scratch.path().join("artifacts"), 30)
+        .await
+        .map_err(|_| anyhow::anyhow!("durable credential catalog migration failed"))?;
+    Ok((engine, scratch))
+}
+
+const CREDENTIAL_STATUS_ALL_MAX: usize = 32;
+const CREDENTIAL_STATUS_TTL: Duration = Duration::from_secs(60);
+
+fn unix_time_ms() -> Result<i64> {
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock is before Unix epoch")?
+            .as_millis(),
+    )
+    .context("system timestamp is out of range")
+}
+
+fn safe_representation_state(
+    inspection: &orbit::credential_registry::CredentialInspection,
+    interface: &str,
+    generation: u64,
+) -> &'static str {
+    match inspection.representations.iter().find(|representation| {
+        representation.interface == interface
+            && representation.generation == generation
+            && representation.current_generation
+    }) {
+        None => "missing",
+        Some(representation)
+            if representation.state == orbit::credential_registry::RepresentationState::Stored
+                && representation.validation == "valid" =>
+        {
+            "valid"
+        }
+        Some(representation)
+            if representation.state == orbit::credential_registry::RepresentationState::Invalid =>
+        {
+            "invalid"
+        }
+        Some(representation)
+            if representation.state == orbit::credential_registry::RepresentationState::Pending =>
+        {
+            "pending"
+        }
+        Some(_) => "unvalidated",
+    }
+}
+
+fn representation_status_reason(
+    inspection: &orbit::credential_registry::CredentialInspection,
+    interface: &str,
+    generation: u64,
+    reference: &str,
+) -> String {
+    let Some(representation) = inspection.representations.iter().find(|representation| {
+        representation.interface == interface
+            && representation.generation == generation
+            && representation.current_generation
+    }) else {
+        return format!("{interface} representation is missing");
+    };
+    match representation.state {
+        orbit::credential_registry::RepresentationState::Invalid => {
+            format!("{interface} representation is invalid")
+        }
+        orbit::credential_registry::RepresentationState::Disabled => {
+            format!("{interface} representation is disabled")
+        }
+        orbit::credential_registry::RepresentationState::Revoked => {
+            format!("{interface} representation is revoked")
+        }
+        orbit::credential_registry::RepresentationState::Pending => format!(
+            "{interface} representation is pending at stage {}; rerun `orbit credential add-representation {reference} --interface {interface}` to resume",
+            representation
+                .enrollment_stage
+                .as_deref()
+                .unwrap_or("unknown")
+        ),
+        orbit::credential_registry::RepresentationState::Stored
+            if representation.validation != "valid" =>
+        {
+            format!(
+                "{interface} representation is unvalidated at stage {}; rerun `orbit credential add-representation {reference} --interface {interface}` to resume",
+                representation
+                    .enrollment_stage
+                    .as_deref()
+                    .unwrap_or("unknown")
+            )
+        }
+        orbit::credential_registry::RepresentationState::Stored => {
+            format!("{interface} representation is not eligible for this runtime")
+        }
+    }
+}
+
+fn compact_agy_runtime_effects(entries: &[serde_json::Value]) -> serde_json::Value {
+    let mut categories = std::collections::BTreeSet::new();
+    let observed_runtime_entries = entries
+        .iter()
+        .filter(|entry| entry["path"] != ".gemini/antigravity-cli/antigravity-oauth-token")
+        .count();
+    for entry in entries {
+        let Some(path) = entry["path"].as_str() else {
+            categories.insert("other".to_owned());
+            continue;
+        };
+        let category = if path.starts_with(".gemini/antigravity-cli/builtin/")
+            || path == ".gemini/antigravity-cli/builtin"
+        {
+            "builtins"
+        } else if path.starts_with(".gemini/antigravity-cli/cache/")
+            || path == ".gemini/antigravity-cli/cache"
+        {
+            "cache"
+        } else if path.starts_with(".gemini/antigravity-cli/log/")
+            || path == ".gemini/antigravity-cli/log"
+            || path == ".gemini/antigravity-cli/cli.log"
+        {
+            "logs"
+        } else if path.starts_with(".gemini/antigravity-cli/conversations/")
+            || path == ".gemini/antigravity-cli/conversations"
+            || path == ".gemini/antigravity-cli/conversation_summaries.db"
+        {
+            "conversation_state"
+        } else if path.starts_with(".gemini/antigravity-cli/crashes/")
+            || path == ".gemini/antigravity-cli/crashes"
+        {
+            "crash_state"
+        } else if path.starts_with(".gemini/antigravity-cli/brain/")
+            || path == ".gemini/antigravity-cli/brain"
+            || path == ".gemini/antigravity-cli/installation_id"
+            || path == ".gemini/antigravity-cli/jetski_state.pbtxt"
+        {
+            "runtime_state"
+        } else if path.starts_with(".gemini/config/") || path == ".gemini/config" {
+            "runtime_configuration"
+        } else if path == ".gemini" || path == ".gemini/antigravity-cli" {
+            "runtime_directories"
+        } else if path == ".gemini/antigravity-cli/antigravity-oauth-token" {
+            continue;
+        } else {
+            "other"
+        };
+        categories.insert(category.to_owned());
+    }
+    serde_json::json!({
+        "staged_auth_artifact": true,
+        "observed_runtime_entries": observed_runtime_entries,
+        "runtime_categories": categories,
+    })
+}
+
+fn snapshot_status(
+    snapshot: Option<&orbit::availability::AvailabilitySnapshot>,
+    now_ms: i64,
+) -> serde_json::Value {
+    let Some(snapshot) = snapshot else {
+        return serde_json::json!({"state":"unknown","fresh":false,"observed_at_ms":null,"expires_at_ms":null,"quota_buckets":[],"quota_groups":[]});
+    };
+    let fresh = snapshot.observed_at_ms <= now_ms && snapshot.expires_at_ms > now_ms;
+    serde_json::json!({
+        "state": if fresh { snapshot.state } else { orbit::availability::AvailabilityState::Unknown },
+        "recorded_state": snapshot.state,
+        "fresh": fresh,
+        "observed_at_ms": snapshot.observed_at_ms,
+        "expires_at_ms": snapshot.expires_at_ms,
+        "quota_windows": snapshot.quota_windows,
+        "quota_buckets": snapshot.quota_buckets,
+        "quota_groups": snapshot.quota_groups,
+    })
+}
+
+fn attach_status_health_dimensions(report: &mut serde_json::Value) {
+    let status = &report["status"];
+    let availability = &report["availability"];
+    let status_state = status["state"].as_str().unwrap_or("unknown");
+    let fresh = availability["fresh"].as_bool().unwrap_or(false);
+    let quota_buckets = availability["quota_buckets"].as_array().map_or(0, Vec::len);
+    let quota_groups = availability["quota_groups"].as_array().map_or(0, Vec::len);
+    let quota_windows = availability["quota_windows"].as_array().map_or(0, Vec::len);
+    let runtime_state = if status["authenticated"].as_bool() == Some(true) {
+        "healthy"
+    } else {
+        "not_established"
+    };
+    report["health"] = serde_json::json!({
+        "auth": {"representations": report["representations"].clone()},
+        "runtime": {"state": runtime_state},
+        "provider_scope": {"state": status["provider_scope"].as_str().unwrap_or("none")},
+        "status_observation": {
+            "state": status_state,
+            "observed_now": matches!(status_state, "observed" | "partial"),
+            "last_snapshot_fresh": fresh,
+            "observed_at_ms": availability["observed_at_ms"],
+            "expires_at_ms": availability["expires_at_ms"],
+        },
+        "quota_evidence": {
+            "persisted_bucket_count": quota_buckets,
+            "persisted_window_count": quota_windows,
+            "persisted_group_count": quota_groups,
+        },
+        "scheduling_availability": {
+            "state": availability["state"],
+            "fresh": fresh,
+        },
+    });
+}
+
+async fn credential_status_report(
+    pool: &sqlx::PgPool,
+    backend: &orbit::secret_backend::LocalPrivateSecretBackend,
+    reference: &str,
+    diagnostics: bool,
+) -> Result<serde_json::Value> {
+    let store = CredentialStore::new(pool);
+    let Some(credential) = store.get(reference).await? else {
+        return Ok(serde_json::json!({
+            "reference": reference,
+            "status": {"state":"unavailable","reason":"credential not found"}
+        }));
+    };
+    let now_ms = unix_time_ms()?;
+    let inspection = store
+        .inspect(reference)
+        .await?
+        .context("credential disappeared during status inspection")?;
+    let snapshot = AvailabilityStore::new(pool)
+        .current_for_credential(&credential.identity())
+        .await?;
+    let mut current_representations = serde_json::Map::new();
+    for representation in inspection
+        .representations
+        .iter()
+        .filter(|representation| representation.current_generation)
+    {
+        let secret_artifact = match store.representation(&representation.id).await {
+            Ok(Some(stored)) => match stored.secret_locator {
+                Some(locator) => match backend.exists(locator).await {
+                    Ok(true) => "present",
+                    Ok(false) => "missing",
+                    Err(_) => "unavailable",
+                },
+                None => "not_configured",
+            },
+            _ => "unknown",
+        };
+        current_representations.insert(
+            representation.interface.clone(),
+            serde_json::json!({
+                "auth_type": representation.auth_type,
+                "publication_state": representation.state,
+                "validation": representation.validation,
+                "enrollment_stage": representation.enrollment_stage,
+                "last_validated_at_ms": representation.last_validated_at_ms,
+                "catalog_locator_present": representation.has_secret,
+                "secret_artifact": secret_artifact,
+            }),
+        );
+    }
+    let mut report = serde_json::json!({
+        "credential": {
+            "reference": credential.reference,
+            "id": credential.id,
+            "provider": credential.provider,
+            "generation": credential.generation,
+            "lifecycle": credential.status,
+        },
+        "representations": current_representations,
+        "status": {"state":"unavailable","reason":"status adapter not available"},
+        "availability": snapshot_status(snapshot.as_ref(), now_ms),
+    });
+    let unavailable = |report: &mut serde_json::Value, reason: &str| {
+        report["status"] = serde_json::json!({"state":"unavailable","reason":reason});
+        attach_status_health_dimensions(report);
+    };
+
+    if credential.status != orbit::credential_registry::CredentialStatus::Enrolled {
+        let reason = match credential.status {
+            orbit::credential_registry::CredentialStatus::Revoked => "credential is revoked",
+            orbit::credential_registry::CredentialStatus::Pending => {
+                "credential enrollment is pending"
+            }
+            orbit::credential_registry::CredentialStatus::Invalid => "credential is invalid",
+            orbit::credential_registry::CredentialStatus::Disabled => "credential is disabled",
+            orbit::credential_registry::CredentialStatus::Enrolled => unreachable!(),
+        };
+        unavailable(&mut report, reason);
+        return Ok(report);
+    }
+    if credential.secret_backend != backend.backend_id() {
+        unavailable(&mut report, "configured SecretBackend is unavailable");
+        return Ok(report);
+    }
+
+    match credential.provider.as_str() {
+        "codex" => {
+            match safe_representation_state(
+                &inspection,
+                orbit::codex_credential_enrollment::CODEX_INTERFACE,
+                credential.generation,
+            ) {
+                "missing" => {
+                    unavailable(&mut report, "Codex representation is not enrolled");
+                    return Ok(report);
+                }
+                "valid" => {}
+                _ => {
+                    unavailable(
+                        &mut report,
+                        &representation_status_reason(
+                            &inspection,
+                            orbit::codex_credential_enrollment::CODEX_INTERFACE,
+                            credential.generation,
+                            reference,
+                        ),
+                    );
+                    return Ok(report);
+                }
+            }
+            let (runtime, resource) =
+                match orbit::codex_status_probe::cataloged_codex_runtime(&credential) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        unavailable(&mut report, "Codex runtime configuration is unavailable");
+                        return Ok(report);
+                    }
+                };
+            let bindings = orbit::provider_scope::BindingStore::new(pool);
+            let existing_binding = match bindings.inspect(&credential.identity()).await {
+                Ok(binding) => binding,
+                Err(_) => {
+                    unavailable(&mut report, "provider-scope state could not be read");
+                    return Ok(report);
+                }
+            };
+            let (binding, mode) = match existing_binding.as_ref() {
+                Some(binding)
+                    if binding.state == orbit::provider_scope::BindingState::Confirmed =>
+                {
+                    (
+                        orbit::codex_status_probe::ProbeBinding::ConfirmedFingerprint(
+                            &binding.fingerprint,
+                        ),
+                        orbit::provider_scope::ObservationMode::Confirmed,
+                    )
+                }
+                _ => (
+                    orbit::codex_status_probe::ProbeBinding::Enroll,
+                    orbit::provider_scope::ObservationMode::Enrollment,
+                ),
+            };
+            let control = match orbit::codex_status_probe::private_control_tempdir() {
+                Ok(control) => control,
+                Err(_) => {
+                    unavailable(&mut report, "private runtime staging failed");
+                    return Ok(report);
+                }
+            };
+            let outcome = match orbit::codex_status_probe::probe_cataloged_once(
+                orbit::codex_status_probe::CatalogCredentialSource {
+                    pool,
+                    backend,
+                    reference,
+                },
+                &runtime,
+                &resource,
+                binding,
+                control.path(),
+                CREDENTIAL_STATUS_TTL,
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(failure) => {
+                    unavailable(&mut report, failure.kind.safe_message());
+                    report["status"]["failure_kind"] = serde_json::to_value(failure.kind)?;
+                    return Ok(report);
+                }
+            };
+            if !outcome.receipt.cleanup_confirmed
+                || !outcome.receipt.authenticated_account_present
+                || !outcome.receipt.correlated_status_response
+                || outcome.receipt.model_thread_created
+                || outcome.receipt.model_turn_started
+            {
+                unavailable(&mut report, "Codex status evidence was incomplete");
+                return Ok(report);
+            }
+            let observed_quota_windows =
+                outcome
+                    .receipt
+                    .quota_observation
+                    .as_ref()
+                    .is_some_and(|observation| {
+                        observation.state
+                            == orbit::provider_status::CodexRateLimitObservationState::Observed
+                    });
+            let account_read_schema = outcome.receipt.account_read_schema.clone();
+            let rate_limits_schema = outcome.receipt.rate_limits_schema.clone();
+            let quota_observation = outcome.receipt.quota_observation.clone();
+            let account_identity_value_comparison =
+                outcome.receipt.account_identity_value_comparison;
+            let recorded = match bindings
+                .record_observation(
+                    &credential.identity(),
+                    outcome.provider_scope_fingerprint.as_deref(),
+                    mode,
+                    outcome.snapshot,
+                )
+                .await
+            {
+                Ok(recorded) => recorded,
+                Err(_) => {
+                    unavailable(&mut report, "status evidence could not be persisted");
+                    return Ok(report);
+                }
+            };
+            let provider_scope = recorded
+                .binding
+                .as_ref()
+                .map(|binding| format!("{:?}", binding.state).to_ascii_lowercase())
+                .unwrap_or_else(|| "none".to_owned());
+            let scope_fingerprint = recorded.binding.as_ref().map(|binding| {
+                if binding.state == orbit::provider_scope::BindingState::Mismatch {
+                    binding
+                        .mismatch_fingerprint
+                        .as_ref()
+                        .unwrap_or(&binding.fingerprint)
+                } else {
+                    &binding.fingerprint
+                }
+            });
+            let quota_observed = serde_json::json!({
+                "scope":"codex-provider-status",
+                "buckets":recorded.snapshot.quota_buckets,
+                "legacy_windows":recorded.snapshot.quota_windows,
+            });
+            let provider_status_observation =
+                recorded.snapshot.provider_status_observation.as_ref();
+            let quota_promoted = provider_status_observation.is_some_and(|observation| {
+                observation.quota_promotion == orbit::availability::QuotaEvidencePromotion::Promoted
+            });
+            let quota_promotion_reason = provider_status_observation
+                .map(|observation| serde_json::to_value(observation.quota_promotion))
+                .transpose()?
+                .unwrap_or_else(|| serde_json::json!("no_usable_windows_observed"));
+            let quota_evidence_persisted = !recorded.snapshot.quota_buckets.is_empty()
+                || !recorded.snapshot.quota_windows.is_empty();
+            report["status"] = serde_json::json!({
+                "state":"observed",
+                "request_count":1,
+                "authenticated":true,
+                "account_read":true,
+                "rate_limits_read":true,
+                "fresh_backend_representation_staged":true,
+                "model_turn":false,
+                "account_read_schema":account_read_schema,
+                "rate_limits_read_schema":rate_limits_schema,
+                "provider_quota_observation":quota_observation,
+                "usable_quota_windows_observed":observed_quota_windows,
+                "account_identity_value_comparison":account_identity_value_comparison,
+                "quota_promoted":quota_promoted,
+                "quota_promotion_reason":quota_promotion_reason,
+                "snapshot_id":recorded.snapshot_id,
+                "provider_scope":provider_scope,
+                "provider_scope_fingerprint":scope_fingerprint,
+                "quota_observed":quota_observed,
+                "quota_persisted":quota_evidence_persisted,
+                "scheduling_availability":recorded.snapshot.state,
+            });
+            report["availability"] = snapshot_status(Some(&recorded.snapshot), unix_time_ms()?);
+        }
+        "antigravity" => {
+            match safe_representation_state(
+                &inspection,
+                orbit::agy_cli_representation::AGY_CLI_INTERFACE,
+                credential.generation,
+            ) {
+                "missing" => {
+                    report["representations"]["agy-cli"] =
+                        serde_json::json!({"auth_type":"oauth-personal","state":"missing"});
+                    unavailable(&mut report, "agy-cli representation not enrolled");
+                    return Ok(report);
+                }
+                "valid" => {}
+                _ => {
+                    unavailable(
+                        &mut report,
+                        &representation_status_reason(
+                            &inspection,
+                            orbit::agy_cli_representation::AGY_CLI_INTERFACE,
+                            credential.generation,
+                            reference,
+                        ),
+                    );
+                    return Ok(report);
+                }
+            }
+            let receipt = match orbit::agy_cli_representation::capture_usage_for_credential(
+                pool, backend, reference,
+            )
+            .await
+            {
+                Ok(receipt) => receipt,
+                Err(_) => {
+                    unavailable(
+                        &mut report,
+                        "agy status staging, authentication or provider request failed",
+                    );
+                    return Ok(report);
+                }
+            };
+            if !receipt.status.normalization_ready {
+                report["status"] = serde_json::json!({
+                    "state":"partial",
+                    "request_count":1,
+                    "authenticated":true,
+                    "model_turn":false,
+                    "reason":"provider status could not be normalized safely",
+                    "schema_summary":receipt.status.summary,
+                });
+                attach_status_health_dimensions(&mut report);
+                return Ok(report);
+            }
+            let observed_at_ms = unix_time_ms()?;
+            let expires_at_ms = observed_at_ms + CREDENTIAL_STATUS_TTL.as_millis() as i64;
+            let snapshot = match receipt.status.availability_snapshot(
+                credential.identity(),
+                observed_at_ms,
+                expires_at_ms,
+            ) {
+                Ok(snapshot) => snapshot,
+                Err(_) => {
+                    unavailable(&mut report, "normalized agy status evidence was invalid");
+                    return Ok(report);
+                }
+            };
+            let snapshot_id = match AvailabilityStore::new(pool).record(&snapshot).await {
+                Ok(id) => id,
+                Err(_) => {
+                    unavailable(&mut report, "status evidence could not be persisted");
+                    return Ok(report);
+                }
+            };
+            report["status"] = serde_json::json!({
+                "state":"observed",
+                "request_count":1,
+                "authenticated":true,
+                "model_turn":false,
+                "snapshot_id":snapshot_id,
+                "normalization_ready":receipt.status.normalization_ready,
+                "group_metadata_ready":receipt.status.group_metadata_ready,
+                "membership_ready":receipt.status.membership_ready,
+                "token_file_metadata_changed":receipt.token_metadata_changed,
+                "schema_summary":receipt.status.summary,
+                "runtime_effects":compact_agy_runtime_effects(&receipt.created_or_changed_home_entries),
+            });
+            if diagnostics {
+                report["status"]["home_entries"] =
+                    serde_json::json!(receipt.created_or_changed_home_entries);
+            }
+            report["availability"] = snapshot_status(Some(&snapshot), unix_time_ms()?);
+        }
+        _ => unavailable(
+            &mut report,
+            "no status adapter is available for this provider",
+        ),
+    }
+    attach_status_health_dimensions(&mut report);
+    Ok(report)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -507,6 +1151,63 @@ async fn main() -> Result<()> {
             Output::Json | Output::Text => println!("{}", serde_json::to_string_pretty(&value)?),
             Output::Jsonl => println!("{}", serde_json::to_string(&value)?),
         }
+        return Ok(());
+    }
+    if let Commands::Credential(CredentialArgs {
+        action:
+            CredentialAction::Rename {
+                old_reference,
+                new_reference,
+                database_url_file,
+            },
+    }) = &cli.command
+    {
+        let database_url = read_private_database_url(database_url_file.as_deref()).await?;
+        let (engine, scratch) = connect_durable_catalog_engine(database_url.as_str()).await?;
+        let renamed = CredentialStore::new(&engine.pool)
+            .rename(old_reference, new_reference)
+            .await?;
+        let summary = serde_json::json!({
+            "credential_id": renamed.id,
+            "old_reference": old_reference,
+            "new_reference": renamed.reference,
+            "provider": renamed.provider,
+            "generation": renamed.generation,
+            "lifecycle": renamed.status,
+        });
+        match output_format {
+            Output::Json | Output::Text => println!("{}", serde_json::to_string_pretty(&summary)?),
+            Output::Jsonl => println!("{}", serde_json::to_string(&summary)?),
+        }
+        engine.pool.close().await;
+        drop(scratch);
+        return Ok(());
+    }
+    if let Commands::Credential(CredentialArgs {
+        action:
+            CredentialAction::Remove {
+                reference,
+                database_url_file,
+            },
+    }) = &cli.command
+    {
+        let database_url = read_private_database_url(database_url_file.as_deref()).await?;
+        let (engine, scratch) = connect_durable_catalog_engine(database_url.as_str()).await?;
+        let revoked = CredentialStore::new(&engine.pool).revoke(reference).await?;
+        let summary = serde_json::json!({
+            "credential_id": revoked.id,
+            "reference": revoked.reference,
+            "provider": revoked.provider,
+            "generation": revoked.generation,
+            "lifecycle": revoked.status,
+            "secret_bytes_destroyed": false,
+        });
+        match output_format {
+            Output::Json | Output::Text => println!("{}", serde_json::to_string_pretty(&summary)?),
+            Output::Jsonl => println!("{}", serde_json::to_string(&summary)?),
+        }
+        engine.pool.close().await;
+        drop(scratch);
         return Ok(());
     }
     if let Commands::Credential(CredentialArgs {
@@ -614,7 +1315,7 @@ async fn main() -> Result<()> {
             orbit::credential_registry::valid_reference(reference)
                 && interface == orbit::agy_cli_representation::AGY_CLI_INTERFACE
                 && auth_type == orbit::agy_cli_representation::AGY_CLI_AUTH_TYPE,
-            "only the qualified agy-cli oauth-personal representation is enabled"
+            "only the agy-cli oauth-personal representation is enabled"
         );
         let database_url = read_private_database_url(database_url_file.as_deref()).await?;
         validate_durable_catalog_url(database_url.as_str())?;
@@ -648,13 +1349,22 @@ async fn main() -> Result<()> {
                 anyhow::anyhow!("durable credential catalog connection or migration failed")
             })?;
         let backend = orbit::secret_backend::LocalPrivateSecretBackend::default_for_operator()?;
-        let result = orbit::agy_cli_representation::import_and_validate(
-            &engine.pool,
-            &backend,
-            reference,
-            source_file,
-        )
-        .await?;
+        let result = if let Some(source_file) = source_file {
+            orbit::agy_cli_representation::import_and_validate(
+                &engine.pool,
+                &backend,
+                reference,
+                source_file,
+            )
+            .await?
+        } else {
+            orbit::agy_cli_representation::enroll_existing_agy_cli(
+                &engine.pool,
+                &backend,
+                reference,
+            )
+            .await?
+        };
         let summary = serde_json::json!({
             "credential": {
                 "id": result.credential_id,
@@ -682,6 +1392,213 @@ async fn main() -> Result<()> {
             Output::Jsonl => println!("{}", serde_json::to_string(&summary)?),
         }
         engine.pool.close().await;
+        return Ok(());
+    }
+    if let Commands::Credential(CredentialArgs {
+        action: CredentialAction::ProviderScope { action },
+    }) = &cli.command
+    {
+        let (reference, database_url_file) = match action {
+            ProviderScopeAction::Inspect {
+                reference,
+                database_url_file,
+            }
+            | ProviderScopeAction::Confirm {
+                reference,
+                database_url_file,
+                ..
+            } => (reference, database_url_file),
+        };
+        anyhow::ensure!(
+            orbit::credential_registry::valid_reference(reference),
+            "invalid credential reference"
+        );
+        let database_url = read_private_database_url(database_url_file.as_deref()).await?;
+        let pool = connect_durable_catalog(database_url.as_str()).await?;
+        let store = CredentialStore::new(&pool);
+        let credential = store
+            .get(reference)
+            .await?
+            .context("credential not found")?;
+        anyhow::ensure!(
+            credential.provider == "codex",
+            "provider-scope CLI is currently enabled for Codex credentials only"
+        );
+        anyhow::ensure!(
+            credential.status == orbit::credential_registry::CredentialStatus::Enrolled,
+            "credential is not enrolled"
+        );
+        let bindings = orbit::provider_scope::BindingStore::new(&pool);
+        let identity = credential.identity();
+        let summary = match action {
+            ProviderScopeAction::Inspect { .. } => {
+                let binding = bindings.inspect(&identity).await?;
+                let history = bindings.history(&identity).await?;
+                let observed = history.iter().find(|event| event.event_kind == "observed");
+                let latest_snapshot = orbit::availability::AvailabilityStore::new(&pool)
+                    .current_for_credential(&identity)
+                    .await?;
+                let observation = latest_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.provider_status_observation.as_ref());
+                serde_json::json!({
+                    "credential": {
+                        "reference": credential.reference,
+                        "id": credential.id,
+                        "provider": credential.provider,
+                        "generation": credential.generation,
+                        "lifecycle": credential.status,
+                    },
+                    "provider_scope": binding.as_ref().map(|binding| serde_json::json!({
+                        "state": binding.state,
+                        "fingerprint": if binding.state == orbit::provider_scope::BindingState::Mismatch {
+                            binding.mismatch_fingerprint.as_ref().unwrap_or(&binding.fingerprint)
+                        } else { &binding.fingerprint },
+                        "observed_at_ms": observed.map(|event| event.recorded_at_ms),
+                        "identity_value_comparison": observation.map(|value| value.identity_value_comparison),
+                        "quota_promotion": observation.map(|value| value.quota_promotion),
+                    })).unwrap_or(serde_json::Value::Null),
+                })
+            }
+            ProviderScopeAction::Confirm { fingerprint, .. } => {
+                let confirmed = bindings
+                    .confirm(&identity, fingerprint, "operator-cli")
+                    .await?;
+                serde_json::json!({
+                    "credential": {
+                        "reference": credential.reference,
+                        "id": credential.id,
+                        "provider": credential.provider,
+                        "generation": credential.generation,
+                        "lifecycle": credential.status,
+                    },
+                    "provider_scope": {
+                        "state": confirmed.state,
+                        "fingerprint": confirmed.fingerprint,
+                        "confirmed": true,
+                    },
+                    "status_probe_required": true,
+                })
+            }
+        };
+        match output_format {
+            Output::Json | Output::Text => println!("{}", serde_json::to_string_pretty(&summary)?),
+            Output::Jsonl => println!("{}", serde_json::to_string(&summary)?),
+        }
+        pool.close().await;
+        return Ok(());
+    }
+    if let Commands::Credential(CredentialArgs {
+        action:
+            CredentialAction::Status {
+                reference,
+                all,
+                quota,
+                json,
+                debug,
+                diagnostics,
+                database_url_file,
+            },
+    }) = &cli.command
+    {
+        let database_url = read_private_database_url(database_url_file.as_deref()).await?;
+        let pool = connect_durable_catalog(database_url.as_str()).await?;
+        let backend = orbit::secret_backend::LocalPrivateSecretBackend::default_for_operator()?;
+        let diagnostics_flag = *diagnostics || *debug;
+        let now_ms = unix_time_ms()?;
+        if *all {
+            let credentials = CredentialStore::new(&pool).list().await?;
+            anyhow::ensure!(
+                credentials.len() <= CREDENTIAL_STATUS_ALL_MAX,
+                "credential status --all is bounded to 32 credentials; specify one reference instead"
+            );
+            let mut reports = Vec::with_capacity(credentials.len());
+            for credential in credentials {
+                let report = credential_status_report(
+                    &pool,
+                    &backend,
+                    &credential.reference,
+                    diagnostics_flag,
+                )
+                .await
+                .unwrap_or_else(|_| serde_json::json!({
+                    "credential":{"reference":credential.reference,"provider":credential.provider,"generation":credential.generation,"lifecycle":credential.status},
+                    "status":{"state":"unavailable","reason":"credential catalog or status observation failed"}
+                }));
+                reports.push(report);
+            }
+            if *debug {
+                let summary = serde_json::json!({
+                    "count": reports.len(),
+                    "maximum_provider_observations": CREDENTIAL_STATUS_ALL_MAX,
+                    "credentials": reports,
+                });
+                if output_format == Output::Jsonl {
+                    println!("{}", serde_json::to_string(&summary)?);
+                } else {
+                    println!("{}", serde_json::to_string_pretty(&summary)?);
+                }
+            } else if *json || output_format == Output::Jsonl {
+                let clean_reports: Vec<serde_json::Value> = reports
+                    .into_iter()
+                    .map(orbit::credential_status_view::clean_structured_json)
+                    .collect();
+                let summary = serde_json::json!({
+                    "count": clean_reports.len(),
+                    "maximum_provider_observations": CREDENTIAL_STATUS_ALL_MAX,
+                    "credentials": clean_reports,
+                });
+                if output_format == Output::Jsonl {
+                    println!("{}", serde_json::to_string(&summary)?);
+                } else {
+                    println!("{}", serde_json::to_string_pretty(&summary)?);
+                }
+            } else if *quota {
+                print!(
+                    "{}",
+                    orbit::credential_status_view::format_all_quota(
+                        &reports,
+                        now_ms,
+                        orbit::credential_status_view::terminal_width(),
+                    )
+                );
+            } else {
+                print!(
+                    "{}",
+                    orbit::credential_status_view::format_all_overview(&reports, now_ms)
+                );
+            }
+        } else {
+            let reference = reference
+                .as_deref()
+                .context("credential reference is required unless --all is used")?;
+            anyhow::ensure!(
+                orbit::credential_registry::valid_reference(reference),
+                "invalid credential reference"
+            );
+            let report =
+                credential_status_report(&pool, &backend, reference, diagnostics_flag).await?;
+            if *debug {
+                if output_format == Output::Jsonl {
+                    println!("{}", serde_json::to_string(&report)?);
+                } else {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                }
+            } else if *json || output_format == Output::Jsonl {
+                let clean_report = orbit::credential_status_view::clean_structured_json(report);
+                if output_format == Output::Jsonl {
+                    println!("{}", serde_json::to_string(&clean_report)?);
+                } else {
+                    println!("{}", serde_json::to_string_pretty(&clean_report)?);
+                }
+            } else {
+                print!(
+                    "{}",
+                    orbit::credential_status_view::format_single_credential(&report, now_ms)
+                );
+            }
+        }
+        pool.close().await;
         return Ok(());
     }
     if let Commands::Credential(CredentialArgs {
@@ -883,14 +1800,25 @@ async fn main() -> Result<()> {
             CredentialAction::Add { .. } => {
                 unreachable!("local enrollment handled before API credential resolution")
             }
+            CredentialAction::Rename { .. } | CredentialAction::Remove { .. } => {
+                unreachable!("local credential lifecycle handled before API credential resolution")
+            }
             CredentialAction::AddRepresentation { .. } => {
                 unreachable!("local representation import handled before API credential resolution")
+            }
+            CredentialAction::Status { .. } => {
+                unreachable!("local credential status handled before API credential resolution")
             }
             CredentialAction::CaptureAgyUsage { .. } => {
                 unreachable!("local agy status capture handled before API credential resolution")
             }
             CredentialAction::ProbeCodexStatus { .. } => {
                 unreachable!("local Codex status probe handled before API credential resolution")
+            }
+            CredentialAction::ProviderScope { .. } => {
+                unreachable!(
+                    "local provider-scope command handled before API credential resolution"
+                )
             }
             CredentialAction::List => client.get("/credentials").await?,
             CredentialAction::Inspect { reference } => {
@@ -1391,5 +2319,200 @@ mod durable_catalog_target_tests {
             let error = validate_durable_catalog_url(wrong).unwrap_err().to_string();
             assert!(!error.contains("placeholder"));
         }
+    }
+}
+
+#[cfg(test)]
+mod credential_status_tests {
+    use super::{
+        CREDENTIAL_STATUS_ALL_MAX, attach_status_health_dimensions, compact_agy_runtime_effects,
+        representation_status_reason, safe_representation_state, snapshot_status,
+    };
+    use orbit::credential_registry::{
+        CredentialInspection, CredentialStatus, CredentialView, GenerationView,
+        RepresentationState, RepresentationView,
+    };
+
+    fn inspection(representations: Vec<RepresentationView>) -> CredentialInspection {
+        CredentialInspection {
+            credential: CredentialView {
+                id: "11111111-1111-4111-8111-111111111111".into(),
+                provider: "antigravity".into(),
+                reference: "antigravity-test".into(),
+                generation: 1,
+                endpoint: None,
+                auth_type: "oauth-personal".into(),
+                secret_backend: "local-private".into(),
+                status: CredentialStatus::Enrolled,
+                has_secret: true,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            },
+            generations: vec![GenerationView {
+                generation: 1,
+                secret_backend: "local-private".into(),
+                state: "enrolled".into(),
+                has_secret: true,
+                created_at_ms: 1,
+                retired_at_ms: None,
+            }],
+            representations,
+            identity_bindings: vec![],
+        }
+    }
+
+    fn representation(
+        interface: &str,
+        state: RepresentationState,
+        validation: &str,
+    ) -> RepresentationView {
+        RepresentationView {
+            id: format!("{interface}-id"),
+            generation: 1,
+            current_generation: true,
+            interface: interface.into(),
+            auth_type: if interface == "codex" {
+                "chatgpt-device-code"
+            } else {
+                "oauth-personal"
+            }
+            .into(),
+            state,
+            validation: validation.into(),
+            capabilities: vec![],
+            runtime_provenance: None,
+            enrollment_stage: (interface == "agy-cli").then(|| "validated".into()),
+            has_secret: true,
+            last_validated_at_ms: Some(1),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn agy_status_distinguishes_acp_only_from_valid_dual_representation() {
+        let acp_only = inspection(vec![representation(
+            "acp",
+            RepresentationState::Stored,
+            "valid",
+        )]);
+        assert_eq!(safe_representation_state(&acp_only, "acp", 1), "valid");
+        assert_eq!(
+            safe_representation_state(&acp_only, "agy-cli", 1),
+            "missing"
+        );
+
+        let dual = inspection(vec![
+            representation("acp", RepresentationState::Stored, "valid"),
+            representation("agy-cli", RepresentationState::Stored, "valid"),
+        ]);
+        assert_eq!(safe_representation_state(&dual, "agy-cli", 1), "valid");
+    }
+
+    #[test]
+    fn status_never_treats_pending_or_old_generation_as_valid() {
+        let pending = inspection(vec![representation(
+            "codex",
+            RepresentationState::Pending,
+            "unvalidated",
+        )]);
+        assert_eq!(safe_representation_state(&pending, "codex", 1), "pending");
+        assert_eq!(safe_representation_state(&pending, "codex", 2), "missing");
+    }
+
+    #[test]
+    fn stored_but_unvalidated_agy_representation_is_not_reported_valid() {
+        let mut unvalidated = representation("agy-cli", RepresentationState::Stored, "unvalidated");
+        unvalidated.enrollment_stage = Some("secret_persisted".into());
+        unvalidated.last_validated_at_ms = None;
+        let inspection = inspection(vec![unvalidated]);
+        assert_eq!(
+            safe_representation_state(&inspection, "agy-cli", 1),
+            "unvalidated"
+        );
+        let reason = representation_status_reason(&inspection, "agy-cli", 1, "antigravity-test");
+        assert!(reason.contains("secret_persisted"));
+        assert!(reason.contains("add-representation antigravity-test --interface agy-cli"));
+        assert!(!reason.contains("credential://"));
+    }
+
+    #[test]
+    fn normal_agy_status_effects_are_bounded_and_do_not_echo_file_inventory() {
+        let summary = compact_agy_runtime_effects(&[
+            serde_json::json!({"path":".gemini/antigravity-cli/antigravity-oauth-token"}),
+            serde_json::json!({"path":".gemini/antigravity-cli/cache/index"}),
+            serde_json::json!({"path":".gemini/antigravity-cli/builtin"}),
+            serde_json::json!({"path":".gemini/antigravity-cli/cli.log"}),
+            serde_json::json!({"path":".gemini/antigravity-cli/conversation_summaries.db"}),
+        ]);
+        assert_eq!(summary["staged_auth_artifact"], true);
+        assert_eq!(summary["observed_runtime_entries"], 4);
+        assert_eq!(summary["runtime_categories"].as_array().unwrap().len(), 4);
+        let rendered = summary.to_string();
+        assert!(!rendered.contains(".gemini"));
+        assert!(!rendered.contains("antigravity-oauth-token"));
+        assert!(!rendered.contains("conversation_summaries.db"));
+    }
+
+    #[test]
+    fn health_report_separates_auth_runtime_freshness_quota_and_availability() {
+        let mut report = serde_json::json!({
+            "representations":{"codex":{"validation":"valid"}},
+            "status":{"state":"observed","authenticated":true,"provider_scope":"unconfirmed"},
+            "availability":{
+                "state":"unknown","fresh":true,"observed_at_ms":10,"expires_at_ms":20,
+                "quota_buckets":[],"quota_windows":[],"quota_groups":[]
+            }
+        });
+        attach_status_health_dimensions(&mut report);
+        assert_eq!(report["health"]["runtime"]["state"], "healthy");
+        assert_eq!(report["health"]["provider_scope"]["state"], "unconfirmed");
+        assert_eq!(
+            report["health"]["status_observation"]["last_snapshot_fresh"],
+            true
+        );
+        assert_eq!(
+            report["health"]["scheduling_availability"]["state"],
+            "unknown"
+        );
+        assert_eq!(
+            report["health"]["quota_evidence"]["persisted_bucket_count"],
+            0
+        );
+    }
+
+    #[test]
+    fn status_all_has_a_fixed_preflight_bound() {
+        assert_eq!(CREDENTIAL_STATUS_ALL_MAX, 32);
+    }
+
+    #[test]
+    fn expired_status_evidence_is_reported_unknown_without_erasing_history() {
+        let snapshot = orbit::availability::AvailabilitySnapshot {
+            applies_to: orbit::availability::AvailabilityScope::Credential(
+                orbit::availability::CredentialIdentity {
+                    provider: "antigravity".into(),
+                    reference: "antigravity-test".into(),
+                    generation: "1".into(),
+                    catalog_id: Some("11111111-1111-4111-8111-111111111111".into()),
+                },
+            ),
+            observed_at_ms: 1,
+            expires_at_ms: 2,
+            state: orbit::availability::AvailabilityState::Ready,
+            quota_windows: vec![],
+            quota_buckets: vec![],
+            quota_groups: vec![],
+            source: orbit::availability::EvidenceSource::ProviderNativeStatus,
+            confidence: orbit::availability::EvidenceConfidence::AuthoritativeNative,
+            source_revision: "status-v1".into(),
+            evidence_digest: format!("sha256:{}", "a".repeat(64)),
+            provider_observed_at_ms: None,
+            provider_status_observation: None,
+        };
+        let status = snapshot_status(Some(&snapshot), 3);
+        assert_eq!(status["state"], "unknown");
+        assert_eq!(status["recorded_state"], "ready");
+        assert_eq!(status["fresh"], false);
     }
 }

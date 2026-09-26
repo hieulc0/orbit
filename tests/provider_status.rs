@@ -1,10 +1,12 @@
 use orbit::availability::{
     AvailabilityScope, AvailabilityState, CredentialIdentity, EvidenceConfidence,
-    ExecutionResourceIdentity, RuntimeIdentity, effective_at,
+    ExecutionResourceIdentity, ProviderScopeEvidenceState, QuotaEvidencePromotion, RuntimeIdentity,
+    effective_at,
 };
 use orbit::continuation::TerminationReason;
 use orbit::provider_status::{
-    antigravity_usage_capture, codex_rate_limits_snapshot, execution_result_snapshot,
+    CodexRateLimitObservationState, antigravity_usage_capture, codex_rate_limits_observation,
+    codex_rate_limits_snapshot, execution_result_snapshot,
 };
 use serde_json::json;
 use std::collections::BTreeSet;
@@ -720,6 +722,14 @@ fn codex_versioned_structured_status_preserves_windows_without_model_claims() {
     );
     assert_eq!(status.quota_buckets[0].windows[0].used_percent, Some(25.0));
     assert_eq!(
+        status.quota_buckets[0].windows[0].remaining_percent,
+        Some(75.0)
+    );
+    assert_eq!(
+        status.quota_buckets[0].windows[0].remaining_fraction,
+        Some(0.75)
+    );
+    assert_eq!(
         status.quota_buckets[0].windows[0].duration_minutes,
         Some(15)
     );
@@ -738,7 +748,7 @@ fn codex_versioned_structured_status_preserves_windows_without_model_claims() {
         w.used_percent == Some(25.0)
             && w.duration_minutes == Some(15)
             && w.resets_at_ms == Some(1_730_947_200_000)
-            && w.remaining_percent.is_none()
+            && w.remaining_percent == Some(75.0)
             && w.exhausted.is_none()
     }));
     assert!(status.quota_windows.iter().any(|w| {
@@ -763,6 +773,241 @@ fn codex_versioned_structured_status_preserves_windows_without_model_claims() {
 }
 
 #[test]
+fn codex_rate_limit_observation_is_separate_from_scope_promotion() {
+    let result = json!({
+        "accountId":"synthetic-account-id",
+        "ordinaryUsageAllowed":true,
+        "rateLimitsByLimitId":{
+            "synthetic-limit-a":{
+                "limitId":"synthetic-limit-a",
+                "limitName":"synthetic plan",
+                "primary":{"usedPercent":31,"windowDurationMins":300,"resetsAt":1730947200},
+                "secondary":{"usedPercent":46,"windowDurationMins":10080,"resetsAt":1731542400}
+            }
+        }
+    });
+    let observed = codex_rate_limits_observation(&resource(), &result);
+    assert_eq!(observed.state, CodexRateLimitObservationState::Observed);
+    assert_eq!(observed.bucket_count, 1);
+    assert_eq!(observed.window_count, 2);
+    assert_eq!(
+        observed.legacy_map_identity_relation,
+        orbit::provider_status::CodexLimitIdentityRelation::MapOnly
+    );
+
+    let unconfirmed = codex_rate_limits_snapshot(
+        &resource(),
+        "",
+        &serde_json::to_vec(&result).unwrap(),
+        10_000,
+        20_000,
+    )
+    .unwrap();
+    assert_eq!(unconfirmed.state, AvailabilityState::Unknown);
+    assert_eq!(unconfirmed.quota_buckets.len(), 1);
+    assert_eq!(unconfirmed.quota_windows.len(), 2);
+    let evidence = unconfirmed.provider_status_observation.as_ref().unwrap();
+    assert_eq!(
+        evidence.scope_state,
+        ProviderScopeEvidenceState::Unconfirmed
+    );
+    assert_eq!(
+        evidence.quota_promotion,
+        QuotaEvidencePromotion::ObservedUnconfirmed
+    );
+    assert_eq!(evidence.ordinary_usage_allowed, Some(true));
+
+    let no_windows = json!({
+        "accountId":"synthetic-account-id",
+        "rateLimits":{"primary":null,"secondary":null}
+    });
+    assert_eq!(
+        codex_rate_limits_observation(&resource(), &no_windows).state,
+        CodexRateLimitObservationState::NoUsableWindows
+    );
+    let malformed = json!({
+        "rateLimits":{"primary":{"usedPercent":"unknown"}}
+    });
+    assert_eq!(
+        codex_rate_limits_observation(&resource(), &malformed).state,
+        CodexRateLimitObservationState::UnsupportedShape
+    );
+}
+
+#[test]
+fn codex_map_shape_can_be_normalized_without_legacy_rate_limits_object() {
+    let status = parse(json!({
+        "accountId":"fixture-account-id",
+        "ordinaryUsageAllowed":true,
+        "rateLimitsByLimitId":{
+            "synthetic-limit":{
+                "limitId":"synthetic-limit",
+                "primary":{"usedPercent":0,"windowDurationMins":5,"resetsAt":1730947200},
+                "secondary":null
+            }
+        }
+    }));
+    assert_eq!(status.state, AvailabilityState::Ready);
+    assert_eq!(status.quota_buckets.len(), 1);
+    assert_eq!(status.quota_windows.len(), 1);
+    assert_eq!(status.quota_windows[0].used_percent, Some(0.0));
+}
+
+#[test]
+fn codex_legacy_and_map_identity_match_is_observed_not_assumed() {
+    let combined = json!({
+        "accountId":"fixture-account-id",
+        "ordinaryUsageAllowed":true,
+        "rateLimits":{"limitId":"synthetic-limit","limitName":null,
+            "primary":{"usedPercent":0,"windowDurationMins":300,"resetsAt":0},
+            "secondary":null},
+        "rateLimitsByLimitId":{"synthetic-limit":{"limitId":"synthetic-limit",
+            "limitName":"synthetic-provider-label",
+            "primary":{"usedPercent":0,"windowDurationMins":300,"resetsAt":0},
+            "secondary":null}}
+    });
+    let observation = codex_rate_limits_observation(&resource(), &combined);
+    assert_eq!(
+        observation.legacy_map_identity_relation,
+        orbit::provider_status::CodexLimitIdentityRelation::ExactMatch
+    );
+    let combined_snapshot = parse(combined);
+    let legacy_only_snapshot = parse(json!({
+        "accountId":"fixture-account-id",
+        "ordinaryUsageAllowed":true,
+        "rateLimits":{"limitId":"synthetic-limit","limitName":null,
+            "primary":{"usedPercent":0,"windowDurationMins":300,"resetsAt":0},
+            "secondary":null}
+    }));
+    assert_eq!(combined_snapshot.quota_buckets.len(), 1);
+    assert_eq!(legacy_only_snapshot.quota_buckets.len(), 1);
+    assert_eq!(
+        combined_snapshot.quota_buckets[0].provider_bucket_fingerprint,
+        legacy_only_snapshot.quota_buckets[0].provider_bucket_fingerprint
+    );
+    let window = &combined_snapshot.quota_buckets[0].windows[0];
+    assert_eq!(window.used_percent, Some(0.0));
+    assert_eq!(window.remaining_percent, Some(100.0));
+    assert_eq!(window.remaining_fraction, Some(1.0));
+    assert_eq!(window.duration_minutes, Some(300));
+    assert_eq!(window.resets_at_ms, Some(0));
+    assert_eq!(
+        combined_snapshot.quota_buckets[0].provider_label.as_deref(),
+        Some("synthetic-provider-label")
+    );
+    let safe = serde_json::to_string(&combined_snapshot).unwrap();
+    assert!(!safe.contains("synthetic-limit"));
+}
+
+#[test]
+fn codex_0156_observed_rate_limit_schema_is_understood_without_retaining_raw_ids() {
+    // Sanitized fixture mirrors the one live-observed shape. Every account,
+    // bucket, description, and reset value here is synthetic.
+    let result = json!({
+        "accountId":"fixture-account-id",
+        "ordinaryUsageAllowed":true,
+        "rateLimits":{
+            "credits":{"balance":"synthetic-balance","hasCredits":true,"unlimited":false},
+            "individualLimit":null,
+            "limitId":"synthetic-default-limit",
+            "limitName":null,
+            "normalModelSlug":null,
+            "planType":"synthetic-plan",
+            "primary":{"usedPercent":12,"windowDurationMins":300,"resetsAt":1730947200},
+            "rateLimitReachedType":null,
+            "secondary":{"usedPercent":46,"windowDurationMins":10080,"resetsAt":1731542400},
+            "spendControlReached":false
+        },
+        "rateLimitsByLimitId":{
+            "synthetic-limit-a":{
+                "credits":{"balance":"synthetic-balance","hasCredits":true,"unlimited":false},
+                "individualLimit":null,
+                "limitId":"synthetic-limit-a",
+                "limitName":"synthetic-name-a",
+                "normalModelSlug":null,
+                "planType":"synthetic-plan",
+                "primary":{"usedPercent":25,"windowDurationMins":300,"resetsAt":1730947200},
+                "rateLimitReachedType":null,
+                "secondary":null,
+                "spendControlReached":null
+            },
+            "synthetic-limit-b":{
+                "credits":null,
+                "individualLimit":null,
+                "limitId":"synthetic-limit-b",
+                "limitName":null,
+                "normalModelSlug":"synthetic-model-label",
+                "planType":"synthetic-plan",
+                "primary":{"usedPercent":100,"windowDurationMins":5,"resetsAt":1730947500},
+                "rateLimitReachedType":null,
+                "secondary":{"usedPercent":0,"windowDurationMins":60,"resetsAt":1730950800},
+                "spendControlReached":false
+            }
+        },
+        "rateLimitResetCredits":{
+            "availableCount":0,
+            "credits":[{
+                "description":"synthetic credit",
+                "expiresAt":1731000000,
+                "grantedAt":1730900000,
+                "id":"synthetic-credit-id",
+                "resetType":"synthetic-reset",
+                "status":"synthetic-status",
+                "title":"synthetic-title"
+            }]
+        },
+        "rateLimitUpsell":null
+    });
+
+    let observed = codex_rate_limits_observation(&resource(), &result);
+    assert_eq!(observed.state, CodexRateLimitObservationState::Observed);
+    assert_eq!(observed.bucket_count, 2);
+    assert_eq!(observed.window_count, 3);
+    assert_eq!(
+        observed.legacy_map_identity_relation,
+        orbit::provider_status::CodexLimitIdentityRelation::ExactMismatch
+    );
+
+    let snapshot = parse(result);
+    assert_eq!(snapshot.state, AvailabilityState::Ready);
+    assert_eq!(snapshot.quota_buckets.len(), 2);
+    assert_eq!(snapshot.quota_windows.len(), 3);
+    assert_eq!(snapshot.quota_buckets[0].windows.len(), 1);
+    assert_eq!(snapshot.quota_buckets[1].windows.len(), 2);
+    assert_eq!(
+        snapshot.quota_buckets[0].provider_label.as_deref(),
+        Some("synthetic-name-a")
+    );
+    assert_eq!(
+        snapshot.quota_buckets[0].windows[0].remaining_percent,
+        Some(75.0)
+    );
+    assert_eq!(
+        snapshot.quota_buckets[0].windows[0].remaining_fraction,
+        Some(0.75)
+    );
+    assert_eq!(
+        snapshot.quota_buckets[1].windows[0].remaining_percent,
+        Some(0.0)
+    );
+    assert_eq!(
+        snapshot.quota_buckets[1].windows[1].remaining_percent,
+        Some(100.0)
+    );
+    let durable = serde_json::to_string(&snapshot).unwrap();
+    for private_value in [
+        "synthetic-account",
+        "synthetic-limit-a",
+        "synthetic-limit-b",
+        "synthetic-balance",
+        "synthetic-credit-id",
+        "synthetic-model-label",
+    ] {
+        assert!(!durable.contains(private_value));
+    }
+}
+
+#[test]
 fn codex_missing_mismatched_or_malformed_identity_stays_unknown() {
     let ordinary = json!({
         "accountId":"different-account",
@@ -771,7 +1016,15 @@ fn codex_missing_mismatched_or_malformed_identity_stays_unknown() {
     });
     let mismatch = parse(ordinary.clone());
     assert_eq!(mismatch.state, AvailabilityState::Unknown);
-    assert!(mismatch.quota_windows.is_empty());
+    assert_eq!(mismatch.quota_windows.len(), 1);
+    assert_eq!(
+        mismatch
+            .provider_status_observation
+            .as_ref()
+            .unwrap()
+            .quota_promotion,
+        QuotaEvidencePromotion::ObservedUnconfirmed
+    );
     let mut missing = ordinary;
     missing.as_object_mut().unwrap().remove("accountId");
     assert_eq!(parse(missing).state, AvailabilityState::Unknown);

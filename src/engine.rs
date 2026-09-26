@@ -66,6 +66,21 @@ impl Engine {
         ))
         .execute(&mut *migration)
         .await?;
+        sqlx::raw_sql(include_str!(
+            "../migrations/0012_credential_reference_rename.sql"
+        ))
+        .execute(&mut *migration)
+        .await?;
+        sqlx::raw_sql(include_str!(
+            "../migrations/0013_credential_runtime_provenance_compat.sql"
+        ))
+        .execute(&mut *migration)
+        .await?;
+        sqlx::raw_sql(include_str!(
+            "../migrations/0014_agy_representation_enrollment_stage.sql"
+        ))
+        .execute(&mut *migration)
+        .await?;
         migration.commit().await?;
         Ok(Self {
             pool,

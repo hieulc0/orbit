@@ -55,6 +55,43 @@ pub struct DeviceLoginPrompt {
     login_id: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CredentialStagingFailure {
+    CredentialNotFound,
+    CredentialRevoked,
+    GenerationUnavailable,
+    RepresentationMissing,
+    RepresentationInvalid,
+    SecretBackendUnavailable,
+    SecretBackendReadFailed,
+    SecretArtifactMissing,
+    CredentialStoreUnavailable,
+}
+
+impl CredentialStagingFailure {
+    pub fn safe_message(self) -> &'static str {
+        match self {
+            Self::CredentialNotFound => "credential not found",
+            Self::CredentialRevoked => "credential is revoked",
+            Self::GenerationUnavailable => "current credential generation is unavailable",
+            Self::RepresentationMissing => "Codex representation is missing",
+            Self::RepresentationInvalid => "Codex representation is not valid",
+            Self::SecretBackendUnavailable => "configured SecretBackend is unavailable",
+            Self::SecretBackendReadFailed => "SecretBackend artifact could not be loaded",
+            Self::SecretArtifactMissing => "SecretBackend artifact is missing",
+            Self::CredentialStoreUnavailable => "credential catalog could not be read",
+        }
+    }
+}
+
+impl std::fmt::Display for CredentialStagingFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.safe_message())
+    }
+}
+
+impl std::error::Error for CredentialStagingFailure {}
+
 fn checked_private_directory(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path).context("private Codex directory unavailable")?;
     ensure!(
@@ -169,21 +206,39 @@ pub async fn registered_auth(
     backend: &dyn SecretBackend,
     reference: &str,
 ) -> Result<SecretBytes> {
+    registered_auth_diagnostic(pool, backend, reference)
+        .await
+        .map_err(anyhow::Error::new)
+}
+
+pub async fn registered_auth_diagnostic(
+    pool: &PgPool,
+    backend: &dyn SecretBackend,
+    reference: &str,
+) -> std::result::Result<SecretBytes, CredentialStagingFailure> {
     let store = CredentialStore::new(pool);
     let credential = store
         .get(reference)
-        .await?
-        .context("credential not found")?;
-    ensure!(
-        credential.provider == "codex"
-            && credential.status == CredentialStatus::Enrolled
-            && credential.secret_backend == backend.backend_id(),
-        "Codex credential is not enrolled in the selected backend"
-    );
+        .await
+        .map_err(|_| CredentialStagingFailure::CredentialStoreUnavailable)?
+        .ok_or(CredentialStagingFailure::CredentialNotFound)?;
+    if credential.status == CredentialStatus::Revoked {
+        return Err(CredentialStagingFailure::CredentialRevoked);
+    }
+    if credential.status != CredentialStatus::Enrolled {
+        return Err(CredentialStagingFailure::GenerationUnavailable);
+    }
+    if credential.provider != "codex" {
+        return Err(CredentialStagingFailure::RepresentationInvalid);
+    }
+    if credential.secret_backend != backend.backend_id() {
+        return Err(CredentialStagingFailure::SecretBackendUnavailable);
+    }
     let inspection = store
         .inspect(reference)
-        .await?
-        .context("credential disappeared")?;
+        .await
+        .map_err(|_| CredentialStagingFailure::CredentialStoreUnavailable)?
+        .ok_or(CredentialStagingFailure::GenerationUnavailable)?;
     let view = inspection
         .representations
         .iter()
@@ -192,21 +247,30 @@ pub async fn registered_auth(
                 && representation.generation == credential.generation
                 && representation.current_generation
         })
-        .context("current Codex representation missing")?;
-    ensure!(
-        view.state == RepresentationState::Stored
-            && view.validation == "valid"
-            && view.auth_type == CODEX_AUTH_TYPE,
-        "current Codex representation is not validated"
-    );
+        .ok_or(CredentialStagingFailure::RepresentationMissing)?;
+    if view.state != RepresentationState::Stored
+        || view.validation != "valid"
+        || view.auth_type != CODEX_AUTH_TYPE
+    {
+        return Err(CredentialStagingFailure::RepresentationInvalid);
+    }
     let representation = store
         .representation(&view.id)
-        .await?
-        .context("Codex representation disappeared")?;
+        .await
+        .map_err(|_| CredentialStagingFailure::CredentialStoreUnavailable)?
+        .ok_or(CredentialStagingFailure::GenerationUnavailable)?;
     let locator = representation
         .secret_locator
-        .context("Codex secret locator missing")?;
-    backend.read(locator).await
+        .ok_or(CredentialStagingFailure::SecretArtifactMissing)?;
+    match backend.exists(locator).await {
+        Ok(true) => {}
+        Ok(false) => return Err(CredentialStagingFailure::SecretArtifactMissing),
+        Err(_) => return Err(CredentialStagingFailure::SecretBackendUnavailable),
+    }
+    backend
+        .read(locator)
+        .await
+        .map_err(|_| CredentialStagingFailure::SecretBackendReadFailed)
 }
 
 fn validate_device_prompt(result: Value) -> Result<DeviceLoginPrompt> {

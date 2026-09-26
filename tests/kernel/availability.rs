@@ -40,6 +40,7 @@ async fn availability_history_is_idempotent_and_current_is_monotonic() -> Result
         source_revision: "fixture".into(),
         evidence_digest: format!("sha256:{}", "b".repeat(64)),
         provider_observed_at_ms: None,
+        provider_status_observation: None,
     };
     let old = evidence(AvailabilityState::Ready, 10);
     let new = evidence(AvailabilityState::QuotaExhausted, 20);
@@ -159,6 +160,7 @@ async fn malformed_or_unclassified_status_does_not_write_availability() -> Resul
         source_revision: "synthetic".into(),
         evidence_digest: format!("sha256:{}", "d".repeat(64)),
         provider_observed_at_ms: None,
+        provider_status_observation: None,
     };
     let store = AvailabilityStore::new(&fixture.engine.pool);
     assert!(store.record(&invalid).await.is_err());

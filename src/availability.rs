@@ -156,22 +156,96 @@ impl AvailabilityScope {
 
     pub fn key(&self) -> Result<String> {
         self.validate()?;
+        if self.has_catalog_credential() {
+            let mut stable = self.clone();
+            stable.map_credential_identity(normalize_catalog_reference);
+            return Ok(format!(
+                "as2:{}",
+                crate::model::digest(&serde_json::to_vec(&(
+                    "orbit.availability_scope.catalog.v2",
+                    stable
+                ))?)
+            ));
+        }
         Ok(format!(
             "as1:{}",
             crate::model::digest(&serde_json::to_vec(&("orbit.availability_scope.v1", self))?)
         ))
     }
 
+    fn has_catalog_credential(&self) -> bool {
+        match self {
+            Self::Exact(resource) => resource.credential.catalog_id.is_some(),
+            Self::CredentialModel { credential, .. } | Self::Credential(credential) => {
+                credential.catalog_id.is_some()
+            }
+            Self::Runtime(_) => false,
+        }
+    }
+
+    fn map_credential_identity(&mut self, mut map: impl FnMut(&mut CredentialIdentity)) {
+        match self {
+            Self::Exact(resource) => map(&mut resource.credential),
+            Self::CredentialModel { credential, .. } | Self::Credential(credential) => {
+                map(credential)
+            }
+            Self::Runtime(_) => {}
+        }
+    }
+
     pub fn matches(&self, resource: &ExecutionResourceIdentity) -> bool {
         match self {
-            Self::Exact(r) => r == resource,
-            Self::CredentialModel { credential, model } => {
-                credential == &resource.credential && model == &resource.model
+            Self::Exact(r) => {
+                r.runtime == resource.runtime
+                    && credential_identity_matches(&r.credential, &resource.credential)
+                    && r.model == resource.model
+                    && r.reasoning_effort == resource.reasoning_effort
             }
-            Self::Credential(c) => c == &resource.credential,
+            Self::CredentialModel { credential, model } => {
+                credential_identity_matches(credential, &resource.credential)
+                    && model == &resource.model
+            }
+            Self::Credential(c) => credential_identity_matches(c, &resource.credential),
             Self::Runtime(r) => r == &resource.runtime,
         }
     }
+}
+
+fn normalize_catalog_reference(credential: &mut CredentialIdentity) {
+    if let Some(catalog_id) = &credential.catalog_id {
+        credential.reference = format!("catalog-{catalog_id}");
+    }
+}
+
+fn credential_identity_matches(left: &CredentialIdentity, right: &CredentialIdentity) -> bool {
+    match (&left.catalog_id, &right.catalog_id) {
+        (Some(left_id), Some(right_id)) => {
+            left_id == right_id
+                && left.provider == right.provider
+                && left.generation == right.generation
+        }
+        (None, None) => left == right,
+        _ => false,
+    }
+}
+
+fn stable_scope_key(scope: &AvailabilityScope) -> Result<String> {
+    let mut stable = scope.clone();
+    if stable.has_catalog_credential() {
+        stable.map_credential_identity(normalize_catalog_reference);
+    }
+    stable.key()
+}
+
+fn legacy_scope_key(scope: &AvailabilityScope) -> Result<String> {
+    scope.validate()?;
+    Ok(format!(
+        "as1:{}",
+        crate::model::digest(&serde_json::to_vec(&(
+            "orbit.availability_scope.v1",
+            scope
+        ))?)
+    ))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -326,7 +400,10 @@ impl QuotaBucketWindow {
         self.duration_minutes == window.duration_minutes
             && self.used_percent == window.used_percent
             && self.remaining_percent == window.remaining_percent
-            && self.remaining_fraction.is_none()
+            && self.remaining_fraction.is_none_or(|fraction| {
+                self.remaining_percent
+                    .is_some_and(|percent| fraction == percent / 100.0)
+            })
             && self.resets_at_ms == window.resets_at_ms
             && self.provider_reset_time.is_none()
             && self.exhausted == window.exhausted
@@ -360,10 +437,56 @@ impl QuotaBucketScope {
 #[serde(deny_unknown_fields)]
 pub struct QuotaBucket {
     pub provider_bucket_fingerprint: String,
+    /// Optional provider-supplied user-facing quota label. Opaque provider IDs
+    /// remain fingerprint-only and are never stored here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<QuotaBucketScope>,
     #[serde(default)]
     pub windows: Vec<QuotaBucketWindow>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderScopeEvidenceState {
+    Unbound,
+    Unconfirmed,
+    Confirmed,
+    Mismatch,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderIdentityValueComparison {
+    #[default]
+    NotComparable,
+    ExactValueMatch,
+    ExactValueMismatch,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaEvidencePromotion {
+    ObservedUnconfirmed,
+    Promoted,
+    WithheldScopeMismatch,
+    WithheldIdentityMismatch,
+    WithheldIdentityUnverified,
+    NoUsableQuota,
+}
+
+/// Safe, credential-scoped status metadata persisted alongside normalized
+/// quota values. This records the trust decision without retaining provider
+/// account identifiers or the raw response.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderStatusObservation {
+    pub scope_state: ProviderScopeEvidenceState,
+    pub identity_value_comparison: ProviderIdentityValueComparison,
+    pub quota_promotion: QuotaEvidencePromotion,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ordinary_usage_allowed: Option<bool>,
 }
 
 /// Basis used to derive an Orbit identity for a provider-defined quota group.
@@ -493,6 +616,12 @@ impl QuotaBucket {
             versioned_sha256(&self.provider_bucket_fingerprint, "qb1:"),
             "invalid provider quota bucket fingerprint"
         );
+        ensure!(
+            self.provider_label
+                .as_deref()
+                .is_none_or(safe_provider_quota_label),
+            "invalid provider quota label"
+        );
         if let Some(scope) = &self.scope {
             scope.validate()?;
         }
@@ -507,6 +636,15 @@ impl QuotaBucket {
         }
         Ok(())
     }
+}
+
+fn safe_provider_quota_label(value: &str) -> bool {
+    !value.trim().is_empty()
+        && value.len() <= 128
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
+        && !value.contains('@')
+        && !value.contains("://")
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -532,6 +670,11 @@ pub struct AvailabilitySnapshot {
     pub evidence_digest: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_observed_at_ms: Option<i64>,
+    /// Codex-safe status metadata. Old snapshots omit this field and remain
+    /// readable; unknown/unconfirmed observations can still retain quota data
+    /// while their effective availability remains UNKNOWN.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_status_observation: Option<ProviderStatusObservation>,
 }
 
 impl AvailabilitySnapshot {
@@ -746,6 +889,34 @@ impl<'a> AvailabilityStore<'a> {
         Ok(id)
     }
 
+    /// Return the current credential-scoped snapshot only. This is an
+    /// operator/status read and never falls back to provider- or runtime-wide
+    /// evidence belonging to another credential.
+    pub async fn current_for_credential(
+        &self,
+        credential: &CredentialIdentity,
+    ) -> Result<Option<AvailabilitySnapshot>> {
+        credential.validate()?;
+        let expected_scope = AvailabilityScope::Credential(credential.clone());
+        let key = expected_scope.key()?;
+        let row = sqlx::query("SELECT s.id, c.scope_key, s.evidence FROM orbit_availability_current c JOIN orbit_availability_snapshots s ON s.id=c.snapshot_id WHERE c.scope_key=$1")
+            .bind(&key)
+            .fetch_optional(self.pool)
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let id: String = row.get("id");
+        let stored_scope: String = row.get("scope_key");
+        let snapshot: AvailabilitySnapshot = serde_json::from_value(row.get("evidence"))?;
+        snapshot.validate()?;
+        ensure!(
+            stored_scope == key && snapshot.applies_to == expected_scope && snapshot.id()? == id,
+            "credential availability identity mismatch"
+        );
+        Ok(Some(snapshot))
+    }
+
     pub(crate) async fn record_in_tx(
         tx: &mut Transaction<'_, Postgres>,
         snapshot: &AvailabilitySnapshot,
@@ -780,20 +951,57 @@ impl<'a> AvailabilityStore<'a> {
             AvailabilityScope::Credential(resource.credential.clone()).key()?,
             AvailabilityScope::Runtime(resource.runtime.clone()).key()?,
         ];
-        let rows = sqlx::query("SELECT s.id, s.scope_key, c.scope_key AS current_scope_key, s.evidence FROM orbit_availability_current c JOIN orbit_availability_snapshots s ON s.id=c.snapshot_id WHERE c.scope_key = ANY($1)")
-            .bind(&keys).fetch_all(self.pool).await?;
-        rows.into_iter()
-            .map(|r| {
-                let snapshot: AvailabilitySnapshot = serde_json::from_value(r.get("evidence"))?;
-                ensure!(
-                    snapshot.id()? == r.get::<String, _>("id")
-                        && snapshot.applies_to.key()? == r.get::<String, _>("scope_key")
-                        && snapshot.applies_to.key()? == r.get::<String, _>("current_scope_key")
-                        && snapshot.applies_to.matches(resource),
-                    "availability evidence identity mismatch"
-                );
-                Ok(snapshot)
-            })
-            .collect()
+        let rows = if let Some(catalog_id) = &resource.credential.catalog_id {
+            sqlx::query("SELECT s.id, s.scope_key, c.scope_key AS current_scope_key, s.evidence FROM orbit_availability_current c JOIN orbit_availability_snapshots s ON s.id=c.snapshot_id WHERE c.scope_key = ANY($1) OR (COALESCE(s.evidence #>> '{applies_to,identity,catalog_id}', s.evidence #>> '{applies_to,identity,credential,catalog_id}')=$2 AND COALESCE(s.evidence #>> '{applies_to,identity,generation}', s.evidence #>> '{applies_to,identity,credential,generation}')=$3 AND COALESCE(s.evidence #>> '{applies_to,identity,provider}', s.evidence #>> '{applies_to,identity,credential,provider}')=$4) ORDER BY c.observed_at_ms DESC, c.snapshot_id DESC LIMIT 65")
+                .bind(&keys)
+                .bind(catalog_id)
+                .bind(&resource.credential.generation)
+                .bind(&resource.credential.provider)
+                .fetch_all(self.pool)
+                .await?
+        } else {
+            sqlx::query("SELECT s.id, s.scope_key, c.scope_key AS current_scope_key, s.evidence FROM orbit_availability_current c JOIN orbit_availability_snapshots s ON s.id=c.snapshot_id WHERE c.scope_key = ANY($1)")
+                .bind(&keys)
+                .fetch_all(self.pool)
+                .await?
+        };
+        ensure!(
+            rows.len() <= 64,
+            "availability identity history exceeds bound"
+        );
+        let mut current =
+            std::collections::BTreeMap::<String, (String, AvailabilitySnapshot)>::new();
+        for row in rows {
+            let snapshot: AvailabilitySnapshot = serde_json::from_value(row.get("evidence"))?;
+            let id: String = row.get("id");
+            let scope_key: String = row.get("scope_key");
+            let current_scope_key: String = row.get("current_scope_key");
+            let calculated_scope_key = snapshot.applies_to.key()?;
+            let legacy_catalog_key = snapshot
+                .applies_to
+                .has_catalog_credential()
+                .then(|| legacy_scope_key(&snapshot.applies_to))
+                .transpose()?;
+            let stored_key_matches = scope_key == calculated_scope_key
+                || legacy_catalog_key.as_ref() == Some(&scope_key);
+            ensure!(
+                snapshot.id()? == id
+                    && stored_key_matches
+                    && scope_key == current_scope_key
+                    && snapshot.applies_to.matches(resource),
+                "availability evidence identity mismatch"
+            );
+            let stable_key = stable_scope_key(&snapshot.applies_to)?;
+            let replace = current.get(&stable_key).is_none_or(|(old_id, old)| {
+                (snapshot.observed_at_ms, &id) > (old.observed_at_ms, old_id)
+            });
+            if replace {
+                current.insert(stable_key, (id, snapshot));
+            }
+        }
+        Ok(current
+            .into_values()
+            .map(|(_, snapshot)| snapshot)
+            .collect())
     }
 }

@@ -225,6 +225,7 @@ pub struct CredentialRepresentation {
     pub secret_locator: Option<SecretLocator>,
     pub capabilities: Vec<String>,
     pub runtime_provenance: Option<RuntimeProvenance>,
+    pub enrollment_stage: Option<String>,
     pub last_validated_at_ms: Option<i64>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
@@ -244,6 +245,16 @@ impl CredentialRepresentation {
         if let Some(provenance) = &self.runtime_provenance {
             provenance.validate()?;
         }
+        ensure!(
+            if self.interface == "agy-cli" {
+                self.enrollment_stage
+                    .as_deref()
+                    .is_some_and(valid_agy_enrollment_stage)
+            } else {
+                self.enrollment_stage.is_none()
+            },
+            "invalid representation enrollment stage"
+        );
         ensure!(
             self.secret_locator
                 .is_none_or(|locator| locator.belongs_to(&self.credential_id, self.generation))
@@ -274,6 +285,7 @@ impl CredentialRepresentation {
                 .runtime_provenance
                 .as_ref()
                 .map(RuntimeProvenance::public),
+            enrollment_stage: self.enrollment_stage.clone(),
             has_secret: self.secret_locator.is_some(),
             last_validated_at_ms: self.last_validated_at_ms,
             created_at_ms: self.created_at_ms,
@@ -310,6 +322,7 @@ pub struct RepresentationView {
     pub validation: String,
     pub capabilities: Vec<String>,
     pub runtime_provenance: Option<RuntimeProvenanceView>,
+    pub enrollment_stage: Option<String>,
     pub has_secret: bool,
     pub last_validated_at_ms: Option<i64>,
     pub created_at_ms: i64,
@@ -347,7 +360,57 @@ pub struct CredentialIdentityBindingView {
 }
 
 const CREDENTIAL_COLUMNS: &str = "c.id, c.provider, c.reference, c.current_generation AS generation, c.endpoint, c.auth_type, c.status, g.backend, g.secret_locator, floor(extract(epoch FROM c.created_at)*1000)::bigint AS created_at_ms, floor(extract(epoch FROM c.updated_at)*1000)::bigint AS updated_at_ms";
-const REPRESENTATION_COLUMNS: &str = "id, credential_id, generation, interface, auth_type, state, secret_locator, capabilities, runtime_provenance, floor(extract(epoch FROM last_validated_at)*1000)::bigint AS last_validated_at_ms, floor(extract(epoch FROM created_at)*1000)::bigint AS created_at_ms, floor(extract(epoch FROM updated_at)*1000)::bigint AS updated_at_ms";
+const REPRESENTATION_COLUMNS: &str = "id, credential_id, generation, interface, auth_type, state, secret_locator, capabilities, runtime_provenance, enrollment_stage, floor(extract(epoch FROM last_validated_at)*1000)::bigint AS last_validated_at_ms, floor(extract(epoch FROM created_at)*1000)::bigint AS created_at_ms, floor(extract(epoch FROM updated_at)*1000)::bigint AS updated_at_ms";
+
+fn valid_agy_enrollment_stage(stage: &str) -> bool {
+    matches!(
+        stage,
+        "legacy_unknown"
+            | "prepared"
+            | "login_started"
+            | "login_completed"
+            | "token_captured"
+            | "secret_persisted"
+            | "validation_started"
+            | "validation_succeeded"
+            | "validated"
+    )
+}
+
+fn valid_agy_enrollment_transition(from: &str, to: &str) -> bool {
+    match to {
+        // A retry may restart login after a prior interactive session ended,
+        // or continue it if the process completed before the stage write.
+        "login_started" => matches!(
+            from,
+            "prepared" | "legacy_unknown" | "login_started" | "login_completed"
+        ),
+        "login_completed" => matches!(from, "login_started" | "login_completed"),
+        "token_captured" => matches!(from, "login_completed" | "token_captured"),
+        // The artifact can exist even if the process stopped before recording
+        // its publication stage, so recovery may advance from any pre-validation
+        // state once SecretBackend existence has been checked.
+        "secret_persisted" => matches!(
+            from,
+            "prepared"
+                | "legacy_unknown"
+                | "login_started"
+                | "login_completed"
+                | "token_captured"
+                | "secret_persisted"
+                | "validation_started"
+                | "validation_succeeded"
+        ),
+        "validation_started" => matches!(
+            from,
+            "secret_persisted" | "validation_started" | "validation_succeeded"
+        ),
+        "validation_succeeded" => {
+            matches!(from, "validation_started" | "validation_succeeded")
+        }
+        _ => false,
+    }
+}
 
 fn decode_credential(row: PgRow) -> Result<Credential> {
     let locator: Option<String> = row.get("secret_locator");
@@ -370,25 +433,90 @@ fn decode_credential(row: PgRow) -> Result<Credential> {
 
 fn decode_representation(row: PgRow) -> Result<CredentialRepresentation> {
     let locator: Option<String> = row.get("secret_locator");
+    let interface: String = row.get("interface");
+    let runtime_provenance: Option<serde_json::Value> = row.get("runtime_provenance");
     let representation = CredentialRepresentation {
         id: row.get("id"),
         credential_id: row.get("credential_id"),
         generation: row.get::<i64, _>("generation") as u64,
-        interface: row.get("interface"),
+        interface: interface.clone(),
         auth_type: row.get("auth_type"),
         state: RepresentationState::parse(row.get("state"))?,
         secret_locator: locator.as_deref().map(SecretLocator::parse).transpose()?,
         capabilities: row.get("capabilities"),
-        runtime_provenance: row
-            .get::<Option<serde_json::Value>, _>("runtime_provenance")
-            .map(serde_json::from_value)
-            .transpose()?,
+        runtime_provenance: decode_runtime_provenance(runtime_provenance, &interface)?,
+        enrollment_stage: row.get("enrollment_stage"),
         last_validated_at_ms: row.get("last_validated_at_ms"),
         created_at_ms: row.get("created_at_ms"),
         updated_at_ms: row.get("updated_at_ms"),
     };
     representation.validate()?;
     Ok(representation)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyBinaryProvenance {
+    binary: String,
+    version: String,
+    sha256: String,
+    provenance: String,
+}
+
+/// Decode legacy provenance written before the catalog switched from a runtime
+/// executable field to a logical artifact label. The reviewed runtime identity
+/// is checked for the interface, and the path is normalized away before it can
+/// reach operator output. Unknown legacy shapes fail closed.
+fn decode_runtime_provenance(
+    value: Option<serde_json::Value>,
+    interface: &str,
+) -> Result<Option<RuntimeProvenance>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value
+        .as_object()
+        .is_some_and(|object| object.contains_key("binary"))
+    {
+        let legacy: LegacyBinaryProvenance =
+            serde_json::from_value(value).context("legacy runtime provenance is malformed")?;
+        let (artifact, version, sha256) = match interface {
+            crate::codex_credential_enrollment::CODEX_INTERFACE => {
+                ensure!(
+                    legacy.binary == crate::codex_credential_enrollment::CODEX_BINARY,
+                    "legacy runtime provenance does not match a reviewed pinned artifact"
+                );
+                (
+                    crate::codex_credential_enrollment::CODEX_ARTIFACT,
+                    crate::codex_credential_enrollment::CODEX_VERSION,
+                    crate::codex_credential_enrollment::CODEX_BINARY_SHA256,
+                )
+            }
+            crate::agy_cli_representation::AGY_CLI_INTERFACE => (
+                crate::agy_cli_representation::AGY_CLI_ARTIFACT,
+                crate::agy_cli_representation::AGY_CLI_VERSION,
+                crate::agy_cli_representation::AGY_CLI_SHA256,
+            ),
+            _ => anyhow::bail!("legacy runtime provenance is unsupported for this interface"),
+        };
+        ensure!(
+            !legacy.binary.trim().is_empty()
+                && legacy.version == version
+                && legacy.sha256 == sha256,
+            "legacy runtime provenance does not match a reviewed pinned artifact"
+        );
+        let normalized = RuntimeProvenance {
+            artifact: artifact.to_owned(),
+            version: legacy.version,
+            sha256: legacy.sha256,
+            provenance: legacy.provenance,
+        };
+        normalized.validate()?;
+        return Ok(Some(normalized));
+    }
+    let provenance: RuntimeProvenance = serde_json::from_value(value)?;
+    provenance.validate()?;
+    Ok(Some(provenance))
 }
 
 pub struct CredentialStore<'a> {
@@ -424,6 +552,65 @@ impl<'a> CredentialStore<'a> {
         self.get(reference)
             .await?
             .context("created credential missing")
+    }
+
+    /// Change only the operator-facing reference. Credential UUID, generations,
+    /// representations, locators, and evidence remain attached to this row.
+    pub async fn rename(&self, old_reference: &str, new_reference: &str) -> Result<Credential> {
+        ensure!(
+            logical(old_reference) && logical(new_reference),
+            "invalid credential reference"
+        );
+        let mut tx = self.pool.begin().await?;
+        let source = sqlx::query(
+            "SELECT id FROM orbit_credentials WHERE scope_key=$1 AND reference=$2 FOR UPDATE",
+        )
+        .bind(CONTROL_SCOPE)
+        .bind(old_reference)
+        .fetch_optional(&mut *tx)
+        .await?
+        .context("credential not found")?;
+        let credential_id: String = source.get("id");
+
+        if old_reference == new_reference {
+            tx.commit().await?;
+            return self
+                .get(old_reference)
+                .await?
+                .context("renamed credential missing");
+        }
+
+        let target_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM orbit_credentials WHERE scope_key=$1 AND reference=$2)",
+        )
+        .bind(CONTROL_SCOPE)
+        .bind(new_reference)
+        .fetch_one(&mut *tx)
+        .await?;
+        ensure!(!target_exists, "credential reference already exists");
+
+        let update = sqlx::query(
+            "UPDATE orbit_credentials SET reference=$2, updated_at=clock_timestamp() WHERE id=$1",
+        )
+        .bind(&credential_id)
+        .bind(new_reference)
+        .execute(&mut *tx)
+        .await;
+        if let Err(error) = update {
+            if error
+                .as_database_error()
+                .and_then(|database| database.code())
+                .as_deref()
+                == Some("23505")
+            {
+                anyhow::bail!("credential reference already exists");
+            }
+            return Err(error.into());
+        }
+        tx.commit().await?;
+        self.get(new_reference)
+            .await?
+            .context("renamed credential missing")
     }
 
     pub async fn get(&self, reference: &str) -> Result<Option<Credential>> {
@@ -655,7 +842,7 @@ impl<'a> CredentialStore<'a> {
         let representation_id = id();
         let locator = SecretLocator::new(&credential_id, generation as u64, &representation_id)?;
         let provenance = runtime_provenance.map(serde_json::to_value).transpose()?;
-        sqlx::query("INSERT INTO orbit_credential_representations(id, credential_id, generation, interface, auth_type, state, secret_locator, capabilities, runtime_provenance) VALUES($1,$2,$3,$4,$5,'pending',$6,$7,$8)")
+        sqlx::query("INSERT INTO orbit_credential_representations(id, credential_id, generation, interface, auth_type, state, secret_locator, capabilities, runtime_provenance, enrollment_stage) VALUES($1,$2,$3,$4,$5,'pending',$6,$7,$8,CASE WHEN $4='agy-cli' THEN 'prepared' ELSE NULL END)")
             .bind(&representation_id).bind(&credential_id).bind(generation).bind(interface).bind(auth_type).bind(locator.encode()).bind(capabilities).bind(provenance)
             .execute(&mut *tx).await?;
         tx.commit().await?;
@@ -675,6 +862,37 @@ impl<'a> CredentialStore<'a> {
             .await?
             .map(decode_representation)
             .transpose()
+    }
+
+    /// Record only the last completed agy enrollment stage. Values contain no
+    /// auth material, locator, or host path and make interrupted enrollment
+    /// recoverable without guessing which phase completed.
+    pub async fn set_agy_enrollment_stage(
+        &self,
+        representation_id: &str,
+        stage: &str,
+    ) -> Result<()> {
+        ensure!(
+            valid_agy_enrollment_stage(stage) && stage != "legacy_unknown" && stage != "validated",
+            "invalid agy enrollment stage transition"
+        );
+        let mut tx = self.pool.begin().await?;
+        let current: Option<String> = sqlx::query_scalar("SELECT r.enrollment_stage FROM orbit_credential_representations r JOIN orbit_credentials c ON r.credential_id=c.id WHERE r.id=$1 AND r.interface='agy-cli' AND r.generation=c.current_generation AND c.status='enrolled' AND r.state IN ('pending','stored') AND r.last_validated_at IS NULL FOR UPDATE OF r")
+            .bind(representation_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let current = current.context("agy representation stage could not be updated")?;
+        ensure!(
+            valid_agy_enrollment_transition(&current, stage),
+            "invalid agy enrollment stage transition"
+        );
+        sqlx::query("UPDATE orbit_credential_representations SET enrollment_stage=$2, updated_at=clock_timestamp() WHERE id=$1")
+            .bind(representation_id)
+            .bind(stage)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Backend I/O completes before the database row lock is taken. Retrying
@@ -744,14 +962,14 @@ impl<'a> CredentialStore<'a> {
         );
         let was_validated: bool = row.get("was_validated");
         if state == "pending" {
-            sqlx::query("UPDATE orbit_credential_representations SET state='stored', last_validated_at=CASE WHEN $2 THEN clock_timestamp() ELSE NULL END, updated_at=clock_timestamp() WHERE id=$1")
+            sqlx::query("UPDATE orbit_credential_representations SET state='stored', last_validated_at=CASE WHEN $2 THEN clock_timestamp() ELSE NULL END, enrollment_stage=CASE WHEN interface='agy-cli' AND $2 THEN 'validated' ELSE enrollment_stage END, updated_at=clock_timestamp() WHERE id=$1")
                 .bind(representation_id).bind(validated).execute(&mut *tx).await?;
             sqlx::query("UPDATE orbit_credential_generations SET state='enrolled', secret_locator=COALESCE(secret_locator,$3) WHERE credential_id=$1 AND generation=$2")
                 .bind(&prepared.credential_id).bind(generation).bind(locator.encode()).execute(&mut *tx).await?;
             sqlx::query("UPDATE orbit_credentials SET status='enrolled', updated_at=clock_timestamp() WHERE id=$1")
                 .bind(&prepared.credential_id).execute(&mut *tx).await?;
         } else if validated && !was_validated {
-            sqlx::query("UPDATE orbit_credential_representations SET last_validated_at=clock_timestamp(), updated_at=clock_timestamp() WHERE id=$1")
+            sqlx::query("UPDATE orbit_credential_representations SET last_validated_at=clock_timestamp(), enrollment_stage=CASE WHEN interface='agy-cli' THEN 'validated' ELSE enrollment_stage END, updated_at=clock_timestamp() WHERE id=$1")
                 .bind(representation_id).execute(&mut *tx).await?;
         }
         tx.commit().await?;
@@ -895,5 +1113,139 @@ impl<'a> CredentialStore<'a> {
     /// policy must remove private files; callers cannot reuse the reference.
     pub async fn delete(&self, reference: &str) -> Result<Credential> {
         self.revoke(reference).await
+    }
+}
+
+#[cfg(test)]
+mod provenance_compatibility_tests {
+    use super::{decode_runtime_provenance, valid_agy_enrollment_transition};
+    use serde_json::json;
+
+    #[test]
+    fn exact_legacy_codex_provenance_is_normalized_without_exposing_binary_path()
+    -> anyhow::Result<()> {
+        let legacy = json!({
+            "binary": crate::codex_credential_enrollment::CODEX_BINARY,
+            "version": crate::codex_credential_enrollment::CODEX_VERSION,
+            "sha256": crate::codex_credential_enrollment::CODEX_BINARY_SHA256,
+            "provenance": "pinned-build",
+        });
+        let decoded = decode_runtime_provenance(
+            Some(legacy),
+            crate::codex_credential_enrollment::CODEX_INTERFACE,
+        )?
+        .expect("legacy provenance is present");
+        assert_eq!(
+            decoded.artifact,
+            crate::codex_credential_enrollment::CODEX_ARTIFACT
+        );
+        let public = serde_json::to_string(&decoded)?;
+        assert!(!public.contains(crate::codex_credential_enrollment::CODEX_BINARY));
+        assert!(!public.contains("binary"));
+        assert!(public.contains(crate::codex_credential_enrollment::CODEX_BINARY_SHA256));
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_binary_provenance_fails_closed_for_other_paths_or_interfaces() {
+        let legacy = || {
+            json!({
+                "binary": "/operator/unreviewed/codex",
+                "version": crate::codex_credential_enrollment::CODEX_VERSION,
+                "sha256": crate::codex_credential_enrollment::CODEX_BINARY_SHA256,
+                "provenance": "pinned-build",
+            })
+        };
+        let error = decode_runtime_provenance(
+            Some(legacy()),
+            crate::codex_credential_enrollment::CODEX_INTERFACE,
+        )
+        .expect_err("unreviewed runtime path rejected");
+        assert!(!error.to_string().contains("/operator/"));
+        assert!(decode_runtime_provenance(Some(legacy()), "agy-cli").is_err());
+    }
+
+    #[test]
+    fn exact_legacy_agy_provenance_is_normalized_without_exposing_binary_path() -> anyhow::Result<()>
+    {
+        let legacy = json!({
+            "binary": "/private/runtime/location/agy",
+            "version": crate::agy_cli_representation::AGY_CLI_VERSION,
+            "sha256": crate::agy_cli_representation::AGY_CLI_SHA256,
+            "provenance": "operator-supplied",
+        });
+        let decoded = decode_runtime_provenance(
+            Some(legacy),
+            crate::agy_cli_representation::AGY_CLI_INTERFACE,
+        )?
+        .expect("legacy provenance is present");
+        assert_eq!(
+            decoded.artifact,
+            crate::agy_cli_representation::AGY_CLI_ARTIFACT
+        );
+        let public = serde_json::to_string(&decoded)?;
+        assert!(!public.contains("/private/runtime/location"));
+        assert!(!public.contains("binary"));
+        assert!(public.contains(crate::agy_cli_representation::AGY_CLI_SHA256));
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_agy_provenance_requires_exact_pinned_identity() {
+        let legacy = json!({
+            "binary": "/private/runtime/location/agy",
+            "version": crate::agy_cli_representation::AGY_CLI_VERSION,
+            "sha256": "unreviewed",
+            "provenance": "operator-supplied",
+        });
+        let error = decode_runtime_provenance(
+            Some(legacy),
+            crate::agy_cli_representation::AGY_CLI_INTERFACE,
+        )
+        .expect_err("unreviewed runtime identity rejected");
+        assert!(!error.to_string().contains("/private/runtime/location"));
+    }
+
+    #[test]
+    fn agy_enrollment_stage_transitions_allow_recovery_but_reject_skips() {
+        assert!(valid_agy_enrollment_transition("prepared", "login_started"));
+        assert!(valid_agy_enrollment_transition(
+            "login_completed",
+            "token_captured"
+        ));
+        assert!(valid_agy_enrollment_transition(
+            "token_captured",
+            "secret_persisted"
+        ));
+        assert!(valid_agy_enrollment_transition(
+            "legacy_unknown",
+            "secret_persisted"
+        ));
+        assert!(valid_agy_enrollment_transition(
+            "validation_started",
+            "secret_persisted"
+        ));
+        assert!(valid_agy_enrollment_transition(
+            "secret_persisted",
+            "validation_started"
+        ));
+        assert!(valid_agy_enrollment_transition(
+            "validation_started",
+            "validation_succeeded"
+        ));
+
+        assert!(!valid_agy_enrollment_transition(
+            "prepared",
+            "validation_succeeded"
+        ));
+        assert!(!valid_agy_enrollment_transition(
+            "login_started",
+            "token_captured"
+        ));
+        assert!(!valid_agy_enrollment_transition(
+            "validated",
+            "login_started"
+        ));
+        assert!(!valid_agy_enrollment_transition("prepared", "validated"));
     }
 }

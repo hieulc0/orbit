@@ -24,6 +24,7 @@ pub mod container;
 pub mod continuation;
 pub mod credential_enrollment;
 pub mod credential_registry;
+pub mod credential_status_view;
 pub mod engine;
 pub mod evidence;
 pub mod execution;

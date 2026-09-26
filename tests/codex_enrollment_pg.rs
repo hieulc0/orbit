@@ -106,6 +106,19 @@ async fn codex_enrollment_is_cataloged_secret_free_and_generation_scoped() -> Re
         )
         .await
         .is_err());
+        let staged_failure = orbit::codex_credential_enrollment::registered_auth_diagnostic(
+            &engine.pool,
+            &backend,
+            "codex-enrollment-test",
+        )
+        .await
+        .expect_err("rotated credential cannot stage its retired representation");
+        assert_eq!(
+            staged_failure,
+            orbit::codex_credential_enrollment::CredentialStagingFailure::GenerationUnavailable
+        );
+        assert!(!staged_failure.to_string().contains("credential://"));
+        assert!(!staged_failure.to_string().contains(home.path().to_string_lossy().as_ref()));
         assert!(backend.exists(locator).await?);
         engine.pool.close().await;
         Ok::<_, anyhow::Error>(())

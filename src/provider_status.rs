@@ -9,8 +9,9 @@ use crate::agy_usage_schema::{
 };
 use crate::availability::{
     AvailabilityScope, AvailabilitySnapshot, AvailabilityState, EvidenceConfidence, EvidenceSource,
-    ExecutionResourceIdentity, ProviderQuotaGroup, ProviderQuotaGroupIdentityBasis,
-    ProviderQuotaMember, QuotaBucket, QuotaBucketWindow, QuotaWindow,
+    ExecutionResourceIdentity, ProviderIdentityValueComparison, ProviderQuotaGroup,
+    ProviderQuotaGroupIdentityBasis, ProviderQuotaMember, ProviderScopeEvidenceState,
+    ProviderStatusObservation, QuotaBucket, QuotaBucketWindow, QuotaEvidencePromotion, QuotaWindow,
 };
 use crate::continuation::TerminationReason;
 use crate::model::digest;
@@ -50,6 +51,71 @@ pub struct AntigravityUsageCapture {
     pub normalization_ready: bool,
     pub group_metadata_ready: bool,
     pub membership_ready: bool,
+}
+
+/// Value-free result of parsing Codex rate-limit data before account-scope
+/// promotion. This lets operators distinguish provider data from trusted,
+/// credential-bound availability without retaining provider identifiers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexRateLimitObservationState {
+    Observed,
+    NoUsableWindows,
+    UnsupportedShape,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct CodexRateLimitObservation {
+    pub state: CodexRateLimitObservationState,
+    pub bucket_count: usize,
+    pub window_count: usize,
+    pub legacy_map_identity_relation: CodexLimitIdentityRelation,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexLimitIdentityRelation {
+    LegacyOnly,
+    MapOnly,
+    ExactMatch,
+    ExactMismatch,
+    #[default]
+    NotComparable,
+}
+
+struct ParsedCodexRateLimits {
+    ordinary_usage_allowed: Option<bool>,
+    quota_windows: Vec<QuotaWindow>,
+    quota_buckets: Vec<QuotaBucket>,
+    legacy_map_identity_relation: CodexLimitIdentityRelation,
+}
+
+/// Parse provider rate-limit data without treating the observed account ID as
+/// confirmed. The result contains counts only; provider IDs and measured values
+/// are not included in the diagnostic representation.
+pub fn codex_rate_limits_observation(
+    resource: &ExecutionResourceIdentity,
+    value: &Value,
+) -> CodexRateLimitObservation {
+    let parsed = parse_codex_rate_limits(resource, value);
+    match parsed {
+        Ok(parsed) => CodexRateLimitObservation {
+            state: if parsed.quota_windows.is_empty() {
+                CodexRateLimitObservationState::NoUsableWindows
+            } else {
+                CodexRateLimitObservationState::Observed
+            },
+            bucket_count: parsed.quota_buckets.len(),
+            window_count: parsed.quota_windows.len(),
+            legacy_map_identity_relation: parsed.legacy_map_identity_relation,
+        },
+        Err(()) => CodexRateLimitObservation {
+            state: CodexRateLimitObservationState::UnsupportedShape,
+            bucket_count: 0,
+            window_count: 0,
+            legacy_map_identity_relation: CodexLimitIdentityRelation::NotComparable,
+        },
+    }
 }
 
 impl AntigravityUsageCapture {
@@ -95,6 +161,7 @@ impl AntigravityUsageCapture {
             source_revision: ANTIGRAVITY_USAGE_REVISION.into(),
             evidence_digest,
             provider_observed_at_ms: None,
+            provider_status_observation: None,
         };
         snapshot.validate()?;
         Ok(snapshot)
@@ -434,6 +501,7 @@ fn extract_antigravity_buckets(
             windows.sort_by(|left, right| left.provider_window_id.cmp(&right.provider_window_id));
             QuotaBucket {
                 provider_bucket_fingerprint,
+                provider_label: None,
                 scope: None,
                 windows,
             }
@@ -844,8 +912,11 @@ fn days_from_civil(year: i32, month: i32, day: i32) -> Option<i64> {
 /// expected-ID equality or equality of a provider-scope fingerprint against a
 /// previously confirmed durable credential-generation binding. Only then may
 /// it pass the observed raw ID as `expected_account_id`; an unconfirmed first
-/// observation must pass no expected ID. Missing or mismatched identity yields
-/// UNKNOWN and discards all quota facts.
+/// observation passes no expected ID. Safe quota windows are normalized either
+/// way; absent/mismatched identity keeps state and confidence UNKNOWN. The raw
+/// ID and opaque limit IDs are discarded after fingerprinting. The separate
+/// `codex_rate_limits_observation` reports bounded counts and the legacy/map
+/// identity relation without values.
 pub fn codex_rate_limits_snapshot(
     resource: &ExecutionResourceIdentity,
     expected_account_id: &str,
@@ -879,12 +950,10 @@ pub fn codex_rate_limits_snapshot(
             }
         ),
         provider_observed_at_ms: None,
+        provider_status_observation: None,
     };
     snapshot.validate()?;
-    if result_bytes.len() > MAX_STATUS_BYTES
-        || expected_account_id.is_empty()
-        || expected_account_id.len() > 256
-    {
+    if result_bytes.len() > MAX_STATUS_BYTES {
         return Ok(snapshot);
     }
     let Ok(value) = serde_json::from_slice::<Value>(result_bytes) else {
@@ -898,76 +967,179 @@ pub fn codex_rate_limits_snapshot(
     if body.contains_key("version") || body.contains_key("schemaVersion") {
         return Ok(snapshot);
     }
-    let Some(account_id) = body.get("accountId").and_then(Value::as_str) else {
+    let Ok(parsed) = parse_codex_rate_limits(resource, &value) else {
         return Ok(snapshot);
     };
-    if account_id.is_empty() || account_id.len() > 256 || account_id != expected_account_id {
-        return Ok(snapshot);
+    let account_id = body.get("accountId").and_then(Value::as_str);
+    let valid_account_id = account_id.is_some_and(|id| {
+        !id.is_empty() && id.len() <= 256 && id.trim() == id && !id.chars().any(char::is_control)
+    });
+    let scope_matches = valid_account_id
+        && !expected_account_id.is_empty()
+        && expected_account_id.len() <= 256
+        && account_id == Some(expected_account_id);
+    let has_quota = !parsed.quota_buckets.is_empty() || !parsed.quota_windows.is_empty();
+    if scope_matches {
+        snapshot.confidence = EvidenceConfidence::AuthoritativeNative;
+        // Account-wide permission is not model-specific availability. Even
+        // READY here cannot establish READY for an exact candidate.
+        snapshot.state = match parsed.ordinary_usage_allowed {
+            Some(true) => AvailabilityState::Ready,
+            Some(false) => AvailabilityState::Limited,
+            None => AvailabilityState::Unknown,
+        };
     }
-    let allowed = match body.get("ordinaryUsageAllowed") {
+    snapshot.quota_windows = parsed.quota_windows;
+    snapshot.quota_buckets = parsed.quota_buckets;
+    snapshot.provider_status_observation = Some(ProviderStatusObservation {
+        scope_state: if scope_matches {
+            ProviderScopeEvidenceState::Confirmed
+        } else if valid_account_id {
+            ProviderScopeEvidenceState::Unconfirmed
+        } else {
+            ProviderScopeEvidenceState::Unbound
+        },
+        identity_value_comparison: ProviderIdentityValueComparison::NotComparable,
+        quota_promotion: if has_quota && scope_matches {
+            QuotaEvidencePromotion::Promoted
+        } else if has_quota {
+            QuotaEvidencePromotion::ObservedUnconfirmed
+        } else {
+            QuotaEvidencePromotion::NoUsableQuota
+        },
+        ordinary_usage_allowed: parsed.ordinary_usage_allowed,
+    });
+    snapshot.validate()?;
+    Ok(snapshot)
+}
+
+fn parse_codex_rate_limits(
+    resource: &ExecutionResourceIdentity,
+    value: &Value,
+) -> std::result::Result<ParsedCodexRateLimits, ()> {
+    let body = value.as_object().ok_or(())?;
+    if body.contains_key("version") || body.contains_key("schemaVersion") {
+        return Err(());
+    }
+    let ordinary_usage_allowed = match body.get("ordinaryUsageAllowed") {
         Some(Value::Bool(value)) => Some(*value),
+        Some(Value::Null) | None | Some(_) => None,
+    };
+    let default = match body.get("rateLimits") {
+        Some(Value::Object(object)) => Some(object),
         Some(Value::Null) | None => None,
-        _ => return Ok(snapshot),
+        Some(_) => return Err(()),
     };
-    let Some(default) = body.get("rateLimits").and_then(Value::as_object) else {
-        return Ok(snapshot);
+    let by_limit_id = match body.get("rateLimitsByLimitId") {
+        Some(Value::Object(object)) if object.len() <= MAX_BUCKETS => Some(object),
+        Some(Value::Object(_)) => return Err(()),
+        Some(Value::Null) | None => None,
+        Some(_) => return Err(()),
     };
-    let mut windows = Vec::new();
-    let mut quota_buckets = Vec::new();
-    match body.get("rateLimitsByLimitId") {
-        Some(Value::Object(buckets)) if !buckets.is_empty() => {
-            if buckets.len() > MAX_BUCKETS {
-                return Ok(snapshot);
+
+    let legacy_map_identity_relation = match (default, by_limit_id.filter(|map| !map.is_empty())) {
+        (Some(legacy), Some(map)) => match legacy.get("limitId").and_then(Value::as_str) {
+            Some(legacy_id) if map.contains_key(legacy_id) => {
+                CodexLimitIdentityRelation::ExactMatch
             }
-            for (key, bucket) in buckets {
-                let Some(bucket) = bucket.as_object() else {
-                    return Ok(snapshot);
-                };
-                if bucket.get("limitId").and_then(Value::as_str) != Some(key.as_str()) {
-                    return Ok(snapshot);
-                }
-                if key.is_empty() || key.len() > 256 || key.chars().any(char::is_control) {
-                    return Ok(snapshot);
-                }
-                let label = format!("bucket.{}", digest(key.as_bytes()));
-                let Some(parsed) = parse_windows(bucket) else {
-                    return Ok(snapshot);
-                };
-                windows.extend(project_legacy_windows(&parsed, &label));
-                quota_buckets.push(QuotaBucket {
-                    provider_bucket_fingerprint: format!(
-                        "qb1:{}",
-                        digest(&serde_json::to_vec(&(
+            Some(_) => CodexLimitIdentityRelation::ExactMismatch,
+            None => CodexLimitIdentityRelation::NotComparable,
+        },
+        (Some(_), None) => CodexLimitIdentityRelation::LegacyOnly,
+        (None, Some(_)) => CodexLimitIdentityRelation::MapOnly,
+        (None, None) => CodexLimitIdentityRelation::NotComparable,
+    };
+
+    let mut quota_windows = Vec::new();
+    let mut quota_buckets = Vec::new();
+    if let Some(buckets) = by_limit_id.filter(|buckets| !buckets.is_empty()) {
+        for (key, bucket) in buckets {
+            let bucket = bucket.as_object().ok_or(())?;
+            if bucket.get("limitId").and_then(Value::as_str) != Some(key.as_str())
+                || key.is_empty()
+                || key.len() > 256
+                || key.chars().any(char::is_control)
+            {
+                return Err(());
+            }
+            let parsed = parse_windows(bucket).ok_or(())?;
+            let provider_label = parse_codex_limit_name(bucket).ok_or(())?;
+            let label = format!("bucket.{}", digest(key.as_bytes()));
+            quota_windows.extend(project_legacy_windows(&parsed, &label));
+            quota_buckets.push(QuotaBucket {
+                provider_bucket_fingerprint: format!(
+                    "qb1:{}",
+                    digest(
+                        &serde_json::to_vec(&(
                             "orbit.provider_quota_bucket.v1",
                             resource.credential.provider.as_str(),
                             key.as_str()
-                        ))?)
-                    ),
-                    scope: None,
-                    windows: parsed,
-                });
+                        ))
+                        .map_err(|_| ())?
+                    )
+                ),
+                provider_label,
+                scope: None,
+                windows: parsed,
+            });
+        }
+    } else if let Some(default) = default {
+        let parsed = parse_windows(default).ok_or(())?;
+        let provider_label = parse_codex_limit_name(default).ok_or(())?;
+        if let Some(limit_id) = default.get("limitId").and_then(Value::as_str) {
+            if limit_id.is_empty()
+                || limit_id.len() > 256
+                || limit_id.trim() != limit_id
+                || limit_id.chars().any(char::is_control)
+            {
+                return Err(());
             }
+            let label = format!("bucket.{}", digest(limit_id.as_bytes()));
+            quota_windows = project_legacy_windows(&parsed, &label);
+            quota_buckets.push(QuotaBucket {
+                provider_bucket_fingerprint: format!(
+                    "qb1:{}",
+                    digest(
+                        &serde_json::to_vec(&(
+                            "orbit.provider_quota_bucket.v1",
+                            resource.credential.provider.as_str(),
+                            limit_id
+                        ))
+                        .map_err(|_| ())?
+                    )
+                ),
+                provider_label,
+                scope: None,
+                windows: parsed,
+            });
+        } else {
+            quota_windows = project_legacy_windows(&parsed, "default");
         }
-        Some(Value::Null) | None | Some(Value::Object(_)) => {
-            let Some(parsed) = parse_windows(default) else {
-                return Ok(snapshot);
-            };
-            windows = project_legacy_windows(&parsed, "default");
-        }
-        _ => return Ok(snapshot),
     }
-    snapshot.confidence = EvidenceConfidence::AuthoritativeNative;
-    // Account-wide permission is not model-specific availability. Even READY
-    // here cannot establish READY for an exact candidate in effective_at.
-    snapshot.state = match allowed {
-        Some(true) => AvailabilityState::Ready,
-        Some(false) => AvailabilityState::Limited,
-        None => AvailabilityState::Unknown,
-    };
-    snapshot.quota_windows = windows;
-    snapshot.quota_buckets = quota_buckets;
-    snapshot.validate()?;
-    Ok(snapshot)
+
+    Ok(ParsedCodexRateLimits {
+        ordinary_usage_allowed,
+        quota_windows,
+        quota_buckets,
+        legacy_map_identity_relation,
+    })
+}
+
+fn parse_codex_limit_name(bucket: &serde_json::Map<String, Value>) -> Option<Option<String>> {
+    match bucket.get("limitName") {
+        None | Some(Value::Null) => Some(None),
+        Some(Value::String(value))
+            if !value.is_empty()
+                && value.len() <= 128
+                && value.trim() == value
+                && !value.chars().any(char::is_control)
+                && !value.contains('@')
+                && !value.contains("://") =>
+        {
+            Some(Some(value.clone()))
+        }
+        _ => None,
+    }
 }
 
 fn parse_windows(bucket: &serde_json::Map<String, Value>) -> Option<Vec<QuotaBucketWindow>> {
@@ -985,16 +1157,17 @@ fn parse_windows(bucket: &serde_json::Map<String, Value>) -> Option<Vec<QuotaBuc
             return None;
         }
         let duration_minutes = optional_positive_i64(object.get("windowDurationMins"))?;
-        let resets_at_ms = match optional_positive_i64(object.get("resetsAt"))? {
+        let resets_at_ms = match optional_nonnegative_i64(object.get("resetsAt"))? {
             Some(seconds) => Some(seconds.checked_mul(1000)?),
             None => None,
         };
+        let remaining_percent = 100.0 - used_percent;
         windows.push(QuotaBucketWindow {
             provider_window_id: name.to_owned(),
             duration_minutes,
             used_percent: Some(used_percent),
-            remaining_percent: None,
-            remaining_fraction: None,
+            remaining_percent: Some(remaining_percent),
+            remaining_fraction: Some(remaining_percent / 100.0),
             resets_at_ms,
             provider_reset_time: None,
             exhausted: None,
@@ -1021,6 +1194,14 @@ fn optional_positive_i64(value: Option<&Value>) -> Option<Option<i64>> {
     match value {
         None | Some(Value::Null) => Some(None),
         Some(Value::Number(value)) => value.as_i64().filter(|v| *v > 0).map(Some),
+        _ => None,
+    }
+}
+
+fn optional_nonnegative_i64(value: Option<&Value>) -> Option<Option<i64>> {
+    match value {
+        None | Some(Value::Null) => Some(None),
+        Some(Value::Number(value)) => value.as_i64().filter(|v| *v >= 0).map(Some),
         _ => None,
     }
 }
@@ -1061,6 +1242,7 @@ pub fn execution_result_snapshot(
             ))?)
         ),
         provider_observed_at_ms: None,
+        provider_status_observation: None,
     };
     snapshot.validate()?;
     Ok(Some(snapshot))

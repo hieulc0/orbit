@@ -11,11 +11,20 @@ use crate::{
     acp_runtime::{Adapter, AgentNetwork, AuthStore, Launch, Runtime},
     acp_wire::{StreamClosed, Wire},
     agent::{Binding, Budget},
-    availability::{AvailabilitySnapshot, ExecutionResourceIdentity},
-    codex_credential_enrollment::{clear_staged_auth_json, registered_auth, stage_auth_json},
+    agy_usage_schema::{FieldClassification, classify_field_name},
+    availability::{
+        AvailabilitySnapshot, ExecutionResourceIdentity, ProviderIdentityValueComparison,
+        ProviderScopeEvidenceState, QuotaEvidencePromotion,
+    },
+    codex_credential_enrollment::{
+        CredentialStagingFailure, clear_staged_auth_json, registered_auth_diagnostic,
+        stage_auth_json,
+    },
     credential_registry::CredentialStore,
     provider_scope::fingerprint,
-    provider_status::codex_rate_limits_snapshot,
+    provider_status::{
+        CodexRateLimitObservation, codex_rate_limits_observation, codex_rate_limits_snapshot,
+    },
     secret_backend::SecretBackend,
 };
 use anyhow::{Context, Result, ensure};
@@ -23,6 +32,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs,
     os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
     path::{Component, Path, PathBuf},
@@ -33,6 +43,12 @@ use std::{
 const MAX_WIRE_BYTES: u64 = 65_536;
 const MAX_NOTIFICATIONS: usize = 8;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_CODEX_SCHEMA_NODES: usize = 192;
+const MAX_CODEX_SCHEMA_DEPTH: usize = 12;
+const MAX_CODEX_SCHEMA_KEYS: usize = 64;
+const MAX_CODEX_SCHEMA_ARRAY_ITEMS: usize = 16;
+const MAX_CODEX_SCHEMA_PATHS: usize = 128;
+const MAX_CODEX_SCHEMA_OUTPUT_BYTES: usize = 16_384;
 
 /// Construct the fixed, previously qualified Codex status runtime identity for
 /// a catalog credential. The catalog-backed probe stages SecretBackend data
@@ -142,8 +158,10 @@ pub struct ProbeReceipt {
     pub authenticated_account_present: bool,
     pub status_request_sent: bool,
     pub correlated_status_response: bool,
-    /// Exact match to the private operator-supplied ID or confirmed fingerprint.
-    /// `account/read` has no documented matching field.
+    /// Exact in-memory equality between the two reviewed status identity fields.
+    /// Raw account IDs are discarded before this receipt is returned.
+    pub account_identity_value_comparison: ProviderIdentityValueComparison,
+    /// Match to the private operator-supplied ID or confirmed fingerprint.
     pub account_scope_matched: bool,
     pub model_thread_created: bool,
     pub model_turn_started: bool,
@@ -152,6 +170,148 @@ pub struct ProbeReceipt {
     pub broker_terminal_callbacks: u8,
     pub repository_effects: u8,
     pub cleanup_confirmed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_read_schema: Option<Box<CodexResponseSchemaSummary>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limits_schema: Option<Box<CodexResponseSchemaSummary>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota_observation: Option<CodexRateLimitObservation>,
+}
+
+/// Bounded type/path metadata only. Dynamic `rateLimitsByLimitId` map keys and
+/// fields classified as sensitive are never included in paths.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CodexResponseSchemaSummary {
+    pub version: u8,
+    pub paths: Vec<CodexResponseSchemaPath>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opaque_limit_map_entry_count: Option<usize>,
+    pub sensitive_field_count: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CodexResponseSchemaPath {
+    pub path: String,
+    pub value_types: Vec<&'static str>,
+}
+
+#[derive(Default)]
+struct CodexSchemaBuilder {
+    nodes: BTreeMap<String, BTreeSet<&'static str>>,
+    visited: usize,
+    sensitive_field_count: usize,
+    opaque_limit_map_entry_count: Option<usize>,
+    truncated: bool,
+}
+
+pub fn codex_response_schema_summary(value: &Value) -> CodexResponseSchemaSummary {
+    let mut builder = CodexSchemaBuilder::default();
+    collect_codex_schema(value, "$", 0, &mut builder);
+    let mut paths = builder
+        .nodes
+        .into_iter()
+        .map(|(path, types)| CodexResponseSchemaPath {
+            path,
+            value_types: types.into_iter().collect(),
+        })
+        .collect::<Vec<_>>();
+    if paths.len() > MAX_CODEX_SCHEMA_PATHS {
+        paths.truncate(MAX_CODEX_SCHEMA_PATHS);
+        builder.truncated = true;
+    }
+    let mut summary = CodexResponseSchemaSummary {
+        version: 1,
+        paths,
+        opaque_limit_map_entry_count: builder.opaque_limit_map_entry_count,
+        sensitive_field_count: builder.sensitive_field_count,
+        truncated: builder.truncated,
+    };
+    while serde_json::to_vec(&summary)
+        .map(|bytes| bytes.len() > MAX_CODEX_SCHEMA_OUTPUT_BYTES)
+        .unwrap_or(true)
+        && !summary.paths.is_empty()
+    {
+        summary.paths.pop();
+        summary.truncated = true;
+    }
+    summary
+}
+
+fn collect_codex_schema(value: &Value, path: &str, depth: usize, builder: &mut CodexSchemaBuilder) {
+    if builder.visited >= MAX_CODEX_SCHEMA_NODES || depth > MAX_CODEX_SCHEMA_DEPTH {
+        builder.truncated = true;
+        return;
+    }
+    builder.visited += 1;
+    builder
+        .nodes
+        .entry(path.to_owned())
+        .or_default()
+        .insert(codex_json_type(value));
+
+    match value {
+        Value::Object(fields) => {
+            if path == "$.rateLimitsByLimitId" {
+                builder.opaque_limit_map_entry_count = Some(fields.len());
+            }
+            if fields.len() > MAX_CODEX_SCHEMA_KEYS {
+                builder.truncated = true;
+            }
+            for (index, (key, child)) in fields.iter().enumerate() {
+                if index >= MAX_CODEX_SCHEMA_KEYS || builder.visited >= MAX_CODEX_SCHEMA_NODES {
+                    builder.truncated = true;
+                    break;
+                }
+                if path != "$.rateLimitsByLimitId"
+                    && classify_field_name(key) == FieldClassification::Sensitive
+                {
+                    builder.sensitive_field_count += 1;
+                    builder.visited += 1;
+                    builder
+                        .nodes
+                        .entry(format!("{path}.<redacted-sensitive-field>"))
+                        .or_default()
+                        .insert(codex_json_type(child));
+                    continue;
+                }
+                let segment = if path == "$.rateLimitsByLimitId" {
+                    "<limit-id>".to_owned()
+                } else if key.len() > 128 || key.chars().any(char::is_control) {
+                    builder.truncated = true;
+                    "<bounded-field-name>".to_owned()
+                } else {
+                    key.clone()
+                };
+                let child_path = format!("{path}.{segment}");
+                collect_codex_schema(child, &child_path, depth + 1, builder);
+            }
+        }
+        Value::Array(items) => {
+            if items.len() > MAX_CODEX_SCHEMA_ARRAY_ITEMS {
+                builder.truncated = true;
+            }
+            for item in items.iter().take(MAX_CODEX_SCHEMA_ARRAY_ITEMS) {
+                if builder.visited >= MAX_CODEX_SCHEMA_NODES {
+                    builder.truncated = true;
+                    break;
+                }
+                collect_codex_schema(item, &format!("{path}[*]"), depth + 1, builder);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+}
+
+fn codex_json_type(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 /// The catalog-backed equivalent of [`probe_once`]. It stages only the
@@ -198,29 +358,35 @@ pub async fn probe_cataloged_once(
     let credential = CredentialStore::new(source.pool)
         .get(source.reference)
         .await
-        .map_err(|_| failure(ProbeFailureKind::CredentialUnavailable, &receipt))?
-        .ok_or_else(|| failure(ProbeFailureKind::CredentialUnavailable, &receipt))?;
+        .map_err(|_| failure(ProbeFailureKind::CredentialStoreUnavailable, &receipt))?
+        .ok_or_else(|| failure(ProbeFailureKind::CredentialNotFound, &receipt))?;
+    if credential.status == crate::credential_registry::CredentialStatus::Revoked {
+        return Err(failure(ProbeFailureKind::CredentialRevoked, &receipt));
+    }
+    if credential.status != crate::credential_registry::CredentialStatus::Enrolled {
+        return Err(failure(ProbeFailureKind::GenerationUnavailable, &receipt));
+    }
     if credential.provider != resource.credential.provider
         || credential.generation.to_string() != resource.credential.generation
         || resource.credential.catalog_id.as_deref() != Some(credential.id.as_str())
     {
         return Err(failure(ProbeFailureKind::InvalidBinding, &receipt));
     }
-    let secret = registered_auth(source.pool, source.backend, source.reference)
+    let secret = registered_auth_diagnostic(source.pool, source.backend, source.reference)
         .await
-        .map_err(|_| failure(ProbeFailureKind::CredentialUnavailable, &receipt))?;
+        .map_err(|cause| failure(cause.into(), &receipt))?;
     let probe_id = crate::model::id();
     let home = root.join(format!("status-home-{probe_id}"));
     fs::DirBuilder::new()
         .mode(0o700)
         .create(&home)
-        .map_err(|_| failure(ProbeFailureKind::CredentialUnavailable, &receipt))?;
+        .map_err(|_| failure(ProbeFailureKind::RuntimeStagingFailed, &receipt))?;
     fs::DirBuilder::new()
         .mode(0o700)
         .create(home.join("workspace"))
-        .map_err(|_| failure(ProbeFailureKind::CredentialUnavailable, &receipt))?;
+        .map_err(|_| failure(ProbeFailureKind::RuntimeStagingFailed, &receipt))?;
     stage_auth_json(&home, &secret)
-        .map_err(|_| failure(ProbeFailureKind::CredentialUnavailable, &receipt))?;
+        .map_err(|_| failure(ProbeFailureKind::RuntimeStagingFailed, &receipt))?;
     drop(secret);
     receipt.isolated_auth_staged = true;
     let name = format!("orbit-status-{probe_id}");
@@ -276,6 +442,7 @@ pub async fn probe_cataloged_once(
         .map_err(|_| failure(ProbeFailureKind::CleanupUncertain, &receipt))?;
     receipt.cleanup_confirmed = true;
     let value = read.map_err(|kind| failure(kind, &receipt))?;
+    receipt.quota_observation = Some(codex_rate_limits_observation(resource, &value));
     let observed_at_ms = i64::try_from(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -290,11 +457,31 @@ pub async fn probe_cataloged_once(
         normalize_observation(resource, binding, &value, observed_at_ms, expires_at_ms)
             .map_err(|_| failure(ProbeFailureKind::Protocol, &receipt))?;
     receipt.account_scope_matched = matched;
+    let mut snapshot = snapshot;
+    apply_identity_value_comparison(&mut snapshot, receipt.account_identity_value_comparison);
     Ok(ProbeOutcome {
         snapshot,
         receipt,
         provider_scope_fingerprint,
     })
+}
+
+impl From<CredentialStagingFailure> for ProbeFailureKind {
+    fn from(value: CredentialStagingFailure) -> Self {
+        match value {
+            CredentialStagingFailure::CredentialNotFound => Self::CredentialNotFound,
+            CredentialStagingFailure::CredentialRevoked => Self::CredentialRevoked,
+            CredentialStagingFailure::GenerationUnavailable => Self::GenerationUnavailable,
+            CredentialStagingFailure::RepresentationMissing => Self::RepresentationMissing,
+            CredentialStagingFailure::RepresentationInvalid => Self::RepresentationInvalid,
+            CredentialStagingFailure::SecretBackendUnavailable => Self::SecretBackendUnavailable,
+            CredentialStagingFailure::SecretBackendReadFailed => Self::SecretBackendReadFailed,
+            CredentialStagingFailure::SecretArtifactMissing => Self::SecretArtifactMissing,
+            CredentialStagingFailure::CredentialStoreUnavailable => {
+                Self::CredentialStoreUnavailable
+            }
+        }
+    }
 }
 
 pub struct ProbeOutcome {
@@ -303,8 +490,9 @@ pub struct ProbeOutcome {
     pub provider_scope_fingerprint: Option<String>,
 }
 
-/// Only the expected-ID path or a previously confirmed fingerprint may
-/// produce trusted availability. Enrollment is deliberately observation-only.
+/// Only the expected-ID path or a previously confirmed fingerprint can
+/// nominate scope for promotion. Enrollment retains safe quota observations
+/// but remains UNKNOWN until scope and response identity values are confirmed.
 #[derive(Clone, Copy)]
 pub enum ProbeBinding<'a> {
     ExpectedAccountId(&'a str),
@@ -319,6 +507,17 @@ pub enum ProbeFailureKind {
     InvalidControlRoot,
     InvalidPolicy,
     CredentialUnavailable,
+    CredentialNotFound,
+    CredentialRevoked,
+    GenerationUnavailable,
+    RepresentationMissing,
+    RepresentationInvalid,
+    SecretBackendUnavailable,
+    SecretBackendReadFailed,
+    SecretArtifactMissing,
+    SecretArtifactInvalid,
+    RuntimeStagingFailed,
+    CredentialStoreUnavailable,
     RuntimeLaunch,
     Authentication,
     Protocol,
@@ -380,11 +579,39 @@ impl std::fmt::Display for ProbeFailure {
                 diagnostic.parent_mode.map(|mode| format!("{mode:#o}")),
             )
         } else {
-            write!(f, "Codex status probe failed: {:?}", self.kind)
+            write!(f, "Codex status probe failed: {}", self.kind.safe_message())
         }
     }
 }
 impl std::error::Error for ProbeFailure {}
+
+impl ProbeFailureKind {
+    pub fn safe_message(self) -> &'static str {
+        match self {
+            Self::CredentialUnavailable => "credential is unavailable",
+            Self::CredentialNotFound => "credential not found",
+            Self::CredentialRevoked => "credential is revoked",
+            Self::GenerationUnavailable => "current generation is unavailable",
+            Self::RepresentationMissing => "Codex representation is missing",
+            Self::RepresentationInvalid => "Codex representation is not valid",
+            Self::SecretBackendUnavailable => "configured SecretBackend is unavailable",
+            Self::SecretBackendReadFailed => "SecretBackend artifact could not be loaded",
+            Self::SecretArtifactMissing => "SecretBackend artifact is missing",
+            Self::SecretArtifactInvalid => "SecretBackend artifact is invalid",
+            Self::RuntimeStagingFailed => "fresh runtime credential staging failed",
+            Self::CredentialStoreUnavailable => "credential catalog could not be read",
+            Self::InvalidBinding => "status request credential binding is invalid",
+            Self::InvalidControlRoot => "private status workspace is invalid",
+            Self::InvalidPolicy => "status request policy is invalid",
+            Self::RuntimeLaunch => "Codex status runtime could not start",
+            Self::Authentication => "Codex rejected the stored authentication",
+            Self::Protocol => "Codex status response was invalid",
+            Self::UnexpectedEof => "Codex status connection closed unexpectedly",
+            Self::Timeout => "Codex status request timed out",
+            Self::CleanupUncertain => "private status runtime cleanup is uncertain",
+        }
+    }
+}
 
 /// Create a private control root beneath the platform temporary directory.
 /// The shared parent may be sticky/world-writable (for example `/tmp`); the
@@ -625,14 +852,44 @@ pub async fn protocol(wire: &mut Wire, receipt: &mut ProbeReceipt) -> Result<Val
     receipt.protocol_initialized = true;
     wire.notify("initialized", json!({})).await?;
     let account = call(wire, "account/read", json!({"refreshToken":false})).await?;
+    receipt.account_read_schema = Some(Box::new(codex_response_schema_summary(&account)));
     if account["account"].is_null() && account["requiresOpenaiAuth"] != false {
         return Err(AuthRequired.into());
     }
     receipt.authenticated_account_present = !account["account"].is_null();
     receipt.status_request_sent = true;
     let status = call(wire, "account/rateLimits/read", json!({})).await?;
+    receipt.rate_limits_schema = Some(Box::new(codex_response_schema_summary(&status)));
+    let account_read_scope_id = account
+        .pointer("/workspaceRouting/chatgptAccountId")
+        .and_then(Value::as_str);
+    let rate_limits_scope_id = status.get("accountId").and_then(Value::as_str);
+    receipt.account_identity_value_comparison =
+        compare_account_scope_values(account_read_scope_id, rate_limits_scope_id);
     receipt.correlated_status_response = true;
     Ok(status)
+}
+
+fn compare_account_scope_values(
+    account_read_id: Option<&str>,
+    rate_limits_id: Option<&str>,
+) -> ProviderIdentityValueComparison {
+    let valid = |value: &str| {
+        !value.is_empty()
+            && value.len() <= 256
+            && value.trim() == value
+            && !value.chars().any(char::is_control)
+    };
+    match (account_read_id, rate_limits_id) {
+        (Some(account), Some(limits)) if valid(account) && valid(limits) => {
+            if account == limits {
+                ProviderIdentityValueComparison::ExactValueMatch
+            } else {
+                ProviderIdentityValueComparison::ExactValueMismatch
+            }
+        }
+        _ => ProviderIdentityValueComparison::NotComparable,
+    }
 }
 
 /// One isolated, single-credential status read. The caller may persist the
@@ -731,6 +988,7 @@ pub async fn probe_once(
         .map_err(|_| failure(ProbeFailureKind::CleanupUncertain, &receipt))?;
     receipt.cleanup_confirmed = true;
     let value = read.map_err(|kind| failure(kind, &receipt))?;
+    receipt.quota_observation = Some(codex_rate_limits_observation(resource, &value));
     let observed_at_ms = i64::try_from(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -745,6 +1003,8 @@ pub async fn probe_once(
         normalize_observation(resource, binding, &value, observed_at_ms, expires_at_ms)
             .map_err(|_| failure(ProbeFailureKind::Protocol, &receipt))?;
     receipt.account_scope_matched = matched;
+    let mut snapshot = snapshot;
+    apply_identity_value_comparison(&mut snapshot, receipt.account_identity_value_comparison);
     Ok(ProbeOutcome {
         snapshot,
         receipt,
@@ -775,20 +1035,100 @@ fn normalize_observation(
         ProbeBinding::Enroll => None,
         _ => None,
     };
-    let snapshot = codex_rate_limits_snapshot(
+    let mut snapshot = codex_rate_limits_snapshot(
         resource,
         expected.unwrap_or_default(),
         &serde_json::to_vec(value)?,
         observed_at_ms,
         expires_at_ms,
     )?;
+    let scope_state = if provider_scope_fingerprint.is_none() {
+        ProviderScopeEvidenceState::Unbound
+    } else if matches!(binding, ProbeBinding::Enroll) {
+        ProviderScopeEvidenceState::Unconfirmed
+    } else if expected.is_some() {
+        ProviderScopeEvidenceState::Confirmed
+    } else {
+        ProviderScopeEvidenceState::Mismatch
+    };
+    let promotion = quota_promotion_for(
+        &snapshot,
+        scope_state,
+        ProviderIdentityValueComparison::NotComparable,
+    );
+    if let Some(evidence) = &mut snapshot.provider_status_observation {
+        evidence.scope_state = scope_state;
+        evidence.quota_promotion = promotion;
+    }
+    if promotion != QuotaEvidencePromotion::Promoted {
+        snapshot.state = crate::availability::AvailabilityState::Unknown;
+        snapshot.confidence = crate::availability::EvidenceConfidence::Unknown;
+    }
     Ok((snapshot, provider_scope_fingerprint, expected.is_some()))
+}
+
+fn apply_identity_value_comparison(
+    snapshot: &mut AvailabilitySnapshot,
+    comparison: ProviderIdentityValueComparison,
+) {
+    let scope_state = snapshot
+        .provider_status_observation
+        .as_ref()
+        .map(|evidence| evidence.scope_state);
+    let Some(scope_state) = scope_state else {
+        return;
+    };
+    let promotion = quota_promotion_for(snapshot, scope_state, comparison);
+    if let Some(evidence) = &mut snapshot.provider_status_observation {
+        evidence.identity_value_comparison = comparison;
+        evidence.quota_promotion = promotion;
+    }
+    if promotion == QuotaEvidencePromotion::Promoted {
+        let allowed = snapshot
+            .provider_status_observation
+            .as_ref()
+            .and_then(|evidence| evidence.ordinary_usage_allowed);
+        snapshot.state = match allowed {
+            Some(true) => crate::availability::AvailabilityState::Ready,
+            Some(false) => crate::availability::AvailabilityState::Limited,
+            None => crate::availability::AvailabilityState::Unknown,
+        };
+        snapshot.confidence = crate::availability::EvidenceConfidence::AuthoritativeNative;
+    } else {
+        snapshot.state = crate::availability::AvailabilityState::Unknown;
+        snapshot.confidence = crate::availability::EvidenceConfidence::Unknown;
+    }
+}
+
+fn quota_promotion_for(
+    snapshot: &AvailabilitySnapshot,
+    scope_state: ProviderScopeEvidenceState,
+    comparison: ProviderIdentityValueComparison,
+) -> QuotaEvidencePromotion {
+    if snapshot.quota_buckets.is_empty() && snapshot.quota_windows.is_empty() {
+        return QuotaEvidencePromotion::NoUsableQuota;
+    }
+    match (scope_state, comparison) {
+        (_, ProviderIdentityValueComparison::ExactValueMismatch) => {
+            QuotaEvidencePromotion::WithheldIdentityMismatch
+        }
+        (ProviderScopeEvidenceState::Mismatch, _) => QuotaEvidencePromotion::WithheldScopeMismatch,
+        (ProviderScopeEvidenceState::Confirmed, ProviderIdentityValueComparison::NotComparable) => {
+            QuotaEvidencePromotion::WithheldIdentityUnverified
+        }
+        (
+            ProviderScopeEvidenceState::Confirmed,
+            ProviderIdentityValueComparison::ExactValueMatch,
+        ) => QuotaEvidencePromotion::Promoted,
+        _ => QuotaEvidencePromotion::ObservedUnconfirmed,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ControlRootFailureReason, ProbeBinding, ProbeReceipt, normalize_observation,
+        ControlRootFailureReason, ProbeBinding, ProbeReceipt, apply_identity_value_comparison,
+        codex_response_schema_summary, compare_account_scope_values, normalize_observation,
         private_control_tempdir, protocol, validate_control_parent_fields, validate_control_root,
         validate_private_directory,
     };
@@ -803,6 +1143,26 @@ mod tests {
     use anyhow::{Result, ensure};
     use serde_json::{Value, json};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    #[test]
+    fn account_scope_comparison_retains_only_equality_result() {
+        use crate::availability::ProviderIdentityValueComparison as Comparison;
+
+        assert_eq!(
+            compare_account_scope_values(Some("synthetic-account"), Some("synthetic-account")),
+            Comparison::ExactValueMatch
+        );
+        assert_eq!(
+            compare_account_scope_values(Some("synthetic-account-a"), Some("synthetic-account-b")),
+            Comparison::ExactValueMismatch
+        );
+        assert_eq!(
+            compare_account_scope_values(Some("synthetic-account"), None),
+            Comparison::NotComparable
+        );
+        let diagnostic = serde_json::to_string(&Comparison::ExactValueMatch).unwrap();
+        assert!(!diagnostic.contains("synthetic-account"));
+    }
 
     #[test]
     fn catalog_runtime_is_pinned_and_keeps_each_logical_account_distinct() -> Result<()> {
@@ -851,6 +1211,44 @@ mod tests {
         );
         assert_ne!(first_resource.id()?, second_resource.id()?);
         Ok(())
+    }
+
+    #[test]
+    fn credential_staging_failures_are_actionable_and_never_expose_backend_paths() {
+        let cases = [
+            (
+                crate::codex_credential_enrollment::CredentialStagingFailure::CredentialNotFound,
+                super::ProbeFailureKind::CredentialNotFound,
+                "credential not found",
+            ),
+            (
+                crate::codex_credential_enrollment::CredentialStagingFailure::CredentialRevoked,
+                super::ProbeFailureKind::CredentialRevoked,
+                "credential is revoked",
+            ),
+            (
+                crate::codex_credential_enrollment::CredentialStagingFailure::RepresentationMissing,
+                super::ProbeFailureKind::RepresentationMissing,
+                "Codex representation is missing",
+            ),
+            (
+                crate::codex_credential_enrollment::CredentialStagingFailure::SecretArtifactMissing,
+                super::ProbeFailureKind::SecretArtifactMissing,
+                "SecretBackend artifact is missing",
+            ),
+            (
+                crate::codex_credential_enrollment::CredentialStagingFailure::SecretBackendReadFailed,
+                super::ProbeFailureKind::SecretBackendReadFailed,
+                "SecretBackend artifact could not be loaded",
+            ),
+        ];
+        for (cause, expected, message) in cases {
+            let kind: super::ProbeFailureKind = cause.into();
+            assert_eq!(kind.safe_message(), expected.safe_message());
+            assert_eq!(kind.safe_message(), message);
+            assert!(!kind.safe_message().contains("credential://"));
+            assert!(!kind.safe_message().contains("/home/"));
+        }
     }
 
     #[test]
@@ -998,15 +1396,21 @@ mod tests {
         let r = resource();
         let value = json!({"accountId":"personal-scope","ordinaryUsageAllowed":true,
             "rateLimits":{"primary":{"usedPercent":12,"resetsAt":null}}});
-        let (strong, scope, matched) = normalize_observation(
+        let (mut strong, scope, matched) = normalize_observation(
             &r,
             ProbeBinding::ExpectedAccountId("personal-scope"),
             &value,
             10,
             20,
         )?;
-        assert_eq!(strong.state, AvailabilityState::Ready);
+        assert_eq!(strong.state, AvailabilityState::Unknown);
+        assert_eq!(strong.quota_windows.len(), 1);
         assert!(matched);
+        apply_identity_value_comparison(
+            &mut strong,
+            crate::availability::ProviderIdentityValueComparison::ExactValueMatch,
+        );
+        assert_eq!(strong.state, AvailabilityState::Ready);
         let scope = scope.expect("valid opaque scope");
         let (wrong, _, matched) = normalize_observation(
             &r,
@@ -1016,25 +1420,32 @@ mod tests {
             20,
         )?;
         assert_eq!(wrong.state, AvailabilityState::Unknown);
+        assert_eq!(wrong.quota_windows.len(), 1);
         assert!(!matched);
         let (first, observed, matched) =
             normalize_observation(&r, ProbeBinding::Enroll, &value, 10, 20)?;
         assert_eq!(observed.as_deref(), Some(scope.as_str()));
         assert_eq!(first.state, AvailabilityState::Unknown);
+        assert_eq!(first.quota_windows.len(), 1);
         assert!(!matched);
         assert_eq!(
             effective_at(&r, std::slice::from_ref(&first), 11)?.state,
             AvailabilityState::Unknown
         );
-        let (later, _, matched) = normalize_observation(
+        let (mut later, _, matched) = normalize_observation(
             &r,
             ProbeBinding::ConfirmedFingerprint(&scope),
             &value,
             11,
             21,
         )?;
-        assert_eq!(later.state, AvailabilityState::Ready);
+        assert_eq!(later.state, AvailabilityState::Unknown);
         assert!(matched);
+        apply_identity_value_comparison(
+            &mut later,
+            crate::availability::ProviderIdentityValueComparison::ExactValueMatch,
+        );
+        assert_eq!(later.state, AvailabilityState::Ready);
         assert_eq!(
             effective_at(&r, &[later], 22)?.state,
             AvailabilityState::Unknown
@@ -1047,6 +1458,7 @@ mod tests {
             21,
         )?;
         assert_eq!(mismatch.state, AvailabilityState::Unknown);
+        assert_eq!(mismatch.quota_windows.len(), 1);
         assert!(!matched);
         assert!(!serde_json::to_string(&first)?.contains("personal-scope"));
         Ok(())
@@ -1064,6 +1476,60 @@ mod tests {
             assert!(!matched);
         }
         Ok(())
+    }
+
+    #[test]
+    fn codex_schema_summary_keeps_types_and_nesting_but_redacts_values_and_ids() -> Result<()> {
+        let result = json!({
+            "accountId":"synthetic-account-secret",
+            "ordinaryUsageAllowed":true,
+            "planType":"synthetic-plan",
+            "rateLimitsByLimitId":{
+                "synthetic-opaque-limit-id":{
+                    "limitId":"synthetic-opaque-limit-id",
+                    "limitName":"synthetic-name",
+                    "primary":{
+                        "usedPercent":0,
+                        "windowDurationMins":300,
+                        "resetsAt":1730947200,
+                        "rateLimitReachedType":null,
+                        "spendControlReached":false,
+                        "rateLimitResetCredits":12
+                    },
+                    "secondary":null
+                }
+            },
+            "access_token":"synthetic-token-secret"
+        });
+        let schema = codex_response_schema_summary(&result);
+        let encoded = serde_json::to_string(&schema)?;
+        assert!(encoded.contains("$.rateLimitsByLimitId.<limit-id>.primary.usedPercent"));
+        assert!(encoded.contains("$.rateLimitsByLimitId.<limit-id>.primary.resetsAt"));
+        assert!(encoded.contains("$.rateLimitsByLimitId.<limit-id>.secondary"));
+        assert!(encoded.contains("$.rateLimitsByLimitId.<limit-id>.limitName"));
+        assert!(encoded.contains("$.planType"));
+        assert!(encoded.contains("$.ordinaryUsageAllowed"));
+        assert!(encoded.contains("$.<redacted-sensitive-field>"));
+        assert_eq!(schema.opaque_limit_map_entry_count, Some(1));
+        assert!(!encoded.contains("synthetic-account-secret"));
+        assert!(!encoded.contains("synthetic-opaque-limit-id"));
+        assert!(!encoded.contains("synthetic-name"));
+        assert!(!encoded.contains("synthetic-token-secret"));
+        assert!(!encoded.contains("1730947200"));
+        assert!(!encoded.contains("300"));
+        assert!(!encoded.contains("12"));
+        Ok(())
+    }
+
+    #[test]
+    fn codex_schema_summary_truncates_pathological_shapes() {
+        let keys = (0..300)
+            .map(|index| (format!("field_{index}"), json!([1, 2, 3])))
+            .collect::<serde_json::Map<_, _>>();
+        let schema = codex_response_schema_summary(&Value::Object(keys));
+        assert!(schema.truncated);
+        assert!(schema.paths.len() <= super::MAX_CODEX_SCHEMA_PATHS);
+        assert!(serde_json::to_vec(&schema).unwrap().len() <= super::MAX_CODEX_SCHEMA_OUTPUT_BYTES);
     }
 
     #[tokio::test]
@@ -1085,13 +1551,27 @@ mod tests {
             fixture_reply(
                 &mut server,
                 "account/read",
-                json!({"account":{"type":"chatgpt"}}),
+                json!({
+                    "account":{"type":"chatgpt","email":"synthetic@example.invalid"},
+                    "workspaceRouting":{"chatgptAccountId":"synthetic-account-secret"}
+                }),
             )
             .await?;
             fixture_reply(
                 &mut server,
                 "account/rateLimits/read",
-                json!({"accountId":"expected","rateLimits":{},"ordinaryUsageAllowed":true}),
+                json!({
+                    "accountId":"synthetic-account-secret",
+                    "ordinaryUsageAllowed":true,
+                    "rateLimitsByLimitId":{
+                        "synthetic-opaque-limit-id":{
+                            "limitId":"synthetic-opaque-limit-id",
+                            "limitName":"synthetic-name",
+                            "primary":{"usedPercent":31,"windowDurationMins":300,"resetsAt":1730947200},
+                            "secondary":null
+                        }
+                    }
+                }),
             )
             .await?;
             // Once status returned, no model/broker protocol message can follow.
@@ -1109,13 +1589,33 @@ mod tests {
             tokio::join!(server_task, protocol(&mut wire, &mut receipt));
         server_result?;
         let result = client_result?;
-        ensure!(result["accountId"] == "expected", "status result missing");
+        ensure!(result["accountId"].is_string(), "status result missing");
         ensure!(
             receipt.protocol_initialized
                 && receipt.authenticated_account_present
                 && receipt.status_request_sent
                 && receipt.correlated_status_response,
             "status lifecycle incomplete"
+        );
+        ensure!(
+            receipt.account_identity_value_comparison
+                == crate::availability::ProviderIdentityValueComparison::ExactValueMatch,
+            "account identities were not compared"
+        );
+        let safe_schema = serde_json::to_string(&receipt)?;
+        ensure!(
+            safe_schema.contains("$.account.email")
+                && safe_schema.contains("$.rateLimitsByLimitId.<limit-id>.primary.usedPercent")
+                && safe_schema.contains("$.rateLimitsByLimitId.<limit-id>.secondary"),
+            "status response schema was not retained"
+        );
+        ensure!(
+            !safe_schema.contains("synthetic@example.invalid")
+                && !safe_schema.contains("synthetic-account-secret")
+                && !safe_schema.contains("synthetic-opaque-limit-id")
+                && !safe_schema.contains("synthetic-name")
+                && !safe_schema.contains("1730947200"),
+            "provider values escaped into schema evidence"
         );
         ensure!(
             !receipt.model_thread_created
