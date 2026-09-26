@@ -5,7 +5,7 @@
 //! 3. Read-write role allows mutation.
 //! 4. Structured handoff validation: strictly parses envelopes and rejects invalid formats.
 //! 5. Fail-safe verification policy: workflows without authoritative policies fail safely.
-//! 6. Mock mode guarded by `ORBIT_MOCK_ACP=1`.
+//! 6. Simulated execution is explicitly injected and cannot be selected by environment.
 
 use anyhow::Result;
 use orbit::{engine::Engine, model::id, workflow::*, workflow_coordinator::*};
@@ -263,7 +263,7 @@ async fn b32_03_role_permission_enforcement_read_only_vs_read_write() -> Result<
 }
 
 #[tokio::test]
-async fn b32_04_fail_safe_verification_policy_rejection() -> Result<()> {
+async fn b32_04_host_verification_is_blocked_without_pinned_profile() -> Result<()> {
     let ctx = match setup_test().await? {
         Some(c) => c,
         None => return Ok(()),
@@ -298,17 +298,20 @@ async fn b32_04_fail_safe_verification_policy_rejection() -> Result<()> {
     // Step 3: Implementing -> Verifying (computes workspace state)
     coord.step(&wf.id).await?;
 
-    // Step 4: Verifying -> without authoritative policy or repo definition
-    // must fail safely with VERIFICATION_POLICY_REQUIRED
+    // Verification cannot reach the host executor without a pinned container profile.
     let res = coord.step(&wf.id).await;
     assert!(
         res.is_err(),
-        "expected coordinator to reject missing verification policy"
+        "expected coordinator to reject unpinned verification"
     );
     let err_msg = res.unwrap_err().to_string();
     assert!(
-        err_msg.contains("VERIFICATION_POLICY_REQUIRED"),
-        "expected VERIFICATION_POLICY_REQUIRED, got: {err_msg}"
+        err_msg.contains("VERIFICATION_PROFILE_REQUIRED"),
+        "expected VERIFICATION_PROFILE_REQUIRED, got: {err_msg}"
+    );
+    assert_eq!(
+        ctx.store.get_workflow_run(&wf.id).await?.unwrap().status,
+        WorkflowStage::Verifying
     );
 
     teardown_test(ctx).await?;
@@ -316,12 +319,7 @@ async fn b32_04_fail_safe_verification_policy_rejection() -> Result<()> {
 }
 
 #[tokio::test]
-async fn b32_05_mock_mode_explicitly_guarded_by_orbit_mock_acp() -> Result<()> {
-    // When ORBIT_MOCK_ACP=1 is set, RealAcpRoleExecutor can execute simulated roles for tests
-    unsafe {
-        std::env::set_var("ORBIT_MOCK_ACP", "1");
-    }
-
+async fn b32_05_simulation_is_explicitly_injected() -> Result<()> {
     let ctx = match setup_test().await? {
         Some(c) => c,
         None => return Ok(()),
@@ -358,7 +356,7 @@ async fn b32_05_mock_mode_explicitly_guarded_by_orbit_mock_acp() -> Result<()> {
         .create_role_execution(&wf.id, &role, "PLANNING", 0, None, None)
         .await?;
 
-    let executor = RealAcpRoleExecutor;
+    let executor = SimulatedRoleExecutor::with_approval();
     let outcome = executor
         .execute_role(
             &ctx.engine.pool,
@@ -375,10 +373,109 @@ async fn b32_05_mock_mode_explicitly_guarded_by_orbit_mock_acp() -> Result<()> {
     assert!(outcome.raw_output.contains(ORBIT_HANDOFF_START));
     assert_eq!(outcome.termination_reason, Some("completed".into()));
 
-    unsafe {
-        std::env::remove_var("ORBIT_MOCK_ACP");
-    }
-
     teardown_test(ctx).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn b32_06_orbit_mock_acp_cannot_switch_the_real_executor() -> Result<()> {
+    use std::time::Duration;
+
+    let previous = std::env::var_os("ORBIT_MOCK_ACP");
+    unsafe { std::env::set_var("ORBIT_MOCK_ACP", "1") };
+
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .acquire_timeout(Duration::from_millis(250))
+        .connect_lazy_with(
+            sqlx::postgres::PgConnectOptions::new()
+                .host("127.0.0.1")
+                .port(1)
+                .username("orbit")
+                .database("orbit"),
+        );
+    let role = RoleDefinition::planner_v1();
+    let target = ResolvedExecutionTarget {
+        provider: "codex".into(),
+        runtime_interface: "codex-acp".into(),
+        credential_id: Some("codex-main".into()),
+        credential_generation: Some(1),
+        requested_model: Some("gpt-6-luna".into()),
+        resolved_model: Some("gpt-6-luna".into()),
+        runtime_image_digest: None,
+        resolution_reason: "environment-switch regression test".into(),
+    };
+    let wf = WorkflowRun {
+        id: "wf-env-switch".into(),
+        task_id: "task-env-switch".into(),
+        attempt_id: "attempt-env-switch".into(),
+        workflow_kind: "software_change".into(),
+        workflow_version: 1,
+        status: WorkflowStage::Planning,
+        current_stage: "PLANNING".into(),
+        iteration: 0,
+        max_iterations: 1,
+        current_workspace_state_id: None,
+        verification_policy_id: None,
+        verification_policy_version: None,
+        verification_policy_digest: None,
+        regression_policy_id: None,
+        regression_policy_version: None,
+        regression_policy_digest: None,
+        selection_policy_id: None,
+        selection_policy_version: None,
+        selection_policy_digest: None,
+        task_prompt: Some("must not be simulated".into()),
+        repository_path: Some(".".into()),
+        base_revision: Some("HEAD".into()),
+        failure_reason: None,
+        cancellation_reason: None,
+        started_at_ms: 0,
+        finished_at_ms: None,
+    };
+    let role_exec = RoleExecution {
+        id: "role-env-switch".into(),
+        workflow_run_id: wf.id.clone(),
+        role_id: role.role_id.clone(),
+        role_version: role.version,
+        role_digest: role.digest(),
+        stage: "PLANNING".into(),
+        iteration: 0,
+        status: RoleExecutionStatus::Running,
+        input_workspace_state_id: None,
+        output_workspace_state_id: None,
+        resolved_target: Some(target.clone()),
+        agent_execution_ids: vec![],
+        handoff_input_id: None,
+        handoff_output_id: None,
+        started_at_ms: 0,
+        finished_at_ms: None,
+        termination_reason: None,
+        failure_message: None,
+    };
+
+    let outcome = RealAcpRoleExecutor
+        .execute_role(
+            &pool,
+            &wf,
+            &role_exec,
+            &role,
+            &target,
+            "must not be simulated",
+            Path::new("."),
+            None,
+        )
+        .await;
+
+    unsafe {
+        if let Some(value) = previous {
+            std::env::set_var("ORBIT_MOCK_ACP", value);
+        } else {
+            std::env::remove_var("ORBIT_MOCK_ACP");
+        }
+    }
+    assert!(
+        outcome.is_err(),
+        "real executor reached real credential lookup"
+    );
     Ok(())
 }

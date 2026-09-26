@@ -38,6 +38,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+const ERR_CLI_WORKFLOW_TERMINAL_DISABLED: &str =
+    "CLI_WORKFLOW_TERMINAL_DISABLED: no qualified confined terminal owner is available";
+
 /// Result of a single coordinator execution step.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkflowStepResult {
@@ -1176,6 +1179,7 @@ impl WorkflowCoordinator {
     ) -> Result<VerificationRun> {
         let repo_path = Path::new(wf.repository_path.as_deref().unwrap_or("."));
         let env = EnvironmentIdentity::default();
+        crate::verification::validate_pinned_verification_profile(&env)?;
 
         if let Some(sp) = sel_policy {
             let selected_plan =
@@ -1639,7 +1643,7 @@ fn build_role_prompt(
         )
     };
 
-    match role.role_id.as_str() {
+    let prompt = match role.role_id.as_str() {
         "planner" => format!(
             "You are the PLANNER role in an Orbit automated software change workflow.\n            Your responsibility is to analyze the task, inspect the repository using read-only tools, and produce a clear, structured implementation plan.\n\n            TASK OBJECTIVE:\n{task_text}\n\n            REPOSITORY CONTEXT:\n            Repository Path: {repo_path}\n            Base Revision: {base_revision}{docs_manifest}\n            WORKSPACE PERMISSIONS:\n            You have READ-ONLY workspace access. You can inspect the repository using:\n            - fs/read_text_file (or read_file): read file content\n            - fs/list_directory: inspect workspace directory entries\n            - fs/find_path: search for files matching patterns\n            - search/grep: regex or text search across files\n            - git/status, git/diff, git/show: inspect git working tree and commit history\n            You CANNOT write or edit files, and CANNOT create terminals.\n\n            INSTRUCTIONS:\n            1. Inspect existing files, search patterns, and repository structure using the read-only tools.\n            2. Formulate a concrete step-by-step implementation plan.\n            3. You MUST end your response with a structured JSON plan handoff block inside the exact delimiters:\n            <<<ORBIT_HANDOFF_START>>>\n            {{\n              \"summary\": \"Concise summary of the plan\",\n              \"affected_areas\": [\"area1\", \"area2\"],\n              \"implementation_steps\": [\"step 1\", \"step 2\"],\n              \"expected_files\": [\"docs/file1.md\"],\n              \"risks\": [],\n              \"verification_notes\": [\"verification instructions\"],\n              \"open_questions\": []\n            }}\n            <<<ORBIT_HANDOFF_END>>>\n",
             repo_path = repo_path.display(),
@@ -1677,7 +1681,11 @@ fn build_role_prompt(
             role_id = role.role_id,
             task_text = task_text,
         ),
-    }
+    };
+    prompt.replace(
+        "- terminal/create, terminal/output, terminal/wait_for_exit, terminal/kill, terminal/release: run tests or commands",
+        "- CLI workflow terminal execution is unavailable until a confined terminal owner is qualified",
+    )
 }
 
 pub struct AcpTurnState<'a> {
@@ -1798,11 +1806,34 @@ pub async fn handle_acp_message(
             return Ok(());
         }
 
+        if matches!(
+            tool,
+            crate::tool_surface::CanonicalToolName::TerminalCreate
+                | crate::tool_surface::CanonicalToolName::TerminalOutput
+                | crate::tool_surface::CanonicalToolName::TerminalWaitForExit
+                | crate::tool_surface::CanonicalToolName::TerminalKill
+                | crate::tool_surface::CanonicalToolName::TerminalRelease
+        ) {
+            state.tool_failures += 1;
+            wire.response_error(req_id, -32603, ERR_CLI_WORKFLOW_TERMINAL_DISABLED)
+                .await?;
+            return Ok(());
+        }
+
         // Mutation lock enforcement for mutating operations
-        if meta.requires_mutation_lock
-            && let (Some(pool), Some(att_id), Some(role_id)) =
+        if meta.requires_mutation_lock {
+            let (Some(pool), Some(att_id), Some(role_id)) =
                 (state.pool, &state.wf_attempt_id, &state.role_exec_id)
-        {
+            else {
+                state.tool_failures += 1;
+                wire.response_error(
+                    req_id,
+                    -32603,
+                    crate::tool_surface::ERR_MUTATION_LOCK_REQUIRED,
+                )
+                .await?;
+                return Ok(());
+            };
             let wf_store = WorkflowStore::new(pool.clone());
             let lock_held = wf_store
                 .check_workspace_mutation_lock(att_id, role_id)
@@ -2777,7 +2808,7 @@ async fn execute_real_acp_turn(
                     "diff": true,
                     "show": true
                 },
-                "terminal": role.workspace_access == WorkspaceAccess::ReadWrite
+                "terminal": false
             }
         }),
     )
@@ -2975,23 +3006,6 @@ impl RoleAgentExecutor for RealAcpRoleExecutor {
             ]
         };
 
-        // Check if mock mode is requested via env or if we run directly
-        if std::env::var("ORBIT_MOCK_ACP").as_deref() == Ok("1") {
-            let sim = SimulatedRoleExecutor::with_approval();
-            return sim
-                .execute_role(
-                    pool,
-                    wf_run,
-                    role_exec,
-                    role,
-                    target,
-                    task_text,
-                    repo_path,
-                    input_handoff,
-                )
-                .await;
-        }
-
         execute_real_acp_turn(
             pool,
             wf_run,
@@ -3009,7 +3023,6 @@ impl RoleAgentExecutor for RealAcpRoleExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use tempfile::tempdir;
 
     fn make_test_wire() -> (Wire, Wire) {
@@ -3021,14 +3034,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_acp_message_filesystem_mutations() -> Result<()> {
+    async fn test_handle_acp_message_mutation_requires_lock_context() -> Result<()> {
         let repo = tempdir()?;
         let repo_path = repo.path();
         let (mut server_wire, mut client_wire) = make_test_wire();
 
         let mut state = AcpTurnState::new(repo_path, WorkspaceAccess::ReadWrite);
 
-        // 1. Create directory
         let msg = serde_json::json!({
             "id": 1,
             "method": "fs/create_directory",
@@ -3040,64 +3052,49 @@ mod tests {
         handle_acp_message(&mut server_wire, &mut state, msg).await?;
         let resp = client_wire.read().await?;
         assert_eq!(resp["id"], 1);
-        assert_eq!(resp["result"]["success"], true);
-        assert!(repo_path.join("docs/archive").is_dir());
-
-        // 2. Create file to move
-        fs::write(repo_path.join("docs/old.md"), "content")?;
-
-        // 3. Move file
-        let msg = serde_json::json!({
-            "id": 2,
-            "method": "fs/move",
-            "params": {
-                "source": "docs/old.md",
-                "destination": "docs/archive/old.md"
-            }
-        });
-        handle_acp_message(&mut server_wire, &mut state, msg).await?;
-        let resp = client_wire.read().await?;
-        assert_eq!(resp["id"], 2);
-        assert_eq!(resp["result"]["success"], true);
-        assert!(repo_path.join("docs/archive/old.md").is_file());
-        assert!(!repo_path.join("docs/old.md").exists());
-
-        // 4. Delete file
-        let msg = serde_json::json!({
-            "id": 3,
-            "method": "fs/delete_file",
-            "params": {
-                "path": "docs/archive/old.md"
-            }
-        });
-        handle_acp_message(&mut server_wire, &mut state, msg).await?;
-        let resp = client_wire.read().await?;
-        assert_eq!(resp["id"], 3);
-        assert_eq!(resp["result"]["success"], true);
-        assert!(!repo_path.join("docs/archive/old.md").exists());
-
-        // 5. Delete directory
-        let msg = serde_json::json!({
-            "id": 4,
-            "method": "fs/delete_directory",
-            "params": {
-                "path": "docs/archive",
-                "recursive": false
-            }
-        });
-        handle_acp_message(&mut server_wire, &mut state, msg).await?;
-        let resp = client_wire.read().await?;
-        assert_eq!(resp["id"], 4);
-        assert_eq!(resp["result"]["success"], true);
+        assert!(
+            resp["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(crate::tool_surface::ERR_MUTATION_LOCK_REQUIRED)
+        );
         assert!(!repo_path.join("docs/archive").exists());
+        assert_eq!(state.tool_calls, 1);
+        assert_eq!(state.tool_successes, 0);
+        assert_eq!(state.tool_failures, 1);
 
-        assert_eq!(state.tool_calls, 4);
-        assert_eq!(state.tool_successes, 4);
-        assert_eq!(state.tool_failures, 0);
-        assert_eq!(state.tool_counts["create_directory"], 1);
-        assert_eq!(state.tool_counts["move"], 1);
-        assert_eq!(state.tool_counts["delete_file"], 1);
-        assert_eq!(state.tool_counts["delete_directory"], 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_handle_acp_message_denies_unconfined_terminal_creation() -> Result<()> {
+        let repo = tempdir()?;
+        let repo_path = repo.path();
+        let (mut server_wire, mut client_wire) = make_test_wire();
+        let mut state = AcpTurnState::new(repo_path, WorkspaceAccess::ReadWrite);
+
+        handle_acp_message(
+            &mut server_wire,
+            &mut state,
+            serde_json::json!({
+                "id": 1,
+                "method": "terminal/create",
+                "params": {"command":"sh", "args":["-c", "touch should-not-exist"]}
+            }),
+        )
+        .await?;
+
+        let response = client_wire.read().await?;
+        assert!(response.get("error").is_some());
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(ERR_CLI_WORKFLOW_TERMINAL_DISABLED)
+        );
+        assert!(!repo_path.join("should-not-exist").exists());
+        assert!(state.terminals.is_empty());
+        assert_eq!(state.tool_failures, 1);
 
         Ok(())
     }

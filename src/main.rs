@@ -645,6 +645,18 @@ async fn connect_durable_catalog(database_url: &str) -> Result<sqlx::PgPool> {
     Ok(pool)
 }
 
+fn ensure_cli_workflow_execution_enabled(action: &WorkflowAction) -> Result<()> {
+    if matches!(
+        action,
+        WorkflowAction::Start { .. } | WorkflowAction::Run { .. }
+    ) {
+        anyhow::bail!(
+            "CLI_WORKFLOW_EXECUTION_GATED: workflow start and resume are disabled pending R4 qualification"
+        );
+    }
+    Ok(())
+}
+
 async fn connect_durable_catalog_engine(database_url: &str) -> Result<(Engine, tempfile::TempDir)> {
     let preflight = connect_durable_catalog(database_url).await?;
     preflight.close().await;
@@ -1275,6 +1287,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     if let Commands::Workflow(WorkflowArgs { action }) = &cli.command {
+        ensure_cli_workflow_execution_enabled(action)?;
         match action {
             WorkflowAction::Start {
                 pos_task_id,
@@ -1588,6 +1601,10 @@ async fn main() -> Result<()> {
                 policy,
                 database_url_file,
             } => {
+                anyhow::ensure!(
+                    image.is_some(),
+                    "VERIFICATION_PROFILE_REQUIRED: host verification is disabled; select a pinned isolated image"
+                );
                 let database_url = read_private_database_url(database_url_file.as_deref()).await?;
                 let (engine, scratch) =
                     connect_durable_catalog_engine(database_url.as_str()).await?;
@@ -2954,6 +2971,46 @@ mod durable_catalog_target_tests {
             let error = validate_durable_catalog_url(wrong).unwrap_err().to_string();
             assert!(!error.contains("placeholder"));
         }
+    }
+}
+
+#[cfg(test)]
+mod workflow_execution_gate_tests {
+    use super::*;
+
+    #[test]
+    fn production_start_and_resume_are_gated_before_database_access() {
+        let start = WorkflowAction::Start {
+            pos_task_id: None,
+            pos_attempt_id: None,
+            task_id: None,
+            attempt_id: None,
+            task: Some("task".into()),
+            task_file: None,
+            repo: None,
+            base_revision: None,
+            kind: "software-change".into(),
+            max_iterations: 3,
+            policy: None,
+            regression_policy: None,
+            selection_policy: None,
+            detach: true,
+            database_url_file: None,
+        };
+        let resume = WorkflowAction::Run {
+            workflow_run_id: "wf-1".into(),
+            database_url_file: None,
+        };
+        let show = WorkflowAction::Show {
+            workflow_run_id: "wf-1".into(),
+            database_url_file: None,
+        };
+
+        for action in [&start, &resume] {
+            let error = ensure_cli_workflow_execution_enabled(action).unwrap_err();
+            assert!(error.to_string().contains("CLI_WORKFLOW_EXECUTION_GATED"));
+        }
+        assert!(ensure_cli_workflow_execution_enabled(&show).is_ok());
     }
 }
 

@@ -601,6 +601,68 @@ async fn b34_04_role_matrix_planner_denial_and_implementer_allowance() -> Result
 // -----------------------------------------------------------------------------
 
 #[tokio::test]
+async fn b34_04_missing_mutation_lock_context_is_denied() -> Result<()> {
+    let repo = tempdir()?;
+    let (server_in, client_out) = tokio::io::duplex(65536);
+    let (client_in, server_out) = tokio::io::duplex(65536);
+    let mut server_wire = Wire::new(server_in, server_out, 16 * 1024 * 1024);
+    let mut client_wire = Wire::new(client_in, client_out, 16 * 1024 * 1024);
+    let mut state = AcpTurnState::new(repo.path(), WorkspaceAccess::ReadWrite);
+
+    handle_acp_message(
+        &mut server_wire,
+        &mut state,
+        json!({
+            "jsonrpc":"2.0", "id":1, "method":"fs/write_text_file",
+            "params":{"path":"must-not-exist.txt", "content":"denied"}
+        }),
+    )
+    .await?;
+
+    let response = client_wire.read().await?;
+    assert!(response.get("error").is_some());
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(ERR_MUTATION_LOCK_REQUIRED)
+    );
+    assert!(!repo.path().join("must-not-exist.txt").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn b34_04_cli_terminal_create_is_denied() -> Result<()> {
+    let repo = tempdir()?;
+    let (server_in, client_out) = tokio::io::duplex(65536);
+    let (client_in, server_out) = tokio::io::duplex(65536);
+    let mut server_wire = Wire::new(server_in, server_out, 16 * 1024 * 1024);
+    let mut client_wire = Wire::new(client_in, client_out, 16 * 1024 * 1024);
+    let mut state = AcpTurnState::new(repo.path(), WorkspaceAccess::ReadWrite);
+
+    handle_acp_message(
+        &mut server_wire,
+        &mut state,
+        json!({
+            "jsonrpc":"2.0", "id":1, "method":"terminal/create",
+            "params":{"command":"sh", "args":["-c", "touch terminal-ran"]}
+        }),
+    )
+    .await?;
+
+    let response = client_wire.read().await?;
+    assert!(response.get("error").is_some());
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("CLI_WORKFLOW_TERMINAL_DISABLED")
+    );
+    assert!(!repo.path().join("terminal-ran").exists());
+    Ok(())
+}
+
+#[tokio::test]
 async fn b34_05_attempt_mutation_lock_enforcement() -> Result<()> {
     let ctx = match setup_test().await? {
         Some(c) => c,
@@ -1005,17 +1067,57 @@ async fn b34_12_terminal_lifecycle_and_bounded_preview() -> Result<()> {
 // -----------------------------------------------------------------------------
 
 #[tokio::test]
-async fn b34_13_coordinator_wire_dispatch_all_tools() -> Result<()> {
+async fn b34_13_coordinator_wire_dispatch_enforces_s1_gates() -> Result<()> {
+    let Some(ctx) = setup_test().await? else {
+        return Ok(());
+    };
     let repo = tempdir()?;
     let p = repo.path();
     init_git_repo(p)?;
+
+    let attempt_id = format!("att-{}", id());
+    let repo_path = p.to_string_lossy().into_owned();
+    let workflow = ctx
+        .store
+        .create_workflow_run_full(
+            "software_change_v1",
+            &attempt_id,
+            3,
+            None,
+            None,
+            None,
+            Some("wire dispatch authority test"),
+            Some(&repo_path),
+            Some("HEAD"),
+        )
+        .await?;
+    let role = RoleDefinition::implementer_v1();
+    let role_execution = ctx
+        .store
+        .create_role_execution(&workflow.id, &role, "IMPLEMENTING", 0, None, None)
+        .await?;
+    ctx.store
+        .acquire_workspace_mutation_lock(&attempt_id, &role_execution.id)
+        .await?;
 
     let (server_in, client_out) = tokio::io::duplex(65536);
     let (client_in, server_out) = tokio::io::duplex(65536);
     let mut server_wire = Wire::new(server_in, server_out, 16 * 1024 * 1024);
     let mut client_wire = Wire::new(client_in, client_out, 16 * 1024 * 1024);
 
-    let mut state = AcpTurnState::new(p, WorkspaceAccess::ReadWrite);
+    let mut state = AcpTurnState {
+        repo_path: p,
+        workspace_access: WorkspaceAccess::ReadWrite,
+        agent_output: String::new(),
+        tool_calls: 0,
+        tool_successes: 0,
+        tool_failures: 0,
+        tool_counts: BTreeMap::new(),
+        terminals: BTreeMap::new(),
+        wf_attempt_id: Some(attempt_id.clone()),
+        role_exec_id: Some(role_execution.id.clone()),
+        pool: Some(&ctx.engine.pool),
+    };
 
     // 1. fs/create_directory
     handle_acp_message(
@@ -1157,7 +1259,8 @@ async fn b34_13_coordinator_wire_dispatch_all_tools() -> Result<()> {
     let resp = client_wire.read().await?;
     assert!(resp.get("result").is_some());
 
-    // 10. terminal/create + wait_for_exit + output + release
+    // 10. terminal/create is always denied until the CLI has a confined owner.
+    let terminal_marker = p.join("terminal-must-not-run");
     handle_acp_message(
         &mut server_wire,
         &mut state,
@@ -1165,67 +1268,34 @@ async fn b34_13_coordinator_wire_dispatch_all_tools() -> Result<()> {
             "jsonrpc": "2.0",
             "id": 10,
             "method": "terminal/create",
-            "params": { "command": "echo", "args": ["wire test"] }
+            "params": {
+                "command": "sh",
+                "args": ["-c", format!("touch {}", terminal_marker.display())]
+            }
         }),
     )
     .await?;
     let resp = client_wire.read().await?;
-    let tid = resp["result"]["terminalId"].as_str().unwrap().to_string();
-
-    handle_acp_message(
-        &mut server_wire,
-        &mut state,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 11,
-            "method": "terminal/wait_for_exit",
-            "params": { "terminalId": tid }
-        }),
-    )
-    .await?;
-    let resp = client_wire.read().await?;
-    assert_eq!(resp["result"]["exitStatus"]["exitCode"].as_i64(), Some(0));
-
-    handle_acp_message(
-        &mut server_wire,
-        &mut state,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 12,
-            "method": "terminal/output",
-            "params": { "terminalId": tid }
-        }),
-    )
-    .await?;
-    let resp = client_wire.read().await?;
+    assert!(resp.get("error").is_some());
     assert!(
-        resp["result"]["output"]
+        resp["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("wire test")
+            .contains("CLI_WORKFLOW_TERMINAL_DISABLED")
     );
-
-    handle_acp_message(
-        &mut server_wire,
-        &mut state,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 13,
-            "method": "terminal/release",
-            "params": { "terminalId": tid }
-        }),
-    )
-    .await?;
-    let resp = client_wire.read().await?;
-    assert!(resp.get("result").is_some());
+    assert!(!terminal_marker.exists());
 
     // Verify turn state metrics
-    assert!(state.tool_calls >= 13);
-    assert_eq!(state.tool_failures, 0);
+    assert!(state.tool_calls >= 10);
+    assert_eq!(state.tool_failures, 1);
     assert!(state.tool_counts.contains_key("fs.write_text_file"));
     assert!(state.tool_counts.contains_key("fs.edit_file"));
     assert!(state.tool_counts.contains_key("terminal.create"));
 
+    ctx.store
+        .release_workspace_mutation_lock(&attempt_id, &role_execution.id)
+        .await?;
+    teardown_test(ctx).await?;
     Ok(())
 }
 

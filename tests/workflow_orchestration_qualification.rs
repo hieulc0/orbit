@@ -93,6 +93,18 @@ fn sample_policy() -> VerificationPolicy {
     }
 }
 
+async fn assert_verification_profile_gate(
+    coordinator: &WorkflowCoordinator,
+    store: &WorkflowStore,
+    workflow_id: &str,
+) -> Result<()> {
+    let error = coordinator.step(workflow_id).await.unwrap_err();
+    assert!(error.to_string().contains("VERIFICATION_PROFILE_REQUIRED"));
+    let workflow = store.get_workflow_run(workflow_id).await?.unwrap();
+    assert_eq!(workflow.status, WorkflowStage::Verifying);
+    Ok(())
+}
+
 async fn enroll_sample_credentials(pool: &PgPool) -> Result<()> {
     let mut tx = pool.begin().await?;
     let cred_id1 = id();
@@ -121,13 +133,15 @@ async fn enroll_sample_credentials(pool: &PgPool) -> Result<()> {
 }
 
 #[tokio::test]
-async fn b31_01_workflow_start_drives_execution() -> Result<()> {
+async fn b31_01_workflow_fails_closed_without_pinned_verification_profile() -> Result<()> {
     let Some(ctx) = setup_test().await? else {
         return Ok(());
     };
     enroll_sample_credentials(&ctx.engine.pool).await?;
 
     let policy = sample_policy();
+    let repo = tempfile::tempdir()?;
+    let repo_path = repo.path().to_string_lossy().into_owned();
     let wf = ctx
         .store
         .create_workflow_run_full(
@@ -138,7 +152,7 @@ async fn b31_01_workflow_start_drives_execution() -> Result<()> {
             None,
             None,
             Some("Refactor internal utils"),
-            Some("."),
+            Some(&repo_path),
             Some("HEAD"),
         )
         .await?;
@@ -147,11 +161,13 @@ async fn b31_01_workflow_start_drives_execution() -> Result<()> {
     let executor = Arc::new(SimulatedRoleExecutor::with_approval());
     let coordinator = WorkflowCoordinator::new(ctx.engine.pool.clone(), executor);
 
-    let final_wf = coordinator.run_to_completion(&wf.id).await?;
-    assert_eq!(final_wf.status, WorkflowStage::Completed);
+    coordinator.step(&wf.id).await?; // -> Planning
+    coordinator.step(&wf.id).await?; // -> Implementing
+    coordinator.step(&wf.id).await?; // -> Verifying
+    assert_verification_profile_gate(&coordinator, &ctx.store, &wf.id).await?;
 
     let roles = ctx.store.list_role_executions(&wf.id).await?;
-    assert_eq!(roles.len(), 3); // Planner, Implementer, Reviewer
+    assert_eq!(roles.len(), 2); // Planner and Implementer only
     assert!(
         roles
             .iter()
@@ -384,6 +400,8 @@ async fn b31_13_fast_auto_execution() -> Result<()> {
     enroll_sample_credentials(&ctx.engine.pool).await?;
 
     let policy = sample_policy();
+    let repo = tempfile::tempdir()?;
+    let repo_path = repo.path().to_string_lossy().into_owned();
     let wf = ctx
         .store
         .create_workflow_run_full(
@@ -394,8 +412,8 @@ async fn b31_13_fast_auto_execution() -> Result<()> {
             None,
             None,
             None,
-            None,
-            None,
+            Some(&repo_path),
+            Some("HEAD"),
         )
         .await?;
 
@@ -412,10 +430,7 @@ async fn b31_13_fast_auto_execution() -> Result<()> {
     let wf_verifying = ctx.store.get_workflow_run(&wf.id).await?.unwrap();
     assert_eq!(wf_verifying.status, WorkflowStage::Verifying);
 
-    // Step 4: Verifying runs FAST and STANDARD -> Reviewing
-    coordinator.step(&wf.id).await?;
-    let wf_reviewing = ctx.store.get_workflow_run(&wf.id).await?.unwrap();
-    assert_eq!(wf_reviewing.status, WorkflowStage::Reviewing);
+    assert_verification_profile_gate(&coordinator, &ctx.store, &wf.id).await?;
 
     teardown_test(ctx).await
 }
@@ -428,6 +443,8 @@ async fn b31_14_standard_auto_execution() -> Result<()> {
     enroll_sample_credentials(&ctx.engine.pool).await?;
 
     let policy = sample_policy();
+    let repo = tempfile::tempdir()?;
+    let repo_path = repo.path().to_string_lossy().into_owned();
     let wf = ctx
         .store
         .create_workflow_run_full(
@@ -438,8 +455,8 @@ async fn b31_14_standard_auto_execution() -> Result<()> {
             None,
             None,
             None,
-            None,
-            None,
+            Some(&repo_path),
+            Some("HEAD"),
         )
         .await?;
 
@@ -449,10 +466,7 @@ async fn b31_14_standard_auto_execution() -> Result<()> {
     coordinator.step(&wf.id).await?; // -> Planning
     coordinator.step(&wf.id).await?; // -> Implementing
     coordinator.step(&wf.id).await?; // -> Verifying
-    coordinator.step(&wf.id).await?; // -> Reviewing
-
-    let wf_reviewing = ctx.store.get_workflow_run(&wf.id).await?.unwrap();
-    assert_eq!(wf_reviewing.status, WorkflowStage::Reviewing);
+    assert_verification_profile_gate(&coordinator, &ctx.store, &wf.id).await?;
 
     teardown_test(ctx).await
 }
@@ -465,6 +479,8 @@ async fn b31_15_review_auto_execution() -> Result<()> {
     enroll_sample_credentials(&ctx.engine.pool).await?;
 
     let policy = sample_policy();
+    let repo = tempfile::tempdir()?;
+    let repo_path = repo.path().to_string_lossy().into_owned();
     let wf = ctx
         .store
         .create_workflow_run_full(
@@ -475,22 +491,18 @@ async fn b31_15_review_auto_execution() -> Result<()> {
             None,
             None,
             None,
-            None,
-            None,
+            Some(&repo_path),
+            Some("HEAD"),
         )
         .await?;
 
     let executor = Arc::new(SimulatedRoleExecutor::with_approval());
     let coordinator = WorkflowCoordinator::new(ctx.engine.pool.clone(), executor);
 
-    coordinator.step(&wf.id).await?;
-    coordinator.step(&wf.id).await?;
-    coordinator.step(&wf.id).await?;
-    coordinator.step(&wf.id).await?; // Advances to Reviewing
-
-    coordinator.step(&wf.id).await?; // Reviewer executes and approves -> Regression
-    let wf_reg = ctx.store.get_workflow_run(&wf.id).await?.unwrap();
-    assert_eq!(wf_reg.status, WorkflowStage::Regression);
+    coordinator.step(&wf.id).await?; // -> Planning
+    coordinator.step(&wf.id).await?; // -> Implementing
+    coordinator.step(&wf.id).await?; // -> Verifying
+    assert_verification_profile_gate(&coordinator, &ctx.store, &wf.id).await?;
 
     teardown_test(ctx).await
 }
@@ -503,6 +515,8 @@ async fn b31_16_full_auto_execution() -> Result<()> {
     enroll_sample_credentials(&ctx.engine.pool).await?;
 
     let policy = sample_policy();
+    let repo = tempfile::tempdir()?;
+    let repo_path = repo.path().to_string_lossy().into_owned();
     let wf = ctx
         .store
         .create_workflow_run_full(
@@ -513,28 +527,32 @@ async fn b31_16_full_auto_execution() -> Result<()> {
             None,
             None,
             None,
-            None,
-            None,
+            Some(&repo_path),
+            Some("HEAD"),
         )
         .await?;
 
     let executor = Arc::new(SimulatedRoleExecutor::with_approval());
     let coordinator = WorkflowCoordinator::new(ctx.engine.pool.clone(), executor);
 
-    let final_wf = coordinator.run_to_completion(&wf.id).await?;
-    assert_eq!(final_wf.status, WorkflowStage::Completed);
+    coordinator.step(&wf.id).await?; // -> Planning
+    coordinator.step(&wf.id).await?; // -> Implementing
+    coordinator.step(&wf.id).await?; // -> Verifying
+    assert_verification_profile_gate(&coordinator, &ctx.store, &wf.id).await?;
 
     teardown_test(ctx).await
 }
 
 #[tokio::test]
-async fn b31_17_repair_auto_loop() -> Result<()> {
+async fn b31_17_repair_path_is_blocked_without_verification_profile() -> Result<()> {
     let Some(ctx) = setup_test().await? else {
         return Ok(());
     };
     enroll_sample_credentials(&ctx.engine.pool).await?;
 
     let policy = sample_policy();
+    let repo = tempfile::tempdir()?;
+    let repo_path = repo.path().to_string_lossy().into_owned();
     let wf = ctx
         .store
         .create_workflow_run_full(
@@ -545,59 +563,18 @@ async fn b31_17_repair_auto_loop() -> Result<()> {
             None,
             None,
             None,
-            None,
-            None,
+            Some(&repo_path),
+            Some("HEAD"),
         )
         .await?;
 
     let executor = Arc::new(SimulatedRoleExecutor::with_approval());
-    // Inject changes requested
-    *executor.review_response.lock().unwrap() = Some(format!(
-        "{}\n{}\n{}",
-        ORBIT_HANDOFF_START,
-        serde_json::to_string(&ReviewDecision {
-            decision: ReviewDecisionStatus::ChangesRequested,
-            summary: "Needs fixes for test coverage".into(),
-            findings: vec![],
-            requested_changes: vec!["Add edge cases".into()],
-            suggested_additional_checks: vec![],
-        })?,
-        ORBIT_HANDOFF_END
-    ));
-
     let coordinator = WorkflowCoordinator::new(ctx.engine.pool.clone(), executor.clone());
 
     coordinator.step(&wf.id).await?; // -> Planning
     coordinator.step(&wf.id).await?; // -> Implementing
     coordinator.step(&wf.id).await?; // -> Verifying
-    coordinator.step(&wf.id).await?; // -> Reviewing
-    coordinator.step(&wf.id).await?; // Reviewer says ChangesRequested -> Repairing!
-
-    let wf_rep = ctx.store.get_workflow_run(&wf.id).await?.unwrap();
-    assert_eq!(wf_rep.status, WorkflowStage::Repairing);
-    assert_eq!(wf_rep.iteration, 1);
-
-    // In repair, switch reviewer to approve
-    *executor.review_response.lock().unwrap() = Some(format!(
-        "{}\n{}\n{}",
-        ORBIT_HANDOFF_START,
-        serde_json::to_string(&ReviewDecision {
-            decision: ReviewDecisionStatus::Approve,
-            summary: "Approved after repair".into(),
-            findings: vec![],
-            requested_changes: vec![],
-            suggested_additional_checks: vec![],
-        })?,
-        ORBIT_HANDOFF_END
-    ));
-
-    coordinator.step(&wf.id).await?; // Repairing executes implementer -> Verifying (iteration 2)
-    let wf_it2 = ctx.store.get_workflow_run(&wf.id).await?.unwrap();
-    assert_eq!(wf_it2.status, WorkflowStage::Verifying);
-    assert_eq!(wf_it2.iteration, 2);
-
-    let final_wf = coordinator.run_to_completion(&wf.id).await?;
-    assert_eq!(final_wf.status, WorkflowStage::Completed);
+    assert_verification_profile_gate(&coordinator, &ctx.store, &wf.id).await?;
 
     teardown_test(ctx).await
 }
@@ -628,6 +605,8 @@ async fn b31_19_session_independence_live_path() -> Result<()> {
     enroll_sample_credentials(&ctx.engine.pool).await?;
 
     let policy = sample_policy();
+    let repo = tempfile::tempdir()?;
+    let repo_path = repo.path().to_string_lossy().into_owned();
     let wf = ctx
         .store
         .create_workflow_run_full(
@@ -638,16 +617,20 @@ async fn b31_19_session_independence_live_path() -> Result<()> {
             None,
             None,
             None,
-            None,
-            None,
+            Some(&repo_path),
+            Some("HEAD"),
         )
         .await?;
 
     let executor = Arc::new(SimulatedRoleExecutor::with_approval());
     let coordinator = WorkflowCoordinator::new(ctx.engine.pool.clone(), executor);
 
-    coordinator.run_to_completion(&wf.id).await?;
+    coordinator.step(&wf.id).await?; // -> Planning
+    coordinator.step(&wf.id).await?; // -> Implementing
+    coordinator.step(&wf.id).await?; // -> Verifying
+    assert_verification_profile_gate(&coordinator, &ctx.store, &wf.id).await?;
     let roles = ctx.store.list_role_executions(&wf.id).await?;
+    assert_eq!(roles.len(), 2);
 
     let agent_ids: Vec<String> = roles
         .iter()
@@ -667,6 +650,8 @@ async fn b31_20_restart_recovery() -> Result<()> {
     enroll_sample_credentials(&ctx.engine.pool).await?;
 
     let policy = sample_policy();
+    let repo = tempfile::tempdir()?;
+    let repo_path = repo.path().to_string_lossy().into_owned();
     let wf = ctx
         .store
         .create_workflow_run_full(
@@ -677,8 +662,8 @@ async fn b31_20_restart_recovery() -> Result<()> {
             None,
             None,
             None,
-            None,
-            None,
+            Some(&repo_path),
+            Some("HEAD"),
         )
         .await?;
 
@@ -692,8 +677,8 @@ async fn b31_20_restart_recovery() -> Result<()> {
 
     // New coordinator starts up fresh and resumes
     let coordinator2 = WorkflowCoordinator::new(ctx.engine.pool.clone(), executor);
-    let final_wf = coordinator2.run_to_completion(&wf.id).await?;
-    assert_eq!(final_wf.status, WorkflowStage::Completed);
+    coordinator2.step(&wf.id).await?; // Implementing -> Verifying
+    assert_verification_profile_gate(&coordinator2, &ctx.store, &wf.id).await?;
 
     teardown_test(ctx).await
 }

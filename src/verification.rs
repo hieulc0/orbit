@@ -462,6 +462,38 @@ pub struct EnvironmentIdentity {
     pub orbit_version: String,
 }
 
+fn is_sha256_image_id(value: &str) -> bool {
+    let digest = value.strip_prefix("sha256:").unwrap_or(value);
+    digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn is_pinned_oci_image(value: &str) -> bool {
+    is_sha256_image_id(value)
+        || value.rsplit_once("@sha256:").is_some_and(|(_, digest)| {
+            digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())
+        })
+}
+
+pub(crate) fn validate_pinned_verification_profile(
+    environment: &EnvironmentIdentity,
+) -> Result<()> {
+    ensure!(
+        environment.execution_profile == "sandboxed-container"
+            && environment.isolation == "rootless-podman"
+            && environment.oci_runtime.as_deref() == Some("podman")
+            && environment
+                .runtime_image
+                .as_deref()
+                .is_some_and(|image| !image.trim().is_empty())
+            && environment
+                .runtime_image_digest
+                .as_deref()
+                .is_some_and(is_sha256_image_id),
+        "VERIFICATION_PROFILE_REQUIRED: verification requires a pinned rootless Podman image"
+    );
+    Ok(())
+}
+
 /// Durable record of a verification step execution.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VerificationStepRun {
@@ -608,6 +640,14 @@ pub async fn execute_verification_command_isolated_with_network(
     use std::process::Stdio;
     use tokio::{io::AsyncReadExt, process::Command};
 
+    let isolation_image = isolation_image.context(
+        "VERIFICATION_PROFILE_REQUIRED: host verification is disabled; a pinned isolated image is required",
+    )?;
+    ensure!(
+        is_pinned_oci_image(isolation_image),
+        "VERIFICATION_PROFILE_REQUIRED: isolated image must be pinned by SHA-256"
+    );
+
     step.validate()?;
     let canonical_workspace = workspace_dir.canonicalize()?;
     let cwd = canonical_workspace.join(&step.cwd).canonicalize()?;
@@ -617,9 +657,10 @@ pub async fn execute_verification_command_isolated_with_network(
     );
 
     let start_instant = Instant::now();
-    let container_name = isolation_image.map(|_| format!("orbit-vstep-{}", crate::model::id()));
+    let container_name = Some(format!("orbit-vstep-{}", crate::model::id()));
 
-    let mut cmd = if let Some(image) = isolation_image {
+    let mut cmd = {
+        let image = isolation_image;
         let mut c = Command::new("podman");
         let name = container_name.as_ref().unwrap();
         let rel_cwd = cwd
@@ -724,49 +765,6 @@ pub async fn execute_verification_command_isolated_with_network(
                 c.arg(arg);
             }
         }
-        c
-    } else {
-        let mut c = Command::new(&step.argv[0]);
-        let mut env_map: BTreeMap<String, String> = BTreeMap::new();
-        env_map.insert("HOME".to_string(), "/tmp/orbit-home".to_string());
-        env_map.insert("CI".to_string(), "1".to_string());
-        env_map.insert("LANG".to_string(), "C.UTF-8".to_string());
-        env_map.insert("LC_ALL".to_string(), "C.UTF-8".to_string());
-        env_map.insert("TERM".to_string(), "dumb".to_string());
-        env_map.insert(
-            "PATH".to_string(),
-            std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into()),
-        );
-        env_map.insert("ORBIT_VERIFICATION".to_string(), "1".to_string());
-
-        if let Some(pol) = environment_policy {
-            for key in &pol.inherit {
-                if !pol.deny.contains(key)
-                    && let Ok(val) = std::env::var(key)
-                {
-                    env_map.insert(key.clone(), val);
-                }
-            }
-            for (k, v) in &pol.set {
-                if !pol.deny.contains(k) {
-                    env_map.insert(k.clone(), v.clone());
-                }
-            }
-        }
-
-        for (k, v) in &step.env {
-            if let Some(pol) = environment_policy
-                && pol.deny.contains(k)
-            {
-                continue;
-            }
-            env_map.insert(k.clone(), v.clone());
-        }
-
-        c.args(&step.argv[1..])
-            .current_dir(&cwd)
-            .env_clear()
-            .envs(&env_map);
         c
     };
 
@@ -1787,6 +1785,7 @@ pub async fn execute_verification_plan_with_policy(
     if let Some(pol) = policy {
         pol.check_plan(plan)?;
     }
+    validate_pinned_verification_profile(&environment)?;
 
     let run = store
         .create_run_with_policy(attempt_id, workspace_state, plan, environment, policy)
@@ -1837,7 +1836,7 @@ pub async fn execute_run_contents(
         });
 
     let run_id = run.id.clone();
-    let runtime_image = run.environment_identity.runtime_image.clone();
+    let runtime_image = run.environment_identity.runtime_image_digest.clone();
 
     // Helper executing the steps given a network_name
     let execute_steps =
@@ -2324,6 +2323,19 @@ pub fn format_verification_show(run: &VerificationRun) -> String {
 mod tests {
     use super::*;
 
+    async fn assert_unpinned_host_command_denied(
+        step: &VerificationStep,
+        workspace: &Path,
+        timeout: Option<Duration>,
+        cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> Result<()> {
+        let error = execute_verification_command(step, workspace, timeout, cancellation)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("VERIFICATION_PROFILE_REQUIRED"));
+        Ok(())
+    }
+
     #[test]
     fn test_workspace_state_computation_and_invalidation() {
         let ws_a1 =
@@ -2366,21 +2378,14 @@ mod tests {
             "Echo",
             vec!["echo".into(), "hello orbit".into()],
         );
-        let cap_pass =
-            execute_verification_command(&step_pass, temp_dir.path(), None, None).await?;
-        assert_eq!(cap_pass.exit_code, Some(0));
-        assert!(String::from_utf8_lossy(&cap_pass.stdout_bytes).contains("hello orbit"));
-        assert!(!cap_pass.timed_out);
+        assert_unpinned_host_command_denied(&step_pass, temp_dir.path(), None, None).await?;
 
         let step_fail = VerificationStep::new_command(
             "fail_test",
             "Fail",
             vec!["sh".into(), "-c".into(), "exit 42".into()],
         );
-        let cap_fail =
-            execute_verification_command(&step_fail, temp_dir.path(), None, None).await?;
-        assert_eq!(cap_fail.exit_code, Some(42));
-        assert!(!cap_fail.timed_out);
+        assert_unpinned_host_command_denied(&step_fail, temp_dir.path(), None, None).await?;
 
         Ok(())
     }
@@ -2391,15 +2396,13 @@ mod tests {
         let mut step =
             VerificationStep::new_command("sleep_test", "Sleep", vec!["sleep".into(), "10".into()]);
         step.timeout_seconds = 1;
-        let cap = execute_verification_command(
+        assert_unpinned_host_command_denied(
             &step,
             temp_dir.path(),
             Some(Duration::from_millis(100)),
             None,
         )
         .await?;
-        assert!(cap.timed_out);
-        assert!(cap.exit_code.is_none());
 
         Ok(())
     }
@@ -2414,22 +2417,16 @@ mod tests {
         );
         let (tx, rx) = tokio::sync::watch::channel(false);
 
-        let worker = tokio::spawn(async move {
-            execute_verification_command(
-                &step,
-                temp_dir.path(),
-                Some(Duration::from_secs(30)),
-                Some(rx),
-            )
-            .await
-        });
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        tx.send(true)?;
-
-        let res = worker.await?;
-        assert!(res.is_err());
-        assert!(res.unwrap_err().to_string().contains("cancelled"));
+        let error = execute_verification_command(
+            &step,
+            temp_dir.path(),
+            Some(Duration::from_secs(30)),
+            Some(rx),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("VERIFICATION_PROFILE_REQUIRED"));
+        drop(tx);
 
         Ok(())
     }
@@ -2445,16 +2442,18 @@ mod tests {
             vec!["sh".into(), "-c".into(), script],
         );
 
-        let cap = execute_verification_command(
+        assert_unpinned_host_command_denied(
             &step,
             temp_dir.path(),
             Some(Duration::from_millis(200)),
             None,
         )
         .await?;
-        assert!(cap.timed_out);
-
         tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !marker.exists(),
+            "unconfined child process must not be spawned"
+        );
         Ok(())
     }
 

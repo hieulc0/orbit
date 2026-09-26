@@ -34,6 +34,99 @@ async fn setup_db_store() -> Result<(Engine, VerificationStore, tempfile::TempDi
     Ok((engine, store, home))
 }
 
+async fn pinned_podman_image_id(image: &str) -> Result<String> {
+    let output = tokio::process::Command::new("podman")
+        .args(["image", "inspect", image, "--format", "{{.Id}}"])
+        .output()
+        .await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "preloaded Podman image is required: {image}"
+    );
+    let image_id = String::from_utf8(output.stdout)?.trim().to_owned();
+    anyhow::ensure!(
+        image_id.len() == 64 && image_id.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "Podman did not return a full immutable image ID"
+    );
+    Ok(image_id)
+}
+
+#[tokio::test]
+async fn b1_unpinned_host_verification_is_denied_before_spawn() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let marker = workspace.path().join("host-verification-ran");
+    let store = VerificationStore::new(PgPool::connect_lazy(
+        "postgres://orbit:orbit@127.0.0.1:1/orbit",
+    )?);
+    let plan = VerificationPlan::new(
+        "host-denial",
+        "Host Denial",
+        vec![VerificationStep::new_command(
+            "host_probe",
+            "Host Probe",
+            vec!["sh".into(), "-c".into(), "touch never-run".into()],
+        )],
+    );
+    let profile_error = execute_verification_plan(
+        &store,
+        "attempt-host-denial",
+        &WorkspaceState::compute_from_parts("base", "head", None),
+        &plan,
+        workspace.path(),
+        EnvironmentIdentity::default(),
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        profile_error
+            .to_string()
+            .contains("VERIFICATION_PROFILE_REQUIRED")
+    );
+
+    let step = VerificationStep::new_command(
+        "host_probe",
+        "Host Execution Probe",
+        vec![
+            "sh".into(),
+            "-c".into(),
+            format!("touch {}", marker.display()),
+        ],
+    );
+
+    let error = execute_verification_command_isolated(
+        &step,
+        workspace.path(),
+        Some(Duration::from_secs(5)),
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("VERIFICATION_PROFILE_REQUIRED"));
+    assert!(!marker.exists(), "host command must not be spawned");
+
+    let tag_error = execute_verification_command_isolated(
+        &step,
+        workspace.path(),
+        Some(Duration::from_secs(5)),
+        None,
+        Some(PODMAN_IMAGE_ALPINE),
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        tag_error
+            .to_string()
+            .contains("VERIFICATION_PROFILE_REQUIRED")
+    );
+    assert!(!marker.exists(), "mutable image tags must not be executed");
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires podman sandbox"]
 async fn test_b1_qualification_host_isolation_and_security_escape() -> Result<()> {
@@ -66,12 +159,13 @@ async fn test_b1_qualification_host_isolation_and_security_escape() -> Result<()
         ],
     );
 
+    let image_id = pinned_podman_image_id(PODMAN_IMAGE_ALPINE).await?;
     let capture = execute_verification_command_isolated(
         &step,
         ws_dir.path(),
         Some(Duration::from_secs(20)),
         None,
-        Some(PODMAN_IMAGE_ALPINE),
+        Some(&image_id),
         None,
     )
     .await?;
@@ -115,7 +209,7 @@ async fn test_b1_qualification_large_output_accounting_and_truncation() -> Resul
         execution_profile: "sandboxed-container".into(),
         isolation: "rootless-podman".into(),
         runtime_image: Some(PODMAN_IMAGE_PYTHON.into()),
-        runtime_image_digest: None,
+        runtime_image_digest: Some(pinned_podman_image_id(PODMAN_IMAGE_PYTHON).await?),
         oci_runtime: Some("podman".into()),
         network_policy: VerificationNetworkPolicy::None,
         cache_policy: VerificationCachePolicy::Clean,
@@ -228,7 +322,7 @@ fn test_addition() {
         execution_profile: "sandboxed-container".into(),
         isolation: "rootless-podman".into(),
         runtime_image: Some(PODMAN_IMAGE_RUST.into()),
-        runtime_image_digest: None,
+        runtime_image_digest: Some(pinned_podman_image_id(PODMAN_IMAGE_RUST).await?),
         oci_runtime: Some("podman".into()),
         network_policy: VerificationNetworkPolicy::None,
         cache_policy: VerificationCachePolicy::Clean,
@@ -324,7 +418,7 @@ def test_calc_pass():
         execution_profile: "sandboxed-container".into(),
         isolation: "rootless-podman".into(),
         runtime_image: Some(PODMAN_IMAGE_PYTHON.into()),
-        runtime_image_digest: None,
+        runtime_image_digest: Some(pinned_podman_image_id(PODMAN_IMAGE_PYTHON).await?),
         oci_runtime: Some("podman".into()),
         network_policy: VerificationNetworkPolicy::None,
         cache_policy: VerificationCachePolicy::Clean,
@@ -413,11 +507,11 @@ async fn test_b1_qualification_restart_durability() -> Result<()> {
 
     let ws_state = WorkspaceState::compute_from_parts("base-dur-1", "head-dur-1", None);
     let env = EnvironmentIdentity {
-        execution_profile: "local-operator".into(),
-        isolation: "process-group".into(),
-        runtime_image: None,
-        runtime_image_digest: None,
-        oci_runtime: None,
+        execution_profile: "sandboxed-container".into(),
+        isolation: "rootless-podman".into(),
+        runtime_image: Some(PODMAN_IMAGE_ALPINE.into()),
+        runtime_image_digest: Some(pinned_podman_image_id(PODMAN_IMAGE_ALPINE).await?),
+        oci_runtime: Some("podman".into()),
         network_policy: VerificationNetworkPolicy::None,
         cache_policy: VerificationCachePolicy::Clean,
         environment_policy_digest: None,
@@ -567,12 +661,13 @@ async fn test_b2_qualification_host_env_leak_and_clean_home() -> Result<()> {
         ],
     );
 
+    let image_id = pinned_podman_image_id(PODMAN_IMAGE_ALPINE).await?;
     let capture = execute_verification_command_isolated(
         &step,
         ws_dir.path(),
         Some(Duration::from_secs(20)),
         None,
-        Some(PODMAN_IMAGE_ALPINE),
+        Some(&image_id),
         None,
     )
     .await?;
@@ -625,12 +720,13 @@ async fn test_b2_qualification_explicit_env_injection_and_allowlist() -> Result<
         ],
     );
 
+    let image_id = pinned_podman_image_id(PODMAN_IMAGE_ALPINE).await?;
     let capture = execute_verification_command_isolated(
         &step,
         ws_dir.path(),
         Some(Duration::from_secs(20)),
         None,
-        Some(PODMAN_IMAGE_ALPINE),
+        Some(&image_id),
         Some(&env_policy),
     )
     .await?;
@@ -663,12 +759,13 @@ async fn test_b2_qualification_network_remains_unavailable() -> Result<()> {
         ],
     );
 
+    let image_id = pinned_podman_image_id(PODMAN_IMAGE_ALPINE).await?;
     let capture = execute_verification_command_isolated(
         &step,
         ws_dir.path(),
         Some(Duration::from_secs(20)),
         None,
-        Some(PODMAN_IMAGE_ALPINE),
+        Some(&image_id),
         None,
     )
     .await?;
@@ -705,7 +802,7 @@ async fn test_b2_qualification_policy_mutation_invalidates_qualification() -> Re
         execution_profile: "sandboxed-container".into(),
         isolation: "rootless-podman".into(),
         runtime_image: Some(PODMAN_IMAGE_ALPINE.into()),
-        runtime_image_digest: None,
+        runtime_image_digest: Some(pinned_podman_image_id(PODMAN_IMAGE_ALPINE).await?),
         oci_runtime: Some("podman".into()),
         network_policy: VerificationNetworkPolicy::None,
         cache_policy: VerificationCachePolicy::Clean,
@@ -790,7 +887,7 @@ async fn test_b2_qualification_environment_identity_mutation_invalidates_qualifi
         execution_profile: "sandboxed-container".into(),
         isolation: "rootless-podman".into(),
         runtime_image: Some(PODMAN_IMAGE_ALPINE.into()),
-        runtime_image_digest: Some("sha256:digest-alpha".into()),
+        runtime_image_digest: Some(pinned_podman_image_id(PODMAN_IMAGE_ALPINE).await?),
         oci_runtime: Some("podman".into()),
         network_policy: VerificationNetworkPolicy::None,
         cache_policy: VerificationCachePolicy::Clean,
@@ -830,7 +927,7 @@ async fn test_b2_qualification_environment_identity_mutation_invalidates_qualifi
 
     // Fails under different image digest requirement env_b
     let mut env_b = env_a.clone();
-    env_b.runtime_image_digest = Some("sha256:digest-beta".into());
+    env_b.runtime_image_digest = Some(format!("sha256:{}", "b".repeat(64)));
 
     let qual_b = store
         .check_workspace_qualification(&ws_state.state_id, &policy, Some(&env_b))
@@ -871,7 +968,7 @@ async fn test_b2_qualification_required_step_policy_enforcement() -> Result<()> 
         execution_profile: "sandboxed-container".into(),
         isolation: "rootless-podman".into(),
         runtime_image: Some(PODMAN_IMAGE_ALPINE.into()),
-        runtime_image_digest: None,
+        runtime_image_digest: Some(pinned_podman_image_id(PODMAN_IMAGE_ALPINE).await?),
         oci_runtime: Some("podman".into()),
         network_policy: VerificationNetworkPolicy::None,
         cache_policy: VerificationCachePolicy::Clean,
@@ -938,7 +1035,7 @@ async fn test_b2_qualification_restart_durability_with_policy() -> Result<()> {
         execution_profile: "sandboxed-container".into(),
         isolation: "rootless-podman".into(),
         runtime_image: Some(PODMAN_IMAGE_ALPINE.into()),
-        runtime_image_digest: None,
+        runtime_image_digest: Some(pinned_podman_image_id(PODMAN_IMAGE_ALPINE).await?),
         oci_runtime: Some("podman".into()),
         network_policy: VerificationNetworkPolicy::None,
         cache_policy: VerificationCachePolicy::Clean,
