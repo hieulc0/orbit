@@ -13,6 +13,7 @@ pub mod agy_usage_schema;
 pub mod api;
 pub mod artifacts;
 pub mod availability;
+pub mod browser_verification;
 pub mod codex_bridge;
 pub mod codex_credential_enrollment;
 pub mod codex_session;

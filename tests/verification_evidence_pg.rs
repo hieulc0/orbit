@@ -62,6 +62,8 @@ async fn verification_evidence_lifecycle_and_mutation_invalidation() -> Result<(
         architecture: "x86_64".into(),
         os: "linux".into(),
         orbit_version: "0.1.0".into(),
+        browser_verification_digest: None,
+        browser_runtime_image_digest: None,
     };
 
     // 2. Case A: PASSING VERIFICATION RUN

@@ -124,6 +124,8 @@ async fn test_b1_qualification_large_output_accounting_and_truncation() -> Resul
         architecture: "x86_64".into(),
         os: "linux".into(),
         orbit_version: "0.1.0".into(),
+        browser_verification_digest: None,
+        browser_runtime_image_digest: None,
     };
 
     let ws_state = WorkspaceState::compute_from_parts("base-flood", "head-flood", None);
@@ -233,6 +235,8 @@ fn test_addition() {
         architecture: "x86_64".into(),
         os: "linux".into(),
         orbit_version: "0.1.0".into(),
+        browser_verification_digest: None,
+        browser_runtime_image_digest: None,
     };
 
     let ws_state_pass = WorkspaceState::compute_from_parts("base-1", "head-1", Some("sha256-pass"));
@@ -325,6 +329,8 @@ def test_calc_pass():
         architecture: "x86_64".into(),
         os: "linux".into(),
         orbit_version: "0.1.0".into(),
+        browser_verification_digest: None,
+        browser_runtime_image_digest: None,
     };
 
     let ws_state_pass =
@@ -413,6 +419,8 @@ async fn test_b1_qualification_restart_durability() -> Result<()> {
         architecture: "x86_64".into(),
         os: "linux".into(),
         orbit_version: "0.1.0".into(),
+        browser_verification_digest: None,
+        browser_runtime_image_digest: None,
     };
 
     let run_id = {
@@ -699,6 +707,8 @@ async fn test_b2_qualification_policy_mutation_invalidates_qualification() -> Re
         architecture: "x86_64".into(),
         os: "linux".into(),
         orbit_version: "0.1.0".into(),
+        browser_verification_digest: None,
+        browser_runtime_image_digest: None,
     };
 
     let ws_state = WorkspaceState::compute_from_parts("base-p1", "head-p1", None);
@@ -780,6 +790,8 @@ async fn test_b2_qualification_environment_identity_mutation_invalidates_qualifi
         architecture: "x86_64".into(),
         os: "linux".into(),
         orbit_version: "0.1.0".into(),
+        browser_verification_digest: None,
+        browser_runtime_image_digest: None,
     };
 
     let ws_state = WorkspaceState::compute_from_parts("base-e1", "head-e1", None);
@@ -857,6 +869,8 @@ async fn test_b2_qualification_required_step_policy_enforcement() -> Result<()> 
         architecture: "x86_64".into(),
         os: "linux".into(),
         orbit_version: "0.1.0".into(),
+        browser_verification_digest: None,
+        browser_runtime_image_digest: None,
     };
 
     let ws_state = WorkspaceState::compute_from_parts("base-req", "head-req", None);
@@ -919,6 +933,8 @@ async fn test_b2_qualification_restart_durability_with_policy() -> Result<()> {
         architecture: "x86_64".into(),
         os: "linux".into(),
         orbit_version: "0.1.0".into(),
+        browser_verification_digest: None,
+        browser_runtime_image_digest: None,
     };
 
     let ws_state = WorkspaceState::compute_from_parts("base-rst", "head-rst", None);

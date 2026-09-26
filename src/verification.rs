@@ -303,6 +303,8 @@ pub struct VerificationPolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub integration_environment_spec:
         Option<crate::integration_environment::IntegrationEnvironmentSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_verification_spec: Option<crate::browser_verification::BrowserVerificationSpec>,
 }
 
 impl VerificationPolicy {
@@ -317,6 +319,7 @@ impl VerificationPolicy {
             network_policy: VerificationNetworkPolicy::None,
             cache_policy: VerificationCachePolicy::Clean,
             integration_environment_spec: None,
+            browser_verification_spec: None,
         }
     }
 
@@ -329,6 +332,9 @@ impl VerificationPolicy {
         ensure!(!self.id.trim().is_empty(), "policy id required");
         ensure!(!self.name.trim().is_empty(), "policy name required");
         ensure!(self.version > 0, "policy version must be > 0");
+        if let Some(ref b) = self.browser_verification_spec {
+            b.validate()?;
+        }
         Ok(())
     }
 
@@ -438,6 +444,10 @@ pub struct EnvironmentIdentity {
     pub environment_policy_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub integration_environment_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_verification_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_runtime_image_digest: Option<String>,
     pub architecture: String,
     pub os: String,
     pub orbit_version: String,
@@ -489,6 +499,8 @@ pub struct VerificationRun {
     pub finished_at_ms: Option<i64>,
     pub overall_result: Option<VerificationRunResult>,
     pub step_runs: Vec<VerificationStepRun>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_verification_run: Option<crate::browser_verification::BrowserVerificationRun>,
 }
 
 pub fn now_millis() -> i64 {
@@ -1064,6 +1076,7 @@ impl VerificationStore {
             finished_at_ms: None,
             overall_result: None,
             step_runs: Vec::new(),
+            browser_verification_run: None,
         })
     }
 
@@ -1288,6 +1301,12 @@ impl VerificationStore {
             _ => VerificationStepStatus::Skipped,
         };
 
+        let bstore = crate::browser_verification::BrowserStore::new(self.pool.clone());
+        let browser_verification_run = bstore
+            .get_browser_run_for_verification(&row.id)
+            .await
+            .unwrap_or(None);
+
         Ok(Some(VerificationRun {
             id: row.id,
             attempt_id: row.attempt_id,
@@ -1304,6 +1323,7 @@ impl VerificationStore {
             finished_at_ms: row.finished_at_ms,
             overall_result,
             step_runs,
+            browser_verification_run,
         }))
     }
 
@@ -1412,6 +1432,39 @@ impl VerificationStore {
                     {
                         continue;
                     }
+                    if req_env.browser_verification_digest.is_some()
+                        && req_env.browser_verification_digest
+                            != run.environment_identity.browser_verification_digest
+                    {
+                        continue;
+                    }
+                    if req_env.browser_runtime_image_digest.is_some()
+                        && req_env.browser_runtime_image_digest
+                            != run.environment_identity.browser_runtime_image_digest
+                    {
+                        continue;
+                    }
+                }
+
+                if let Some(ref _bspec) = policy.browser_verification_spec {
+                    let bstore = crate::browser_verification::BrowserStore::new(self.pool.clone());
+                    if let Ok(Some(brun)) = bstore.get_browser_run_for_verification(&run.id).await {
+                        if brun.status
+                            != crate::browser_verification::BrowserVerificationStatus::Passed
+                        {
+                            continue;
+                        }
+                        let all_req_browser_passed = brun.test_runs.iter().all(|t| {
+                            !t.required
+                                || t.status
+                                    == crate::browser_verification::BrowserTestStatus::Passed
+                        });
+                        if !all_req_browser_passed {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
                 }
 
                 // Ensure all required steps in the policy actually ran and passed
@@ -1490,7 +1543,7 @@ pub async fn execute_verification_plan_with_policy(
         .create_run_with_policy(attempt_id, workspace_state, plan, environment, policy)
         .await?;
 
-    let overall_result;
+    let mut overall_result;
     let mut step_runs = Vec::new();
 
     // Check if policy specifies an integration environment spec
@@ -1498,6 +1551,18 @@ pub async fn execute_verification_plan_with_policy(
     let env_manager = crate::integration_environment::EnvironmentManager::new(
         crate::integration_environment::EnvironmentStore::new(store.pool().clone()),
     );
+    let browser_spec = policy.and_then(|p| p.browser_verification_spec.as_ref());
+    let browser_store = crate::browser_verification::BrowserStore::new(store.pool().clone());
+    let browser_manager =
+        crate::browser_verification::BrowserVerificationManager::new(browser_store);
+    let artifacts_dir = std::env::var("ORBIT_ARTIFACTS_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| std::path::PathBuf::from(h).join(".orbit").join("artifacts"))
+                .unwrap_or_else(|| std::path::PathBuf::from("/tmp/orbit-artifacts"))
+        });
 
     let run_id = run.id.clone();
     let runtime_image = run.environment_identity.runtime_image.clone();
@@ -1655,8 +1720,55 @@ pub async fn execute_verification_plan_with_policy(
                 cancellation_token,
                 |net_name| {
                     let cancel_inner = cancel_clone.clone();
+                    let b_spec = browser_spec.cloned();
+                    let b_mgr = browser_manager.clone();
+                    let b_run_id = run_id.clone();
+                    let b_ws_state = workspace_state.state_id.clone();
+                    let b_ws_dir = workspace_dir.to_path_buf();
+                    let b_art_dir = artifacts_dir.clone();
                     async move {
-                        let (res, steps) = execute_steps(net_name, cancel_inner).await;
+                        let (res, steps) = execute_steps(net_name.clone(), cancel_inner.clone()).await;
+                        if res == VerificationRunResult::Passed
+                            && let Some(ref bs) = b_spec {
+                                let b_res = b_mgr
+                                    .execute_browser_verification(
+                                        &b_run_id,
+                                        None,
+                                        &b_ws_state,
+                                        bs,
+                                        &b_ws_dir,
+                                        net_name.as_deref(),
+                                        None,
+                                        cancel_inner,
+                                        &b_art_dir,
+                                    )
+                                    .await;
+                                match b_res {
+                                    Ok(brun) => {
+                                        if brun.status != crate::browser_verification::BrowserVerificationStatus::Passed {
+                                            let st = match brun.status {
+                                                crate::browser_verification::BrowserVerificationStatus::TimedOut => {
+                                                    VerificationRunResult::TimedOut
+                                                }
+                                                crate::browser_verification::BrowserVerificationStatus::Cancelled => {
+                                                    VerificationRunResult::Cancelled
+                                                }
+                                                crate::browser_verification::BrowserVerificationStatus::Error => {
+                                                    VerificationRunResult::Error
+                                                }
+                                                _ => VerificationRunResult::Failed,
+                                            };
+                                            return Ok((st, steps));
+                                        }
+                                    }
+                                    Err(err) => {
+                                        return Err((
+                                            crate::integration_environment::EnvironmentRunStatus::Error,
+                                            format!("Browser verification failed: {}", err),
+                                        ));
+                                    }
+                                }
+                            }
                         Ok((res, steps))
                     }
                 },
@@ -1718,9 +1830,49 @@ pub async fn execute_verification_plan_with_policy(
             }
         }
     } else {
-        let (res, steps) = execute_steps(None, cancellation_token).await;
+        let (res, steps) = execute_steps(None, cancellation_token.clone()).await;
         overall_result = res;
         step_runs = steps;
+
+        if overall_result == VerificationRunResult::Passed
+            && let Some(bs) = browser_spec
+        {
+            let b_res = browser_manager
+                .execute_browser_verification(
+                    &run.id,
+                    None,
+                    &workspace_state.state_id,
+                    bs,
+                    workspace_dir,
+                    None,
+                    None,
+                    cancellation_token,
+                    &artifacts_dir,
+                )
+                .await;
+            match b_res {
+                Ok(brun) => {
+                    if brun.status != crate::browser_verification::BrowserVerificationStatus::Passed
+                    {
+                        overall_result = match brun.status {
+                            crate::browser_verification::BrowserVerificationStatus::TimedOut => {
+                                VerificationRunResult::TimedOut
+                            }
+                            crate::browser_verification::BrowserVerificationStatus::Cancelled => {
+                                VerificationRunResult::Cancelled
+                            }
+                            crate::browser_verification::BrowserVerificationStatus::Error => {
+                                VerificationRunResult::Error
+                            }
+                            _ => VerificationRunResult::Failed,
+                        };
+                    }
+                }
+                Err(_) => {
+                    overall_result = VerificationRunResult::Error;
+                }
+            }
+        }
     }
 
     store.finalize_run(&run.id, overall_result).await?;
@@ -1729,6 +1881,25 @@ pub async fn execute_verification_plan_with_policy(
         .await?
         .context("run record disappeared")?;
     completed_run.step_runs = step_runs;
+    if browser_spec.is_some() {
+        let bstore = crate::browser_verification::BrowserStore::new(store.pool().clone());
+        if let Ok(Some(brun)) = bstore.get_browser_run_for_verification(&run.id).await {
+            completed_run
+                .environment_identity
+                .browser_verification_digest = Some(brun.spec_digest.clone());
+            completed_run
+                .environment_identity
+                .browser_runtime_image_digest = Some(brun.browser_image_digest.clone());
+            sqlx::query(
+                "UPDATE orbit_verification_runs SET environment_identity = $2 WHERE id = $1",
+            )
+            .bind(&run.id)
+            .bind(serde_json::to_value(&completed_run.environment_identity)?)
+            .execute(store.pool())
+            .await?;
+            completed_run.browser_verification_run = Some(brun);
+        }
+    }
     Ok(completed_run)
 }
 
@@ -1765,6 +1936,20 @@ pub fn format_verification_show(run: &VerificationRun) -> String {
     if let Some(int_dig) = &run.environment_identity.integration_environment_digest {
         out.push_str(&format!("Env Digest    {}\n", int_dig));
     }
+    if let Some(b_dig) = &run.environment_identity.browser_verification_digest {
+        out.push_str(&format!(
+            "Browser Spec  {}
+",
+            b_dig
+        ));
+    }
+    if let Some(b_img) = &run.environment_identity.browser_runtime_image_digest {
+        out.push_str(&format!(
+            "Browser Image {}
+",
+            b_img
+        ));
+    }
     let res_str = run
         .overall_result
         .map(|r| r.to_string())
@@ -1798,6 +1983,47 @@ pub fn format_verification_show(run: &VerificationRun) -> String {
             dur_str,
             exit_str
         ));
+    }
+
+    if let Some(brun) = &run.browser_verification_run {
+        out.push_str("\nBROWSER VERIFICATION\n");
+        out.push_str(&format!("  Backend:        {}\n", brun.browser_backend));
+        out.push_str(&format!("  Status:         {}\n", brun.status));
+        if let Some(reason) = &brun.overall_failure_reason {
+            out.push_str(&format!("  Failure Reason: {}\n", reason));
+        }
+        if let Some(dur) = brun.duration_ms {
+            out.push_str(&format!("  Duration:       {:.1}s\n", dur as f64 / 1000.0));
+        }
+        out.push_str("\n  BROWSER TESTS\n");
+        out.push_str(&format!(
+            "  {:<20} {:<10} {:<10} {}\n",
+            "TEST ID", "STATUS", "DURATION", "REASON"
+        ));
+        for t in &brun.test_runs {
+            let dur_str = t
+                .duration_ms
+                .map(|d| format!("{:.1}s", d as f64 / 1000.0))
+                .unwrap_or_else(|| "—".into());
+            let reason_str = t
+                .failure_reason
+                .as_ref()
+                .map(|r| r.to_string())
+                .unwrap_or_else(|| "—".into());
+            out.push_str(&format!(
+                "  {:<20} {:<10} {:<10} {}\n",
+                t.test_id, t.status, dur_str, reason_str
+            ));
+        }
+        if !brun.artifacts.is_empty() {
+            out.push_str("\n  BROWSER ARTIFACTS\n");
+            for a in &brun.artifacts {
+                out.push_str(&format!(
+                    "  - {} ({}, {} bytes) -> {}\n",
+                    a.name, a.mime_type, a.byte_size, a.storage_ref
+                ));
+            }
+        }
     }
 
     out
@@ -2020,6 +2246,7 @@ mod tests {
             started_at_ms: 1000,
             finished_at_ms: Some(43800),
             overall_result: Some(VerificationRunResult::Passed),
+            browser_verification_run: None,
             step_runs: vec![
                 VerificationStepRun {
                     id: "vstep-1".into(),

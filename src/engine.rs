@@ -100,6 +100,9 @@ impl Engine {
         ))
         .execute(&mut *migration)
         .await?;
+        sqlx::raw_sql(include_str!("../migrations/0020_browser_verification.sql"))
+            .execute(&mut *migration)
+            .await?;
         migration.commit().await?;
         Ok(Self {
             pool,
