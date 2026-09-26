@@ -1705,6 +1705,29 @@ fn resolve_workspace_path(repo_path: &Path, requested: &str) -> PathBuf {
     }
 }
 
+fn extract_text_from_json(val: &serde_json::Value, out: &mut String) {
+    match val {
+        serde_json::Value::Object(map) => {
+            if let Some(serde_json::Value::String(s)) = map.get("text") {
+                out.push_str(s);
+            } else if let Some(serde_json::Value::String(s)) = map.get("delta") {
+                out.push_str(s);
+            }
+            for (k, v) in map {
+                if k != "text" && k != "delta" {
+                    extract_text_from_json(v, out);
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                extract_text_from_json(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 async fn handle_acp_message(
     wire: &mut Wire,
     state: &mut AcpTurnState<'_>,
@@ -1715,22 +1738,9 @@ async fn handle_acp_message(
             "session/update" => {
                 if let Some(params) = message.get("params") {
                     if let Some(update) = params.get("update") {
-                        if let Some(text) = update
-                            .get("content")
-                            .and_then(|c| c.get("text"))
-                            .and_then(|t| t.as_str())
-                            .or_else(|| update.get("text").and_then(|t| t.as_str()))
-                            .or_else(|| {
-                                update
-                                    .get("agent_message_chunk")
-                                    .and_then(|c| c.get("text"))
-                                    .and_then(|t| t.as_str())
-                            })
-                        {
-                            state.agent_output.push_str(text);
-                        }
-                    } else if let Some(text) = params.get("text").and_then(|t| t.as_str()) {
-                        state.agent_output.push_str(text);
+                        extract_text_from_json(update, &mut state.agent_output);
+                    } else {
+                        extract_text_from_json(params, &mut state.agent_output);
                     }
                 }
                 Ok(())
@@ -2242,11 +2252,7 @@ async fn execute_real_acp_turn(
     ).await.context("ACP session/prompt failed")?;
 
     if !state.agent_output.contains(ORBIT_HANDOFF_START) {
-        if let Some(txt) = prompt_res.get("text").and_then(|t| t.as_str()) {
-            state.agent_output.push_str(txt);
-        } else if let Some(txt) = prompt_res.get("output").and_then(|t| t.as_str()) {
-            state.agent_output.push_str(txt);
-        }
+        extract_text_from_json(&prompt_res, &mut state.agent_output);
     }
 
     drop(wire);
