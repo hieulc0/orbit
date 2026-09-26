@@ -3,9 +3,11 @@ use orbit::{
     engine::Engine,
     model::id,
     verification::{
-        EnvironmentIdentity, MAX_INLINE_OUTPUT_BYTES, VerificationPlan, VerificationRunResult,
-        VerificationStep, VerificationStepStatus, VerificationStore, WorkspaceState,
-        execute_verification_command_isolated, execute_verification_plan,
+        AllowedCommand, EnvironmentIdentity, MAX_INLINE_OUTPUT_BYTES, VerificationCachePolicy,
+        VerificationEnvironmentPolicy, VerificationNetworkPolicy, VerificationPlan,
+        VerificationPolicy, VerificationRunResult, VerificationStep, VerificationStepStatus,
+        VerificationStore, WorkspaceState, execute_verification_command_isolated,
+        execute_verification_plan, execute_verification_plan_with_policy,
     },
 };
 use sqlx::PgPool;
@@ -70,6 +72,7 @@ async fn test_b1_qualification_host_isolation_and_security_escape() -> Result<()
         Some(Duration::from_secs(20)),
         None,
         Some(PODMAN_IMAGE_ALPINE),
+        None,
     )
     .await?;
 
@@ -114,6 +117,9 @@ async fn test_b1_qualification_large_output_accounting_and_truncation() -> Resul
         runtime_image: Some(PODMAN_IMAGE_PYTHON.into()),
         runtime_image_digest: None,
         oci_runtime: Some("podman".into()),
+        network_policy: VerificationNetworkPolicy::None,
+        cache_policy: VerificationCachePolicy::Clean,
+        environment_policy_digest: None,
         architecture: "x86_64".into(),
         os: "linux".into(),
         orbit_version: "0.1.0".into(),
@@ -219,6 +225,9 @@ fn test_addition() {
         runtime_image: Some(PODMAN_IMAGE_RUST.into()),
         runtime_image_digest: None,
         oci_runtime: Some("podman".into()),
+        network_policy: VerificationNetworkPolicy::None,
+        cache_policy: VerificationCachePolicy::Clean,
+        environment_policy_digest: None,
         architecture: "x86_64".into(),
         os: "linux".into(),
         orbit_version: "0.1.0".into(),
@@ -307,6 +316,9 @@ def test_calc_pass():
         runtime_image: Some(PODMAN_IMAGE_PYTHON.into()),
         runtime_image_digest: None,
         oci_runtime: Some("podman".into()),
+        network_policy: VerificationNetworkPolicy::None,
+        cache_policy: VerificationCachePolicy::Clean,
+        environment_policy_digest: None,
         architecture: "x86_64".into(),
         os: "linux".into(),
         orbit_version: "0.1.0".into(),
@@ -391,6 +403,9 @@ async fn test_b1_qualification_restart_durability() -> Result<()> {
         runtime_image: None,
         runtime_image_digest: None,
         oci_runtime: None,
+        network_policy: VerificationNetworkPolicy::None,
+        cache_policy: VerificationCachePolicy::Clean,
+        environment_policy_digest: None,
         architecture: "x86_64".into(),
         os: "linux".into(),
         orbit_version: "0.1.0".into(),
@@ -471,5 +486,483 @@ async fn test_b1_qualification_empty_or_no_test_rejection() -> Result<()> {
             .contains("at least one required verification step")
     );
 
+    Ok(())
+}
+
+// ======================================================================
+// PHASE B2 QUALIFICATION TESTS
+// ======================================================================
+
+#[tokio::test]
+#[ignore = "requires podman sandbox"]
+async fn test_b2_qualification_host_env_leak_and_clean_home() -> Result<()> {
+    let ws_dir = tempfile::tempdir()?;
+    unsafe {
+        std::env::set_var("ORBIT_SECRET_CANARY", "should-not-be-visible");
+    }
+
+    let step = VerificationStep::new_command(
+        "clean_env_probe",
+        "Clean Environment & HOME Probe",
+        vec![
+            "sh".into(),
+            "-c".into(),
+            r#"
+            echo "--- PROBING ENVIRONMENT CLEANLINESS ---"
+            # 1. Host variable must not leak
+            if [ -n "$ORBIT_SECRET_CANARY" ]; then
+                echo "LEAK: ORBIT_SECRET_CANARY=$ORBIT_SECRET_CANARY"
+                exit 110
+            fi
+
+            # 2. HOME must be isolated /tmp/orbit-home
+            if [ "$HOME" != "/tmp/orbit-home" ]; then
+                echo "INVALID HOME: $HOME"
+                exit 111
+            fi
+
+            # 3. Clean HOME probe: credential & config paths must be absent
+            test -e "$HOME/.ssh" && exit 112
+            test -e "$HOME/.gitconfig" && exit 113
+            test -e "$HOME/.cargo/credentials" && exit 114
+            test -e "$HOME/.npmrc" && exit 115
+            test -e "$HOME/.pypirc" && exit 116
+            test -e "$HOME/.config" && exit 117
+            test -e "$HOME/.aws" && exit 118
+            test -e "$HOME/.kube" && exit 119
+            test -e "$HOME/.docker" && exit 120
+            test -e "$HOME/.orbit" && exit 121
+
+            # 4. Standard clean environment defaults must be present
+            test "$CI" = "1" || exit 122
+            test "$LANG" = "C.UTF-8" || exit 123
+            test "$LC_ALL" = "C.UTF-8" || exit 124
+            test "$TERM" = "dumb" || exit 125
+            test "$ORBIT_VERIFICATION" = "1" || exit 126
+
+            echo "CLEAN_ENVIRONMENT_VERIFIED"
+            exit 0
+            "#
+            .into(),
+        ],
+    );
+
+    let capture = execute_verification_command_isolated(
+        &step,
+        ws_dir.path(),
+        Some(Duration::from_secs(20)),
+        None,
+        Some(PODMAN_IMAGE_ALPINE),
+        None,
+    )
+    .await?;
+
+    assert_eq!(
+        capture.exit_code,
+        Some(0),
+        "Probe failed with exit code {:?}: stderr: {}",
+        capture.exit_code,
+        String::from_utf8_lossy(&capture.stderr_bytes)
+    );
+    assert!(
+        String::from_utf8_lossy(&capture.stdout_bytes).contains("CLEAN_ENVIRONMENT_VERIFIED"),
+        "stdout missing verification marker"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires podman sandbox"]
+async fn test_b2_qualification_explicit_env_injection_and_allowlist() -> Result<()> {
+    let ws_dir = tempfile::tempdir()?;
+
+    unsafe {
+        std::env::set_var("HOST_INHERITED_ALLOWED", "from-host-env");
+        std::env::set_var("HOST_INHERITED_DENIED", "should-be-denied");
+    }
+
+    let mut env_policy = VerificationEnvironmentPolicy::clean();
+    env_policy.inherit.push("HOST_INHERITED_ALLOWED".into());
+    env_policy
+        .set
+        .insert("ORBIT_TEST_VALUE".into(), "hello-b2".into());
+    env_policy.deny.push("HOST_INHERITED_DENIED".into());
+
+    let step = VerificationStep::new_command(
+        "explicit_env_probe",
+        "Explicit Env Probe",
+        vec![
+            "sh".into(),
+            "-c".into(),
+            r#"
+            test "$ORBIT_TEST_VALUE" = "hello-b2" || exit 131
+            test "$HOST_INHERITED_ALLOWED" = "from-host-env" || exit 132
+            test -z "$HOST_INHERITED_DENIED" || exit 133
+            echo "ENV_ALLOWLIST_VERIFIED"
+            exit 0
+            "#
+            .into(),
+        ],
+    );
+
+    let capture = execute_verification_command_isolated(
+        &step,
+        ws_dir.path(),
+        Some(Duration::from_secs(20)),
+        None,
+        Some(PODMAN_IMAGE_ALPINE),
+        Some(&env_policy),
+    )
+    .await?;
+
+    assert_eq!(capture.exit_code, Some(0));
+    assert!(String::from_utf8_lossy(&capture.stdout_bytes).contains("ENV_ALLOWLIST_VERIFIED"));
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires podman sandbox"]
+async fn test_b2_qualification_network_remains_unavailable() -> Result<()> {
+    let ws_dir = tempfile::tempdir()?;
+
+    let step = VerificationStep::new_command(
+        "net_probe",
+        "Network Isolation Probe",
+        vec![
+            "sh".into(),
+            "-c".into(),
+            r#"
+            # In a network=none container, loopback is the only interface (or no route to external)
+            # Connecting to any arbitrary non-loopback IP must immediately fail (network unreachable)
+            nc -z -w 1 8.8.8.8 53 2>/dev/null && exit 141
+            nc -z -w 1 1.1.1.1 80 2>/dev/null && exit 142
+            echo "NETWORK_NONE_VERIFIED"
+            exit 0
+            "#
+            .into(),
+        ],
+    );
+
+    let capture = execute_verification_command_isolated(
+        &step,
+        ws_dir.path(),
+        Some(Duration::from_secs(20)),
+        None,
+        Some(PODMAN_IMAGE_ALPINE),
+        None,
+    )
+    .await?;
+
+    assert_eq!(capture.exit_code, Some(0));
+    assert!(String::from_utf8_lossy(&capture.stdout_bytes).contains("NETWORK_NONE_VERIFIED"));
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL and podman"]
+async fn test_b2_qualification_policy_mutation_invalidates_qualification() -> Result<()> {
+    let (engine, store, _home) = setup_db_store().await?;
+    let ws_dir = tempfile::tempdir()?;
+
+    let mut policy_v1 = VerificationPolicy::new("pol-test", "Policy Test V1");
+    policy_v1.version = 1;
+    policy_v1.required_steps = vec!["check1".into()];
+    policy_v1.allowed_commands = vec![AllowedCommand::exact("echo")];
+    store.save_policy(&policy_v1).await?;
+
+    let plan = VerificationPlan::new(
+        "plan-pol",
+        "Plan",
+        vec![VerificationStep::new_command(
+            "check1",
+            "Check 1",
+            vec!["echo".into(), "ok".into()],
+        )],
+    );
+    store.save_plan(&plan).await?;
+
+    let env = EnvironmentIdentity {
+        execution_profile: "sandboxed-container".into(),
+        isolation: "rootless-podman".into(),
+        runtime_image: Some(PODMAN_IMAGE_ALPINE.into()),
+        runtime_image_digest: None,
+        oci_runtime: Some("podman".into()),
+        network_policy: VerificationNetworkPolicy::None,
+        cache_policy: VerificationCachePolicy::Clean,
+        environment_policy_digest: Some(policy_v1.environment_policy.digest()),
+
+        architecture: "x86_64".into(),
+        os: "linux".into(),
+        orbit_version: "0.1.0".into(),
+    };
+
+    let ws_state = WorkspaceState::compute_from_parts("base-p1", "head-p1", None);
+
+    let run = execute_verification_plan_with_policy(
+        &store,
+        "attempt-p1",
+        &ws_state,
+        &plan,
+        ws_dir.path(),
+        env.clone(),
+        Some(&policy_v1),
+        None,
+    )
+    .await?;
+
+    assert_eq!(run.overall_result, Some(VerificationRunResult::Passed));
+
+    // Under policy v1, workspace is qualified!
+    let qualified_v1 = store
+        .check_workspace_qualification(&ws_state.state_id, &policy_v1, Some(&env))
+        .await?;
+    assert!(
+        qualified_v1.is_some(),
+        "workspace must qualify under policy v1"
+    );
+
+    // Mutate policy to v2 (requires check2 in addition to check1)
+    let mut policy_v2 = policy_v1.clone();
+    policy_v2.version = 2;
+    policy_v2.required_steps.push("check2".into());
+    store.save_policy(&policy_v2).await?;
+
+    // Under policy v2, the exact same workspace state does NOT qualify!
+    let qualified_v2 = store
+        .check_workspace_qualification(&ws_state.state_id, &policy_v2, Some(&env))
+        .await?;
+    assert!(
+        qualified_v2.is_none(),
+        "workspace state must NOT qualify under mutated policy v2"
+    );
+
+    engine.pool.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL and podman"]
+async fn test_b2_qualification_environment_identity_mutation_invalidates_qualification()
+-> Result<()> {
+    let (engine, store, _home) = setup_db_store().await?;
+    let ws_dir = tempfile::tempdir()?;
+
+    let policy = VerificationPolicy::new("pol-env-test", "Policy Env Test");
+    store.save_policy(&policy).await?;
+
+    let plan = VerificationPlan::new(
+        "plan-env",
+        "Plan",
+        vec![VerificationStep::new_command(
+            "step1",
+            "Step 1",
+            vec!["echo".into(), "hello".into()],
+        )],
+    );
+    store.save_plan(&plan).await?;
+
+    let env_a = EnvironmentIdentity {
+        execution_profile: "sandboxed-container".into(),
+        isolation: "rootless-podman".into(),
+        runtime_image: Some(PODMAN_IMAGE_ALPINE.into()),
+        runtime_image_digest: Some("sha256:digest-alpha".into()),
+        oci_runtime: Some("podman".into()),
+        network_policy: VerificationNetworkPolicy::None,
+        cache_policy: VerificationCachePolicy::Clean,
+        environment_policy_digest: Some(policy.environment_policy.digest()),
+
+        architecture: "x86_64".into(),
+        os: "linux".into(),
+        orbit_version: "0.1.0".into(),
+    };
+
+    let ws_state = WorkspaceState::compute_from_parts("base-e1", "head-e1", None);
+
+    let run = execute_verification_plan_with_policy(
+        &store,
+        "attempt-e1",
+        &ws_state,
+        &plan,
+        ws_dir.path(),
+        env_a.clone(),
+        Some(&policy),
+        None,
+    )
+    .await?;
+
+    assert_eq!(run.overall_result, Some(VerificationRunResult::Passed));
+
+    // Matches env_a
+    let qual_a = store
+        .check_workspace_qualification(&ws_state.state_id, &policy, Some(&env_a))
+        .await?;
+    assert!(qual_a.is_some());
+
+    // Fails under different image digest requirement env_b
+    let mut env_b = env_a.clone();
+    env_b.runtime_image_digest = Some("sha256:digest-beta".into());
+
+    let qual_b = store
+        .check_workspace_qualification(&ws_state.state_id, &policy, Some(&env_b))
+        .await?;
+    assert!(
+        qual_b.is_none(),
+        "prior run under digest alpha must not satisfy digest beta requirement"
+    );
+
+    engine.pool.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL and podman"]
+async fn test_b2_qualification_required_step_policy_enforcement() -> Result<()> {
+    let (engine, store, _home) = setup_db_store().await?;
+    let ws_dir = tempfile::tempdir()?;
+
+    // Policy requires both "fmt" and "test"
+    let mut policy = VerificationPolicy::new("pol-req", "Required Steps Policy");
+    policy.required_steps = vec!["fmt".into(), "test".into()];
+    store.save_policy(&policy).await?;
+
+    // Plan that only has "fmt"
+    let plan_partial = VerificationPlan::new(
+        "plan-partial",
+        "Partial Plan",
+        vec![VerificationStep::new_command(
+            "fmt",
+            "Format",
+            vec!["echo".into(), "fmt ok".into()],
+        )],
+    );
+    store.save_plan(&plan_partial).await?;
+
+    let env = EnvironmentIdentity {
+        execution_profile: "sandboxed-container".into(),
+        isolation: "rootless-podman".into(),
+        runtime_image: Some(PODMAN_IMAGE_ALPINE.into()),
+        runtime_image_digest: None,
+        oci_runtime: Some("podman".into()),
+        network_policy: VerificationNetworkPolicy::None,
+        cache_policy: VerificationCachePolicy::Clean,
+        environment_policy_digest: Some(policy.environment_policy.digest()),
+
+        architecture: "x86_64".into(),
+        os: "linux".into(),
+        orbit_version: "0.1.0".into(),
+    };
+
+    let ws_state = WorkspaceState::compute_from_parts("base-req", "head-req", None);
+
+    // Attempting to execute with policy must fail fast before running because plan is missing required step
+    let res = execute_verification_plan_with_policy(
+        &store,
+        "attempt-req-fail",
+        &ws_state,
+        &plan_partial,
+        ws_dir.path(),
+        env,
+        Some(&policy),
+        None,
+    )
+    .await;
+
+    assert!(res.is_err());
+    assert!(res.unwrap_err().to_string().contains("mandated by policy"));
+
+    engine.pool.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL and podman"]
+async fn test_b2_qualification_restart_durability_with_policy() -> Result<()> {
+    let base = std::env::var("ORBIT_TEST_DATABASE_URL")
+        .context("set ORBIT_TEST_DATABASE_URL to a disposable PostgreSQL database")?;
+    let admin = PgPool::connect(&base).await?;
+    let schema = format!("orbit_qual_{}", id().replace('-', ""));
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&admin)
+        .await?;
+    let separator = if base.contains('?') { '&' } else { '?' };
+    let url = format!("{base}{separator}options=-csearch_path%3D{schema}");
+    let home = tempfile::tempdir()?;
+
+    let policy = VerificationPolicy::new("pol-restart", "Restart Durability Policy");
+    let plan = VerificationPlan::new(
+        "plan-restart",
+        "Restart Plan",
+        vec![VerificationStep::new_command(
+            "step1",
+            "Step 1",
+            vec!["echo".into(), "restart-ok".into()],
+        )],
+    );
+
+    let env = EnvironmentIdentity {
+        execution_profile: "sandboxed-container".into(),
+        isolation: "rootless-podman".into(),
+        runtime_image: Some(PODMAN_IMAGE_ALPINE.into()),
+        runtime_image_digest: None,
+        oci_runtime: Some("podman".into()),
+        network_policy: VerificationNetworkPolicy::None,
+        cache_policy: VerificationCachePolicy::Clean,
+        environment_policy_digest: Some(policy.environment_policy.digest()),
+        architecture: "x86_64".into(),
+        os: "linux".into(),
+        orbit_version: "0.1.0".into(),
+    };
+
+    let ws_state = WorkspaceState::compute_from_parts("base-rst", "head-rst", None);
+
+    let run_id = {
+        let engine = Engine::connect(&url, home.path().join("artifacts"), 3).await?;
+        let store = VerificationStore::new(engine.pool.clone());
+        store.save_policy(&policy).await?;
+        store.save_plan(&plan).await?;
+        let ws_dir = tempfile::tempdir()?;
+        let run = execute_verification_plan_with_policy(
+            &store,
+            "attempt-rst",
+            &ws_state,
+            &plan,
+            ws_dir.path(),
+            env.clone(),
+            Some(&policy),
+            None,
+        )
+        .await?;
+        assert_eq!(run.overall_result, Some(VerificationRunResult::Passed));
+        engine.pool.close().await;
+        run.id
+    };
+
+    // Reopen fresh connection pool to the EXACT SAME schema
+    {
+        let reconnected_engine =
+            Engine::connect(&url, home.path().join("artifacts_new"), 3).await?;
+        let reconnected_store = VerificationStore::new(reconnected_engine.pool.clone());
+
+        let reloaded_run = reconnected_store.get_run(&run_id).await?.unwrap();
+        assert_eq!(reloaded_run.policy_id, Some("pol-restart".into()));
+        assert_eq!(reloaded_run.policy_digest, Some(policy.digest()));
+        assert_eq!(
+            reloaded_run.environment_identity.network_policy,
+            VerificationNetworkPolicy::None
+        );
+        assert_eq!(
+            reloaded_run.environment_identity.cache_policy,
+            VerificationCachePolicy::Clean
+        );
+
+        // Verify qualification decision remains identical on reconnected store
+        let qualified = reconnected_store
+            .check_workspace_qualification(&ws_state.state_id, &policy, Some(&env))
+            .await?;
+        assert!(qualified.is_some());
+        assert_eq!(qualified.unwrap().id, run_id);
+
+        reconnected_engine.pool.close().await;
+    }
     Ok(())
 }

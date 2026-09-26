@@ -163,6 +163,205 @@ impl VerificationPlan {
     }
 }
 
+/// Network isolation policy for verification environments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationNetworkPolicy {
+    #[default]
+    None,
+}
+
+impl std::fmt::Display for VerificationNetworkPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => write!(f, "none"),
+        }
+    }
+}
+
+/// Cache policy for dependencies/language packages in verification sandboxes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationCachePolicy {
+    #[default]
+    Clean,
+    DeclaredCache,
+}
+
+impl std::fmt::Display for VerificationCachePolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Clean => write!(f, "clean"),
+            Self::DeclaredCache => write!(f, "declared_cache"),
+        }
+    }
+}
+
+/// Allowlist-based environment variable policy for verification sandboxes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct VerificationEnvironmentPolicy {
+    #[serde(default)]
+    pub inherit: Vec<String>,
+    #[serde(default)]
+    pub set: BTreeMap<String, String>,
+    #[serde(default)]
+    pub deny: Vec<String>,
+}
+
+impl VerificationEnvironmentPolicy {
+    pub fn clean() -> Self {
+        Self {
+            inherit: Vec::new(),
+            set: BTreeMap::new(),
+            deny: Vec::new(),
+        }
+    }
+
+    pub fn digest(&self) -> String {
+        let serialized = serde_json::to_string(self).unwrap_or_default();
+        crate::model::digest(serialized.as_bytes())
+    }
+}
+
+/// Permitted command or check declaration under a verification policy.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AllowedCommand {
+    pub executable: String,
+    #[serde(default)]
+    pub args_prefix: Vec<String>,
+}
+
+impl AllowedCommand {
+    pub fn exact(executable: impl Into<String>) -> Self {
+        Self {
+            executable: executable.into(),
+            args_prefix: Vec::new(),
+        }
+    }
+
+    pub fn with_prefix(executable: impl Into<String>, prefix: Vec<String>) -> Self {
+        Self {
+            executable: executable.into(),
+            args_prefix: prefix,
+        }
+    }
+
+    pub fn permits(&self, argv: &[String]) -> bool {
+        if argv.is_empty() {
+            return false;
+        }
+        let exec = &argv[0];
+        // Match executable by base name or full path
+        let exec_base = Path::new(exec)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or(exec);
+        let allowed_base = Path::new(&self.executable)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or(&self.executable);
+
+        if exec_base != allowed_base && exec != &self.executable {
+            return false;
+        }
+
+        if self.args_prefix.is_empty() {
+            return true;
+        }
+
+        if argv.len() - 1 < self.args_prefix.len() {
+            return false;
+        }
+
+        for (actual, expected) in argv[1..].iter().zip(&self.args_prefix) {
+            if actual != expected {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Durable, versioned policy describing what qualifies a workspace.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerificationPolicy {
+    pub id: String,
+    pub version: u32,
+    pub name: String,
+    #[serde(default)]
+    pub required_steps: Vec<String>,
+    #[serde(default)]
+    pub allowed_commands: Vec<AllowedCommand>,
+    #[serde(default)]
+    pub environment_policy: VerificationEnvironmentPolicy,
+    #[serde(default)]
+    pub network_policy: VerificationNetworkPolicy,
+    #[serde(default)]
+    pub cache_policy: VerificationCachePolicy,
+}
+
+impl VerificationPolicy {
+    pub fn new(id: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            version: 1,
+            name: name.into(),
+            required_steps: Vec::new(),
+            allowed_commands: Vec::new(),
+            environment_policy: VerificationEnvironmentPolicy::clean(),
+            network_policy: VerificationNetworkPolicy::None,
+            cache_policy: VerificationCachePolicy::Clean,
+        }
+    }
+
+    pub fn digest(&self) -> String {
+        let serialized = serde_json::to_string(self).unwrap_or_default();
+        crate::model::digest(serialized.as_bytes())
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        ensure!(!self.id.trim().is_empty(), "policy id required");
+        ensure!(!self.name.trim().is_empty(), "policy name required");
+        ensure!(self.version > 0, "policy version must be > 0");
+        Ok(())
+    }
+
+    /// Check if a plan satisfies this policy before execution.
+    pub fn check_plan(&self, plan: &VerificationPlan) -> Result<()> {
+        plan.validate()?;
+
+        // 1. If policy specifies required steps by ID, they must exist in the plan
+        for req_id in &self.required_steps {
+            let found = plan.steps.iter().any(|s| &s.id == req_id && s.required);
+            ensure!(
+                found,
+                "plan does not contain required step '{}' mandated by policy '{}'",
+                req_id,
+                self.id
+            );
+        }
+
+        // 2. Check allowed commands if policy defines an allowlist
+        if !self.allowed_commands.is_empty() {
+            for step in &plan.steps {
+                let allowed = self
+                    .allowed_commands
+                    .iter()
+                    .any(|ac| ac.permits(&step.argv));
+                ensure!(
+                    allowed,
+                    "step '{}' with argv {:?} is not permitted by verification policy '{}'",
+                    step.id,
+                    step.argv,
+                    self.id
+                );
+            }
+        }
+
+        Ok(())
+    }
+}
+
 /// Status of an individual verification step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -225,6 +424,12 @@ pub struct EnvironmentIdentity {
     pub runtime_image_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oci_runtime: Option<String>,
+    #[serde(default)]
+    pub network_policy: VerificationNetworkPolicy,
+    #[serde(default)]
+    pub cache_policy: VerificationCachePolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_policy_digest: Option<String>,
     pub architecture: String,
     pub os: String,
     pub orbit_version: String,
@@ -264,6 +469,12 @@ pub struct VerificationRun {
     pub plan_id: String,
     pub plan_version: u32,
     pub plan_snapshot: VerificationPlan,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_digest: Option<String>,
     pub status: VerificationStepStatus,
     pub environment_identity: EnvironmentIdentity,
     pub started_at_ms: i64,
@@ -319,6 +530,7 @@ pub async fn execute_verification_command(
         timeout_override,
         cancellation_token,
         None,
+        None,
     )
     .await
 }
@@ -329,6 +541,7 @@ pub async fn execute_verification_command_isolated(
     timeout_override: Option<Duration>,
     mut cancellation_token: Option<tokio::sync::watch::Receiver<bool>>,
     isolation_image: Option<&str>,
+    environment_policy: Option<&VerificationEnvironmentPolicy>,
 ) -> Result<CommandOutputCapture> {
     use std::process::Stdio;
     use tokio::{io::AsyncReadExt, process::Command};
@@ -357,6 +570,50 @@ pub async fn execute_verification_command_isolated(
             format!("/workspace/{}", rel_cwd)
         };
 
+        // Deterministic clean environment defaults per B2 specification
+        let mut env_map: BTreeMap<String, String> = BTreeMap::new();
+        env_map.insert("HOME".to_string(), "/tmp/orbit-home".to_string());
+        env_map.insert("CI".to_string(), "1".to_string());
+        env_map.insert("LANG".to_string(), "C.UTF-8".to_string());
+        env_map.insert("LC_ALL".to_string(), "C.UTF-8".to_string());
+        env_map.insert("TERM".to_string(), "dumb".to_string());
+        env_map.insert(
+            "PATH".to_string(),
+            "/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+                .to_string(),
+        );
+        env_map.insert("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string());
+        env_map.insert("GIT_CONFIG_GLOBAL".to_string(), "/dev/null".to_string());
+        env_map.insert("ORBIT_VERIFICATION".to_string(), "1".to_string());
+
+        // Apply environment policy if provided
+        if let Some(pol) = environment_policy {
+            // Inherit explicitly allowed keys only
+            for key in &pol.inherit {
+                if !pol.deny.contains(key)
+                    && let Ok(val) = std::env::var(key)
+                {
+                    env_map.insert(key.clone(), val);
+                }
+            }
+            // Explicitly set variables
+            for (k, v) in &pol.set {
+                if !pol.deny.contains(k) {
+                    env_map.insert(k.clone(), v.clone());
+                }
+            }
+        }
+
+        // Apply step-level env additions (unless denied by policy)
+        for (k, v) in &step.env {
+            if let Some(pol) = environment_policy
+                && pol.deny.contains(k)
+            {
+                continue;
+            }
+            env_map.insert(k.clone(), v.clone());
+        }
+
         c.args([
             "--remote=false",
             "--cgroup-manager=cgroupfs",
@@ -380,15 +637,9 @@ pub async fn execute_verification_command_isolated(
             ),
             "--workdir",
             &cont_cwd,
-            "--env",
-            "HOME=/tmp",
-            "--env",
-            "GIT_CONFIG_NOSYSTEM=1",
-            "--env",
-            "GIT_CONFIG_GLOBAL=/dev/null",
         ]);
 
-        for (k, v) in &step.env {
+        for (k, v) in &env_map {
             c.arg("--env").arg(format!("{}={}", k, v));
         }
 
@@ -407,18 +658,46 @@ pub async fn execute_verification_command_isolated(
         c
     } else {
         let mut c = Command::new(&step.argv[0]);
+        let mut env_map: BTreeMap<String, String> = BTreeMap::new();
+        env_map.insert("HOME".to_string(), "/tmp/orbit-home".to_string());
+        env_map.insert("CI".to_string(), "1".to_string());
+        env_map.insert("LANG".to_string(), "C.UTF-8".to_string());
+        env_map.insert("LC_ALL".to_string(), "C.UTF-8".to_string());
+        env_map.insert("TERM".to_string(), "dumb".to_string());
+        env_map.insert(
+            "PATH".to_string(),
+            std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into()),
+        );
+        env_map.insert("ORBIT_VERIFICATION".to_string(), "1".to_string());
+
+        if let Some(pol) = environment_policy {
+            for key in &pol.inherit {
+                if !pol.deny.contains(key)
+                    && let Ok(val) = std::env::var(key)
+                {
+                    env_map.insert(key.clone(), val);
+                }
+            }
+            for (k, v) in &pol.set {
+                if !pol.deny.contains(k) {
+                    env_map.insert(k.clone(), v.clone());
+                }
+            }
+        }
+
+        for (k, v) in &step.env {
+            if let Some(pol) = environment_policy
+                && pol.deny.contains(k)
+            {
+                continue;
+            }
+            env_map.insert(k.clone(), v.clone());
+        }
+
         c.args(&step.argv[1..])
             .current_dir(&cwd)
             .env_clear()
-            .envs(&step.env)
-            .env(
-                "PATH",
-                std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into()),
-            )
-            .env(
-                "HOME",
-                std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()),
-            );
+            .envs(&env_map);
         c
     };
 
@@ -614,6 +893,65 @@ impl VerificationStore {
         }
     }
 
+    /// Save or update a verification policy.
+    pub async fn save_policy(&self, policy: &VerificationPolicy) -> Result<()> {
+        policy.validate()?;
+        let digest = policy.digest();
+        sqlx::query(
+            r#"
+            INSERT INTO orbit_verification_policies (id, version, digest, name, definition)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (id, version) DO UPDATE SET
+                digest = EXCLUDED.digest,
+                name = EXCLUDED.name,
+                definition = EXCLUDED.definition
+            "#,
+        )
+        .bind(&policy.id)
+        .bind(policy.version as i32)
+        .bind(&digest)
+        .bind(&policy.name)
+        .bind(serde_json::to_value(policy)?)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Get a policy by ID and version.
+    pub async fn get_policy(
+        &self,
+        policy_id: &str,
+        version: u32,
+    ) -> Result<Option<VerificationPolicy>> {
+        let row = sqlx::query_scalar::<_, serde_json::Value>(
+            "SELECT definition FROM orbit_verification_policies WHERE id = $1 AND version = $2",
+        )
+        .bind(policy_id)
+        .bind(version as i32)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some(val) => Ok(Some(serde_json::from_value(val)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Get the latest version of a policy by ID.
+    pub async fn get_latest_policy(&self, policy_id: &str) -> Result<Option<VerificationPolicy>> {
+        let row = sqlx::query_scalar::<_, serde_json::Value>(
+            "SELECT definition FROM orbit_verification_policies WHERE id = $1 ORDER BY version DESC LIMIT 1",
+        )
+        .bind(policy_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some(val) => Ok(Some(serde_json::from_value(val)?)),
+            None => Ok(None),
+        }
+    }
+
     /// Create a new VerificationRun record in PENDING status.
     pub async fn create_run(
         &self,
@@ -622,17 +960,37 @@ impl VerificationStore {
         plan: &VerificationPlan,
         environment: EnvironmentIdentity,
     ) -> Result<VerificationRun> {
+        self.create_run_with_policy(attempt_id, workspace_state, plan, environment, None)
+            .await
+    }
+
+    /// Create a new VerificationRun record in PENDING status optionally bound to a policy.
+    pub async fn create_run_with_policy(
+        &self,
+        attempt_id: &str,
+        workspace_state: &WorkspaceState,
+        plan: &VerificationPlan,
+        environment: EnvironmentIdentity,
+        policy: Option<&VerificationPolicy>,
+    ) -> Result<VerificationRun> {
         plan.validate()?;
+        if let Some(pol) = policy {
+            pol.check_plan(plan)?;
+        }
         let run_id = format!("vrun-{}", crate::model::id());
         let started_at_ms = now_millis();
+        let (pol_id, pol_ver, pol_dig) = policy
+            .map(|p| (Some(p.id.clone()), Some(p.version as i32), Some(p.digest())))
+            .unwrap_or((None, None, None));
 
         sqlx::query(
             r#"
             INSERT INTO orbit_verification_runs (
                 id, attempt_id, workspace_state_id, plan_id, plan_version,
-                plan_snapshot, status, environment_identity, started_at_ms
+                plan_snapshot, policy_id, policy_version, policy_digest,
+                status, environment_identity, started_at_ms
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             "#,
         )
         .bind(&run_id)
@@ -641,6 +999,9 @@ impl VerificationStore {
         .bind(&plan.id)
         .bind(plan.version as i32)
         .bind(serde_json::to_value(plan)?)
+        .bind(&pol_id)
+        .bind(pol_ver)
+        .bind(&pol_dig)
         .bind("PENDING")
         .bind(serde_json::to_value(&environment)?)
         .bind(started_at_ms)
@@ -654,6 +1015,9 @@ impl VerificationStore {
             plan_id: plan.id.clone(),
             plan_version: plan.version,
             plan_snapshot: plan.clone(),
+            policy_id: pol_id,
+            policy_version: pol_ver.map(|v| v as u32),
+            policy_digest: pol_dig,
             status: VerificationStepStatus::Pending,
             environment_identity: environment,
             started_at_ms,
@@ -756,6 +1120,9 @@ impl VerificationStore {
             plan_id: String,
             plan_version: i32,
             plan_snapshot: serde_json::Value,
+            policy_id: Option<String>,
+            policy_version: Option<i32>,
+            policy_digest: Option<String>,
             status: String,
             environment_identity: serde_json::Value,
             started_at_ms: i64,
@@ -766,7 +1133,8 @@ impl VerificationStore {
         let run_opt = sqlx::query_as::<_, RunRow>(
             r#"
             SELECT id, attempt_id, workspace_state_id, plan_id, plan_version,
-                   plan_snapshot, status, environment_identity, started_at_ms,
+                   plan_snapshot, policy_id, policy_version, policy_digest,
+                   status, environment_identity, started_at_ms,
                    finished_at_ms, overall_result
             FROM orbit_verification_runs
             WHERE id = $1
@@ -887,6 +1255,9 @@ impl VerificationStore {
             plan_id: row.plan_id,
             plan_version: row.plan_version as u32,
             plan_snapshot: serde_json::from_value(row.plan_snapshot)?,
+            policy_id: row.policy_id,
+            policy_version: row.policy_version.map(|v| v as u32),
+            policy_digest: row.policy_digest,
             status,
             environment_identity: serde_json::from_value(row.environment_identity)?,
             started_at_ms: row.started_at_ms,
@@ -939,6 +1310,94 @@ impl VerificationStore {
             None => Ok(None),
         }
     }
+
+    /// Check if a workspace state qualifies under a specific policy and environment requirements.
+    ///
+    /// Section 10 Qualification Lookup Invariant:
+    /// A valid qualification must require:
+    /// - workspace_state_id matches
+    /// - policy identity/version matches
+    /// - environment requirements match (runtime_image_digest, isolation, network_policy)
+    /// - run status == PASSED
+    /// - all required steps passed
+    pub async fn check_workspace_qualification(
+        &self,
+        workspace_state_id: &str,
+        policy: &VerificationPolicy,
+        required_environment: Option<&EnvironmentIdentity>,
+    ) -> Result<Option<VerificationRun>> {
+        let runs: Vec<String> = sqlx::query_scalar(
+            r#"
+            SELECT id FROM orbit_verification_runs
+            WHERE workspace_state_id = $1
+              AND policy_id = $2
+              AND policy_version = $3
+              AND overall_result = 'PASSED'
+            ORDER BY created_at DESC
+            "#,
+        )
+        .bind(workspace_state_id)
+        .bind(&policy.id)
+        .bind(policy.version as i32)
+        .fetch_all(&self.pool)
+        .await?;
+
+        for run_id in runs {
+            if let Some(run) = self.get_run(&run_id).await? {
+                // Check policy digest matches
+                if run.policy_digest.as_deref() != Some(&policy.digest()) {
+                    continue;
+                }
+
+                // Check environment requirements if specified
+                if let Some(req_env) = required_environment {
+                    if req_env.isolation != run.environment_identity.isolation {
+                        continue;
+                    }
+                    if req_env.runtime_image_digest.is_some()
+                        && req_env.runtime_image_digest
+                            != run.environment_identity.runtime_image_digest
+                    {
+                        continue;
+                    }
+                    if req_env.network_policy != run.environment_identity.network_policy {
+                        continue;
+                    }
+                    if req_env.cache_policy != run.environment_identity.cache_policy {
+                        continue;
+                    }
+                }
+
+                // Ensure all required steps in the policy actually ran and passed
+                let mut policy_steps_satisfied = true;
+                for req_step_id in &policy.required_steps {
+                    let step_passed = run.step_runs.iter().any(|s| {
+                        &s.step_id == req_step_id && s.status == VerificationStepStatus::Passed
+                    });
+                    if !step_passed {
+                        policy_steps_satisfied = false;
+                        break;
+                    }
+                }
+                if !policy_steps_satisfied {
+                    continue;
+                }
+
+                // Ensure all required steps in the plan passed
+                let all_plan_req_passed = run
+                    .step_runs
+                    .iter()
+                    .all(|s| !s.required || s.status == VerificationStepStatus::Passed);
+                if !all_plan_req_passed {
+                    continue;
+                }
+
+                return Ok(Some(run));
+            }
+        }
+
+        Ok(None)
+    }
 }
 
 /// Execute an entire VerificationPlan against a workspace directory, persisting evidence to PostgreSQL.
@@ -951,9 +1410,38 @@ pub async fn execute_verification_plan(
     environment: EnvironmentIdentity,
     cancellation_token: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<VerificationRun> {
+    execute_verification_plan_with_policy(
+        store,
+        attempt_id,
+        workspace_state,
+        plan,
+        workspace_dir,
+        environment,
+        None,
+        cancellation_token,
+    )
+    .await
+}
+
+/// Execute a VerificationPlan governed by an explicit VerificationPolicy.
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_verification_plan_with_policy(
+    store: &VerificationStore,
+    attempt_id: &str,
+    workspace_state: &WorkspaceState,
+    plan: &VerificationPlan,
+    workspace_dir: &Path,
+    environment: EnvironmentIdentity,
+    policy: Option<&VerificationPolicy>,
+    cancellation_token: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<VerificationRun> {
     plan.validate()?;
+    if let Some(pol) = policy {
+        pol.check_plan(plan)?;
+    }
+
     let run = store
-        .create_run(attempt_id, workspace_state, plan, environment)
+        .create_run_with_policy(attempt_id, workspace_state, plan, environment, policy)
         .await?;
 
     let mut overall_result = VerificationRunResult::Passed;
@@ -972,12 +1460,14 @@ pub async fn execute_verification_plan(
         let step_started_at_ms = now_millis();
 
         let image_opt = run.environment_identity.runtime_image.as_deref();
+        let env_pol = policy.map(|p| &p.environment_policy);
         let capture_res = execute_verification_command_isolated(
             step,
             workspace_dir,
             None,
             cancellation_token.clone(),
             image_opt,
+            env_pol,
         )
         .await;
 
@@ -1104,6 +1594,30 @@ pub fn format_verification_show(run: &VerificationRun) -> String {
     out.push_str(&format!("Verification {}\n", run.id));
     out.push_str(&format!("Attempt       {}\n", run.attempt_id));
     out.push_str(&format!("Workspace     {}\n", run.workspace_state_id));
+    if let Some(pid) = &run.policy_id {
+        out.push_str(&format!(
+            "Policy        {} (v{})\n",
+            pid,
+            run.policy_version.unwrap_or(1)
+        ));
+    }
+    if let Some(pdig) = &run.policy_digest {
+        out.push_str(&format!("Policy Digest {}\n", pdig));
+    }
+    if let Some(img) = &run.environment_identity.runtime_image {
+        out.push_str(&format!("Image         {}\n", img));
+    }
+    if let Some(dig) = &run.environment_identity.runtime_image_digest {
+        out.push_str(&format!("Image Digest  {}\n", dig));
+    }
+    out.push_str(&format!(
+        "Network       {}\n",
+        run.environment_identity.network_policy
+    ));
+    out.push_str(&format!(
+        "Cache Policy  {}\n",
+        run.environment_identity.cache_policy
+    ));
     let res_str = run
         .overall_result
         .map(|r| r.to_string())
@@ -1281,6 +1795,68 @@ mod tests {
     }
 
     #[test]
+    fn test_verification_policy_validation_and_checking() {
+        let mut policy = VerificationPolicy::new("rust-strict", "Rust Strict Policy");
+        policy.required_steps = vec!["fmt".into(), "test".into()];
+        policy.allowed_commands = vec![
+            AllowedCommand::with_prefix("cargo", vec!["fmt".into()]),
+            AllowedCommand::with_prefix("cargo", vec!["test".into()]),
+        ];
+        assert!(policy.validate().is_ok());
+
+        // Valid plan
+        let plan_valid = VerificationPlan::new(
+            "rust-plan",
+            "Plan",
+            vec![
+                VerificationStep::new_command("fmt", "Format", vec!["cargo".into(), "fmt".into()]),
+                VerificationStep::new_command("test", "Tests", vec!["cargo".into(), "test".into()]),
+            ],
+        );
+        assert!(policy.check_plan(&plan_valid).is_ok());
+
+        // Missing required step
+        let plan_missing = VerificationPlan::new(
+            "rust-plan-partial",
+            "Plan",
+            vec![VerificationStep::new_command(
+                "fmt",
+                "Format",
+                vec!["cargo".into(), "fmt".into()],
+            )],
+        );
+        assert!(policy.check_plan(&plan_missing).is_err());
+
+        // Disallowed command
+        let plan_disallowed = VerificationPlan::new(
+            "rust-plan-disallowed",
+            "Plan",
+            vec![
+                VerificationStep::new_command("fmt", "Format", vec!["cargo".into(), "fmt".into()]),
+                VerificationStep::new_command("test", "Tests", vec!["cargo".into(), "test".into()]),
+                VerificationStep::new_command(
+                    "hack",
+                    "Hack",
+                    vec!["curl".into(), "evil.com".into()],
+                ),
+            ],
+        );
+        assert!(policy.check_plan(&plan_disallowed).is_err());
+    }
+
+    #[test]
+    fn test_verification_environment_policy_digest_and_defaults() {
+        let env_pol = VerificationEnvironmentPolicy::clean();
+        let dig1 = env_pol.digest();
+        let dig2 = env_pol.digest();
+        assert_eq!(dig1, dig2);
+
+        let mut env_pol_custom = VerificationEnvironmentPolicy::clean();
+        env_pol_custom.set.insert("FOO".into(), "BAR".into());
+        assert_ne!(dig1, env_pol_custom.digest());
+    }
+
+    #[test]
     fn test_format_verification_show() {
         let run = VerificationRun {
             id: "vrun-1234".into(),
@@ -1289,6 +1865,9 @@ mod tests {
             plan_id: "rust-standard".into(),
             plan_version: 1,
             plan_snapshot: VerificationPlan::new("rust-standard", "Rust", vec![]),
+            policy_id: Some("policy-strict".into()),
+            policy_version: Some(1),
+            policy_digest: Some("sha256-pol-digest".into()),
             status: VerificationStepStatus::Passed,
             environment_identity: Default::default(),
             started_at_ms: 1000,

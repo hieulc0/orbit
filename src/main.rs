@@ -229,6 +229,9 @@ enum VerificationAction {
         /// Optional container image for isolated execution (e.g. docker.io/library/rust:latest)
         #[arg(long)]
         image: Option<String>,
+        /// Optional path to verification policy JSON file
+        #[arg(long)]
+        policy: Option<PathBuf>,
         #[arg(long, env = "ORBIT_DATABASE_URL_FILE", hide_env_values = true)]
         database_url_file: Option<PathBuf>,
     },
@@ -1197,6 +1200,7 @@ async fn main() -> Result<()> {
                 workspace,
                 plan,
                 image,
+                policy,
                 database_url_file,
             } => {
                 let database_url = read_private_database_url(database_url_file.as_deref()).await?;
@@ -1261,6 +1265,39 @@ async fn main() -> Result<()> {
                     )
                 };
 
+                let policy_def: Option<orbit::verification::VerificationPolicy> =
+                    if let Some(pol_path) = policy {
+                        let pol_raw =
+                            tokio::fs::read_to_string(&pol_path)
+                                .await
+                                .with_context(|| {
+                                    format!("cannot read policy file: {}", pol_path.display())
+                                })?;
+                        let p: orbit::verification::VerificationPolicy =
+                            serde_json::from_str(&pol_raw).with_context(|| {
+                                format!("invalid policy JSON in {}", pol_path.display())
+                            })?;
+                        p.validate()?;
+                        store.save_policy(&p).await?;
+                        Some(p)
+                    } else {
+                        None
+                    };
+
+                let (net_pol, cache_pol, env_pol_digest) = if let Some(p) = &policy_def {
+                    (
+                        p.network_policy,
+                        p.cache_policy,
+                        Some(p.environment_policy.digest()),
+                    )
+                } else {
+                    (
+                        orbit::verification::VerificationNetworkPolicy::None,
+                        orbit::verification::VerificationCachePolicy::Clean,
+                        None,
+                    )
+                };
+
                 let env = orbit::verification::EnvironmentIdentity {
                     execution_profile: profile_name,
                     isolation,
@@ -1271,13 +1308,23 @@ async fn main() -> Result<()> {
                     } else {
                         None
                     },
+                    network_policy: net_pol,
+                    cache_policy: cache_pol,
+                    environment_policy_digest: env_pol_digest,
                     architecture: std::env::consts::ARCH.into(),
                     os: std::env::consts::OS.into(),
                     orbit_version: env!("CARGO_PKG_VERSION").into(),
                 };
 
-                let run = orbit::verification::execute_verification_plan(
-                    &store, attempt_id, &ws_state, &plan_def, workspace, env, None,
+                let run = orbit::verification::execute_verification_plan_with_policy(
+                    &store,
+                    attempt_id,
+                    &ws_state,
+                    &plan_def,
+                    workspace,
+                    env,
+                    policy_def.as_ref(),
+                    None,
                 )
                 .await?;
 
