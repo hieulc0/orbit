@@ -32,7 +32,7 @@ use anyhow::{Context, Result, bail, ensure};
 use sqlx::PgPool;
 use std::{
     collections::BTreeMap,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -1652,6 +1652,22 @@ struct AcpTurnState<'a> {
     tool_counts: BTreeMap<String, u64>,
 }
 
+fn resolve_workspace_path(repo_path: &Path, requested: &str) -> PathBuf {
+    let clean = requested.trim();
+    if let Some(stripped) = clean.strip_prefix("/orbit/home/") {
+        repo_path.join(stripped)
+    } else if clean == "/orbit/home" {
+        repo_path.to_path_buf()
+    } else {
+        let p = Path::new(clean);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            repo_path.join(p)
+        }
+    }
+}
+
 async fn handle_acp_message(
     wire: &mut Wire,
     state: &mut AcpTurnState<'_>,
@@ -1692,12 +1708,7 @@ async fn handle_acp_message(
                     .and_then(|p| p.get("path"))
                     .and_then(|p| p.as_str())
                     .unwrap_or("");
-                let raw_path = Path::new(rel_path_str);
-                let full_path = if raw_path.is_absolute() {
-                    raw_path.to_path_buf()
-                } else {
-                    state.repo_path.join(raw_path)
-                };
+                let full_path = resolve_workspace_path(state.repo_path, rel_path_str);
 
                 let canonical_repo = match state.repo_path.canonicalize() {
                     Ok(c) => c,
@@ -1756,12 +1767,7 @@ async fn handle_acp_message(
                     .and_then(|c| c.as_str())
                     .unwrap_or("");
 
-                let raw_path = Path::new(rel_path_str);
-                let full_path = if raw_path.is_absolute() {
-                    raw_path.to_path_buf()
-                } else {
-                    state.repo_path.join(raw_path)
-                };
+                let full_path = resolve_workspace_path(state.repo_path, rel_path_str);
 
                 let canonical_repo = match state.repo_path.canonicalize() {
                     Ok(c) => c,
