@@ -37,7 +37,7 @@ pub fn thread_start(
         "private bridge control directory required"
     );
     ensure!(
-        names.len() <= 3 && names.iter().collect::<BTreeSet<_>>().len() == names.len(),
+        names.len() <= 10 && names.iter().collect::<BTreeSet<_>>().len() == names.len(),
         "invalid bridge tools"
     );
     let tools = crate::coding_agent::tool_definitions(names)?.into_iter().map(|tool|
