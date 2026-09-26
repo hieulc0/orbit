@@ -40,5 +40,6 @@ pub mod run_export;
 pub mod sdk;
 pub mod secret_backend;
 pub mod telemetry;
+pub mod verification;
 pub mod worker;
 pub mod workspace;

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use orbit::{
     api::{self, App, Config, Submit},
     availability::AvailabilityStore,
@@ -211,10 +211,47 @@ enum ProviderScopeAction {
     },
 }
 
+#[derive(Args)]
+struct VerificationArgs {
+    #[command(subcommand)]
+    action: VerificationAction,
+}
+
+#[derive(Subcommand)]
+enum VerificationAction {
+    /// Execute a verification plan against a workspace.
+    Run {
+        attempt_id: String,
+        #[arg(long)]
+        workspace: PathBuf,
+        #[arg(long)]
+        plan: PathBuf,
+        /// Optional container image for isolated execution (e.g. docker.io/library/rust:latest)
+        #[arg(long)]
+        image: Option<String>,
+        #[arg(long, env = "ORBIT_DATABASE_URL_FILE", hide_env_values = true)]
+        database_url_file: Option<PathBuf>,
+    },
+    /// Show a verification run and its step results.
+    Show {
+        run_id: String,
+        #[arg(long, env = "ORBIT_DATABASE_URL_FILE", hide_env_values = true)]
+        database_url_file: Option<PathBuf>,
+    },
+    /// List verification runs for an attempt.
+    List {
+        attempt_id: String,
+        #[arg(long, env = "ORBIT_DATABASE_URL_FILE", hide_env_values = true)]
+        database_url_file: Option<PathBuf>,
+    },
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Operator credential registry and enrollment.
     Credential(CredentialArgs),
+    /// Execute or inspect isolated verification evidence.
+    Verification(VerificationArgs),
     /// Validate an operator-owned ACP launch policy and print its canonical digest.
     AcpLaunchDigest {
         #[arg(long)]
@@ -1153,6 +1190,155 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
+    if let Commands::Verification(VerificationArgs { action }) = &cli.command {
+        match action {
+            VerificationAction::Run {
+                attempt_id,
+                workspace,
+                plan,
+                image,
+                database_url_file,
+            } => {
+                let database_url = read_private_database_url(database_url_file.as_deref()).await?;
+                let (engine, scratch) =
+                    connect_durable_catalog_engine(database_url.as_str()).await?;
+                let plan_bytes = tokio::fs::read(plan).await?;
+                let plan_def: orbit::verification::VerificationPlan =
+                    serde_json::from_slice(&plan_bytes)
+                        .or_else(|_| serde_yaml::from_slice(&plan_bytes))?;
+                plan_def.validate()?;
+
+                let head = String::from_utf8(
+                    tokio::process::Command::new("git")
+                        .args(["-C", &workspace.to_string_lossy(), "rev-parse", "HEAD"])
+                        .output()
+                        .await?
+                        .stdout,
+                )
+                .unwrap_or_else(|_| "unknown".into())
+                .trim()
+                .to_string();
+
+                let diff_bytes = tokio::process::Command::new("git")
+                    .args(["-C", &workspace.to_string_lossy(), "diff", "HEAD"])
+                    .output()
+                    .await?
+                    .stdout;
+                let diff_sha256 = if diff_bytes.is_empty() {
+                    None
+                } else {
+                    Some(orbit::model::digest(&diff_bytes))
+                };
+
+                let ws_state = orbit::verification::WorkspaceState::compute_from_parts(
+                    &head,
+                    &head,
+                    diff_sha256.as_deref(),
+                );
+                let store = orbit::verification::VerificationStore::new(engine.pool.clone());
+                let (profile_name, isolation, runtime_img, oci_rt) = if let Some(img) = image {
+                    let mut inspect = tokio::process::Command::new("podman");
+                    inspect.args(["image", "inspect", img, "--format", "{{.Id}}"]);
+                    let digest = inspect.output().await.ok().and_then(|o| {
+                        if o.status.success() {
+                            Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+                        } else {
+                            None
+                        }
+                    });
+                    (
+                        "sandboxed-container".to_string(),
+                        "rootless-podman".to_string(),
+                        Some(img.clone()),
+                        digest,
+                    )
+                } else {
+                    (
+                        "local-operator".to_string(),
+                        "process-group".to_string(),
+                        None,
+                        None,
+                    )
+                };
+
+                let env = orbit::verification::EnvironmentIdentity {
+                    execution_profile: profile_name,
+                    isolation,
+                    runtime_image: runtime_img,
+                    runtime_image_digest: oci_rt,
+                    oci_runtime: if image.is_some() {
+                        Some("podman".into())
+                    } else {
+                        None
+                    },
+                    architecture: std::env::consts::ARCH.into(),
+                    os: std::env::consts::OS.into(),
+                    orbit_version: env!("CARGO_PKG_VERSION").into(),
+                };
+
+                let run = orbit::verification::execute_verification_plan(
+                    &store, attempt_id, &ws_state, &plan_def, workspace, env, None,
+                )
+                .await?;
+
+                match output_format {
+                    Output::Text => {
+                        println!("{}", orbit::verification::format_verification_show(&run))
+                    }
+                    Output::Json => println!("{}", serde_json::to_string_pretty(&run)?),
+                    Output::Jsonl => println!("{}", serde_json::to_string(&run)?),
+                }
+                engine.pool.close().await;
+                drop(scratch);
+                return Ok(());
+            }
+            VerificationAction::Show {
+                run_id,
+                database_url_file,
+            } => {
+                let database_url = read_private_database_url(database_url_file.as_deref()).await?;
+                let (engine, scratch) =
+                    connect_durable_catalog_engine(database_url.as_str()).await?;
+                let store = orbit::verification::VerificationStore::new(engine.pool.clone());
+                let run = store
+                    .get_run(run_id)
+                    .await?
+                    .context("verification run not found")?;
+
+                match output_format {
+                    Output::Text => {
+                        println!("{}", orbit::verification::format_verification_show(&run))
+                    }
+                    Output::Json => println!("{}", serde_json::to_string_pretty(&run)?),
+                    Output::Jsonl => println!("{}", serde_json::to_string(&run)?),
+                }
+                engine.pool.close().await;
+                drop(scratch);
+                return Ok(());
+            }
+            VerificationAction::List {
+                attempt_id,
+                database_url_file,
+            } => {
+                let database_url = read_private_database_url(database_url_file.as_deref()).await?;
+                let (engine, scratch) =
+                    connect_durable_catalog_engine(database_url.as_str()).await?;
+                let store = orbit::verification::VerificationStore::new(engine.pool.clone());
+                let runs = store.list_runs(attempt_id).await?;
+
+                match output_format {
+                    Output::Json | Output::Text => {
+                        println!("{}", serde_json::to_string_pretty(&runs)?)
+                    }
+                    Output::Jsonl => println!("{}", serde_json::to_string(&runs)?),
+                }
+                engine.pool.close().await;
+                drop(scratch);
+                return Ok(());
+            }
+        }
+    }
+
     if let Commands::Credential(CredentialArgs {
         action:
             CredentialAction::Rename {
@@ -1194,7 +1380,9 @@ async fn main() -> Result<()> {
         let database_url = read_private_database_url(database_url_file.as_deref()).await?;
         let (engine, scratch) = connect_durable_catalog_engine(database_url.as_str()).await?;
         let backend = orbit::secret_backend::LocalPrivateSecretBackend::default_for_operator()?;
-        let removed = CredentialStore::new(&engine.pool).hard_delete(reference, &backend).await?;
+        let removed = CredentialStore::new(&engine.pool)
+            .hard_delete(reference, &backend)
+            .await?;
         let summary = serde_json::json!({
             "credential_id": removed.id,
             "reference": removed.reference,
@@ -1797,6 +1985,9 @@ async fn main() -> Result<()> {
     };
     let client = Client::new(cli.url, token)?;
     let value = match cli.command {
+        Commands::Verification(_) => {
+            unreachable!("local verification handled before API credential resolution")
+        }
         Commands::Credential(args) => match args.action {
             CredentialAction::Add { .. } => {
                 unreachable!("local enrollment handled before API credential resolution")

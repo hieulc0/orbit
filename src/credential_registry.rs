@@ -1112,7 +1112,11 @@ impl<'a> CredentialStore<'a> {
     /// Hard delete a credential, all of its generations, representations, identity
     /// bindings, associated provider scope bindings, and physically destroy its secret bytes.
     /// This frees up the logical reference for immediate reuse.
-    pub async fn hard_delete(&self, reference: &str, backend: &dyn SecretBackend) -> Result<Credential> {
+    pub async fn hard_delete(
+        &self,
+        reference: &str,
+        backend: &dyn SecretBackend,
+    ) -> Result<Credential> {
         ensure!(logical(reference), "invalid credential reference");
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
@@ -1131,14 +1135,14 @@ impl<'a> CredentialStore<'a> {
 
         // Gather all secret locators across generations and representations
         let gen_locators: Vec<Option<String>> = sqlx::query_scalar(
-            "SELECT secret_locator FROM orbit_credential_generations WHERE credential_id=$1"
+            "SELECT secret_locator FROM orbit_credential_generations WHERE credential_id=$1",
         )
         .bind(credential_id)
         .fetch_all(&mut *tx)
         .await?;
 
         let rep_locators: Vec<Option<String>> = sqlx::query_scalar(
-            "SELECT secret_locator FROM orbit_credential_representations WHERE credential_id=$1"
+            "SELECT secret_locator FROM orbit_credential_representations WHERE credential_id=$1",
         )
         .bind(credential_id)
         .fetch_all(&mut *tx)
@@ -1173,7 +1177,7 @@ impl<'a> CredentialStore<'a> {
 
         // Physically destroy secret files on the backend
         let mut all_locators = std::collections::BTreeSet::new();
-        for loc in gen_locators.into_iter().chain(rep_locators.into_iter()).flatten() {
+        for loc in gen_locators.into_iter().chain(rep_locators).flatten() {
             all_locators.insert(loc);
         }
 
@@ -1185,7 +1189,11 @@ impl<'a> CredentialStore<'a> {
 
         // Clean up empty credential directory under private store if accessible
         if let Ok(home) = crate::secret_backend::operator_home() {
-            let cred_dir = home.join(".orbit").join("private").join("credentials").join(credential_id);
+            let cred_dir = home
+                .join(".orbit")
+                .join("private")
+                .join("credentials")
+                .join(credential_id);
             if cred_dir.exists() {
                 let _ = std::fs::remove_dir_all(&cred_dir);
             }

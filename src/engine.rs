@@ -86,6 +86,9 @@ impl Engine {
         ))
         .execute(&mut *migration)
         .await?;
+        sqlx::raw_sql(include_str!("../migrations/0016_verification_evidence.sql"))
+            .execute(&mut *migration)
+            .await?;
         migration.commit().await?;
         Ok(Self {
             pool,
