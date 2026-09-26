@@ -37,6 +37,7 @@ pub mod ops;
 pub mod provider_scope;
 pub mod provider_status;
 pub mod registry;
+pub mod regression_strategy;
 pub mod repository;
 pub mod run_export;
 pub mod sdk;

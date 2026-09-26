@@ -98,6 +98,8 @@ fn sample_environment() -> EnvironmentIdentity {
         orbit_version: "0.1.0".into(),
         browser_verification_digest: None,
         browser_runtime_image_digest: None,
+        regression_policy_digest: None,
+        selection_digest: None,
     }
 }
 

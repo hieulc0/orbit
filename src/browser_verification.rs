@@ -239,6 +239,23 @@ pub struct BrowserVerificationSpec {
 }
 
 impl BrowserVerificationSpec {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            version: 1,
+            backend: BrowserBackend::PlaywrightChromium,
+            base_url: None,
+            tests: Vec::new(),
+            timeout_seconds: 30,
+            artifact_policy: BrowserArtifactPolicy::default(),
+            console_policy: BrowserConsolePolicy::default(),
+            page_error_policy: BrowserPageErrorPolicy::default(),
+            network_policy: BrowserNetworkPolicy::default(),
+            shm_size_mb: None,
+            memory_limit_mb: None,
+        }
+    }
+
     pub fn digest(&self) -> String {
         let serialized = serde_json::to_string(self).unwrap_or_default();
         crate::model::digest(serialized.as_bytes())

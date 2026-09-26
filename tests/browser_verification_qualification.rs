@@ -116,6 +116,8 @@ fn dummy_env_identity() -> EnvironmentIdentity {
         integration_environment_digest: None,
         browser_verification_digest: None,
         browser_runtime_image_digest: None,
+        regression_policy_digest: None,
+        selection_digest: None,
         architecture: std::env::consts::ARCH.into(),
         os: std::env::consts::OS.into(),
         orbit_version: env!("CARGO_PKG_VERSION").into(),

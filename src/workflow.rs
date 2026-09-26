@@ -107,6 +107,12 @@ pub struct WorkflowRun {
     pub verification_policy_id: Option<String>,
     pub verification_policy_version: Option<u32>,
     pub verification_policy_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regression_policy_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regression_policy_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regression_policy_digest: Option<String>,
     pub failure_reason: Option<String>,
     pub cancellation_reason: Option<String>,
     pub started_at_ms: i64,
@@ -411,6 +417,24 @@ impl WorkflowStore {
         max_iterations: u32,
         policy: Option<&VerificationPolicy>,
     ) -> Result<WorkflowRun> {
+        self.create_workflow_run_with_regression_policy(
+            task_id,
+            attempt_id,
+            max_iterations,
+            policy,
+            None,
+        )
+        .await
+    }
+
+    pub async fn create_workflow_run_with_regression_policy(
+        &self,
+        task_id: &str,
+        attempt_id: &str,
+        max_iterations: u32,
+        policy: Option<&VerificationPolicy>,
+        regression_policy: Option<&crate::regression_strategy::RegressionPolicy>,
+    ) -> Result<WorkflowRun> {
         let wf_id = format!("wf-{}", id());
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
@@ -420,14 +444,19 @@ impl WorkflowStore {
         let policy_ver = policy.map(|p| p.version as i32);
         let policy_dig = policy.map(|p| p.digest());
 
+        let reg_id = regression_policy.map(|r| r.id.clone());
+        let reg_ver = regression_policy.map(|r| r.version as i32);
+        let reg_dig = regression_policy.map(|r| r.digest());
+
         sqlx::query(
             r#"
             INSERT INTO orbit_workflow_runs (
                 id, task_id, attempt_id, workflow_kind, workflow_version,
                 status, current_stage, iteration, max_iterations,
                 verification_policy_id, verification_policy_version, verification_policy_digest,
+                regression_policy_id, regression_policy_version, regression_policy_digest,
                 started_at_ms
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
             "#,
         )
         .bind(&wf_id)
@@ -442,6 +471,9 @@ impl WorkflowStore {
         .bind(policy_id.as_deref())
         .bind(policy_ver)
         .bind(policy_dig.as_deref())
+        .bind(reg_id.as_deref())
+        .bind(reg_ver)
+        .bind(reg_dig.as_deref())
         .bind(now_ms)
         .execute(&self.pool)
         .await
@@ -459,6 +491,7 @@ impl WorkflowStore {
                    status, current_stage, iteration, max_iterations,
                    current_workspace_state_id, verification_policy_id,
                    verification_policy_version, verification_policy_digest,
+                   regression_policy_id, regression_policy_version, regression_policy_digest,
                    failure_reason, cancellation_reason, started_at_ms, finished_at_ms
             FROM orbit_workflow_runs WHERE id = $1
             "#,
@@ -472,6 +505,7 @@ impl WorkflowStore {
         let status_str: String = r.get("status");
         let status = WorkflowStage::from_str_strict(&status_str)?;
         let pol_ver: Option<i32> = r.get("verification_policy_version");
+        let reg_ver: Option<i32> = r.get("regression_policy_version");
 
         Ok(Some(WorkflowRun {
             id: r.get("id"),
@@ -487,6 +521,9 @@ impl WorkflowStore {
             verification_policy_id: r.get("verification_policy_id"),
             verification_policy_version: pol_ver.map(|v| v as u32),
             verification_policy_digest: r.get("verification_policy_digest"),
+            regression_policy_id: r.get("regression_policy_id"),
+            regression_policy_version: reg_ver.map(|v| v as u32),
+            regression_policy_digest: r.get("regression_policy_digest"),
             failure_reason: r.get("failure_reason"),
             cancellation_reason: r.get("cancellation_reason"),
             started_at_ms: r.get("started_at_ms"),
@@ -502,6 +539,7 @@ impl WorkflowStore {
                        status, current_stage, iteration, max_iterations,
                        current_workspace_state_id, verification_policy_id,
                        verification_policy_version, verification_policy_digest,
+                       regression_policy_id, regression_policy_version, regression_policy_digest,
                        failure_reason, cancellation_reason, started_at_ms, finished_at_ms
                 FROM orbit_workflow_runs WHERE attempt_id = $1 ORDER BY created_at DESC
                 "#,
@@ -516,6 +554,7 @@ impl WorkflowStore {
                        status, current_stage, iteration, max_iterations,
                        current_workspace_state_id, verification_policy_id,
                        verification_policy_version, verification_policy_digest,
+                       regression_policy_id, regression_policy_version, regression_policy_digest,
                        failure_reason, cancellation_reason, started_at_ms, finished_at_ms
                 FROM orbit_workflow_runs ORDER BY created_at DESC
                 "#,
@@ -529,6 +568,7 @@ impl WorkflowStore {
             let status_str: String = r.get("status");
             let status = WorkflowStage::from_str_strict(&status_str)?;
             let pol_ver: Option<i32> = r.get("verification_policy_version");
+            let reg_ver: Option<i32> = r.get("regression_policy_version");
             out.push(WorkflowRun {
                 id: r.get("id"),
                 task_id: r.get("task_id"),
@@ -543,6 +583,9 @@ impl WorkflowStore {
                 verification_policy_id: r.get("verification_policy_id"),
                 verification_policy_version: pol_ver.map(|v| v as u32),
                 verification_policy_digest: r.get("verification_policy_digest"),
+                regression_policy_id: r.get("regression_policy_id"),
+                regression_policy_version: reg_ver.map(|v| v as u32),
+                regression_policy_digest: r.get("regression_policy_digest"),
                 failure_reason: r.get("failure_reason"),
                 cancellation_reason: r.get("cancellation_reason"),
                 started_at_ms: r.get("started_at_ms"),
@@ -1108,6 +1151,33 @@ impl WorkflowStore {
             !matching_runs.is_empty(),
             "cannot complete workflow: no passed verification evidence for workspace state {}",
             ws_id
+        );
+
+        // 3. Phase B6 Invariant: Completion requires FULL regression tier
+        let required_tier = if let Some(ref reg_id) = wf.regression_policy_id {
+            let reg_store = crate::regression_strategy::RegressionStore::new(self.pool.clone());
+            let reg_pol = reg_store
+                .get_regression_policy(reg_id, wf.regression_policy_version.unwrap_or(1))
+                .await?;
+            reg_pol
+                .map(|p| p.completion_tier)
+                .unwrap_or(crate::regression_strategy::VerificationTier::Full)
+        } else {
+            crate::regression_strategy::VerificationTier::Full
+        };
+
+        let has_passing_completion_tier = matching_runs.iter().any(|r| match r.tier {
+            Some(t) => t >= required_tier,
+            None => false,
+        });
+
+        let all_legacy =
+            wf.regression_policy_id.is_none() && matching_runs.iter().all(|r| r.tier.is_none());
+        ensure!(
+            has_passing_completion_tier || all_legacy,
+            "cannot complete workflow: workspace state {} has not qualified required completion tier {:?}",
+            ws_id,
+            required_tier
         );
 
         Ok(())

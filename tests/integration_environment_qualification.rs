@@ -148,6 +148,8 @@ async fn test_b4_01_managed_container_service_postgres() -> Result<()> {
         orbit_version: "0.1.0".into(),
         browser_verification_digest: None,
         browser_runtime_image_digest: None,
+        regression_policy_digest: None,
+        selection_digest: None,
     };
 
     let ws_state = WorkspaceState::compute_from_parts("base-1", "head-1", None);
@@ -293,6 +295,8 @@ async fn test_b4_02_multi_service_postgres_and_redis() -> Result<()> {
         orbit_version: "0.1.0".into(),
         browser_verification_digest: None,
         browser_runtime_image_digest: None,
+        regression_policy_digest: None,
+        selection_digest: None,
     };
 
     let ws_state = WorkspaceState::compute_from_parts("base-2", "head-2", None);
@@ -457,6 +461,8 @@ async fn test_b4_03_managed_process_service() -> Result<()> {
         orbit_version: "0.1.0".into(),
         browser_verification_digest: None,
         browser_runtime_image_digest: None,
+        regression_policy_digest: None,
+        selection_digest: None,
     };
 
     let ws_state = WorkspaceState::compute_from_parts("base-proc", "head-proc", None);
@@ -590,6 +596,8 @@ async fn test_b4_04_isolated_network_blocks_external_internet() -> Result<()> {
         orbit_version: "0.1.0".into(),
         browser_verification_digest: None,
         browser_runtime_image_digest: None,
+        regression_policy_digest: None,
+        selection_digest: None,
     };
 
     let ws_state = WorkspaceState::compute_from_parts("base-4", "head-4", None);
@@ -677,6 +685,8 @@ async fn test_b4_05_failure_differentiation_readiness_timeout() -> Result<()> {
         orbit_version: "0.1.0".into(),
         browser_verification_digest: None,
         browser_runtime_image_digest: None,
+        regression_policy_digest: None,
+        selection_digest: None,
     };
 
     let ws_state = WorkspaceState::compute_from_parts("base-5", "head-5", None);
@@ -773,6 +783,8 @@ async fn test_b4_06_failure_differentiation_premature_crash() -> Result<()> {
         orbit_version: "0.1.0".into(),
         browser_verification_digest: None,
         browser_runtime_image_digest: None,
+        regression_policy_digest: None,
+        selection_digest: None,
     };
 
     let ws_state = WorkspaceState::compute_from_parts("base-6", "head-6", None);
@@ -908,6 +920,8 @@ async fn test_b4_07_dependency_order_and_setup_step() -> Result<()> {
         orbit_version: "0.1.0".into(),
         browser_verification_digest: None,
         browser_runtime_image_digest: None,
+        regression_policy_digest: None,
+        selection_digest: None,
     };
 
     let ws_state = WorkspaceState::compute_from_parts("base-7", "head-7", None);
@@ -1028,6 +1042,8 @@ async fn test_b4_08_immutable_environment_digest_and_qualification() -> Result<(
         orbit_version: "0.1.0".into(),
         browser_verification_digest: None,
         browser_runtime_image_digest: None,
+        regression_policy_digest: None,
+        selection_digest: None,
     };
 
     let ws_state = WorkspaceState::compute_from_parts("base-8", "head-8", None);
@@ -1137,6 +1153,8 @@ async fn test_b4_09_workflow_integration_with_environment_policy() -> Result<()>
         orbit_version: "0.1.0".into(),
         browser_verification_digest: None,
         browser_runtime_image_digest: None,
+        regression_policy_digest: None,
+        selection_digest: None,
     };
 
     let ws_state = WorkspaceState::compute_from_parts("base-wf", "head-wf", None);
@@ -1231,6 +1249,8 @@ async fn test_b4_10_cleanup_and_restart_durability() -> Result<()> {
         orbit_version: "0.1.0".into(),
         browser_verification_digest: None,
         browser_runtime_image_digest: None,
+        regression_policy_digest: None,
+        selection_digest: None,
     };
 
     let ws_state = WorkspaceState::compute_from_parts("base-clean", "head-clean", None);
@@ -1343,6 +1363,8 @@ async fn test_b4_11_process_service_cleanup_on_test_failure() -> Result<()> {
         orbit_version: "0.1.0".into(),
         browser_verification_digest: None,
         browser_runtime_image_digest: None,
+        regression_policy_digest: None,
+        selection_digest: None,
     };
 
     let ws_state = WorkspaceState::compute_from_parts("base-fail", "head-fail", None);
@@ -1462,6 +1484,8 @@ async fn test_b4_12_process_service_cleanup_on_readiness_timeout() -> Result<()>
         orbit_version: "0.1.0".into(),
         browser_verification_digest: None,
         browser_runtime_image_digest: None,
+        regression_policy_digest: None,
+        selection_digest: None,
     };
 
     let ws_state = WorkspaceState::compute_from_parts("base-timeout", "head-timeout", None);
@@ -1581,6 +1605,8 @@ async fn test_b4_13_process_service_cleanup_on_cancellation() -> Result<()> {
         orbit_version: "0.1.0".into(),
         browser_verification_digest: None,
         browser_runtime_image_digest: None,
+        regression_policy_digest: None,
+        selection_digest: None,
     };
 
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);

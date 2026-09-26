@@ -1496,6 +1496,8 @@ async fn main() -> Result<()> {
                     integration_environment_digest: int_env_digest,
                     browser_verification_digest: None,
                     browser_runtime_image_digest: None,
+                    regression_policy_digest: None,
+                    selection_digest: None,
                     architecture: std::env::consts::ARCH.into(),
                     os: std::env::consts::OS.into(),
                     orbit_version: env!("CARGO_PKG_VERSION").into(),

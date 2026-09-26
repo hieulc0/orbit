@@ -143,6 +143,11 @@ impl VerificationPlan {
         }
     }
 
+    pub fn digest(&self) -> String {
+        let serialized = serde_json::to_string(self).unwrap_or_default();
+        crate::model::digest(serialized.as_bytes())
+    }
+
     pub fn validate(&self) -> Result<()> {
         ensure!(!self.id.trim().is_empty(), "plan id required");
         ensure!(!self.name.trim().is_empty(), "plan name required");
@@ -448,6 +453,10 @@ pub struct EnvironmentIdentity {
     pub browser_verification_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_runtime_image_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regression_policy_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_digest: Option<String>,
     pub architecture: String,
     pub os: String,
     pub orbit_version: String,
@@ -501,6 +510,18 @@ pub struct VerificationRun {
     pub step_runs: Vec<VerificationStepRun>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_verification_run: Option<crate::browser_verification::BrowserVerificationRun>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<crate::regression_strategy::VerificationTier>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regression_policy_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regression_policy_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regression_policy_digest: Option<String>,
 }
 
 pub fn now_millis() -> i64 {
@@ -1025,6 +1046,32 @@ impl VerificationStore {
         environment: EnvironmentIdentity,
         policy: Option<&VerificationPolicy>,
     ) -> Result<VerificationRun> {
+        self.create_run_with_policy_and_tier(
+            attempt_id,
+            workspace_state,
+            plan,
+            environment,
+            policy,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Create a new VerificationRun record in PENDING status bound to policy, tier, selection, and regression policy.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_run_with_policy_and_tier(
+        &self,
+        attempt_id: &str,
+        workspace_state: &WorkspaceState,
+        plan: &VerificationPlan,
+        mut environment: EnvironmentIdentity,
+        policy: Option<&VerificationPolicy>,
+        tier: Option<crate::regression_strategy::VerificationTier>,
+        selection: Option<&crate::regression_strategy::VerificationSelection>,
+        regression_policy: Option<&crate::regression_strategy::RegressionPolicy>,
+    ) -> Result<VerificationRun> {
         plan.validate()?;
         if let Some(pol) = policy {
             pol.check_plan(plan)?;
@@ -1035,14 +1082,29 @@ impl VerificationStore {
             .map(|p| (Some(p.id.clone()), Some(p.version as i32), Some(p.digest())))
             .unwrap_or((None, None, None));
 
+        let sel_id = selection.map(|s| s.id.clone());
+        let sel_dig = selection.map(|s| s.digest.clone());
+        let reg_id = regression_policy.map(|r| r.id.clone());
+        let reg_ver = regression_policy.map(|r| r.version as i32);
+        let reg_dig = regression_policy.map(|r| r.digest());
+
+        if let Some(ref sd) = sel_dig {
+            environment.selection_digest = Some(sd.clone());
+        }
+        if let Some(ref rd) = reg_dig {
+            environment.regression_policy_digest = Some(rd.clone());
+        }
+
         sqlx::query(
             r#"
             INSERT INTO orbit_verification_runs (
                 id, attempt_id, workspace_state_id, plan_id, plan_version,
                 plan_snapshot, policy_id, policy_version, policy_digest,
-                status, environment_identity, started_at_ms
+                status, environment_identity, started_at_ms,
+                tier, selection_id, selection_digest,
+                regression_policy_id, regression_policy_version, regression_policy_digest
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
             "#,
         )
         .bind(&run_id)
@@ -1057,6 +1119,12 @@ impl VerificationStore {
         .bind("PENDING")
         .bind(serde_json::to_value(&environment)?)
         .bind(started_at_ms)
+        .bind(tier.map(|t| t.as_str()))
+        .bind(&sel_id)
+        .bind(&sel_dig)
+        .bind(&reg_id)
+        .bind(reg_ver)
+        .bind(&reg_dig)
         .execute(&self.pool)
         .await?;
 
@@ -1077,6 +1145,12 @@ impl VerificationStore {
             overall_result: None,
             step_runs: Vec::new(),
             browser_verification_run: None,
+            tier,
+            selection_id: sel_id,
+            selection_digest: sel_dig,
+            regression_policy_id: reg_id,
+            regression_policy_version: reg_ver.map(|v| v as u32),
+            regression_policy_digest: reg_dig,
         })
     }
 
@@ -1181,6 +1255,12 @@ impl VerificationStore {
             started_at_ms: i64,
             finished_at_ms: Option<i64>,
             overall_result: Option<String>,
+            tier: Option<String>,
+            selection_id: Option<String>,
+            selection_digest: Option<String>,
+            regression_policy_id: Option<String>,
+            regression_policy_version: Option<i32>,
+            regression_policy_digest: Option<String>,
         }
 
         let run_opt = sqlx::query_as::<_, RunRow>(
@@ -1188,7 +1268,9 @@ impl VerificationStore {
             SELECT id, attempt_id, workspace_state_id, plan_id, plan_version,
                    plan_snapshot, policy_id, policy_version, policy_digest,
                    status, environment_identity, started_at_ms,
-                   finished_at_ms, overall_result
+                   finished_at_ms, overall_result,
+                   tier, selection_id, selection_digest,
+                   regression_policy_id, regression_policy_version, regression_policy_digest
             FROM orbit_verification_runs
             WHERE id = $1
             "#,
@@ -1307,6 +1389,11 @@ impl VerificationStore {
             .await
             .unwrap_or(None);
 
+        let tier = row
+            .tier
+            .as_deref()
+            .and_then(|t| crate::regression_strategy::VerificationTier::from_str_tier(t).ok());
+
         Ok(Some(VerificationRun {
             id: row.id,
             attempt_id: row.attempt_id,
@@ -1324,6 +1411,12 @@ impl VerificationStore {
             overall_result,
             step_runs,
             browser_verification_run,
+            tier,
+            selection_id: row.selection_id,
+            selection_digest: row.selection_digest,
+            regression_policy_id: row.regression_policy_id,
+            regression_policy_version: row.regression_policy_version.map(|v| v as u32),
+            regression_policy_digest: row.regression_policy_digest,
         }))
     }
 
@@ -1497,6 +1590,162 @@ impl VerificationStore {
 
         Ok(None)
     }
+
+    /// Check if a workspace state qualifies under a specific policy, required tier, and optional regression/selection policies.
+    pub async fn check_workspace_qualification_with_tier(
+        &self,
+        workspace_state_id: &str,
+        policy: &VerificationPolicy,
+        target_tier: crate::regression_strategy::VerificationTier,
+        regression_policy: Option<&crate::regression_strategy::RegressionPolicy>,
+        selection_policy: Option<&crate::regression_strategy::SelectionPolicy>,
+        required_environment: Option<&EnvironmentIdentity>,
+    ) -> Result<Option<VerificationRun>> {
+        let runs: Vec<String> = sqlx::query_scalar(
+            r#"
+            SELECT id FROM orbit_verification_runs
+            WHERE workspace_state_id = $1
+              AND policy_id = $2
+              AND policy_version = $3
+              AND overall_result = 'PASSED'
+            ORDER BY created_at DESC
+            "#,
+        )
+        .bind(workspace_state_id)
+        .bind(&policy.id)
+        .bind(policy.version as i32)
+        .fetch_all(&self.pool)
+        .await?;
+
+        for run_id in runs {
+            if let Some(run) = self.get_run(&run_id).await? {
+                // Tier invariant: run.tier must be >= target_tier
+                match run.tier {
+                    Some(run_tier) => {
+                        if run_tier < target_tier {
+                            continue;
+                        }
+                    }
+                    None => continue,
+                }
+
+                // Check regression policy digest if specified
+                if let Some(reg_pol) = regression_policy
+                    && run.regression_policy_digest.as_deref() != Some(&reg_pol.digest())
+                {
+                    continue;
+                }
+
+                // Check selection policy digest if specified
+                if let Some(sel_pol) = selection_policy {
+                    if let Some(sel_id) = &run.selection_id {
+                        let reg_store =
+                            crate::regression_strategy::RegressionStore::new(self.pool.clone());
+                        if let Ok(Some(sel)) = reg_store.get_selection(sel_id).await {
+                            if sel.selection_policy_digest.as_deref() != Some(&sel_pol.digest()) {
+                                continue;
+                            }
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+
+                // Check policy digest matches
+                if run.policy_digest.as_deref() != Some(&policy.digest()) {
+                    continue;
+                }
+
+                // Check environment requirements if specified
+                if let Some(req_env) = required_environment {
+                    if req_env.isolation != run.environment_identity.isolation {
+                        continue;
+                    }
+                    if req_env.runtime_image_digest.is_some()
+                        && req_env.runtime_image_digest
+                            != run.environment_identity.runtime_image_digest
+                    {
+                        continue;
+                    }
+                    if req_env.network_policy != run.environment_identity.network_policy {
+                        continue;
+                    }
+                    if req_env.cache_policy != run.environment_identity.cache_policy {
+                        continue;
+                    }
+                    if req_env.integration_environment_digest.is_some()
+                        && req_env.integration_environment_digest
+                            != run.environment_identity.integration_environment_digest
+                    {
+                        continue;
+                    }
+                    if req_env.browser_verification_digest.is_some()
+                        && req_env.browser_verification_digest
+                            != run.environment_identity.browser_verification_digest
+                    {
+                        continue;
+                    }
+                    if req_env.browser_runtime_image_digest.is_some()
+                        && req_env.browser_runtime_image_digest
+                            != run.environment_identity.browser_runtime_image_digest
+                    {
+                        continue;
+                    }
+                }
+
+                if let Some(ref _bspec) = policy.browser_verification_spec {
+                    let bstore = crate::browser_verification::BrowserStore::new(self.pool.clone());
+                    if let Ok(Some(brun)) = bstore.get_browser_run_for_verification(&run.id).await {
+                        if brun.status
+                            != crate::browser_verification::BrowserVerificationStatus::Passed
+                        {
+                            continue;
+                        }
+                        let all_req_browser_passed = brun.test_runs.iter().all(|t| {
+                            !t.required
+                                || t.status
+                                    == crate::browser_verification::BrowserTestStatus::Passed
+                        });
+                        if !all_req_browser_passed {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+
+                // Ensure all required steps in the policy actually ran and passed
+                let mut policy_steps_satisfied = true;
+                for req_step_id in &policy.required_steps {
+                    let step_passed = run.step_runs.iter().any(|s| {
+                        &s.step_id == req_step_id && s.status == VerificationStepStatus::Passed
+                    });
+                    if !step_passed {
+                        policy_steps_satisfied = false;
+                        break;
+                    }
+                }
+                if !policy_steps_satisfied {
+                    continue;
+                }
+
+                // Ensure all required steps in the plan passed
+                let all_plan_req_passed = run
+                    .step_runs
+                    .iter()
+                    .all(|s| !s.required || s.status == VerificationStepStatus::Passed);
+                if !all_plan_req_passed {
+                    continue;
+                }
+
+                return Ok(Some(run));
+            }
+        }
+
+        Ok(None)
+    }
 }
 
 /// Execute an entire VerificationPlan against a workspace directory, persisting evidence to PostgreSQL.
@@ -1543,6 +1792,29 @@ pub async fn execute_verification_plan_with_policy(
         .create_run_with_policy(attempt_id, workspace_state, plan, environment, policy)
         .await?;
 
+    execute_run_contents(
+        store,
+        run,
+        workspace_state,
+        plan,
+        workspace_dir,
+        policy,
+        cancellation_token,
+    )
+    .await
+}
+
+/// Execute steps, integration environment lifecycle, and browser tests for a prepared VerificationRun.
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_run_contents(
+    store: &VerificationStore,
+    run: VerificationRun,
+    workspace_state: &WorkspaceState,
+    plan: &VerificationPlan,
+    workspace_dir: &Path,
+    policy: Option<&VerificationPolicy>,
+    cancellation_token: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<VerificationRun> {
     let mut overall_result;
     let mut step_runs = Vec::new();
 
@@ -1919,6 +2191,25 @@ pub fn format_verification_show(run: &VerificationRun) -> String {
     if let Some(pdig) = &run.policy_digest {
         out.push_str(&format!("Policy Digest {}\n", pdig));
     }
+    if let Some(tier) = &run.tier {
+        out.push_str(&format!("Tier          {}\n", tier));
+    }
+    if let Some(sel_id) = &run.selection_id {
+        out.push_str(&format!("Selection     {}\n", sel_id));
+    }
+    if let Some(sel_dig) = &run.selection_digest {
+        out.push_str(&format!("Selection Dig {}\n", sel_dig));
+    }
+    if let Some(reg_id) = &run.regression_policy_id {
+        out.push_str(&format!(
+            "Regression Pol {} (v{})\n",
+            reg_id,
+            run.regression_policy_version.unwrap_or(1)
+        ));
+    }
+    if let Some(reg_dig) = &run.regression_policy_digest {
+        out.push_str(&format!("Reg Pol Digest {}\n", reg_dig));
+    }
     if let Some(img) = &run.environment_identity.runtime_image {
         out.push_str(&format!("Image         {}\n", img));
     }
@@ -2247,6 +2538,12 @@ mod tests {
             finished_at_ms: Some(43800),
             overall_result: Some(VerificationRunResult::Passed),
             browser_verification_run: None,
+            tier: Some(crate::regression_strategy::VerificationTier::Fast),
+            selection_id: Some("sel-01".into()),
+            selection_digest: Some("sha256-sel-digest".into()),
+            regression_policy_id: Some("reg-strict".into()),
+            regression_policy_version: Some(1),
+            regression_policy_digest: Some("sha256-reg-digest".into()),
             step_runs: vec![
                 VerificationStepRun {
                     id: "vstep-1".into(),
