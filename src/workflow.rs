@@ -363,12 +363,58 @@ pub enum ReviewDecisionStatus {
 
 /// Individual review finding.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct RawReviewFinding {
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub severity: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub explanation: Option<String>,
+    #[serde(default)]
+    pub requested_change: Option<String>,
+}
+
+/// Individual review finding.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ReviewFinding {
     pub category: String,
     pub severity: String,
     pub path: Option<String>,
     pub explanation: String,
     pub requested_change: Option<String>,
+}
+
+impl<'de> serde::Deserialize<'de> for ReviewFinding {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value {
+            serde_json::Value::String(s) => Ok(ReviewFinding {
+                category: "general".into(),
+                severity: "medium".into(),
+                path: None,
+                explanation: s,
+                requested_change: None,
+            }),
+            serde_json::Value::Object(_) => {
+                let raw: RawReviewFinding =
+                    serde_json::from_value(value).map_err(D::Error::custom)?;
+                Ok(ReviewFinding {
+                    category: raw.category.unwrap_or_else(|| "general".into()),
+                    severity: raw.severity.unwrap_or_else(|| "medium".into()),
+                    path: raw.path,
+                    explanation: raw.explanation.unwrap_or_default(),
+                    requested_change: raw.requested_change,
+                })
+            }
+            _ => Err(D::Error::custom("expected string or object for ReviewFinding")),
+        }
+    }
 }
 
 /// Structured review decision payload.
