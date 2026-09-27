@@ -1413,11 +1413,25 @@ fn durable_tool_call_audit_is_strict(
     let Some(entries) = audit.get("entries").and_then(serde_json::Value::as_array) else {
         return false;
     };
-    audit
+    let Some(provider_updates) = audit
+        .get("provider_updates")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return false;
+    };
+    let common_evidence_is_clean = audit
         .get("schema_version")
         .and_then(serde_json::Value::as_u64)
-        == Some(1)
+        == Some(2)
         && summary.get("total").and_then(serde_json::Value::as_u64) == Some(expected_total)
+        && summary
+            .get("callback_count")
+            .and_then(serde_json::Value::as_u64)
+            == Some(expected_total)
+        && summary
+            .get("provider_notification_count")
+            .and_then(serde_json::Value::as_u64)
+            == Some(expected_total)
         && summary
             .get("successful")
             .and_then(serde_json::Value::as_u64)
@@ -1428,6 +1442,10 @@ fn durable_tool_call_audit_is_strict(
             == Some(expected_failure)
         && summary
             .get("unmatched_provider_calls")
+            .and_then(serde_json::Value::as_u64)
+            == Some(0)
+        && summary
+            .get("unmatched_callbacks")
             .and_then(serde_json::Value::as_u64)
             == Some(0)
         && summary.get("denied").and_then(serde_json::Value::as_u64) == Some(0)
@@ -1442,13 +1460,97 @@ fn durable_tool_call_audit_is_strict(
         && audit
             .get("provider_tool_names_omitted")
             .and_then(serde_json::Value::as_u64)
-            == Some(0)
+            == Some(0);
+    if !common_evidence_is_clean {
+        return false;
+    }
+
+    if expected_total == 0 {
+        return audit
+            .get("correlation_capability")
+            .and_then(serde_json::Value::as_str)
+            == Some("NOT_EXERCISED")
+            && summary.get("mutating").and_then(serde_json::Value::as_u64) == Some(0)
+            && entries.is_empty()
+            && provider_updates.is_empty();
+    }
+
+    audit
+        .get("correlation_capability")
+        .and_then(serde_json::Value::as_str)
+        == Some("SUPPORTED")
         && usize::try_from(expected_total).ok() == Some(entries.len())
-        && successful_tool_audit_rows_are_correlated(entries)
+        && successful_tool_audit_rows_are_correlated(
+            entries,
+            provider_updates,
+            summary.get("mutating").and_then(serde_json::Value::as_u64),
+        )
 }
 
-fn successful_tool_audit_rows_are_correlated(entries: &[serde_json::Value]) -> bool {
-    entries.iter().all(|entry| {
+fn successful_tool_audit_rows_are_correlated(
+    entries: &[serde_json::Value],
+    provider_updates: &[serde_json::Value],
+    expected_mutating: Option<u64>,
+) -> bool {
+    if entries.len() != provider_updates.len() {
+        return false;
+    }
+
+    let mut updates_by_invocation = std::collections::BTreeMap::new();
+    let mut update_provider_call_ids = std::collections::BTreeSet::new();
+    for update in provider_updates {
+        let Some(invocation_id) = update
+            .get("tool_invocation_id")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return false;
+        };
+        let Some(provider_call_id) = update
+            .get("provider_tool_call_id")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return false;
+        };
+        if !qualification_safe_id(invocation_id, 128)
+            || !qualification_safe_id(provider_call_id, 256)
+            || update
+                .get("correlation_state")
+                .and_then(serde_json::Value::as_str)
+                != Some("OBSERVED")
+            || updates_by_invocation
+                .insert(invocation_id, provider_call_id)
+                .is_some()
+            || !update_provider_call_ids.insert(provider_call_id)
+        {
+            return false;
+        }
+    }
+
+    let mut invocation_ids = std::collections::BTreeSet::new();
+    let mut entry_provider_call_ids = std::collections::BTreeSet::new();
+    let mut callback_ids = std::collections::BTreeSet::new();
+    let mut sequences = std::collections::BTreeSet::new();
+    let mut mutating_count = 0u64;
+    for entry in entries {
+        let Some(sequence) = entry.get("sequence").and_then(serde_json::Value::as_u64) else {
+            return false;
+        };
+        if sequence == 0
+            || sequence > entries.len() as u64
+            || !sequences.insert(sequence)
+            || entry
+                .get("turn_completed")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+        {
+            return false;
+        }
+        let Some(mutating) = entry.get("mutating").and_then(serde_json::Value::as_bool) else {
+            return false;
+        };
+        if mutating {
+            mutating_count = mutating_count.saturating_add(1);
+        }
         let provider_name = entry
             .get("provider_tool_name")
             .and_then(serde_json::Value::as_str);
@@ -1459,45 +1561,106 @@ fn successful_tool_audit_rows_are_correlated(entries: &[serde_json::Value]) -> b
             .filter(|name| !name.is_empty() && name.trim() == *name)
             .and_then(orbit::tool_surface::CanonicalToolName::from_wire)
             .is_some_and(|tool| canonical_name == Some(tool.as_str()));
-        let provider_update_is_unassociated = entry
+        let invocation_id = entry
+            .get("tool_invocation_id")
+            .and_then(serde_json::Value::as_str);
+        let provider_call_id = entry
+            .get("provider_tool_call_id")
+            .and_then(serde_json::Value::as_str);
+        let callback_id = entry
+            .get("callback_request_id")
+            .and_then(serde_json::Value::as_str);
+        let provider_update_is_correlated = entry
             .get("provider_update_correlation")
             .and_then(serde_json::Value::as_str)
-            == Some("NOT_OBSERVED")
+            == Some("CORRELATED")
             && entry
                 .get("provider_update_title_class")
                 .and_then(serde_json::Value::as_str)
-                == Some("update_not_observed")
+                .is_some_and(|class| matches!(class, "non_empty_string" | "empty_string"))
             && entry
                 .get("provider_update_tool_kind")
                 .and_then(serde_json::Value::as_str)
-                == Some("update_not_observed")
+                .is_some_and(|kind| {
+                    matches!(
+                        kind,
+                        "read"
+                            | "edit"
+                            | "delete"
+                            | "move"
+                            | "search"
+                            | "execute"
+                            | "think"
+                            | "fetch"
+                            | "switch_mode"
+                            | "other"
+                    )
+                })
             && entry
                 .get("provider_update_status")
                 .and_then(serde_json::Value::as_str)
-                == Some("update_not_observed")
+                == Some("in_progress")
             && entry
                 .get("provider_tool_call_id_shape")
                 .and_then(serde_json::Value::as_str)
-                == Some("update_not_observed");
-        entry.get("outcome").and_then(serde_json::Value::as_str) == Some("SUCCESS")
+                == Some("string")
             && entry
+                .get("callback_request_id_shape")
+                .and_then(serde_json::Value::as_str)
+                == Some("valid")
+            && entry
+                .get("terminal_state")
+                .and_then(serde_json::Value::as_str)
+                == Some("SUCCESS")
+            && invocation_id.is_some_and(|id| qualification_safe_id(id, 128))
+            && provider_call_id.is_some_and(|id| qualification_safe_id(id, 256))
+            && callback_id.is_some_and(|id| qualification_safe_id(id, 130))
+            && invocation_id.is_some_and(|id| invocation_ids.insert(id.to_owned()))
+            && provider_call_id.is_some_and(|id| entry_provider_call_ids.insert(id.to_owned()))
+            && callback_id.is_some_and(|id| callback_ids.insert(id.to_owned()))
+            && invocation_id
+                .and_then(|id| updates_by_invocation.remove(id))
+                .is_some_and(|update_provider_call_id| {
+                    Some(update_provider_call_id) == provider_call_id
+                });
+        if entry.get("outcome").and_then(serde_json::Value::as_str) != Some("SUCCESS")
+            || entry
+                .get("terminal_state")
+                .and_then(serde_json::Value::as_str)
+                != Some("SUCCESS")
+            || !entry
                 .get("error_code")
                 .is_none_or(serde_json::Value::is_null)
-            && provider_update_is_unassociated
-            && entry
+            || !provider_update_is_correlated
+            || entry
                 .get("provider_name_mapping")
                 .and_then(serde_json::Value::as_str)
-                == Some("MATCH")
-            && entry
+                != Some("MATCH")
+            || entry
                 .get("advertised_to_provider")
                 .and_then(serde_json::Value::as_bool)
-                == Some(true)
-            && entry
+                != Some(true)
+            || entry
                 .get("role_allowed")
                 .and_then(serde_json::Value::as_bool)
-                == Some(true)
-            && provider_tool_matches
-    })
+                != Some(true)
+            || !provider_tool_matches
+        {
+            return false;
+        }
+    }
+    updates_by_invocation.is_empty()
+        && sequences.len() == entries.len()
+        && expected_mutating == Some(mutating_count)
+}
+
+fn qualification_safe_id(value: &str, limit: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= limit
+        && value.is_ascii()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
 }
 
 async fn run_live_cli_qualification(
@@ -4541,29 +4704,46 @@ mod live_workflow_qualification_tests {
     fn live_qualification_rejects_unmatched_or_inconsistent_durable_tool_audits() {
         let audit = |total, successful, unsuccessful, unmatched| {
             serde_json::json!({
-                "schema_version": 1,
+                "schema_version": 2,
                 "summary": {
                     "total": total,
+                    "callback_count": total - unmatched,
+                    "provider_notification_count": total,
                     "successful": successful,
                     "unsuccessful": unsuccessful,
+                    "mutating": 0,
                     "unmatched_provider_calls": unmatched,
+                    "unmatched_callbacks": 0,
                     "denied": 0,
                     "mutating_unknown": 0
                 },
+                "correlation_capability": "SUPPORTED",
                 "entries": (0..total).map(|index| serde_json::json!({
                     "sequence": index + 1,
+                    "tool_invocation_id": format!("oti-{index}"),
+                    "provider_tool_call_id": format!("call-{index}"),
+                    "callback_request_id": format!("s:orbit-{index}"),
+                    "callback_request_id_shape": "valid",
                     "provider_tool_name": "fs/read_text_file",
                     "provider_name_mapping": "MATCH",
-                    "provider_update_correlation": "NOT_OBSERVED",
-                    "provider_update_title_class": "update_not_observed",
-                    "provider_update_tool_kind": "update_not_observed",
-                    "provider_update_status": "update_not_observed",
-                    "provider_tool_call_id_shape": "update_not_observed",
+                    "provider_update_correlation": "CORRELATED",
+                    "provider_update_title_class": "non_empty_string",
+                    "provider_update_tool_kind": "other",
+                    "provider_update_status": "in_progress",
+                    "provider_tool_call_id_shape": "string",
                     "canonical_tool_name": "fs.read_text_file",
                     "advertised_to_provider": true,
                     "role_allowed": true,
-                    "outcome": "SUCCESS",
-                    "error_code": null
+                    "outcome": if index < successful { "SUCCESS" } else { "EXECUTION_FAILURE" },
+                    "terminal_state": if index < successful { "SUCCESS" } else { "FAILED" },
+                    "mutating": false,
+                    "turn_completed": true,
+                    "error_code": if index < successful { serde_json::Value::Null } else { serde_json::json!("TOOL_EXECUTION_FAILED") }
+                })).collect::<Vec<_>>(),
+                "provider_updates": (0..total).map(|index| serde_json::json!({
+                    "tool_invocation_id": format!("oti-{index}"),
+                    "provider_tool_call_id": format!("call-{index}"),
+                    "correlation_state": "OBSERVED"
                 })).collect::<Vec<_>>(),
                 "omitted_count": 0,
                 "provider_tool_names_omitted": 0
@@ -4572,6 +4752,140 @@ mod live_workflow_qualification_tests {
 
         let clean = audit(2, 2, 0, 0);
         assert!(durable_tool_call_audit_is_strict(&clean, 2, 2, 0));
+
+        let no_tool_invocations = serde_json::json!({
+            "schema_version": 2,
+            "summary": {
+                "total": 0,
+                "callback_count": 0,
+                "provider_notification_count": 0,
+                "successful": 0,
+                "unsuccessful": 0,
+                "unmatched_provider_calls": 0,
+                "unmatched_callbacks": 0,
+                "mutating": 0,
+                "denied": 0,
+                "mutating_unknown": 0
+            },
+            "correlation_capability": "NOT_EXERCISED",
+            "entries": [],
+            "provider_updates": [],
+            "omitted_count": 0,
+            "provider_tool_names_omitted": 0
+        });
+        assert!(durable_tool_call_audit_is_strict(
+            &no_tool_invocations,
+            0,
+            0,
+            0
+        ));
+
+        let mut empty_but_unsupported = no_tool_invocations.clone();
+        empty_but_unsupported["correlation_capability"] = serde_json::json!("UNSUPPORTED");
+        assert!(!durable_tool_call_audit_is_strict(
+            &empty_but_unsupported,
+            0,
+            0,
+            0
+        ));
+
+        let notification_only = serde_json::json!({
+            "schema_version": 2,
+            "summary": {
+                "total": 1,
+                "callback_count": 0,
+                "provider_notification_count": 1,
+                "successful": 0,
+                "unsuccessful": 1,
+                "unmatched_provider_calls": 1,
+                "unmatched_callbacks": 0,
+                "mutating": 0,
+                "denied": 0,
+                "mutating_unknown": 0
+            },
+            "correlation_capability": "PARTIAL",
+            "entries": [{
+                "provider_update_correlation": "UNMATCHED",
+                "terminal_state": "UNRESOLVED"
+            }],
+            "provider_updates": [{
+                "tool_invocation_id": "oti-notification",
+                "provider_tool_call_id": "provider-notification",
+                "correlation_state": "OBSERVED"
+            }],
+            "omitted_count": 0,
+            "provider_tool_names_omitted": 0
+        });
+        assert!(!durable_tool_call_audit_is_strict(
+            &notification_only,
+            0,
+            0,
+            0
+        ));
+
+        let mut legacy_schema = clean.clone();
+        legacy_schema["schema_version"] = serde_json::json!(1);
+        assert!(!durable_tool_call_audit_is_strict(&legacy_schema, 2, 2, 0));
+
+        let mut reused_invocation = clean.clone();
+        reused_invocation["entries"][1]["tool_invocation_id"] =
+            reused_invocation["entries"][0]["tool_invocation_id"].clone();
+        assert!(!durable_tool_call_audit_is_strict(
+            &reused_invocation,
+            2,
+            2,
+            0
+        ));
+
+        let mut reused_callback = clean.clone();
+        reused_callback["entries"][1]["callback_request_id"] =
+            reused_callback["entries"][0]["callback_request_id"].clone();
+        assert!(!durable_tool_call_audit_is_strict(
+            &reused_callback,
+            2,
+            2,
+            0
+        ));
+
+        let mut malformed_id = clean.clone();
+        malformed_id["entries"][0]["provider_tool_call_id"] =
+            serde_json::json!("/private/provider/payload");
+        assert!(!durable_tool_call_audit_is_strict(&malformed_id, 2, 2, 0));
+
+        let mut duplicate_update = clean.clone();
+        duplicate_update["provider_updates"][1]["tool_invocation_id"] =
+            duplicate_update["provider_updates"][0]["tool_invocation_id"].clone();
+        duplicate_update["provider_updates"][1]["provider_tool_call_id"] =
+            duplicate_update["provider_updates"][0]["provider_tool_call_id"].clone();
+        assert!(!durable_tool_call_audit_is_strict(
+            &duplicate_update,
+            2,
+            2,
+            0
+        ));
+
+        let mut extraneous_update = clean.clone();
+        extraneous_update["provider_updates"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "tool_invocation_id": "oti-extra",
+                "provider_tool_call_id": "call-extra",
+                "correlation_state": "OBSERVED"
+            }));
+        assert!(!durable_tool_call_audit_is_strict(
+            &extraneous_update,
+            2,
+            2,
+            0
+        ));
+
+        let mut missing_update = clean.clone();
+        missing_update["provider_updates"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        assert!(!durable_tool_call_audit_is_strict(&missing_update, 2, 2, 0));
 
         let mut ambiguous_update = clean.clone();
         ambiguous_update["entries"][0]["provider_update_correlation"] =
@@ -4646,7 +4960,9 @@ mod live_workflow_qualification_tests {
         equal_cardinality["entries"][1]["provider_update_correlation"] =
             serde_json::json!("AMBIGUOUS");
         assert!(!successful_tool_audit_rows_are_correlated(
-            equal_cardinality["entries"].as_array().unwrap()
+            equal_cardinality["entries"].as_array().unwrap(),
+            equal_cardinality["provider_updates"].as_array().unwrap(),
+            Some(0)
         ));
         equal_cardinality["entries"]
             .as_array_mut()
@@ -4725,6 +5041,63 @@ mod live_workflow_qualification_tests {
         let mut failed_entry = clean;
         failed_entry["entries"][0]["outcome"] = serde_json::json!("EXECUTION_FAILURE");
         assert!(!durable_tool_call_audit_is_strict(&failed_entry, 2, 2, 0));
+
+        let mut missing_mutating = audit(2, 2, 0, 0);
+        missing_mutating["entries"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("mutating");
+        assert!(!durable_tool_call_audit_is_strict(
+            &missing_mutating,
+            2,
+            2,
+            0
+        ));
+
+        let mut inconsistent_mutating = audit(2, 2, 0, 0);
+        inconsistent_mutating["entries"][0]["mutating"] = serde_json::json!(true);
+        assert!(!durable_tool_call_audit_is_strict(
+            &inconsistent_mutating,
+            2,
+            2,
+            0
+        ));
+        inconsistent_mutating["summary"]["mutating"] = serde_json::json!(1);
+        assert!(durable_tool_call_audit_is_strict(
+            &inconsistent_mutating,
+            2,
+            2,
+            0
+        ));
+
+        let mut incomplete_turn = audit(2, 2, 0, 0);
+        incomplete_turn["entries"][0]["turn_completed"] = serde_json::json!(false);
+        assert!(!durable_tool_call_audit_is_strict(
+            &incomplete_turn,
+            2,
+            2,
+            0
+        ));
+
+        let mut duplicate_sequence = audit(2, 2, 0, 0);
+        duplicate_sequence["entries"][1]["sequence"] =
+            duplicate_sequence["entries"][0]["sequence"].clone();
+        assert!(!durable_tool_call_audit_is_strict(
+            &duplicate_sequence,
+            2,
+            2,
+            0
+        ));
+
+        let mut mismatched_notification_count = audit(2, 2, 0, 0);
+        mismatched_notification_count["summary"]["provider_notification_count"] =
+            serde_json::json!(1);
+        assert!(!durable_tool_call_audit_is_strict(
+            &mismatched_notification_count,
+            2,
+            2,
+            0
+        ));
     }
 
     #[test]

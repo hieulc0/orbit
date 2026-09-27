@@ -333,12 +333,399 @@ async fn load_agent_tool_audit(
     .context("failed to read persisted agent tool audit")
 }
 
+fn b34_audit_has_exact_correlations(audit: &serde_json::Value, expected_count: usize) -> bool {
+    let safe_id = |value: &str, limit: usize| {
+        !value.is_empty()
+            && value.len() <= limit
+            && value.is_ascii()
+            && value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
+            })
+    };
+    let Some(entries) = audit.get("entries").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    let Some(provider_updates) = audit
+        .get("provider_updates")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return false;
+    };
+    let Some(summary) = audit.get("summary") else {
+        return false;
+    };
+    if audit
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(2)
+        || audit
+            .get("correlation_capability")
+            .and_then(serde_json::Value::as_str)
+            != Some("SUPPORTED")
+        || summary
+            .get("unmatched_provider_calls")
+            .and_then(serde_json::Value::as_u64)
+            != Some(0)
+        || summary
+            .get("unmatched_callbacks")
+            .and_then(serde_json::Value::as_u64)
+            != Some(0)
+        || summary
+            .get("callback_count")
+            .and_then(serde_json::Value::as_u64)
+            != Some(expected_count as u64)
+        || summary
+            .get("provider_notification_count")
+            .and_then(serde_json::Value::as_u64)
+            != Some(expected_count as u64)
+        || summary.get("total").and_then(serde_json::Value::as_u64) != Some(expected_count as u64)
+        || summary
+            .get("mutating")
+            .and_then(serde_json::Value::as_u64)
+            .is_none()
+        || summary
+            .get("successful")
+            .and_then(serde_json::Value::as_u64)
+            != Some(expected_count as u64)
+        || summary
+            .get("unsuccessful")
+            .and_then(serde_json::Value::as_u64)
+            != Some(0)
+        || summary.get("denied").and_then(serde_json::Value::as_u64) != Some(0)
+        || summary
+            .get("mutating_unknown")
+            .and_then(serde_json::Value::as_u64)
+            != Some(0)
+        || audit
+            .get("omitted_count")
+            .and_then(serde_json::Value::as_u64)
+            != Some(0)
+        || audit
+            .get("provider_tool_names_omitted")
+            .and_then(serde_json::Value::as_u64)
+            != Some(0)
+        || entries.len() != expected_count
+        || provider_updates.len() != expected_count
+    {
+        return false;
+    }
+
+    let mut updates_by_invocation = BTreeMap::new();
+    let mut seen_update_provider_ids = std::collections::BTreeSet::new();
+    for update in provider_updates {
+        let Some(invocation_id) = update
+            .get("tool_invocation_id")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return false;
+        };
+        let Some(provider_id) = update
+            .get("provider_tool_call_id")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return false;
+        };
+        if update
+            .get("correlation_state")
+            .and_then(serde_json::Value::as_str)
+            != Some("OBSERVED")
+            || !safe_id(invocation_id, 128)
+            || !safe_id(provider_id, 256)
+            || updates_by_invocation
+                .insert(invocation_id, provider_id)
+                .is_some()
+            || !seen_update_provider_ids.insert(provider_id)
+        {
+            return false;
+        }
+    }
+
+    let mut seen_invocations = std::collections::BTreeSet::new();
+    let mut seen_provider_ids = std::collections::BTreeSet::new();
+    let mut seen_callbacks = std::collections::BTreeSet::new();
+    let mut seen_sequences = std::collections::BTreeSet::new();
+    let mut mutating_count = 0u64;
+    for entry in entries {
+        let sequence = entry.get("sequence").and_then(serde_json::Value::as_u64);
+        let mutating = entry.get("mutating").and_then(serde_json::Value::as_bool);
+        if sequence.is_none_or(|value| {
+            value == 0 || value > expected_count as u64 || !seen_sequences.insert(value)
+        }) || mutating.is_none()
+            || entry
+                .get("turn_completed")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+        {
+            return false;
+        }
+        if mutating == Some(true) {
+            mutating_count = mutating_count.saturating_add(1);
+        }
+        let invocation_id = entry
+            .get("tool_invocation_id")
+            .and_then(serde_json::Value::as_str);
+        let provider_id = entry
+            .get("provider_tool_call_id")
+            .and_then(serde_json::Value::as_str);
+        let callback_id = entry
+            .get("callback_request_id")
+            .and_then(serde_json::Value::as_str);
+        let provider_name = entry
+            .get("provider_tool_name")
+            .and_then(serde_json::Value::as_str);
+        let canonical_name = entry
+            .get("canonical_tool_name")
+            .and_then(serde_json::Value::as_str);
+        let provider_method_matches = provider_name
+            .and_then(orbit::tool_surface::CanonicalToolName::from_wire)
+            .is_some_and(|tool| canonical_name == Some(tool.as_str()));
+        if entry.get("outcome").and_then(serde_json::Value::as_str) != Some("SUCCESS")
+            || entry
+                .get("terminal_state")
+                .and_then(serde_json::Value::as_str)
+                != Some("SUCCESS")
+            || entry
+                .get("provider_update_correlation")
+                .and_then(serde_json::Value::as_str)
+                != Some("CORRELATED")
+            || entry
+                .get("provider_name_mapping")
+                .and_then(serde_json::Value::as_str)
+                != Some("MATCH")
+            || !provider_method_matches
+            || entry
+                .get("advertised_to_provider")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            || entry
+                .get("role_allowed")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            || !entry
+                .get("error_code")
+                .is_none_or(serde_json::Value::is_null)
+            || entry
+                .get("callback_request_id_shape")
+                .and_then(serde_json::Value::as_str)
+                != Some("valid")
+            || entry
+                .get("provider_tool_call_id_shape")
+                .and_then(serde_json::Value::as_str)
+                != Some("string")
+            || entry
+                .get("provider_update_title_class")
+                .and_then(serde_json::Value::as_str)
+                != Some("non_empty_string")
+            || !entry
+                .get("provider_update_tool_kind")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|kind| {
+                    matches!(
+                        kind,
+                        "read"
+                            | "edit"
+                            | "delete"
+                            | "move"
+                            | "search"
+                            | "execute"
+                            | "think"
+                            | "fetch"
+                            | "switch_mode"
+                            | "other"
+                    )
+                })
+            || entry
+                .get("provider_update_status")
+                .and_then(serde_json::Value::as_str)
+                != Some("in_progress")
+            || invocation_id.is_none_or(|id| !safe_id(id, 128))
+            || provider_id.is_none_or(|id| !safe_id(id, 256))
+            || callback_id.is_none_or(|id| !safe_id(id, 130))
+            || invocation_id.is_none_or(|id| !seen_invocations.insert(id))
+            || provider_id.is_none_or(|id| !seen_provider_ids.insert(id))
+            || callback_id.is_none_or(|id| !seen_callbacks.insert(id))
+            || invocation_id.and_then(|id| updates_by_invocation.remove(id)) != provider_id
+        {
+            return false;
+        }
+    }
+    updates_by_invocation.is_empty()
+        && seen_sequences.len() == expected_count
+        && summary.get("mutating").and_then(serde_json::Value::as_u64) == Some(mutating_count)
+}
+
+#[test]
+fn b34_audit_correlation_requires_unique_terminal_rows() {
+    let valid = json!({
+        "schema_version": 2,
+        "correlation_capability": "SUPPORTED",
+        "summary": {
+            "total": 2,
+            "mutating": 0,
+            "callback_count": 2,
+            "provider_notification_count": 2,
+            "successful": 2,
+            "unsuccessful": 0,
+            "denied": 0,
+            "mutating_unknown": 0,
+            "unmatched_provider_calls": 0,
+            "unmatched_callbacks": 0
+        },
+        "omitted_count": 0,
+        "provider_tool_names_omitted": 0,
+        "entries": [
+            {
+                "sequence": 1,
+                "tool_invocation_id": "oti-a",
+                "provider_tool_call_id": "provider-a",
+                "callback_request_id": "s:rpc-a",
+                "callback_request_id_shape": "valid",
+                "provider_tool_call_id_shape": "string",
+                "provider_tool_name": "fs.read_text_file",
+                "provider_name_mapping": "MATCH",
+                "canonical_tool_name": "fs.read_text_file",
+                "advertised_to_provider": true,
+                "role_allowed": true,
+                "provider_update_correlation": "CORRELATED",
+                "provider_update_title_class": "non_empty_string",
+                "provider_update_tool_kind": "read",
+                "provider_update_status": "in_progress",
+                "terminal_state": "SUCCESS",
+                "outcome": "SUCCESS",
+                "mutating": false,
+                "turn_completed": true,
+                "error_code": null
+            },
+            {
+                "sequence": 2,
+                "tool_invocation_id": "oti-b",
+                "provider_tool_call_id": "provider-b",
+                "callback_request_id": "s:rpc-b",
+                "callback_request_id_shape": "valid",
+                "provider_tool_call_id_shape": "string",
+                "provider_tool_name": "fs/read_text_file",
+                "provider_name_mapping": "MATCH",
+                "canonical_tool_name": "fs.read_text_file",
+                "advertised_to_provider": true,
+                "role_allowed": true,
+                "provider_update_correlation": "CORRELATED",
+                "provider_update_title_class": "non_empty_string",
+                "provider_update_tool_kind": "read",
+                "provider_update_status": "in_progress",
+                "terminal_state": "SUCCESS",
+                "outcome": "SUCCESS",
+                "mutating": false,
+                "turn_completed": true,
+                "error_code": null
+            }
+        ],
+        "provider_updates": [
+            {
+                "tool_invocation_id": "oti-a",
+                "provider_tool_call_id": "provider-a",
+                "correlation_state": "OBSERVED"
+            },
+            {
+                "tool_invocation_id": "oti-b",
+                "provider_tool_call_id": "provider-b",
+                "correlation_state": "OBSERVED"
+            }
+        ]
+    });
+    assert!(b34_audit_has_exact_correlations(&valid, 2));
+
+    let mut duplicate_invocation = valid.clone();
+    duplicate_invocation["entries"][1]["tool_invocation_id"] =
+        duplicate_invocation["entries"][0]["tool_invocation_id"].clone();
+    assert!(!b34_audit_has_exact_correlations(&duplicate_invocation, 2));
+
+    let mut duplicate_callback = valid.clone();
+    duplicate_callback["entries"][1]["callback_request_id"] =
+        duplicate_callback["entries"][0]["callback_request_id"].clone();
+    assert!(!b34_audit_has_exact_correlations(&duplicate_callback, 2));
+
+    let mut mismatched_update = valid.clone();
+    mismatched_update["provider_updates"][1]["provider_tool_call_id"] =
+        json!("different-provider-id");
+    assert!(!b34_audit_has_exact_correlations(&mismatched_update, 2));
+
+    let mut extra_update = valid.clone();
+    extra_update["provider_updates"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "tool_invocation_id": "oti-extra",
+            "provider_tool_call_id": "provider-extra",
+            "correlation_state": "OBSERVED"
+        }));
+    assert!(!b34_audit_has_exact_correlations(&extra_update, 2));
+
+    let mut ambiguous_row = valid.clone();
+    ambiguous_row["entries"][0]["provider_update_correlation"] = json!("UNRESOLVED");
+    assert!(!b34_audit_has_exact_correlations(&ambiguous_row, 2));
+
+    let mut legacy_schema = valid.clone();
+    legacy_schema["schema_version"] = json!(1);
+    assert!(!b34_audit_has_exact_correlations(&legacy_schema, 2));
+
+    for (field, value) in [
+        ("advertised_to_provider", json!(false)),
+        ("role_allowed", json!(false)),
+        ("error_code", json!("TOOL_EXECUTION_FAILED")),
+        ("canonical_tool_name", json!("fs.write_text_file")),
+        ("provider_update_title_class", json!("missing")),
+        ("provider_update_tool_kind", json!("unrecognized")),
+        ("provider_update_status", json!("completed")),
+    ] {
+        let mut invalid_row = valid.clone();
+        invalid_row["entries"][0][field] = value;
+        assert!(!b34_audit_has_exact_correlations(&invalid_row, 2));
+    }
+
+    for field in ["denied", "mutating_unknown"] {
+        let mut invalid_summary = valid.clone();
+        invalid_summary["summary"][field] = json!(1);
+        assert!(!b34_audit_has_exact_correlations(&invalid_summary, 2));
+    }
+
+    let mut missing_mutating = valid.clone();
+    missing_mutating["entries"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("mutating");
+    assert!(!b34_audit_has_exact_correlations(&missing_mutating, 2));
+
+    let mut inconsistent_mutating = valid.clone();
+    inconsistent_mutating["entries"][0]["mutating"] = json!(true);
+    assert!(!b34_audit_has_exact_correlations(&inconsistent_mutating, 2));
+    inconsistent_mutating["summary"]["mutating"] = json!(1);
+    assert!(b34_audit_has_exact_correlations(&inconsistent_mutating, 2));
+
+    let mut incomplete_turn = valid.clone();
+    incomplete_turn["entries"][0]["turn_completed"] = json!(false);
+    assert!(!b34_audit_has_exact_correlations(&incomplete_turn, 2));
+
+    let mut duplicate_sequence = valid.clone();
+    duplicate_sequence["entries"][1]["sequence"] = json!(1);
+    assert!(!b34_audit_has_exact_correlations(&duplicate_sequence, 2));
+}
+
 async fn load_role_tool_audits(
     pool: &PgPool,
     role_execution_id: &str,
-) -> Result<Vec<(String, String, i64, i64, i64, serde_json::Value)>> {
+) -> Result<
+    Vec<(
+        String,
+        String,
+        i64,
+        i64,
+        i64,
+        Option<String>,
+        serde_json::Value,
+    )>,
+> {
     sqlx::query_as(
-        "SELECT id, status, tool_call_count, tool_success_count, tool_failure_count, metadata \
+        "SELECT id, status, tool_call_count, tool_success_count, tool_failure_count, actual_model, metadata \
          FROM orbit_agent_executions \
          WHERE role_execution_id = $1 ORDER BY started_at_ms, id",
     )
@@ -355,6 +742,7 @@ fn render_live_fixture_audit(
     tool_call_count: i64,
     tool_success_count: i64,
     tool_failure_count: i64,
+    actual_model: Option<&str>,
     metadata: &serde_json::Value,
 ) -> String {
     let safe_id = |value: &str| {
@@ -372,10 +760,24 @@ fn render_live_fixture_audit(
         "SUCCEEDED" | "FAILED" | "CANCELLED" | "TIMEOUT" | "RUNNING" => status,
         _ => "UNKNOWN",
     };
+    let actual_model = match actual_model {
+        Some(value)
+            if !value.is_empty()
+                && value.len() <= 128
+                && value.is_ascii()
+                && value.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
+                }) =>
+        {
+            value.to_owned()
+        }
+        Some(_) => "observed_but_redacted".to_owned(),
+        None => "UNKNOWN / unobserved".to_owned(),
+    };
     let summary = &metadata["tool_call_audit"]["summary"];
     let count = |field: &str| summary[field].as_i64().unwrap_or(0);
     format!(
-        "RoleExecution ID: {}\nAgentExecution ID: {}\nExecution status: {safe_status}\nAggregate tool counts: total={tool_call_count}, success={tool_success_count}, failure={tool_failure_count}, mutating={}, denied={}, unmatched={}\n{}",
+        "RoleExecution ID: {}\nAgentExecution ID: {}\nExecution status: {safe_status}\nActual model: {actual_model}\nAggregate tool counts: total={tool_call_count}, success={tool_success_count}, failure={tool_failure_count}, mutating={}, denied={}, unmatched={}\n{}",
         safe_id(role_execution_id),
         safe_id(agent_execution_id),
         count("mutating"),
@@ -393,7 +795,9 @@ async fn print_live_fixture_audit(pool: &PgPool, role_execution_id: Option<&str>
     };
     match load_role_tool_audits(pool, role_execution_id).await {
         Ok(execution_rows) if !execution_rows.is_empty() => {
-            for (execution_id, status, calls, successes, failures, metadata) in execution_rows {
+            for (execution_id, status, calls, successes, failures, actual_model, metadata) in
+                execution_rows
+            {
                 println!(
                     "{}",
                     render_live_fixture_audit(
@@ -403,6 +807,7 @@ async fn print_live_fixture_audit(pool: &PgPool, role_execution_id: Option<&str>
                         calls,
                         successes,
                         failures,
+                        actual_model.as_deref(),
                         &metadata,
                     )
                 );
@@ -463,12 +868,14 @@ fn live_fixture_audit_report_includes_ids_counts_and_bounded_safe_details() {
         100,
         100,
         0,
+        None,
         &metadata,
     );
 
     assert!(report.contains("RoleExecution ID: role-execution-123"));
     assert!(report.contains("AgentExecution ID: agent-execution-456"));
     assert!(report.contains("Execution status: SUCCEEDED"));
+    assert!(report.contains("Actual model: UNKNOWN / unobserved"));
     assert!(report.contains(
         "Aggregate tool counts: total=100, success=100, failure=0, mutating=2, denied=0, unmatched=0"
     ));
@@ -477,6 +884,71 @@ fn live_fixture_audit_report_includes_ids_counts_and_bounded_safe_details() {
     assert!(!report.contains("/private/host/path"));
     assert!(report.matches("orbit_read_file | MATCH").count() <= 64);
     assert!(report.len() < 20_000);
+}
+
+#[test]
+fn rendered_tool_audit_contains_only_bounded_safe_correlation_ids() {
+    let metadata = json!({
+        "tool_call_audit": {
+            "summary": {
+                "total": 1,
+                "successful": 1,
+                "unsuccessful": 0,
+                "mutating": 1,
+                "denied": 0,
+                "unmatched_provider_calls": 0,
+                "unmatched_callbacks": 0
+            },
+            "correlation_capability": "SUPPORTED",
+            "provider_updates": [{
+                "tool_invocation_id": "oti-safe-1",
+                "provider_tool_call_id": "provider-safe-1",
+                "correlation_state": "OBSERVED"
+            }],
+            "entries": [{
+                "sequence": 1,
+                "tool_invocation_id": "oti-safe-1",
+                "provider_tool_call_id": "provider-safe-1",
+                "callback_request_id": "s:rpc-safe-1",
+                "provider_tool_name": "fs.write_text_file",
+                "provider_name_mapping": "MATCH",
+                "provider_update_correlation": "CORRELATED",
+                "provider_update_title_class": "non_empty_string",
+                "provider_update_tool_kind": "edit",
+                "provider_update_status": "in_progress",
+                "provider_tool_call_id_shape": "string",
+                "callback_request_id_shape": "valid",
+                "canonical_tool_name": "fs.write_text_file",
+                "advertised_to_provider": true,
+                "role_allowed": true,
+                "outcome": "SUCCESS",
+                "terminal_state": "SUCCESS",
+                "mutating": true,
+                "mutation_applied": true,
+                "error_code": null,
+                "path_arguments": []
+            }],
+            "omitted_count": 0,
+            "provider_tool_names_omitted": 0
+        }
+    });
+    let report = render_tool_call_audit(&metadata);
+    assert!(report.contains("oti-safe-1"));
+    assert!(report.contains("provider-safe-1"));
+    assert!(report.contains("s:rpc-safe-1"));
+    assert!(report.contains(
+        "provider notifications=1 (recorded=1, omitted=0), callbacks=1, correlated terminal rows=1"
+    ));
+
+    let mut unsafe_id = metadata;
+    unsafe_id["tool_call_audit"]["entries"][0]["provider_tool_call_id"] =
+        json!("/private/provider/payload");
+    unsafe_id["tool_call_audit"]["entries"][0]["provider_update_correlation"] = json!("UNMATCHED");
+    unsafe_id["tool_call_audit"]["entries"][0]["terminal_state"] = json!("UNRESOLVED");
+    let redacted_report = render_tool_call_audit(&unsafe_id);
+    assert!(redacted_report.contains("redacted"));
+    assert!(redacted_report.contains("UNRESOLVED"));
+    assert!(!redacted_report.contains("/private/provider/payload"));
 }
 
 #[tokio::test]
@@ -543,7 +1015,9 @@ async fn agent_tool_audit_reads_persisted_counter_columns() -> Result<()> {
         );
         let report = render_tool_call_audit(&persisted_metadata);
         ensure!(
-            report.contains("orbit_read_file | MATCH | fs.read_text_file")
+            report.contains("orbit_read_file")
+                && report.contains("| MATCH |")
+                && report.contains("fs.read_text_file")
                 && report.contains("SUCCESS")
                 && !report.contains("provider-secret"),
             "tool-call audit renderer returned incorrect synthetic report"
@@ -1926,13 +2400,13 @@ async fn real_codex_coding_fixture() -> Result<()> {
                 && tool_success_count == tool_call_count,
             "implementer execution evidence includes an unsuccessful tool call"
         );
-        let audit_summary = &execution_metadata["tool_call_audit"]["summary"];
+        let tool_audit = &execution_metadata["tool_call_audit"];
         ensure!(
-            audit_summary["total"].as_i64() == Some(tool_call_count)
-                && audit_summary["successful"].as_i64() == Some(tool_success_count)
-                && audit_summary["unsuccessful"] == 0
-                && audit_summary["unmatched_provider_calls"] == 0,
-            "implementer execution has unsuccessful or unresolved provider tool calls"
+            b34_audit_has_exact_correlations(
+                tool_audit,
+                usize::try_from(tool_call_count)?,
+            ),
+            "implementer execution has unsuccessful, omitted, duplicate, or unresolved provider tool calls"
         );
         let file_mutation_calls = ["fs.write_text_file", "fs.edit_file"]
             .iter()

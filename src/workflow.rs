@@ -1419,6 +1419,173 @@ impl WorkflowStore {
         Ok(())
     }
 
+    /// Start a fenced ACP AgentExecution before provider prompt/tool dispatch.
+    /// The AgentExecution row and role link are committed together so every
+    /// subsequent tool audit update has a durable owner before effects begin.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_agent_execution(
+        &self,
+        id: &str,
+        role_execution_id: &str,
+        agent_type: &str,
+        provider: Option<&str>,
+        model: Option<&str>,
+        started_at_ms: i64,
+        requested_model: Option<&str>,
+        resolved_model: Option<&str>,
+        metadata: &serde_json::Value,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await.context("begin agent execution")?;
+        let inserted = sqlx::query(
+            r#"
+            INSERT INTO orbit_agent_executions (
+                id, role_execution_id, agent_type, provider, model,
+                started_at_ms, status, requested_model, resolved_model,
+                turn_count, tool_call_count, tool_success_count, tool_failure_count,
+                tool_counts, metadata
+            ) SELECT $1, re.id, $3, $4, $5, $6, 'RUNNING', $7, $8,
+                     0, 0, 0, 0, '{}'::jsonb, $9
+              FROM orbit_role_executions re
+              JOIN orbit_workflow_runs wf ON wf.id = re.workflow_run_id
+              WHERE re.id = $2 AND re.status = 'RUNNING'
+                AND wf.status NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'EXHAUSTED')
+            "#,
+        )
+        .bind(id)
+        .bind(role_execution_id)
+        .bind(agent_type)
+        .bind(provider)
+        .bind(model)
+        .bind(started_at_ms)
+        .bind(requested_model)
+        .bind(resolved_model)
+        .bind(metadata)
+        .execute(&mut *tx)
+        .await
+        .context("start orbit_agent_executions")?;
+        ensure!(
+            inserted.rows_affected() == 1,
+            "AGENT_EXECUTION_FENCE_REJECTED"
+        );
+
+        let linked = sqlx::query(
+            r#"
+            UPDATE orbit_role_executions
+            SET agent_execution_ids = agent_execution_ids || jsonb_build_array($1::text)
+            WHERE id = $2 AND status = 'RUNNING'
+              AND EXISTS (SELECT 1 FROM orbit_agent_executions ae
+                          WHERE ae.id = $1 AND ae.role_execution_id = $2)
+            "#,
+        )
+        .bind(id)
+        .bind(role_execution_id)
+        .execute(&mut *tx)
+        .await
+        .context("link started agent execution")?;
+        ensure!(
+            linked.rows_affected() == 1,
+            "AGENT_EXECUTION_FENCE_REJECTED"
+        );
+        tx.commit().await.context("commit agent execution start")?;
+        Ok(())
+    }
+
+    /// Persist the bounded ACP callback audit while its exact role and agent
+    /// executions remain active. This write is completed before a callback may
+    /// enter repository authorization or mutation branches.
+    pub async fn update_running_agent_tool_audit(
+        &self,
+        agent_execution_id: &str,
+        role_execution_id: &str,
+        tool_call_audit: &serde_json::Value,
+    ) -> Result<()> {
+        let updated = sqlx::query(
+            r#"
+            UPDATE orbit_agent_executions ae
+            SET metadata = jsonb_set(ae.metadata, '{tool_call_audit}', $3, true)
+            WHERE ae.id = $1 AND ae.role_execution_id = $2 AND ae.status = 'RUNNING'
+              AND EXISTS (SELECT 1 FROM orbit_role_executions re
+                          JOIN orbit_workflow_runs wf ON wf.id = re.workflow_run_id
+                          WHERE re.id = $2 AND re.status = 'RUNNING'
+                            AND wf.status NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'EXHAUSTED'))
+            "#,
+        )
+        .bind(agent_execution_id)
+        .bind(role_execution_id)
+        .bind(tool_call_audit)
+        .execute(&self.pool)
+        .await
+        .context("persist running ACP tool audit")?;
+        ensure!(
+            updated.rows_affected() == 1,
+            "AGENT_EXECUTION_FENCE_REJECTED"
+        );
+        Ok(())
+    }
+
+    /// Finish the same durable AgentExecution row that owned pre-effect audit
+    /// writes. A missing row or changed role owner is a hard fence failure.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn finish_agent_execution(
+        &self,
+        id: &str,
+        role_execution_id: &str,
+        finished_at_ms: i64,
+        status: &str,
+        termination_reason: Option<&str>,
+        exit_code: Option<i32>,
+        message: Option<&str>,
+        requested_model: Option<&str>,
+        resolved_model: Option<&str>,
+        actual_model: Option<&str>,
+        turn_count: i64,
+        tool_call_count: i64,
+        tool_success_count: i64,
+        tool_failure_count: i64,
+        tool_counts: &serde_json::Value,
+        metadata: &serde_json::Value,
+    ) -> Result<()> {
+        let updated = sqlx::query(
+            r#"
+            UPDATE orbit_agent_executions ae
+            SET finished_at_ms = $3, status = $4, termination_reason = $5,
+                exit_code = $6, message = $7, actual_model = $8,
+                requested_model = $9, resolved_model = $10,
+                turn_count = $11, tool_call_count = $12, tool_success_count = $13,
+                tool_failure_count = $14, tool_counts = $15, metadata = $16
+            WHERE ae.id = $1 AND ae.role_execution_id = $2 AND ae.status = 'RUNNING'
+              AND EXISTS (SELECT 1 FROM orbit_role_executions re
+                          JOIN orbit_workflow_runs wf ON wf.id = re.workflow_run_id
+                          WHERE re.id = $2 AND re.status = 'RUNNING'
+                            AND wf.status NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'EXHAUSTED'))
+            "#,
+        )
+        .bind(id)
+        .bind(role_execution_id)
+        .bind(finished_at_ms)
+        .bind(status)
+        .bind(termination_reason)
+        .bind(exit_code)
+        .bind(message)
+        .bind(actual_model)
+        .bind(requested_model)
+        .bind(resolved_model)
+        .bind(turn_count)
+        .bind(tool_call_count)
+        .bind(tool_success_count)
+        .bind(tool_failure_count)
+        .bind(tool_counts)
+        .bind(metadata)
+        .execute(&self.pool)
+        .await
+        .context("finish orbit_agent_executions")?;
+        ensure!(
+            updated.rows_affected() == 1,
+            "AGENT_EXECUTION_FENCE_REJECTED"
+        );
+        Ok(())
+    }
+
     /// Complete role execution with success and output handoff.
     pub async fn complete_role_execution_success(
         &self,

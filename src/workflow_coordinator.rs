@@ -33,7 +33,7 @@ use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::process::Stdio;
 use std::time::Duration;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
@@ -2226,6 +2226,7 @@ pub struct AcpTurnState<'a> {
     pub terminals: BTreeMap<String, std::sync::Arc<crate::tool_surface::AgentTerminal>>,
     pub wf_attempt_id: Option<String>,
     pub role_exec_id: Option<String>,
+    pub agent_exec_id: Option<String>,
     pub pool: Option<&'a PgPool>,
 }
 
@@ -2246,6 +2247,7 @@ impl<'a> AcpTurnState<'a> {
             terminals: BTreeMap::new(),
             wf_attempt_id: None,
             role_exec_id: None,
+            agent_exec_id: None,
             pool: None,
         }
     }
@@ -2288,6 +2290,10 @@ enum ToolCallOutcome {
 #[derive(Clone, Debug, serde::Serialize)]
 struct ToolCallAuditEntry {
     sequence: u64,
+    tool_invocation_id: Option<String>,
+    provider_tool_call_id: Option<String>,
+    callback_request_id: Option<String>,
+    callback_request_id_shape: &'static str,
     provider_tool_name: &'static str,
     provider_name_mapping: &'static str,
     provider_update_correlation: &'static str,
@@ -2299,6 +2305,7 @@ struct ToolCallAuditEntry {
     advertised_to_provider: Option<bool>,
     role_allowed: Option<bool>,
     outcome: Option<ToolCallOutcome>,
+    terminal_state: &'static str,
     error_code: Option<&'static str>,
     mutating: Option<bool>,
     mutation_applied: Option<bool>,
@@ -2314,12 +2321,23 @@ struct ProviderToolMethodObservation {
     canonical_tool_name: crate::tool_surface::CanonicalToolName,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 struct ProviderToolUpdateObservation {
+    tool_invocation_id: Option<String>,
+    provider_tool_call_id: Option<String>,
+    invocation_id_shape: &'static str,
     title_class: &'static str,
     tool_kind: &'static str,
     status: &'static str,
     tool_call_id_shape: &'static str,
+    correlation_state: &'static str,
+}
+
+#[derive(Clone, Debug)]
+struct ProviderToolInvocation {
+    observation: ProviderToolUpdateObservation,
+    callback_count: u64,
+    invalidated: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -2340,10 +2358,15 @@ struct ToolCallAudit {
     denied_count: u64,
     role_id: Option<String>,
     advertised_tools: Option<BTreeSet<String>>,
-    provider_tool_names: VecDeque<ProviderToolUpdateObservation>,
-    provider_tool_call_ids: HashSet<String>,
+    provider_tool_invocations: BTreeMap<String, ProviderToolInvocation>,
+    provider_tool_call_ids: HashMap<String, String>,
+    seen_provider_tool_call_ids: HashSet<String>,
+    unmatched_provider_updates: Vec<ProviderToolUpdateObservation>,
+    callback_request_ids: HashSet<String>,
+    correlation_supported: bool,
+    correlation_partial: bool,
     provider_tool_names_omitted: u64,
-    pending_overflow_names: u64,
+    unmatched_callback_count: u64,
     active_call: Option<ActiveToolCall>,
 }
 
@@ -2363,7 +2386,16 @@ impl ToolCallAudit {
         self.role_id = role_id.map(str::to_owned);
     }
 
+    #[cfg(test)]
     fn observe_provider_tool_name(&mut self, update: &serde_json::Value) {
+        self.observe_provider_tool_name_with_metadata(update, Ok(None));
+    }
+
+    fn observe_provider_tool_name_with_metadata(
+        &mut self,
+        update: &serde_json::Value,
+        invocation_metadata: Result<Option<crate::acp_wire::OrbitToolInvocationMeta>>,
+    ) {
         if update
             .get("sessionUpdate")
             .and_then(serde_json::Value::as_str)
@@ -2372,13 +2404,24 @@ impl ToolCallAudit {
             return;
         }
 
-        if self.provider_tool_names.len() >= PROVIDER_TOOL_NAME_QUEUE_LIMIT
-            || self.pending_overflow_names > 0
+        if self.provider_tool_invocations.len() + self.unmatched_provider_updates.len()
+            >= PROVIDER_TOOL_NAME_QUEUE_LIMIT
         {
             self.provider_tool_names_omitted = self.provider_tool_names_omitted.saturating_add(1);
-            self.pending_overflow_names = self.pending_overflow_names.saturating_add(1);
+            self.correlation_partial = true;
             return;
         }
+
+        let (tool_invocation_id, provider_tool_call_id, invocation_id_shape) =
+            match invocation_metadata {
+                Ok(Some(meta)) => (
+                    Some(meta.invocation_id),
+                    Some(meta.provider_tool_call_id),
+                    "valid",
+                ),
+                Ok(None) => (None, None, "missing"),
+                Err(_) => (None, None, "malformed"),
+            };
 
         let title = update.get("title");
         let title_class = match title {
@@ -2413,33 +2456,98 @@ impl ToolCallAudit {
                 "canceled",
             ],
         );
-        let tool_call_id_shape = match update.get("toolCallId") {
-            Some(serde_json::Value::String(id)) if id.is_empty() => "empty_string",
-            Some(serde_json::Value::String(id)) if id.len() > 256 => "oversized_string",
-            Some(serde_json::Value::String(id)) if self.provider_tool_call_ids.contains(id) => {
-                "duplicate_string"
-            }
+        let (observed_provider_id, mut tool_call_id_shape) = match update.get("toolCallId") {
             Some(serde_json::Value::String(id))
-                if self.provider_tool_call_ids.len() >= PROVIDER_TOOL_NAME_QUEUE_LIMIT =>
+                if !id.is_empty() && id.len() <= 256 && safe_correlator_id(id, 256) =>
             {
-                "deduplication_limit"
+                (Some(id.clone()), "string")
             }
-            Some(serde_json::Value::String(id)) => {
-                self.provider_tool_call_ids.insert(id.clone());
-                "string"
-            }
-            Some(_) => "non_string",
-            None => "missing",
+            Some(serde_json::Value::String(id)) if id.is_empty() => (None, "empty_string"),
+            Some(serde_json::Value::String(id)) if id.len() > 256 => (None, "oversized_string"),
+            Some(serde_json::Value::String(_)) => (None, "unsafe_string"),
+            Some(_) => (None, "non_string"),
+            None => (None, "missing"),
         };
-        self.provider_tool_names
-            .push_back(ProviderToolUpdateObservation {
+        let duplicate_provider_id = observed_provider_id
+            .as_ref()
+            .is_some_and(|id| !self.seen_provider_tool_call_ids.insert(id.clone()));
+        if duplicate_provider_id {
+            tool_call_id_shape = "duplicate_string";
+        }
+
+        let mut correlation_state = "UNRESOLVED";
+        if let (Some(invocation_id), Some(provider_call_id), Some(observed_id)) = (
+            tool_invocation_id.as_deref(),
+            provider_tool_call_id.as_deref(),
+            observed_provider_id.as_deref(),
+        ) {
+            if provider_call_id != observed_id {
+                correlation_state = "PROVIDER_ID_MISMATCH";
+            } else if duplicate_provider_id {
+                correlation_state = "DUPLICATE_PROVIDER_ID";
+                if let Some(previous_invocation) = self.provider_tool_call_ids.get(provider_call_id)
+                    && let Some(previous) =
+                        self.provider_tool_invocations.get_mut(previous_invocation)
+                {
+                    previous.invalidated = true;
+                    previous.observation.correlation_state = "DUPLICATE_PROVIDER_ID";
+                }
+            } else if let Some(previous_invocation) =
+                self.provider_tool_call_ids.get(provider_call_id)
+            {
+                correlation_state = "DUPLICATE_PROVIDER_ID";
+                if let Some(previous) = self.provider_tool_invocations.get_mut(previous_invocation)
+                {
+                    previous.invalidated = true;
+                    previous.observation.correlation_state = "DUPLICATE_PROVIDER_ID";
+                }
+            } else if self.provider_tool_invocations.contains_key(invocation_id) {
+                correlation_state = "DUPLICATE_INVOCATION_ID";
+                if let Some(previous) = self.provider_tool_invocations.get_mut(invocation_id) {
+                    previous.invalidated = true;
+                    previous.observation.correlation_state = "DUPLICATE_INVOCATION_ID";
+                }
+            } else {
+                correlation_state = "OBSERVED";
+                let observation = ProviderToolUpdateObservation {
+                    tool_invocation_id: tool_invocation_id.clone(),
+                    provider_tool_call_id: observed_provider_id.clone(),
+                    invocation_id_shape,
+                    title_class,
+                    tool_kind,
+                    status,
+                    tool_call_id_shape,
+                    correlation_state,
+                };
+                self.provider_tool_call_ids
+                    .insert(provider_call_id.to_owned(), invocation_id.to_owned());
+                self.provider_tool_invocations.insert(
+                    invocation_id.to_owned(),
+                    ProviderToolInvocation {
+                        observation,
+                        callback_count: 0,
+                        invalidated: false,
+                    },
+                );
+                return;
+            }
+        }
+
+        self.correlation_partial = true;
+        self.unmatched_provider_updates
+            .push(ProviderToolUpdateObservation {
+                tool_invocation_id,
+                provider_tool_call_id: observed_provider_id,
+                invocation_id_shape,
                 title_class,
                 tool_kind,
                 status,
                 tool_call_id_shape,
+                correlation_state,
             });
     }
 
+    #[cfg(test)]
     fn begin_call(
         &mut self,
         sequence: u64,
@@ -2448,16 +2556,90 @@ impl ToolCallAudit {
         successes_before: u64,
         failures_before: u64,
     ) -> u64 {
+        self.begin_call_with_context(
+            sequence,
+            provider_method,
+            None,
+            Ok(None),
+            canonical_tool,
+            successes_before,
+            failures_before,
+        )
+    }
+
+    fn begin_call_with_context(
+        &mut self,
+        sequence: u64,
+        provider_method: &str,
+        request_id: Option<&serde_json::Value>,
+        invocation_metadata: Result<Option<crate::acp_wire::OrbitToolInvocationMeta>>,
+        canonical_tool: Option<crate::tool_surface::CanonicalToolName>,
+        successes_before: u64,
+        failures_before: u64,
+    ) -> u64 {
         for entry in &mut self.entries {
             entry.later_callback_observed = true;
         }
 
-        let provider_update_correlation =
-            if self.provider_tool_names.is_empty() && self.pending_overflow_names == 0 {
-                "NOT_OBSERVED"
+        let callback_request_id = request_id.and_then(safe_json_rpc_request_id);
+        let callback_request_id_shape = if request_id.is_none() {
+            "missing"
+        } else if callback_request_id.is_some() {
+            "valid"
+        } else {
+            "invalid"
+        };
+        let mut duplicate_callback = false;
+        let mut callback_tracking_overflow = false;
+        if let Some(id) = callback_request_id.as_ref() {
+            if self.callback_request_ids.contains(id) {
+                duplicate_callback = true;
+            } else if self.callback_request_ids.len() >= TOOL_CALL_AUDIT_LIMIT {
+                callback_tracking_overflow = true;
             } else {
-                "AMBIGUOUS"
-            };
+                self.callback_request_ids.insert(id.clone());
+            }
+        }
+        let (invocation_metadata, metadata_shape) = match invocation_metadata {
+            Ok(Some(meta)) => (Some(meta), "valid"),
+            Ok(None) => (None, "missing"),
+            Err(_) => (None, "malformed"),
+        };
+        let mut matched_update = None;
+        let mut provider_update_correlation = match metadata_shape {
+            "malformed" => "MALFORMED",
+            "missing" => "CALLBACK_WITHOUT_INVOCATION_ID",
+            _ if callback_tracking_overflow => "CALLBACK_TRACKING_LIMIT_EXCEEDED",
+            _ if duplicate_callback => "DUPLICATE_CALLBACK_ID",
+            _ if callback_request_id.is_none() => "INVALID_CALLBACK_ID",
+            _ => "CALLBACK_WITHOUT_UPDATE",
+        };
+        if let Some(meta) = invocation_metadata.as_ref()
+            && !duplicate_callback
+            && !callback_tracking_overflow
+            && callback_request_id.is_some()
+        {
+            if let Some(invocation) = self.provider_tool_invocations.get_mut(&meta.invocation_id) {
+                if invocation.invalidated {
+                    provider_update_correlation = "INVALIDATED_INVOCATION";
+                } else if invocation.observation.provider_tool_call_id.as_deref()
+                    != Some(meta.provider_tool_call_id.as_str())
+                {
+                    provider_update_correlation = "PROVIDER_ID_MISMATCH";
+                } else if invocation.callback_count > 0 {
+                    provider_update_correlation = "DUPLICATE_INVOCATION_CALLBACK";
+                } else {
+                    invocation.callback_count = 1;
+                    matched_update = Some(invocation.observation.clone());
+                    provider_update_correlation = "CORRELATED";
+                    self.correlation_supported = true;
+                }
+            }
+        }
+        if provider_update_correlation != "CORRELATED" {
+            self.correlation_partial = true;
+            self.unmatched_callback_count = self.unmatched_callback_count.saturating_add(1);
+        }
         let method_observation = provider_tool_method_observation(provider_method);
         let canonical_name = canonical_tool
             .map(|tool| tool.as_str())
@@ -2502,17 +2684,42 @@ impl ToolCallAudit {
 
         self.entries.push(ToolCallAuditEntry {
             sequence,
+            tool_invocation_id: invocation_metadata
+                .as_ref()
+                .map(|meta| meta.invocation_id.clone()),
+            provider_tool_call_id: invocation_metadata
+                .as_ref()
+                .map(|meta| meta.provider_tool_call_id.clone()),
+            callback_request_id: callback_request_id.clone(),
+            callback_request_id_shape,
             provider_tool_name: provider_name,
             provider_name_mapping,
             provider_update_correlation,
-            provider_update_title_class: Some("update_not_observed"),
-            provider_update_tool_kind: Some("update_not_observed"),
-            provider_update_status: Some("update_not_observed"),
-            provider_tool_call_id_shape: Some("update_not_observed"),
+            provider_update_title_class: Some(
+                matched_update
+                    .as_ref()
+                    .map_or("update_not_observed", |update| update.title_class),
+            ),
+            provider_update_tool_kind: Some(
+                matched_update
+                    .as_ref()
+                    .map_or("update_not_observed", |update| update.tool_kind),
+            ),
+            provider_update_status: Some(
+                matched_update
+                    .as_ref()
+                    .map_or("update_not_observed", |update| update.status),
+            ),
+            provider_tool_call_id_shape: Some(
+                matched_update
+                    .as_ref()
+                    .map_or("update_not_observed", |update| update.tool_call_id_shape),
+            ),
             canonical_tool_name: canonical_name,
             advertised_to_provider,
             role_allowed,
             outcome: None,
+            terminal_state: "DISPATCHED",
             error_code: None,
             mutating,
             mutation_applied: None,
@@ -2574,6 +2781,15 @@ impl ToolCallAudit {
             .find(|entry| entry.sequence == sequence)
         {
             entry.outcome = Some(outcome);
+            entry.terminal_state = match outcome {
+                ToolCallOutcome::Success => "SUCCESS",
+                ToolCallOutcome::ExpectedDenial => "DENIED",
+                ToolCallOutcome::InvalidRequest => "INVALID_REQUEST",
+                ToolCallOutcome::ExecutionFailure => "FAILED",
+                ToolCallOutcome::Timeout => "TIMED_OUT",
+                ToolCallOutcome::Cancelled => "CANCELLED",
+                ToolCallOutcome::Unsupported => "UNSUPPORTED",
+            };
             entry.error_code = error_code;
             entry.mutation_applied = match (outcome, entry.mutating) {
                 (ToolCallOutcome::Success, Some(false)) => Some(false),
@@ -2644,57 +2860,68 @@ impl ToolCallAudit {
         for entry in &mut self.entries {
             if entry.outcome.is_none() {
                 entry.outcome = Some(ToolCallOutcome::ExecutionFailure);
+                entry.terminal_state = "PROCESS_EXIT_UNRESOLVED";
                 entry.error_code = Some("TOOL_EXECUTION_FAILED");
             }
             entry.turn_completed = Some(completed);
         }
 
-        self.unmatched_provider_call_count =
-            self.provider_tool_names.len() as u64 + self.pending_overflow_names;
-        if self.unmatched_provider_call_count > 0 {
-            for entry in &mut self.entries {
-                if entry.provider_name_mapping != "UNMATCHED" {
-                    entry.provider_update_correlation = "AMBIGUOUS";
-                }
-            }
-        }
+        let unmatched_invocations = self
+            .provider_tool_invocations
+            .values()
+            .filter(|invocation| invocation.invalidated || invocation.callback_count == 0)
+            .count() as u64;
+        let unmatched_notification_count = unmatched_invocations
+            .saturating_add(self.unmatched_provider_updates.len() as u64)
+            .saturating_add(self.provider_tool_names_omitted);
+        self.unmatched_provider_call_count = unmatched_notification_count;
+        self.correlation_partial |= self.unmatched_provider_call_count > 0;
         let capacity = TOOL_CALL_AUDIT_LIMIT.saturating_sub(self.entries.len());
         let mut next_sequence = callback_count.saturating_add(1);
-        let queued = self.provider_tool_names.drain(..).collect::<Vec<_>>();
-        for _ in &queued {
+        let unmatched_updates = self
+            .provider_tool_invocations
+            .values()
+            .filter(|invocation| invocation.invalidated || invocation.callback_count == 0)
+            .map(|invocation| invocation.observation.clone())
+            .chain(self.unmatched_provider_updates.iter().cloned())
+            .collect::<Vec<_>>();
+        for _ in &unmatched_updates {
             self.record_mutating(None);
         }
         self.mutating_unknown_count = self
             .mutating_unknown_count
-            .saturating_add(self.pending_overflow_names);
-        for observation in queued.iter().copied().take(capacity) {
+            .saturating_add(self.provider_tool_names_omitted);
+        for observation in unmatched_updates.iter().take(capacity) {
             self.push_unmatched_provider_call(next_sequence, Some(observation), completed);
             next_sequence = next_sequence.saturating_add(1);
         }
-        let recorded_queued = queued.len().min(capacity);
+        let recorded_updates = unmatched_updates.len().min(capacity);
         let recorded_overflow = self
-            .pending_overflow_names
-            .min(capacity.saturating_sub(recorded_queued) as u64);
+            .provider_tool_names_omitted
+            .min(capacity.saturating_sub(recorded_updates) as u64);
         for _ in 0..recorded_overflow {
             self.push_unmatched_provider_call(next_sequence, None, completed);
             next_sequence = next_sequence.saturating_add(1);
         }
         self.omitted_count = self.omitted_count.saturating_add(
-            self.unmatched_provider_call_count
-                .saturating_sub(recorded_queued as u64 + recorded_overflow),
+            unmatched_notification_count
+                .saturating_sub(recorded_updates as u64 + recorded_overflow),
         );
-        self.pending_overflow_names = 0;
-        self.provider_tool_call_ids.clear();
     }
 
     fn push_unmatched_provider_call(
         &mut self,
         sequence: u64,
-        observation: Option<ProviderToolUpdateObservation>,
+        observation: Option<&ProviderToolUpdateObservation>,
         completed: bool,
     ) {
         self.entries.push(ToolCallAuditEntry {
             sequence,
+            tool_invocation_id: observation.and_then(|update| update.tool_invocation_id.clone()),
+            provider_tool_call_id: observation
+                .and_then(|update| update.provider_tool_call_id.clone()),
+            callback_request_id: None,
+            callback_request_id_shape: "not_observed",
             provider_tool_name: "unknown",
             provider_name_mapping: "UNMATCHED",
             provider_update_correlation: "UNMATCHED",
@@ -2716,6 +2943,7 @@ impl ToolCallAudit {
             advertised_to_provider: None,
             role_allowed: None,
             outcome: Some(ToolCallOutcome::ExecutionFailure),
+            terminal_state: "UNRESOLVED",
             error_code: Some("PROVIDER_CALLBACK_UNRESOLVED"),
             mutating: None,
             mutation_applied: None,
@@ -2731,22 +2959,126 @@ impl ToolCallAudit {
         success_count: u64,
         failure_count: u64,
     ) -> serde_json::Value {
+        let provider_notification_count = self.provider_notification_count();
+        let correlation_capability = if call_count == 0 && provider_notification_count == 0 {
+            "NOT_EXERCISED"
+        } else {
+            self.correlation_capability()
+        };
         serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "summary": {
-                "total": call_count + self.unmatched_provider_call_count,
+                "total": call_count + self.unmatched_notification_count(),
+                "callback_count": call_count,
+                "provider_notification_count": provider_notification_count,
                 "successful": success_count,
-                "unsuccessful": failure_count + self.unmatched_provider_call_count,
+                "unsuccessful": failure_count + self.unmatched_notification_count(),
                 "mutating": self.mutating_count,
                 "mutating_unknown": self.mutating_unknown_count,
                 "denied": self.denied_count,
                 "unmatched_provider_calls": self.unmatched_provider_call_count,
+                "unmatched_callbacks": self.unmatched_callback_count,
             },
+            "correlation_capability": correlation_capability,
+            "provider_updates": self.provider_update_evidence(),
             "entries": self.entries,
             "omitted_count": self.omitted_count,
             "provider_tool_names_omitted": self.provider_tool_names_omitted,
         })
     }
+
+    fn unmatched_notification_count(&self) -> u64 {
+        self.provider_tool_invocations
+            .values()
+            .filter(|invocation| invocation.invalidated || invocation.callback_count == 0)
+            .count() as u64
+            + self.unmatched_provider_updates.len() as u64
+            + self.provider_tool_names_omitted
+    }
+
+    fn provider_notification_count(&self) -> u64 {
+        (self.provider_tool_invocations.len() as u64)
+            .saturating_add(self.unmatched_provider_updates.len() as u64)
+            .saturating_add(self.provider_tool_names_omitted)
+    }
+
+    fn correlation_capability(&self) -> &'static str {
+        if self.correlation_supported && !self.correlation_partial {
+            "SUPPORTED"
+        } else if self.correlation_supported || self.correlation_partial {
+            "PARTIAL"
+        } else {
+            "UNSUPPORTED"
+        }
+    }
+
+    fn provider_update_evidence(&self) -> Vec<ProviderToolUpdateObservation> {
+        self.provider_tool_invocations
+            .values()
+            .map(|invocation| invocation.observation.clone())
+            .chain(self.unmatched_provider_updates.iter().cloned())
+            .take(PROVIDER_TOOL_NAME_QUEUE_LIMIT)
+            .collect()
+    }
+
+    fn call_is_correlated(&self, sequence: u64) -> bool {
+        self.entries.iter().any(|entry| {
+            entry.sequence == sequence && entry.provider_update_correlation == "CORRELATED"
+        })
+    }
+}
+
+fn safe_correlator_id(value: &str, limit: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= limit
+        && value.is_ascii()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+}
+
+fn safe_json_rpc_request_id(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(value) if safe_correlator_id(value, 128) => {
+            Some(format!("s:{value}"))
+        }
+        serde_json::Value::Number(value)
+            if (value.as_i64().is_some() || value.as_u64().is_some())
+                && value.to_string().len() <= 128 =>
+        {
+            Some(format!("n:{value}"))
+        }
+        _ => None,
+    }
+}
+
+async fn persist_tool_call_audit(state: &AcpTurnState<'_>) -> Result<()> {
+    match (
+        state.pool,
+        state.agent_exec_id.as_deref(),
+        state.role_exec_id.as_deref(),
+    ) {
+        (Some(pool), Some(agent_exec_id), Some(role_execution_id)) => {
+            let audit = state.tool_call_audit.metadata(
+                state.tool_calls,
+                state.tool_successes,
+                state.tool_failures,
+            );
+            WorkflowStore::new(pool.clone())
+                .update_running_agent_tool_audit(agent_exec_id, role_execution_id, &audit)
+                .await
+        }
+        (None, None, None) => Ok(()),
+        _ => bail!("AGENT_EXECUTION_AUDIT_OWNER_MISSING"),
+    }
+}
+
+fn mutation_correlation_permits_dispatch(
+    audit: &ToolCallAudit,
+    sequence: u64,
+    requires_mutation_lock: bool,
+) -> bool {
+    !requires_mutation_lock || audit.call_is_correlated(sequence)
 }
 
 fn classify_provider_update_value(
@@ -3155,6 +3487,11 @@ pub fn render_tool_call_audit(metadata: &serde_json::Value) -> String {
         .and_then(serde_json::Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or_default();
+    let provider_updates = audit
+        .get("provider_updates")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
     let omitted = audit
         .get("omitted_count")
         .and_then(serde_json::Value::as_u64)
@@ -3163,16 +3500,68 @@ pub fn render_tool_call_audit(metadata: &serde_json::Value) -> String {
         .get("provider_tool_names_omitted")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
+    let capability = match audit
+        .get("correlation_capability")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("SUPPORTED") => "SUPPORTED",
+        Some("PARTIAL") => "PARTIAL",
+        Some("NOT_EXERCISED") => "NOT_EXERCISED",
+        _ => "UNSUPPORTED",
+    };
+    let correlated_terminal_rows = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .get("provider_update_correlation")
+                .and_then(serde_json::Value::as_str)
+                == Some("CORRELATED")
+                && entry
+                    .get("terminal_state")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|state| state != "DISPATCHED" && state != "UNRESOLVED")
+        })
+        .count() as u64;
+    let unmatched_provider_calls = count("unmatched_provider_calls");
+    let unmatched_callbacks = count("unmatched_callbacks");
+    let unresolved = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .get("provider_update_correlation")
+                .and_then(serde_json::Value::as_str)
+                != Some("CORRELATED")
+                || entry
+                    .get("terminal_state")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|state| {
+                        matches!(
+                            state,
+                            "DISPATCHED" | "UNRESOLVED" | "PROCESS_EXIT_UNRESOLVED"
+                        )
+                    })
+        })
+        .count() as u64;
+    let recorded_provider_notifications = provider_updates.len() as u64;
+    let provider_notifications = summary
+        .and_then(|summary| summary.get("provider_notification_count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_else(|| recorded_provider_notifications.saturating_add(provider_titles_omitted));
+    let callbacks = summary
+        .and_then(|summary| summary.get("callback_count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_else(|| count("total").saturating_sub(unmatched_provider_calls));
     let mut report = format!(
-        "Tool-call audit: total={}, successful={}, unsuccessful={}, mutating={}, denied={}, unmatched={}, omitted={omitted}, provider titles omitted={provider_titles_omitted}\n",
+        "Tool-call audit: correlation={capability}, provider notifications={provider_notifications} (recorded={recorded_provider_notifications}, omitted={provider_titles_omitted}), callbacks={callbacks}, correlated terminal rows={correlated_terminal_rows}, unresolved={unresolved} (provider={}, callbacks={}), total={}, successful={}, unsuccessful={}, mutating={}, denied={}, omitted={omitted}, provider titles omitted={provider_titles_omitted}\n",
+        unmatched_provider_calls,
+        unmatched_callbacks,
         count("total"),
         count("successful"),
         count("unsuccessful"),
         count("mutating"),
-        count("denied"),
-        count("unmatched_provider_calls")
+        count("denied")
     );
-    report.push_str("seq | provider callback method | update correlation | title class | provider kind | provider status | toolCallId shape | mapping | canonical | advertised | role allowed | outcome | error code | mutation applied | later callback observed | turn complete | paths | detail\n");
+    report.push_str("seq | ToolInvocationId | provider ToolCall ID | callback JSON-RPC ID | provider callback method | update correlation | title class | provider kind | provider status | toolCallId shape | mapping | canonical | advertised | role allowed | outcome | terminal state | error code | mutation applied | later callback observed | turn complete | paths | detail\n");
 
     for entry in entries.iter().take(TOOL_CALL_AUDIT_LIMIT) {
         let string = |name| {
@@ -3181,6 +3570,12 @@ pub fn render_tool_call_audit(metadata: &serde_json::Value) -> String {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("")
         };
+        let report_id =
+            |name: &str, limit: usize| match entry.get(name).and_then(serde_json::Value::as_str) {
+                Some(value) if safe_correlator_id(value, limit) => value,
+                Some(_) => "redacted",
+                None => "-",
+            };
         let provider = provider_tool_method_observation(string("provider_tool_name"))
             .map_or("unknown", |name| name.provider_tool_name);
         let canonical =
@@ -3193,7 +3588,17 @@ pub fn render_tool_call_audit(metadata: &serde_json::Value) -> String {
             _ => "UNKNOWN",
         };
         let update_correlation = match string("provider_update_correlation") {
-            "NOT_OBSERVED" | "AMBIGUOUS" | "UNMATCHED" => string("provider_update_correlation"),
+            "CORRELATED" => "CORRELATED",
+            "UNMATCHED" => "UNMATCHED",
+            "CALLBACK_WITHOUT_INVOCATION_ID"
+            | "CALLBACK_WITHOUT_UPDATE"
+            | "PROVIDER_ID_MISMATCH"
+            | "INVALIDATED_INVOCATION"
+            | "DUPLICATE_CALLBACK_ID"
+            | "DUPLICATE_INVOCATION_CALLBACK"
+            | "CALLBACK_TRACKING_LIMIT_EXCEEDED"
+            | "INVALID_CALLBACK_ID"
+            | "MALFORMED" => "UNRESOLVED",
             _ => "UNKNOWN",
         };
         let title_class = match string("provider_update_title_class") {
@@ -3274,10 +3679,14 @@ pub fn render_tool_call_audit(metadata: &serde_json::Value) -> String {
                 .unwrap_or(&serde_json::Value::Null),
         );
         report.push_str(&format!(
-            "{} | {provider} | {update_correlation} | {title_class} | {provider_kind} | {provider_status} | {tool_call_id_shape} | {mapping} | {canonical} | {} | {} | {outcome} | {error_code} | {mutating}/{applied} | {later} | {complete} | {paths} | {}\n",
+            "{} | {} | {} | {} | {provider} | {update_correlation} | {title_class} | {provider_kind} | {provider_status} | {tool_call_id_shape} | {mapping} | {canonical} | {} | {} | {outcome} | {} | {error_code} | {mutating}/{applied} | {later} | {complete} | {paths} | {}\n",
             entry.get("sequence").and_then(serde_json::Value::as_u64).unwrap_or(0),
+            report_id("tool_invocation_id", 128),
+            report_id("provider_tool_call_id", 256),
+            report_id("callback_request_id", 130),
             audit_bool(entry.get("advertised_to_provider").and_then(serde_json::Value::as_bool)),
             audit_bool(entry.get("role_allowed").and_then(serde_json::Value::as_bool)),
+            entry.get("terminal_state").and_then(serde_json::Value::as_str).filter(|value| matches!(*value, "DISPATCHED" | "SUCCESS" | "DENIED" | "INVALID_REQUEST" | "FAILED" | "TIMED_OUT" | "CANCELLED" | "UNSUPPORTED" | "PROCESS_EXIT_UNRESOLVED" | "UNRESOLVED")).unwrap_or("unknown"),
             detail,
         ));
     }
@@ -3312,14 +3721,65 @@ pub async fn handle_acp_message(
     state: &mut AcpTurnState<'_>,
     message: serde_json::Value,
 ) -> Result<()> {
+    let is_session_update =
+        message.get("method").and_then(serde_json::Value::as_str) == Some("session/update");
+    let persist_audit = if is_session_update {
+        is_provider_tool_call_update(&message)
+    } else {
+        message.get("id").is_some()
+    };
+    let result = handle_acp_message_inner(wire, state, message).await;
+    if persist_audit {
+        let persist_result = persist_tool_call_audit(state).await;
+        if result.is_ok() {
+            persist_result?;
+        } else {
+            // Keep the primary protocol/operation failure while still attempting
+            // to record its terminal or unresolved audit state.
+            persist_result?;
+        }
+    }
+    result
+}
+
+fn is_provider_tool_call_update(message: &serde_json::Value) -> bool {
+    if message.get("method").and_then(serde_json::Value::as_str) != Some("session/update") {
+        return false;
+    }
+    let Some(params) = message.get("params") else {
+        return false;
+    };
+    params
+        .get("update")
+        .unwrap_or(params)
+        .get("sessionUpdate")
+        .and_then(serde_json::Value::as_str)
+        == Some("tool_call")
+}
+
+async fn handle_acp_message_inner(
+    wire: &mut Wire,
+    state: &mut AcpTurnState<'_>,
+    message: serde_json::Value,
+) -> Result<()> {
     if let Some(method) = message.get("method").and_then(|m| m.as_str()) {
         if method == "session/update" {
             if let Some(params) = message.get("params") {
                 if let Some(update) = params.get("update") {
-                    state.tool_call_audit.observe_provider_tool_name(update);
+                    state
+                        .tool_call_audit
+                        .observe_provider_tool_name_with_metadata(
+                            update,
+                            crate::acp_wire::orbit_tool_invocation_meta(&message),
+                        );
                     extract_text_from_json(update, &mut state.agent_output);
                 } else {
-                    state.tool_call_audit.observe_provider_tool_name(params);
+                    state
+                        .tool_call_audit
+                        .observe_provider_tool_name_with_metadata(
+                            params,
+                            crate::acp_wire::orbit_tool_invocation_meta(&message),
+                        );
                     extract_text_from_json(params, &mut state.agent_output);
                 }
             }
@@ -3334,13 +3794,19 @@ pub async fn handle_acp_message(
         let canonical = crate::tool_surface::CanonicalToolName::from_wire(method);
         state.tool_calls = state.tool_calls.saturating_add(1);
         state.tool_call_audit.set_role_id(state.role_id.as_deref());
-        let audit_sequence = state.tool_call_audit.begin_call(
+        let invocation_metadata = crate::acp_wire::orbit_tool_invocation_meta(&message);
+        let audit_sequence = state.tool_call_audit.begin_call_with_context(
             state.tool_calls,
             method,
+            message.get("id"),
+            invocation_metadata,
             canonical,
             state.tool_successes,
             state.tool_failures,
         );
+        // Persist the DISPATCHED row before any callback authorization or
+        // mutation branch. A crash or timeout from here remains unresolved.
+        persist_tool_call_audit(state).await?;
         let Some(tool) = canonical else {
             state.tool_failures = state.tool_failures.saturating_add(1);
             *state.tool_counts.entry("unsupported".into()).or_insert(0) += 1;
@@ -3373,6 +3839,7 @@ pub async fn handle_acp_message(
         state
             .tool_call_audit
             .record_path_arguments(audit_sequence, tool, &params, state.repo_path);
+        persist_tool_call_audit(state).await?;
 
         if matches!(
             tool,
@@ -3457,6 +3924,22 @@ pub async fn handle_acp_message(
                 .await?;
                 return Ok(());
             }
+        }
+
+        if !mutation_correlation_permits_dispatch(
+            &state.tool_call_audit,
+            audit_sequence,
+            meta.requires_mutation_lock,
+        ) {
+            state.tool_failures = state.tool_failures.saturating_add(1);
+            state.tool_call_audit.finish_call(
+                audit_sequence,
+                ToolCallOutcome::ExecutionFailure,
+                Some("PROVIDER_CALLBACK_UNRESOLVED"),
+            );
+            wire.response_error(req_id, -32603, "PROVIDER_CALLBACK_UNRESOLVED")
+                .await?;
+            return Ok(());
         }
 
         let successes_before = state.tool_successes;
@@ -4612,9 +5095,11 @@ async fn execute_real_acp_turn(
         terminals: BTreeMap::new(),
         wf_attempt_id: Some(wf_run.attempt_id.clone()),
         role_exec_id: Some(role_exec.id.clone()),
+        agent_exec_id: Some(agent_exec_id.clone()),
         pool: Some(workflow_state_pool),
     };
 
+    let store = WorkflowStore::new(workflow_state_pool.clone());
     let turn = tokio::select! {
         result = async {
     let _init_res = acp_call(
@@ -4705,6 +5190,26 @@ async fn execute_real_acp_turn(
         git_diff.as_deref(),
     );
 
+    let initial_audit = state.tool_call_audit.metadata(0, 0, 0);
+    store
+        .start_agent_execution(
+            &agent_exec_id,
+            &role_exec.id,
+            &format!("{}-acp", target.provider),
+            Some(&target.provider),
+            target.resolved_model.as_deref(),
+            started_at_ms,
+            target.requested_model.as_deref(),
+            target.resolved_model.as_deref(),
+            &serde_json::json!({
+                "provider": target.provider,
+                "cleanup_confirmed": false,
+                "observed_model": null,
+                "tool_call_audit": initial_audit,
+            }),
+        )
+        .await?;
+
     let prompt_res = acp_call(
         &mut wire,
         &mut state,
@@ -4757,8 +5262,6 @@ async fn execute_real_acp_turn(
 
     let finished_at_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
 
-    let store = WorkflowStore::new(workflow_state_pool.clone());
-
     let mut failure = turn.err();
     if let Err(error) = validate_role_turn_completion(&state.agent_output, &evidence) {
         failure.get_or_insert(error);
@@ -4794,14 +5297,10 @@ async fn execute_real_acp_turn(
             .tool_call_audit
             .metadata(state.tool_calls, state.tool_successes, state.tool_failures);
     store
-        .insert_agent_execution(
+        .finish_agent_execution(
             &agent_exec_id,
             &role_exec.id,
-            &format!("{}-acp", target.provider),
-            Some(&target.provider),
-            target.resolved_model.as_deref(),
-            started_at_ms,
-            Some(finished_at_ms),
+            finished_at_ms,
             status_text,
             Some(reason),
             evidence.exit_code,
@@ -4821,9 +5320,6 @@ async fn execute_real_acp_turn(
                 "tool_call_audit": tool_call_audit,
             }),
         )
-        .await?;
-    store
-        .record_agent_execution(&role_exec.id, &agent_exec_id)
         .await?;
 
     if !evidence.cleanup_confirmed {
@@ -4918,6 +5414,50 @@ impl RoleAgentExecutor for RealAcpRoleExecutor {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn only_tool_call_session_updates_require_audit_persistence() {
+        let tool_call = serde_json::json!({
+            "method": "session/update",
+            "params": { "update": { "sessionUpdate": "tool_call" } }
+        });
+        let agent_message = serde_json::json!({
+            "method": "session/update",
+            "params": { "update": { "sessionUpdate": "agent_message_chunk" } }
+        });
+        let unrelated_notification = serde_json::json!({
+            "method": "session/update",
+            "params": { "update": { "sessionUpdate": "current_mode_update" } }
+        });
+
+        assert!(is_provider_tool_call_update(&tool_call));
+        assert!(!is_provider_tool_call_update(&agent_message));
+        assert!(!is_provider_tool_call_update(&unrelated_notification));
+    }
+
+    #[test]
+    fn audit_schema_v2_distinguishes_not_exercised_from_notification_only() {
+        let empty = ToolCallAudit::default().metadata(0, 0, 0);
+        assert_eq!(empty["schema_version"], 2);
+        assert_eq!(empty["correlation_capability"], "NOT_EXERCISED");
+        assert_eq!(empty["summary"]["callback_count"], 0);
+        assert_eq!(empty["summary"]["provider_notification_count"], 0);
+        let rendered = render_tool_call_audit(&serde_json::json!({"tool_call_audit": empty}));
+        assert!(rendered.contains("correlation=NOT_EXERCISED"));
+
+        let mut notification_only = ToolCallAudit::default();
+        notification_only.observe_provider_tool_name(&serde_json::json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "provider-unmatched",
+            "title": "Read a file",
+            "kind": "read",
+            "status": "in_progress"
+        }));
+        let audit = notification_only.metadata(0, 0, 0);
+        assert_eq!(audit["correlation_capability"], "PARTIAL");
+        assert_eq!(audit["summary"]["provider_notification_count"], 1);
+        assert_eq!(audit["summary"]["total"], 1);
+    }
 
     #[test]
     fn provider_tool_lists_match_role_prompt_and_permissions() -> Result<()> {
@@ -5129,6 +5669,526 @@ mod tests {
         let server_wire = Wire::new(server_r, server_w, 65536);
         let client_wire = Wire::new(client_r, client_w, 65536);
         (server_wire, client_wire)
+    }
+
+    #[tokio::test]
+    async fn invocation_ids_bind_reordered_same_method_reads_to_their_results() -> Result<()> {
+        use crate::acp_wire::OrbitToolInvocationMeta;
+
+        let repo = tempdir()?;
+        std::fs::write(repo.path().join("a.txt"), "result A")?;
+        std::fs::write(repo.path().join("b.txt"), "result B")?;
+        let (mut server, mut client) = make_test_wire();
+        let mut state = AcpTurnState::new(repo.path(), WorkspaceAccess::ReadWrite);
+        state.role_id = Some("implementer".into());
+        state.workspace_identity = Some(repo.path().canonicalize()?.to_string_lossy().into_owned());
+        let allowed = vec!["read_file".to_owned()];
+        state
+            .tool_call_audit
+            .set_context(Some("implementer"), Some(&allowed));
+
+        let invocation_a = OrbitToolInvocationMeta::new("oti-a", "provider-call-a")?;
+        let invocation_b = OrbitToolInvocationMeta::new("oti-b", "provider-call-b")?;
+        for (meta, title) in [(&invocation_a, "Read A"), (&invocation_b, "Read B")] {
+            handle_acp_message(
+                &mut server,
+                &mut state,
+                serde_json::json!({
+                    "jsonrpc":"2.0",
+                    "method":"session/update",
+                    "params":{"update":{
+                        "sessionUpdate":"tool_call",
+                        "toolCallId":meta.provider_tool_call_id,
+                        "title":title,
+                        "kind":"read",
+                        "status":"in_progress"
+                    }},
+                    "_meta":meta.envelope_metadata()
+                }),
+            )
+            .await?;
+        }
+
+        // Reverse callback order. Both callbacks use the same provider method,
+        // so FIFO or method/name matching would bind these results incorrectly.
+        for (rpc_id, path, meta, expected) in [
+            ("rpc-b", "b.txt", &invocation_b, "result B"),
+            ("rpc-a", "a.txt", &invocation_a, "result A"),
+        ] {
+            handle_acp_message(
+                &mut server,
+                &mut state,
+                serde_json::json!({
+                    "jsonrpc":"2.0",
+                    "id":rpc_id,
+                    "method":"fs/read_text_file",
+                    "params":{"path":path},
+                    "_meta":meta.envelope_metadata()
+                }),
+            )
+            .await?;
+            let response = client.read().await?;
+            assert_eq!(response["id"], rpc_id);
+            assert_eq!(response["result"]["content"], expected);
+        }
+
+        state
+            .tool_call_audit
+            .set_turn_completion(true, state.tool_calls);
+        let audit = state.tool_call_audit.metadata(
+            state.tool_calls,
+            state.tool_successes,
+            state.tool_failures,
+        );
+        assert_eq!(audit["correlation_capability"], "SUPPORTED");
+        assert_eq!(audit["summary"]["unmatched_provider_calls"], 0);
+        assert_eq!(audit["summary"]["unmatched_callbacks"], 0);
+        assert_eq!(audit["entries"][0]["tool_invocation_id"], "oti-b");
+        assert_eq!(
+            audit["entries"][0]["provider_tool_call_id"],
+            "provider-call-b"
+        );
+        assert_eq!(audit["entries"][0]["callback_request_id"], "s:rpc-b");
+        assert_eq!(audit["entries"][1]["tool_invocation_id"], "oti-a");
+        assert_eq!(
+            audit["entries"][1]["provider_tool_call_id"],
+            "provider-call-a"
+        );
+        assert_eq!(audit["entries"][1]["callback_request_id"], "s:rpc-a");
+        assert!(audit["entries"].as_array().unwrap().iter().all(|entry| {
+            entry["provider_update_correlation"] == "CORRELATED"
+                && entry["terminal_state"] == "SUCCESS"
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn correlated_path_not_found_is_a_terminal_failure_with_safe_ids() -> Result<()> {
+        use crate::acp_wire::OrbitToolInvocationMeta;
+
+        let repo = tempdir()?;
+        let (mut server, mut client) = make_test_wire();
+        let mut state = AcpTurnState::new(repo.path(), WorkspaceAccess::ReadWrite);
+        state.role_id = Some("implementer".into());
+        state.workspace_identity = Some(repo.path().canonicalize()?.to_string_lossy().into_owned());
+        let allowed = vec!["read_file".to_owned()];
+        state
+            .tool_call_audit
+            .set_context(Some("implementer"), Some(&allowed));
+        let invocation = OrbitToolInvocationMeta::new("oti-missing", "provider-call-missing")?;
+        handle_acp_message(
+            &mut server,
+            &mut state,
+            serde_json::json!({
+                "method":"session/update",
+                "params":{"update":{
+                    "sessionUpdate":"tool_call",
+                    "toolCallId":"provider-call-missing",
+                    "title":"Read absent file",
+                    "kind":"read",
+                    "status":"in_progress"
+                }},
+                "_meta":invocation.envelope_metadata()
+            }),
+        )
+        .await?;
+        handle_acp_message(
+            &mut server,
+            &mut state,
+            serde_json::json!({
+                "id":"rpc-missing",
+                "method":"fs/read_text_file",
+                "params":{"path":"absent.txt"},
+                "_meta":invocation.envelope_metadata()
+            }),
+        )
+        .await?;
+        let _ = client.read().await?;
+        state
+            .tool_call_audit
+            .set_turn_completion(true, state.tool_calls);
+        let audit = state.tool_call_audit.metadata(
+            state.tool_calls,
+            state.tool_successes,
+            state.tool_failures,
+        );
+        assert_eq!(
+            audit["entries"][0]["provider_update_correlation"],
+            "CORRELATED"
+        );
+        assert_eq!(audit["entries"][0]["terminal_state"], "FAILED");
+        assert_eq!(
+            audit["entries"][0]["error_code"],
+            crate::tool_surface::ERR_PATH_NOT_FOUND
+        );
+        assert_eq!(audit["entries"][0]["tool_invocation_id"], "oti-missing");
+        assert_eq!(audit["entries"][0]["callback_request_id"], "s:rpc-missing");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn correlated_read_with_closed_response_peer_is_failed_not_successful() -> Result<()> {
+        use crate::acp_wire::OrbitToolInvocationMeta;
+
+        let repo = tempdir()?;
+        std::fs::write(repo.path().join("candidate.txt"), "known candidate")?;
+        let (mut server, peer) = make_test_wire();
+        drop(peer);
+        let mut state = AcpTurnState::new(repo.path(), WorkspaceAccess::ReadOnly);
+        state.role_id = Some("planner".into());
+        state.workspace_identity = Some(repo.path().canonicalize()?.to_string_lossy().into_owned());
+        let allowed = vec!["read_file".to_owned()];
+        state
+            .tool_call_audit
+            .set_context(Some("planner"), Some(&allowed));
+        let invocation = OrbitToolInvocationMeta::new("oti-response-fail", "provider-read")?;
+
+        handle_acp_message(
+            &mut server,
+            &mut state,
+            serde_json::json!({
+                "method":"session/update",
+                "params":{"update":{
+                    "sessionUpdate":"tool_call",
+                    "toolCallId":"provider-read",
+                    "title":"Read candidate",
+                    "kind":"read",
+                    "status":"in_progress"
+                }},
+                "_meta":invocation.envelope_metadata()
+            }),
+        )
+        .await?;
+
+        let response = handle_acp_message(
+            &mut server,
+            &mut state,
+            serde_json::json!({
+                "jsonrpc":"2.0",
+                "id":"rpc-read",
+                "method":"fs/read_text_file",
+                "params":{"path":"candidate.txt"},
+                "_meta":invocation.envelope_metadata()
+            }),
+        )
+        .await;
+        assert!(
+            response.is_err(),
+            "closed response peer must fail the handler"
+        );
+        assert_eq!(state.tool_calls, 1);
+        assert_eq!(state.tool_successes, 0);
+        assert_eq!(state.tool_failures, 1);
+        assert_eq!(state.tool_call_audit.entries.len(), 1);
+        assert_eq!(
+            state.tool_call_audit.entries[0].provider_update_correlation,
+            "CORRELATED"
+        );
+        assert_eq!(
+            state.tool_call_audit.entries[0].outcome,
+            Some(ToolCallOutcome::ExecutionFailure)
+        );
+        assert_eq!(state.tool_call_audit.entries[0].terminal_state, "FAILED");
+        assert_eq!(
+            state.tool_call_audit.entries[0].error_code,
+            Some("TOOL_RESPONSE_FAILED")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_mutating_callback_keeps_effect_state_uncertain() -> Result<()> {
+        use crate::tool_surface::CanonicalToolName as Tool;
+
+        let mut audit = ToolCallAudit::default();
+        let call = audit.begin_call(1, "fs/write_text_file", Some(Tool::FsWriteTextFile), 0, 0);
+        audit.finish_call(
+            call,
+            ToolCallOutcome::ExecutionFailure,
+            Some("TOOL_RESPONSE_FAILED"),
+        );
+        assert_eq!(audit.entries[0].terminal_state, "FAILED");
+        assert_eq!(
+            audit.entries[0].outcome,
+            Some(ToolCallOutcome::ExecutionFailure)
+        );
+        assert_eq!(audit.entries[0].error_code, Some("TOOL_RESPONSE_FAILED"));
+        assert_eq!(audit.entries[0].mutation_applied, None);
+        Ok(())
+    }
+
+    #[test]
+    fn unmatched_duplicate_and_pending_invocations_never_authorize_mutation() -> Result<()> {
+        use crate::{acp_wire::OrbitToolInvocationMeta, tool_surface::CanonicalToolName as Tool};
+
+        let invocation = OrbitToolInvocationMeta::new("oti-write", "provider-write")?;
+        let update = serde_json::json!({
+            "sessionUpdate":"tool_call",
+            "toolCallId":"provider-write",
+            "title":"private provider display text",
+            "kind":"edit",
+            "status":"in_progress"
+        });
+        let callback_id = serde_json::json!("rpc-write");
+
+        let mut missing_update = ToolCallAudit::default();
+        let missing_call = missing_update.begin_call_with_context(
+            1,
+            "fs/write_text_file",
+            Some(&callback_id),
+            Ok(Some(invocation.clone())),
+            Some(Tool::FsWriteTextFile),
+            0,
+            0,
+        );
+        assert!(!mutation_correlation_permits_dispatch(
+            &missing_update,
+            missing_call,
+            true
+        ));
+        missing_update.finish_call(
+            missing_call,
+            ToolCallOutcome::ExecutionFailure,
+            Some("PROVIDER_CALLBACK_UNRESOLVED"),
+        );
+        missing_update.set_turn_completion(false, 1);
+        assert_eq!(
+            missing_update.entries[0].provider_update_correlation,
+            "CALLBACK_WITHOUT_UPDATE"
+        );
+        assert_eq!(missing_update.entries[0].terminal_state, "FAILED");
+
+        let mut notification_only = ToolCallAudit::default();
+        notification_only
+            .observe_provider_tool_name_with_metadata(&update, Ok(Some(invocation.clone())));
+        notification_only.set_turn_completion(false, 0);
+        let notification_audit = notification_only.metadata(0, 0, 0);
+        assert_eq!(notification_audit["summary"]["unmatched_provider_calls"], 1);
+        assert_eq!(notification_audit["correlation_capability"], "PARTIAL");
+        assert_eq!(
+            notification_audit["entries"][0]["terminal_state"],
+            "UNRESOLVED"
+        );
+
+        let mut duplicate_update = ToolCallAudit::default();
+        duplicate_update
+            .observe_provider_tool_name_with_metadata(&update, Ok(Some(invocation.clone())));
+        duplicate_update
+            .observe_provider_tool_name_with_metadata(&update, Ok(Some(invocation.clone())));
+        let duplicate_call = duplicate_update.begin_call_with_context(
+            1,
+            "fs/write_text_file",
+            Some(&callback_id),
+            Ok(Some(invocation.clone())),
+            Some(Tool::FsWriteTextFile),
+            0,
+            0,
+        );
+        assert_eq!(
+            duplicate_update.entries[0].provider_update_correlation,
+            "INVALIDATED_INVOCATION"
+        );
+        assert!(!mutation_correlation_permits_dispatch(
+            &duplicate_update,
+            duplicate_call,
+            true
+        ));
+
+        let mut mismatched_provider_id = ToolCallAudit::default();
+        let mismatched_update = serde_json::json!({
+            "sessionUpdate":"tool_call",
+            "toolCallId":"different-provider-id",
+            "title":"Read display title",
+            "kind":"edit",
+            "status":"in_progress"
+        });
+        mismatched_provider_id.observe_provider_tool_name_with_metadata(
+            &mismatched_update,
+            Ok(Some(invocation.clone())),
+        );
+        let mismatched_call = mismatched_provider_id.begin_call_with_context(
+            1,
+            "fs/write_text_file",
+            Some(&callback_id),
+            Ok(Some(invocation.clone())),
+            Some(Tool::FsWriteTextFile),
+            0,
+            0,
+        );
+        assert!(!mutation_correlation_permits_dispatch(
+            &mismatched_provider_id,
+            mismatched_call,
+            true
+        ));
+        assert_eq!(
+            mismatched_provider_id.unmatched_provider_updates[0].correlation_state,
+            "PROVIDER_ID_MISMATCH"
+        );
+
+        let mut duplicate_callback = ToolCallAudit::default();
+        duplicate_callback
+            .observe_provider_tool_name_with_metadata(&update, Ok(Some(invocation.clone())));
+        let first = duplicate_callback.begin_call_with_context(
+            1,
+            "fs/write_text_file",
+            Some(&callback_id),
+            Ok(Some(invocation.clone())),
+            Some(Tool::FsWriteTextFile),
+            0,
+            0,
+        );
+        assert!(mutation_correlation_permits_dispatch(
+            &duplicate_callback,
+            first,
+            true
+        ));
+        duplicate_callback.finish_call(first, ToolCallOutcome::Success, None);
+        let replay = duplicate_callback.begin_call_with_context(
+            2,
+            "fs/write_text_file",
+            Some(&callback_id),
+            Ok(Some(invocation.clone())),
+            Some(Tool::FsWriteTextFile),
+            1,
+            0,
+        );
+        assert_eq!(
+            duplicate_callback.entries[1].provider_update_correlation,
+            "DUPLICATE_CALLBACK_ID"
+        );
+        assert!(!mutation_correlation_permits_dispatch(
+            &duplicate_callback,
+            replay,
+            true
+        ));
+
+        let mut invocation_replay = ToolCallAudit::default();
+        invocation_replay
+            .observe_provider_tool_name_with_metadata(&update, Ok(Some(invocation.clone())));
+        let first_effect = invocation_replay.begin_call_with_context(
+            1,
+            "fs/write_text_file",
+            Some(&serde_json::json!("rpc-write-first")),
+            Ok(Some(invocation.clone())),
+            Some(Tool::FsWriteTextFile),
+            0,
+            0,
+        );
+        assert!(mutation_correlation_permits_dispatch(
+            &invocation_replay,
+            first_effect,
+            true
+        ));
+        invocation_replay.finish_call(first_effect, ToolCallOutcome::Success, None);
+
+        let replayed_effect = invocation_replay.begin_call_with_context(
+            2,
+            "fs/write_text_file",
+            Some(&serde_json::json!("rpc-write-second")),
+            Ok(Some(invocation.clone())),
+            Some(Tool::FsWriteTextFile),
+            1,
+            0,
+        );
+        assert_eq!(
+            invocation_replay.entries[1].provider_update_correlation,
+            "DUPLICATE_INVOCATION_CALLBACK"
+        );
+        let mut mutation_effect_count = 1;
+        if mutation_correlation_permits_dispatch(&invocation_replay, replayed_effect, true) {
+            mutation_effect_count += 1;
+        } else {
+            invocation_replay.finish_call(
+                replayed_effect,
+                ToolCallOutcome::ExecutionFailure,
+                Some("PROVIDER_CALLBACK_UNRESOLVED"),
+            );
+        }
+        assert_eq!(mutation_effect_count, 1);
+        assert_eq!(invocation_replay.entries[1].terminal_state, "FAILED");
+        assert_eq!(invocation_replay.unmatched_callback_count, 1);
+
+        let mut callback_tracking_full = ToolCallAudit::default();
+        callback_tracking_full
+            .observe_provider_tool_name_with_metadata(&update, Ok(Some(invocation.clone())));
+        callback_tracking_full
+            .callback_request_ids
+            .extend((0..TOOL_CALL_AUDIT_LIMIT).map(|index| format!("s:rpc-{index}")));
+        let overflow_call = callback_tracking_full.begin_call_with_context(
+            1,
+            "fs/write_text_file",
+            Some(&serde_json::json!("rpc-after-limit")),
+            Ok(Some(invocation.clone())),
+            Some(Tool::FsWriteTextFile),
+            0,
+            0,
+        );
+        assert_eq!(
+            callback_tracking_full.entries[0].provider_update_correlation,
+            "CALLBACK_TRACKING_LIMIT_EXCEEDED"
+        );
+        assert_eq!(
+            callback_tracking_full.callback_request_ids.len(),
+            TOOL_CALL_AUDIT_LIMIT
+        );
+        assert!(!mutation_correlation_permits_dispatch(
+            &callback_tracking_full,
+            overflow_call,
+            true
+        ));
+
+        let mut timed_out = ToolCallAudit::default();
+        timed_out.observe_provider_tool_name_with_metadata(&update, Ok(Some(invocation.clone())));
+        let pending = timed_out.begin_call_with_context(
+            1,
+            "fs/write_text_file",
+            Some(&callback_id),
+            Ok(Some(invocation.clone())),
+            Some(Tool::FsWriteTextFile),
+            0,
+            0,
+        );
+        assert!(mutation_correlation_permits_dispatch(
+            &timed_out, pending, true
+        ));
+        let mut successes = 0;
+        let mut failures = 0;
+        timed_out.finish_interrupted_call(
+            &mut successes,
+            &mut failures,
+            Some(&anyhow::anyhow!("ROLE_SUPERVISOR_TIMEOUT")),
+        );
+        timed_out.set_turn_completion(false, 1);
+        assert_eq!(timed_out.entries[0].terminal_state, "TIMED_OUT");
+        assert_eq!(successes, 0);
+        assert_eq!(failures, 1);
+
+        let mut exited = ToolCallAudit::default();
+        exited.observe_provider_tool_name_with_metadata(&update, Ok(Some(invocation.clone())));
+        let pending_at_exit = exited.begin_call_with_context(
+            1,
+            "fs/write_text_file",
+            Some(&callback_id),
+            Ok(Some(invocation.clone())),
+            Some(Tool::FsWriteTextFile),
+            0,
+            0,
+        );
+        assert!(mutation_correlation_permits_dispatch(
+            &exited,
+            pending_at_exit,
+            true
+        ));
+        exited.set_turn_completion(false, 1);
+        assert_eq!(exited.entries[0].terminal_state, "PROCESS_EXIT_UNRESOLVED");
+        assert_eq!(
+            exited.entries[0].outcome,
+            Some(ToolCallOutcome::ExecutionFailure)
+        );
+
+        let encoded = serde_json::to_string(&notification_audit)?;
+        assert!(!encoded.contains("private provider display text"));
+        Ok(())
     }
 
     #[tokio::test]
@@ -5767,7 +6827,7 @@ mod tests {
         assert!(!report.contains("synthetic-secret-title"));
         assert!(report.contains("unknown"));
         assert!(report.contains("omitted=2"));
-        assert!(report.len() < 16 * 1024);
+        assert!(report.len() < 128 * 1024);
 
         let mut overflow = ToolCallAudit::default();
         for _ in 0..=PROVIDER_TOOL_NAME_QUEUE_LIMIT {
@@ -5790,7 +6850,7 @@ mod tests {
         for status in ["in_progress", "completed", "in_progress", "completed"] {
             audit.observe_provider_tool_name(&serde_json::json!({
                 "sessionUpdate": "tool_call",
-                "toolCallId": "secret-call-id-123",
+                "toolCallId": "provider-call-123",
                 "title": "private-token-shaped-provider-title",
                 "kind": "read",
                 "status": status,
@@ -5838,7 +6898,7 @@ mod tests {
         );
         assert_eq!(
             metadata["tool_call_audit"]["entries"][0]["provider_update_correlation"],
-            "AMBIGUOUS"
+            "CALLBACK_WITHOUT_INVOCATION_ID"
         );
         assert_eq!(
             metadata["tool_call_audit"]["entries"][2]["error_code"],
@@ -5856,12 +6916,12 @@ mod tests {
         let encoded = metadata.to_string();
         let report = render_tool_call_audit(&metadata);
         assert!(!encoded.contains("private-token-shaped-provider-title"));
-        assert!(!encoded.contains("secret-call-id-123"));
+        assert!(encoded.contains("provider-call-123"));
         assert!(!encoded.contains("/private/provider/payload"));
         assert!(!report.contains("private-token-shaped-provider-title"));
-        assert!(!report.contains("secret-call-id-123"));
+        assert!(report.contains("provider-call-123"));
         assert!(!report.contains("/private/provider/payload"));
-        assert!(report.contains("AMBIGUOUS"));
+        assert!(report.contains("UNRESOLVED"));
         assert!(report.contains("non_empty_string"));
         assert!(report.contains("in_progress"));
         assert!(report.contains("completed"));
@@ -5899,7 +6959,7 @@ mod tests {
         );
         assert_eq!(
             human_title_audit.entries[0].provider_update_correlation,
-            "AMBIGUOUS"
+            "CALLBACK_WITHOUT_INVOCATION_ID"
         );
         assert_eq!(
             human_title_audit.entries[1].provider_tool_call_id_shape,
@@ -5910,7 +6970,7 @@ mod tests {
             "UNMATCHED"
         );
         let encoded = serde_json::to_string(&human_title_audit.entries).unwrap();
-        assert!(!encoded.contains("private-id-not-persisted"));
+        assert!(encoded.contains("private-id-not-persisted"));
 
         let mut no_update = ToolCallAudit::default();
         let call = no_update.begin_call(1, "fs/read_text_file", Some(Tool::FsReadTextFile), 0, 0);
@@ -5920,7 +6980,7 @@ mod tests {
         assert_eq!(no_update.entries[0].provider_name_mapping, "MATCH");
         assert_eq!(
             no_update.entries[0].provider_update_correlation,
-            "NOT_OBSERVED"
+            "CALLBACK_WITHOUT_INVOCATION_ID"
         );
         assert_eq!(
             no_update.entries[0].provider_update_status,
@@ -5944,7 +7004,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_provider_tool_call_ids_are_detected_without_persistence() {
+    fn duplicate_provider_tool_call_ids_are_detected_and_recorded_safely() {
         use crate::tool_surface::CanonicalToolName as Tool;
 
         let mut audit = ToolCallAudit::default();
@@ -5970,15 +7030,21 @@ mod tests {
         assert_eq!(audit.entries.len(), 4);
         assert_eq!(audit.entries[0].outcome, Some(ToolCallOutcome::Success));
         assert_eq!(audit.entries[1].outcome, Some(ToolCallOutcome::Success));
-        assert_eq!(audit.entries[0].provider_update_correlation, "AMBIGUOUS");
-        assert_eq!(audit.entries[1].provider_update_correlation, "AMBIGUOUS");
+        assert_eq!(
+            audit.entries[0].provider_update_correlation,
+            "CALLBACK_WITHOUT_INVOCATION_ID"
+        );
+        assert_eq!(
+            audit.entries[1].provider_update_correlation,
+            "CALLBACK_WITHOUT_INVOCATION_ID"
+        );
         assert_eq!(audit.entries[2].provider_tool_call_id_shape, Some("string"));
         assert_eq!(
             audit.entries[3].provider_tool_call_id_shape,
             Some("duplicate_string")
         );
         let encoded = serde_json::to_string(&audit.entries).unwrap();
-        assert!(!encoded.contains("private-duplicate-id"));
+        assert!(encoded.contains("private-duplicate-id"));
     }
 
     #[test]
@@ -6021,7 +7087,7 @@ mod tests {
         );
         assert_eq!(
             metadata["entries"][0]["provider_update_correlation"],
-            "AMBIGUOUS"
+            "CALLBACK_WITHOUT_INVOCATION_ID"
         );
         assert_eq!(metadata["entries"][0]["advertised_to_provider"], true);
         assert_eq!(metadata["entries"][0]["role_allowed"], true);
@@ -6032,7 +7098,7 @@ mod tests {
         );
         assert_eq!(
             metadata["entries"][1]["provider_update_correlation"],
-            "AMBIGUOUS"
+            "CALLBACK_WITHOUT_INVOCATION_ID"
         );
         assert_eq!(
             metadata["entries"][2]["error_code"],
@@ -6043,8 +7109,8 @@ mod tests {
             "PROVIDER_CALLBACK_UNRESOLVED"
         );
         let encoded = metadata.to_string();
-        assert!(!encoded.contains("provider-update-one"));
-        assert!(!encoded.contains("provider-update-two"));
+        assert!(encoded.contains("provider-update-one"));
+        assert!(encoded.contains("provider-update-two"));
         assert!(!encoded.contains("Edit a file"));
         assert!(!encoded.contains("Inspect a file"));
     }

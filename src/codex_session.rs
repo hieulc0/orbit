@@ -2,14 +2,14 @@
 //! only dynamic functions can request client-owned repository effects.
 use crate::{
     acp_process::Request,
-    acp_wire::Wire,
+    acp_wire::{OrbitToolInvocationMeta, Wire},
     codex_bridge::{ToolCall, ToolRouter, thread_start},
 };
 use agent_client_protocol as acp;
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::path::Path;
+use std::{path::Path, sync::Mutex as StdMutex};
 use tokio::sync::Mutex;
 
 /// Bounded protocol state for cleanup evidence. Every string is a fixed local
@@ -125,16 +125,54 @@ impl SessionDiagnostics {
     }
 }
 
-struct Client(Mutex<Wire>);
+struct Client {
+    wire: Mutex<Wire>,
+    active_invocation: StdMutex<Option<OrbitToolInvocationMeta>>,
+}
+
+struct InvocationScope<'a>(&'a Client);
+
+impl Drop for InvocationScope<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.0.active_invocation.lock() {
+            active.take();
+        }
+    }
+}
+
 impl Client {
+    fn begin_invocation(&self, invocation: OrbitToolInvocationMeta) -> Result<InvocationScope<'_>> {
+        let mut active = self
+            .active_invocation
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Codex invocation context unavailable"))?;
+        ensure!(active.is_none(), "Codex invocation context already active");
+        *active = Some(invocation);
+        Ok(InvocationScope(self))
+    }
+
     async fn call<T: serde::Serialize, R: serde::de::DeserializeOwned>(
         &self,
         method: &str,
         params: T,
     ) -> acp::Result<R> {
         let result = async {
-            let mut wire = self.0.lock().await;
-            let id = wire.request(method, serde_json::to_value(params)?).await?;
+            let invocation = self
+                .active_invocation
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Codex invocation context unavailable"))?
+                .clone();
+            let mut wire = self.wire.lock().await;
+            let id = if let Some(invocation) = invocation {
+                wire.request_with_tool_invocation(
+                    method,
+                    serde_json::to_value(params)?,
+                    &invocation,
+                )
+                .await?
+            } else {
+                wire.request(method, serde_json::to_value(params)?).await?
+            };
             let value = wire.read().await?;
             // A concurrent cancel/EOF interrupts the pending callback. The process
             // supervisor then removes Codex; the worker independently stops tools.
@@ -145,6 +183,14 @@ impl Client {
         result.map_err(|_| acp::Error::internal_error())
     }
 }
+
+fn invocation_for_codex_tool_call(call: &ToolCall) -> Result<OrbitToolInvocationMeta> {
+    ensure!(
+        crate::agent::valid_name(&call.call_id) && call.call_id.len() <= 256,
+        "invalid Codex provider tool call id"
+    );
+    OrbitToolInvocationMeta::new(&format!("oti-{}", crate::model::id()), &call.call_id)
+}
 #[async_trait::async_trait(?Send)]
 impl acp::Client for Client {
     async fn request_permission(
@@ -154,7 +200,7 @@ impl acp::Client for Client {
         Err(acp::Error::method_not_found())
     }
     async fn session_notification(&self, p: acp::SessionNotification) -> acp::Result<()> {
-        self.0
+        self.wire
             .lock()
             .await
             .notify(
@@ -482,13 +528,16 @@ pub async fn run(
     client: Wire,
     diagnostics: &mut SessionDiagnostics,
 ) -> Result<()> {
-    let client = Client(Mutex::new(client));
+    let client = Client {
+        wire: Mutex::new(client),
+        active_invocation: StdMutex::new(None),
+    };
     let mut initialized = false;
     let mut session: Option<(String, String, std::path::PathBuf)> = None;
     let mut prompted = false;
     let mut seen = std::collections::BTreeSet::new();
     loop {
-        let message = match client.0.lock().await.read().await {
+        let message = match client.wire.lock().await.read().await {
             Ok(message) => message,
             Err(error) => {
                 diagnostics.peer_read_error(&error);
@@ -622,7 +671,7 @@ pub async fn run(
             }
             _ => {
                 client
-                    .0
+                    .wire
                     .lock()
                     .await
                     .response(id, Err(anyhow::anyhow!("unsupported bridge operation")))
@@ -631,7 +680,7 @@ pub async fn run(
                 continue;
             }
         };
-        client.0.lock().await.response(id, Ok(result)).await?;
+        client.wire.lock().await.response(id, Ok(result)).await?;
         if diagnostics.outcome == "end_turn" {
             diagnostics.last_activity = "acp_end_turn_response_sent";
         }
@@ -670,7 +719,7 @@ async fn turn(
     let mut requests = std::collections::BTreeSet::new();
     loop {
         let incoming = {
-            let mut wire = client.0.lock().await;
+            let mut wire = client.wire.lock().await;
             tokio::select! {
                 result=server.read()=> (true, result),
                 result=wire.read()=> (false, result),
@@ -764,9 +813,22 @@ async fn turn(
             }
             let call: ToolCall = serde_json::from_value(params.clone())
                 .map_err(|_| anyhow::anyhow!("invalid Codex tool call"))?;
-            client.0.lock().await.notify("session/update",json!({"sessionId":session,"update":{
-                "sessionUpdate":"tool_call","toolCallId":call.call_id,"title":call.tool,"kind":"other","status":"in_progress"}})).await?;
-            let result = router.as_mut().unwrap().dispatch(client, call).await;
+            let router = router.as_mut().unwrap();
+            router.validate_call_identity(&call)?;
+            let invocation = invocation_for_codex_tool_call(&call)?;
+            client
+                .wire
+                .lock()
+                .await
+                .notify_with_tool_invocation(
+                    "session/update",
+                    json!({"sessionId":session,"update":{
+                        "sessionUpdate":"tool_call","toolCallId":call.call_id.clone(),"title":call.tool.clone(),"kind":"other","status":"in_progress"}}),
+                    &invocation,
+                )
+                .await?;
+            let _invocation_scope = client.begin_invocation(invocation)?;
+            let result = router.dispatch(client, call).await;
             let failed = result.is_err();
             server.response(id.clone(), result).await?;
             if failed {
@@ -830,7 +892,7 @@ async fn turn(
                     let delta = params["delta"]
                         .as_str()
                         .context("invalid Codex text delta")?;
-                    client.0.lock().await.notify("session/update",json!({"sessionId":session,
+                    client.wire.lock().await.notify("session/update",json!({"sessionId":session,
                         "update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":delta}}})).await?;
                 }
                 "error" => {
@@ -846,8 +908,11 @@ async fn turn(
 
 #[cfg(test)]
 mod tests {
-    use super::SessionDiagnostics;
+    use super::{Client, SessionDiagnostics, invocation_for_codex_tool_call};
+    use crate::{acp_wire::Wire, codex_bridge::ToolCall};
     use serde_json::json;
+    use std::sync::Mutex as StdMutex;
+    use tokio::sync::Mutex;
 
     #[test]
     fn lifecycle_evidence_uses_fixed_categories_and_preserves_turn_result() -> anyhow::Result<()> {
@@ -861,6 +926,43 @@ mod tests {
         assert!(!serialized.contains("prompt-secret"));
         assert!(!serialized.contains("\"method\""));
         assert!(serialized.len() <= 1024);
+        Ok(())
+    }
+
+    #[test]
+    fn codex_native_call_id_is_preserved_in_orbit_invocation_context() -> anyhow::Result<()> {
+        let call = ToolCall {
+            thread_id: "thread-1".into(),
+            turn_id: "turn-1".into(),
+            call_id: "provider-call-42".into(),
+            namespace: None,
+            tool: "orbit_read_file".into(),
+            arguments: json!({"path":"README.md"}),
+        };
+        let invocation = invocation_for_codex_tool_call(&call)?;
+        assert!(invocation.invocation_id.starts_with("oti-"));
+        assert_eq!(invocation.provider_tool_call_id, "provider-call-42");
+        Ok(())
+    }
+
+    #[test]
+    fn callback_invocation_scope_clears_on_drop() -> anyhow::Result<()> {
+        let (_peer, writer) = tokio::io::duplex(4096);
+        let client = Client {
+            wire: Mutex::new(Wire::new(tokio::io::empty(), writer, 4096)),
+            active_invocation: StdMutex::new(None),
+        };
+        let invocation = crate::acp_wire::OrbitToolInvocationMeta::new(
+            "oti-cancel-test",
+            "provider-call-cancel",
+        )?;
+        let scope = client.begin_invocation(invocation.clone())?;
+        assert_eq!(
+            client.active_invocation.lock().unwrap().as_ref(),
+            Some(&invocation)
+        );
+        drop(scope);
+        assert!(client.active_invocation.lock().unwrap().is_none());
         Ok(())
     }
 }

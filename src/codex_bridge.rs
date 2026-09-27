@@ -221,16 +221,7 @@ impl ToolRouter {
         client: &impl OrbitAcpClient,
         call: ToolCall,
     ) -> Result<Value> {
-        ensure!(
-            call.thread_id == self.thread && call.turn_id == self.turn && call.namespace.is_none(),
-            "foreign bridge tool call"
-        );
-        ensure!(
-            crate::agent::valid_name(&call.call_id)
-                && self.seen.len() < self.max_calls
-                && !self.seen.contains(&call.call_id),
-            "duplicate or exhausted bridge call"
-        );
+        self.validate_call_identity(&call)?;
         let tool = call
             .tool
             .strip_prefix("orbit_")
@@ -405,6 +396,24 @@ impl ToolRouter {
             _ => anyhow::bail!("unsupported bridge tool"),
         };
         Ok(json!({"contentItems":[{"type":"inputText","text":text}],"success":true}))
+    }
+
+    /// Validate identity before the caller publishes its session/update. This
+    /// prevents a duplicate or foreign provider call from emitting a correlation
+    /// event that cannot later be dispatched.
+    pub fn validate_call_identity(&self, call: &ToolCall) -> Result<()> {
+        ensure!(
+            call.thread_id == self.thread && call.turn_id == self.turn && call.namespace.is_none(),
+            "foreign bridge tool call"
+        );
+        ensure!(
+            crate::agent::valid_name(&call.call_id)
+                && call.call_id.len() <= 256
+                && self.seen.len() < self.max_calls
+                && !self.seen.contains(&call.call_id),
+            "duplicate or exhausted bridge call"
+        );
+        Ok(())
     }
 
     async fn shell(&self, client: &impl acp::Client, command: &str) -> Result<String> {

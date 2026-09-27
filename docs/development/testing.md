@@ -87,6 +87,11 @@ Antigravity account. Both commands can make real provider calls and consume
 quota; `--nocapture` prints only the sanitized selection summary, not provider
 output or credential data.
 
+The live Codex fixture requires exact one-to-one correlation between each
+Orbit tool invocation, provider `tool_call` update and callback. Its audit prints
+only bounded, allowlisted correlation IDs and rejects unresolved or unsupported
+events; an event that cannot be correlated is not treated as a successful call.
+
 Verification policy ID/version pairs are immutable. Workflow runs pin the
 definition digest at creation and fail if that exact version is missing or its
 content changes. Every selected required check needs a declared command or a
