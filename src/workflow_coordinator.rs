@@ -33,7 +33,7 @@ use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::process::Stdio;
 use std::time::Duration;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet, VecDeque},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
@@ -2177,6 +2177,7 @@ pub struct AcpTurnState<'a> {
     pub tool_successes: u64,
     pub tool_failures: u64,
     pub tool_counts: BTreeMap<String, u64>,
+    tool_call_audit: ToolCallAudit,
     pub terminals: BTreeMap<String, std::sync::Arc<crate::tool_surface::AgentTerminal>>,
     pub wf_attempt_id: Option<String>,
     pub role_exec_id: Option<String>,
@@ -2196,12 +2197,873 @@ impl<'a> AcpTurnState<'a> {
             tool_successes: 0,
             tool_failures: 0,
             tool_counts: BTreeMap::new(),
+            tool_call_audit: ToolCallAudit::default(),
             terminals: BTreeMap::new(),
             wf_attempt_id: None,
             role_exec_id: None,
             pool: None,
         }
     }
+}
+
+const TOOL_CALL_AUDIT_LIMIT: usize = 64;
+const PROVIDER_TOOL_NAME_QUEUE_LIMIT: usize = 64;
+const TOOL_PATH_INPUT_LIMIT: usize = 4096;
+const TOOL_PATH_DISPLAY_LIMIT: usize = 192;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum PathAuditState {
+    WorkspaceRelative,
+    OutsideWorkspaceRedacted,
+    UnnormalizedGitPathFilter,
+    InvalidPath,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct PathArgumentAudit {
+    argument: &'static str,
+    state: PathAuditState,
+    workspace_relative_path: Option<String>,
+    exists: Option<bool>,
+    display_truncated: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum ToolCallOutcome {
+    Success,
+    ExpectedDenial,
+    InvalidRequest,
+    ExecutionFailure,
+    Timeout,
+    Cancelled,
+    Unsupported,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct ToolCallAuditEntry {
+    sequence: u64,
+    provider_tool_name: &'static str,
+    provider_name_mapping: &'static str,
+    canonical_tool_name: &'static str,
+    advertised_to_provider: Option<bool>,
+    role_allowed: Option<bool>,
+    outcome: Option<ToolCallOutcome>,
+    error_code: Option<&'static str>,
+    mutating: Option<bool>,
+    mutation_applied: Option<bool>,
+    later_callback_observed: bool,
+    turn_completed: Option<bool>,
+    path_arguments: Vec<PathArgumentAudit>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ProviderToolNameObservation {
+    provider_tool_name: &'static str,
+    request_tool_name: &'static str,
+    canonical_tool_name: crate::tool_surface::CanonicalToolName,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ActiveToolCall {
+    sequence: u64,
+    successes_before: u64,
+    failures_before: u64,
+    operation_error_code: Option<&'static str>,
+}
+
+#[derive(Debug, Default)]
+struct ToolCallAudit {
+    entries: Vec<ToolCallAuditEntry>,
+    omitted_count: u64,
+    unmatched_provider_call_count: u64,
+    mutating_count: u64,
+    mutating_unknown_count: u64,
+    denied_count: u64,
+    role_id: Option<String>,
+    advertised_tools: Option<BTreeSet<String>>,
+    provider_tool_names: VecDeque<Option<ProviderToolNameObservation>>,
+    provider_tool_names_omitted: u64,
+    pending_overflow_names: u64,
+    active_call: Option<ActiveToolCall>,
+}
+
+impl ToolCallAudit {
+    fn with_context(role_id: Option<&str>, advertised_tools: Option<&[String]>) -> Self {
+        let mut audit = Self::default();
+        audit.set_context(role_id, advertised_tools);
+        audit
+    }
+
+    fn set_context(&mut self, role_id: Option<&str>, advertised_tools: Option<&[String]>) {
+        self.role_id = role_id.map(str::to_owned);
+        self.advertised_tools = advertised_tools.map(|tools| tools.iter().cloned().collect());
+    }
+
+    fn set_role_id(&mut self, role_id: Option<&str>) {
+        self.role_id = role_id.map(str::to_owned);
+    }
+
+    fn observe_provider_tool_name(&mut self, update: &serde_json::Value) {
+        if update
+            .get("sessionUpdate")
+            .and_then(serde_json::Value::as_str)
+            != Some("tool_call")
+        {
+            return;
+        }
+
+        if self.provider_tool_names.len() >= PROVIDER_TOOL_NAME_QUEUE_LIMIT
+            || self.pending_overflow_names > 0
+        {
+            self.provider_tool_names_omitted = self.provider_tool_names_omitted.saturating_add(1);
+            self.pending_overflow_names = self.pending_overflow_names.saturating_add(1);
+            return;
+        }
+
+        let observation = update
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .and_then(codex_provider_tool_name);
+        self.provider_tool_names.push_back(observation);
+    }
+
+    fn begin_call(
+        &mut self,
+        sequence: u64,
+        canonical_tool: Option<crate::tool_surface::CanonicalToolName>,
+        successes_before: u64,
+        failures_before: u64,
+    ) -> u64 {
+        for entry in &mut self.entries {
+            entry.later_callback_observed = true;
+        }
+
+        let observed_event = self.provider_tool_names.pop_front();
+        if observed_event.is_none() && self.pending_overflow_names > 0 {
+            self.pending_overflow_names -= 1;
+        }
+        let observation = observed_event.flatten();
+        let canonical_name = canonical_tool
+            .map(|tool| tool.as_str())
+            .unwrap_or("unknown");
+        let (provider_name, provider_name_mapping) = match observation {
+            Some(observation) => {
+                let mapping = match canonical_tool {
+                    Some(tool) if tool == observation.canonical_tool_name => "MATCH",
+                    Some(_) => "MISMATCH",
+                    None => "MISMATCH",
+                };
+                (observation.provider_tool_name, mapping)
+            }
+            None => ("unknown", "UNKNOWN"),
+        };
+        let metadata = canonical_tool.map(crate::tool_surface::ToolMetadata::for_tool);
+        let advertised_to_provider = observation.and_then(|observation| {
+            self.advertised_tools
+                .as_ref()
+                .map(|tools| tools.contains(observation.request_tool_name))
+        });
+        let role_allowed = metadata.as_ref().and_then(|metadata| {
+            self.role_id
+                .as_deref()
+                .map(|role_id| metadata.is_role_allowed(role_id))
+        });
+        let mutating = metadata.as_ref().map(|metadata| metadata.mutating);
+        self.record_mutating(mutating);
+
+        self.active_call = Some(ActiveToolCall {
+            sequence,
+            successes_before,
+            failures_before,
+            operation_error_code: None,
+        });
+
+        if self.entries.len() >= TOOL_CALL_AUDIT_LIMIT {
+            self.omitted_count = self.omitted_count.saturating_add(1);
+            return sequence;
+        }
+
+        self.entries.push(ToolCallAuditEntry {
+            sequence,
+            provider_tool_name: provider_name,
+            provider_name_mapping,
+            canonical_tool_name: canonical_name,
+            advertised_to_provider,
+            role_allowed,
+            outcome: None,
+            error_code: None,
+            mutating,
+            mutation_applied: None,
+            later_callback_observed: false,
+            turn_completed: None,
+            path_arguments: Vec::new(),
+        });
+        sequence
+    }
+
+    fn record_path_arguments(
+        &mut self,
+        sequence: u64,
+        tool: crate::tool_surface::CanonicalToolName,
+        params: &serde_json::Value,
+        repo_path: &Path,
+    ) {
+        let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.sequence == sequence)
+        else {
+            return;
+        };
+        entry.path_arguments = path_arguments_for_tool(tool, params, repo_path);
+    }
+
+    fn record_operation_error(&mut self, sequence: u64, error: &anyhow::Error) {
+        if let Some(active) = self
+            .active_call
+            .as_mut()
+            .filter(|active| active.sequence == sequence)
+        {
+            active.operation_error_code = Some(normalized_tool_error_code(error));
+        }
+    }
+
+    fn record_mutating(&mut self, mutating: Option<bool>) {
+        if mutating == Some(true) {
+            self.mutating_count = self.mutating_count.saturating_add(1);
+        } else if mutating.is_none() {
+            self.mutating_unknown_count = self.mutating_unknown_count.saturating_add(1);
+        }
+    }
+
+    fn finish_call(
+        &mut self,
+        sequence: u64,
+        outcome: ToolCallOutcome,
+        error_code: Option<&'static str>,
+    ) {
+        let active = self
+            .active_call
+            .filter(|active| active.sequence == sequence);
+        let error_code = error_code.or(active.and_then(|active| active.operation_error_code));
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.sequence == sequence)
+        {
+            entry.outcome = Some(outcome);
+            entry.error_code = error_code;
+            entry.mutation_applied = match (outcome, entry.mutating) {
+                (ToolCallOutcome::Success, Some(false)) => Some(false),
+                (ToolCallOutcome::Success, Some(true)) => None,
+                (ToolCallOutcome::ExpectedDenial | ToolCallOutcome::InvalidRequest, Some(_)) => {
+                    Some(false)
+                }
+                (_, Some(false)) => Some(false),
+                (_, Some(true) | None) => None,
+            };
+        }
+        if active.is_some_and(|_| outcome == ToolCallOutcome::ExpectedDenial) {
+            self.denied_count = self.denied_count.saturating_add(1);
+        }
+        if active.is_some() {
+            self.active_call = None;
+        }
+    }
+
+    fn settle_counters(
+        &self,
+        sequence: u64,
+        successes: &mut u64,
+        failures: &mut u64,
+        succeeded: bool,
+    ) {
+        let Some(active) = self
+            .active_call
+            .as_ref()
+            .filter(|active| active.sequence == sequence)
+        else {
+            return;
+        };
+        *successes = active.successes_before;
+        *failures = active.failures_before;
+        if succeeded {
+            *successes = successes.saturating_add(1);
+        } else {
+            *failures = failures.saturating_add(1);
+        }
+    }
+
+    fn finish_interrupted_call(
+        &mut self,
+        successes: &mut u64,
+        failures: &mut u64,
+        failure: Option<&anyhow::Error>,
+    ) {
+        let Some(active) = self.active_call else {
+            return;
+        };
+
+        *successes = active.successes_before;
+        *failures = active.failures_before.saturating_add(1);
+        let (outcome, code) = match failure.map(anyhow::Error::to_string).as_deref() {
+            Some("ROLE_EXECUTION_CANCELLED") => {
+                (ToolCallOutcome::Cancelled, "ROLE_EXECUTION_CANCELLED")
+            }
+            Some("ROLE_SUPERVISOR_TIMEOUT") => {
+                (ToolCallOutcome::Timeout, "ROLE_SUPERVISOR_TIMEOUT")
+            }
+            _ => (ToolCallOutcome::ExecutionFailure, "TOOL_EXECUTION_FAILED"),
+        };
+        self.finish_call(active.sequence, outcome, Some(code));
+    }
+
+    fn set_turn_completion(&mut self, completed: bool, callback_count: u64) {
+        for entry in &mut self.entries {
+            if entry.outcome.is_none() {
+                entry.outcome = Some(ToolCallOutcome::ExecutionFailure);
+                entry.error_code = Some("TOOL_EXECUTION_FAILED");
+            }
+            entry.turn_completed = Some(completed);
+        }
+
+        self.unmatched_provider_call_count =
+            self.provider_tool_names.len() as u64 + self.pending_overflow_names;
+        let capacity = TOOL_CALL_AUDIT_LIMIT.saturating_sub(self.entries.len());
+        let mut next_sequence = callback_count.saturating_add(1);
+        let queued = self.provider_tool_names.drain(..).collect::<Vec<_>>();
+        for observation in &queued {
+            self.record_mutating(observation.map(|name| {
+                crate::tool_surface::ToolMetadata::for_tool(name.canonical_tool_name).mutating
+            }));
+        }
+        self.mutating_unknown_count = self
+            .mutating_unknown_count
+            .saturating_add(self.pending_overflow_names);
+        for observation in queued.iter().copied().take(capacity) {
+            self.push_unmatched_provider_call(next_sequence, observation, completed);
+            next_sequence = next_sequence.saturating_add(1);
+        }
+        let recorded_queued = queued.len().min(capacity);
+        let recorded_overflow = self
+            .pending_overflow_names
+            .min(capacity.saturating_sub(recorded_queued) as u64);
+        for _ in 0..recorded_overflow {
+            self.push_unmatched_provider_call(next_sequence, None, completed);
+            next_sequence = next_sequence.saturating_add(1);
+        }
+        self.omitted_count = self.omitted_count.saturating_add(
+            self.unmatched_provider_call_count
+                .saturating_sub(recorded_queued as u64 + recorded_overflow),
+        );
+        self.pending_overflow_names = 0;
+    }
+
+    fn push_unmatched_provider_call(
+        &mut self,
+        sequence: u64,
+        observation: Option<ProviderToolNameObservation>,
+        completed: bool,
+    ) {
+        let tool = observation.map(|name| name.canonical_tool_name);
+        let metadata = tool.map(crate::tool_surface::ToolMetadata::for_tool);
+        let mutating = metadata.as_ref().map(|metadata| metadata.mutating);
+        let advertised_to_provider = observation.and_then(|name| {
+            self.advertised_tools
+                .as_ref()
+                .map(|tools| tools.contains(name.request_tool_name))
+        });
+        let role_allowed = metadata.as_ref().and_then(|metadata| {
+            self.role_id
+                .as_deref()
+                .map(|role_id| metadata.is_role_allowed(role_id))
+        });
+        self.entries.push(ToolCallAuditEntry {
+            sequence,
+            provider_tool_name: observation.map_or("unknown", |name| name.provider_tool_name),
+            provider_name_mapping: "UNMATCHED",
+            canonical_tool_name: tool.map_or("unknown", |tool| tool.as_str()),
+            advertised_to_provider,
+            role_allowed,
+            outcome: Some(ToolCallOutcome::ExecutionFailure),
+            error_code: Some("PROVIDER_CALLBACK_UNRESOLVED"),
+            mutating,
+            mutation_applied: None,
+            later_callback_observed: false,
+            turn_completed: Some(completed),
+            path_arguments: Vec::new(),
+        });
+    }
+
+    fn metadata(
+        &self,
+        call_count: u64,
+        success_count: u64,
+        failure_count: u64,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "summary": {
+                "total": call_count + self.unmatched_provider_call_count,
+                "successful": success_count,
+                "unsuccessful": failure_count + self.unmatched_provider_call_count,
+                "mutating": self.mutating_count,
+                "mutating_unknown": self.mutating_unknown_count,
+                "denied": self.denied_count,
+                "unmatched_provider_calls": self.unmatched_provider_call_count,
+            },
+            "entries": self.entries,
+            "omitted_count": self.omitted_count,
+            "provider_tool_names_omitted": self.provider_tool_names_omitted,
+        })
+    }
+}
+
+fn codex_provider_tool_name(name: &str) -> Option<ProviderToolNameObservation> {
+    let tool = crate::tool_surface::CanonicalToolName::from_wire(name)?;
+    let provider_tool_name = match tool {
+        crate::tool_surface::CanonicalToolName::FsReadTextFile => "orbit_read_file",
+        crate::tool_surface::CanonicalToolName::FsWriteTextFile => "orbit_write_file",
+        crate::tool_surface::CanonicalToolName::FsEditFile => "orbit_edit_file",
+        crate::tool_surface::CanonicalToolName::FsListDirectory => "orbit_list_directory",
+        crate::tool_surface::CanonicalToolName::FsFindPath => "orbit_find_path",
+        crate::tool_surface::CanonicalToolName::FsCreateDirectory => "orbit_create_directory",
+        crate::tool_surface::CanonicalToolName::FsMove => "orbit_move",
+        crate::tool_surface::CanonicalToolName::FsCopy => "orbit_copy",
+        crate::tool_surface::CanonicalToolName::FsDeleteFile => "orbit_delete_file",
+        crate::tool_surface::CanonicalToolName::FsDeleteDirectory => "orbit_delete_directory",
+        crate::tool_surface::CanonicalToolName::SearchGrep => "orbit_grep",
+        crate::tool_surface::CanonicalToolName::TerminalCreate => "orbit_shell",
+        crate::tool_surface::CanonicalToolName::TerminalOutput
+        | crate::tool_surface::CanonicalToolName::TerminalWaitForExit
+        | crate::tool_surface::CanonicalToolName::TerminalKill
+        | crate::tool_surface::CanonicalToolName::TerminalRelease => return None,
+        crate::tool_surface::CanonicalToolName::GitStatus => "orbit_git_status",
+        crate::tool_surface::CanonicalToolName::GitDiff => "orbit_git_diff",
+        crate::tool_surface::CanonicalToolName::GitShow => "orbit_git_show",
+    };
+    if name != provider_tool_name {
+        return None;
+    }
+    Some(ProviderToolNameObservation {
+        provider_tool_name,
+        request_tool_name: tool.legacy_name(),
+        canonical_tool_name: tool,
+    })
+}
+
+fn known_tool_error_code(message: &str) -> Option<&'static str> {
+    [
+        crate::tool_surface::ERR_PATH_NOT_FOUND,
+        crate::tool_surface::ERR_PATH_OUTSIDE_WORKSPACE,
+        crate::tool_surface::ERR_DESTINATION_EXISTS,
+        crate::tool_surface::ERR_READ_ONLY_ROLE,
+        crate::tool_surface::ERR_MUTATION_LOCK_REQUIRED,
+        crate::tool_surface::ERR_OUTPUT_TRUNCATED,
+        crate::tool_surface::ERR_COMMAND_TIMEOUT,
+        crate::tool_surface::ERR_PROCESS_NOT_FOUND,
+        crate::tool_surface::ERR_UNSUPPORTED_TOOL,
+        crate::tool_surface::ERR_ROLE_NOT_ALLOWED,
+        crate::tool_surface::ERR_WORKSPACE_IDENTITY_REQUIRED,
+        crate::tool_surface::ERR_TOOL_CALL_LIMIT,
+        crate::tool_surface::ERR_OUTPUT_LIMIT,
+        crate::tool_surface::ERR_NO_MATCH,
+        crate::tool_surface::ERR_MULTIPLE_MATCHES,
+        "CLI_WORKFLOW_TERMINAL_DISABLED",
+        "INVALID_REQUEST",
+        "TOOL_EXECUTION_FAILED",
+        "TOOL_RESPONSE_FAILED",
+        "ROLE_EXECUTION_CANCELLED",
+        "ROLE_SUPERVISOR_TIMEOUT",
+        "PROVIDER_CALLBACK_UNRESOLVED",
+        "TOOL_AUTHORIZATION_DENIED",
+    ]
+    .into_iter()
+    .find(|code| message.contains(code))
+}
+
+fn normalized_tool_error_code(error: &anyhow::Error) -> &'static str {
+    for cause in error.chain() {
+        let message = cause.to_string();
+        if let Some(code) = known_tool_error_code(&message) {
+            return code;
+        }
+        if cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            || message.contains("No such file or directory")
+            || message.contains("os error 2")
+        {
+            return crate::tool_surface::ERR_PATH_NOT_FOUND;
+        }
+        if message.contains("outside workspace")
+            || message.contains("path traversal rejected")
+            || message.contains("absolute path rejected")
+        {
+            return crate::tool_surface::ERR_PATH_OUTSIDE_WORKSPACE;
+        }
+    }
+    "TOOL_EXECUTION_FAILED"
+}
+
+fn tool_request_has_valid_required_args(
+    tool: crate::tool_surface::CanonicalToolName,
+    params: &serde_json::Value,
+) -> bool {
+    use crate::tool_surface::CanonicalToolName as Tool;
+    let required: &[(&str, bool)] = match tool {
+        Tool::FsReadTextFile
+        | Tool::FsCreateDirectory
+        | Tool::FsDeleteFile
+        | Tool::FsDeleteDirectory => &[("path", true)],
+        Tool::FsWriteTextFile => &[("path", true), ("content", false)],
+        Tool::FsEditFile => &[("path", true), ("old_text", true), ("new_text", false)],
+        Tool::FsMove | Tool::FsCopy => &[("source", true), ("destination", true)],
+        Tool::SearchGrep => &[("query", true)],
+        Tool::FsFindPath => &[("pattern", false)],
+        _ => return true,
+    };
+    required.iter().all(|(field, nonempty)| {
+        params
+            .get(*field)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !*nonempty || !value.is_empty())
+    })
+}
+
+fn path_arguments_for_tool(
+    tool: crate::tool_surface::CanonicalToolName,
+    params: &serde_json::Value,
+    repo_path: &Path,
+) -> Vec<PathArgumentAudit> {
+    use crate::tool_surface::CanonicalToolName as Tool;
+
+    let fields: &[(&str, bool)] = match tool {
+        Tool::FsReadTextFile
+        | Tool::FsWriteTextFile
+        | Tool::FsEditFile
+        | Tool::FsCreateDirectory
+        | Tool::FsDeleteFile
+        | Tool::FsDeleteDirectory => &[("path", true)],
+        Tool::FsListDirectory
+        | Tool::FsFindPath
+        | Tool::SearchGrep
+        | Tool::GitStatus
+        | Tool::GitDiff
+        | Tool::GitShow => &[("path", false)],
+        Tool::FsMove | Tool::FsCopy => &[("source", true), ("destination", true)],
+        _ => &[],
+    };
+
+    fields
+        .iter()
+        .filter_map(|(argument, required)| {
+            let value = params.get(*argument);
+            if value.is_none() && !required {
+                return None;
+            }
+            if matches!(tool, Tool::GitStatus | Tool::GitDiff) {
+                return Some(match value.and_then(serde_json::Value::as_str) {
+                    Some(_) => PathArgumentAudit {
+                        argument,
+                        state: PathAuditState::UnnormalizedGitPathFilter,
+                        workspace_relative_path: None,
+                        exists: None,
+                        display_truncated: false,
+                    },
+                    None => invalid_path_argument(argument),
+                });
+            }
+            Some(match value.and_then(serde_json::Value::as_str) {
+                Some(value) => classify_path_argument(argument, value, repo_path),
+                None => invalid_path_argument(argument),
+            })
+        })
+        .collect()
+}
+
+fn invalid_path_argument(argument: &'static str) -> PathArgumentAudit {
+    PathArgumentAudit {
+        argument,
+        state: PathAuditState::InvalidPath,
+        workspace_relative_path: None,
+        exists: None,
+        display_truncated: false,
+    }
+}
+
+fn outside_workspace_path_argument(argument: &'static str) -> PathArgumentAudit {
+    PathArgumentAudit {
+        argument,
+        state: PathAuditState::OutsideWorkspaceRedacted,
+        workspace_relative_path: None,
+        exists: None,
+        display_truncated: false,
+    }
+}
+
+fn classify_path_argument(
+    argument: &'static str,
+    requested: &str,
+    repo_path: &Path,
+) -> PathArgumentAudit {
+    if requested.is_empty() || requested.len() > TOOL_PATH_INPUT_LIMIT || requested.contains('\0') {
+        return invalid_path_argument(argument);
+    }
+
+    let Ok(canonical_root) = repo_path.canonicalize() else {
+        return invalid_path_argument(argument);
+    };
+    let requested_path = Path::new(requested);
+    let windows_absolute = requested.as_bytes().get(1) == Some(&b':')
+        && requested
+            .as_bytes()
+            .get(2)
+            .is_some_and(|separator| matches!(separator, b'/' | b'\\'));
+    if (requested_path.is_absolute() || windows_absolute)
+        && !requested.starts_with("/orbit/home/")
+        && requested != "/orbit/home"
+        && requested_path.strip_prefix(&canonical_root).is_err()
+        && requested_path.strip_prefix(repo_path).is_err()
+    {
+        return outside_workspace_path_argument(argument);
+    }
+
+    let confined_path = match crate::fs_tools::confine_path(repo_path, requested, false, true) {
+        Ok(path) => path,
+        Err(error) if path_error_indicates_workspace_escape(&error) => {
+            return outside_workspace_path_argument(argument);
+        }
+        Err(_) => return invalid_path_argument(argument),
+    };
+    let Ok(relative_path) = confined_path.strip_prefix(&canonical_root) else {
+        return invalid_path_argument(argument);
+    };
+    let Some(relative_text) = safe_relative_path_display(relative_path) else {
+        return invalid_path_argument(argument);
+    };
+    let exists = match confined_path.symlink_metadata() {
+        Ok(_) => Some(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
+    };
+    let (relative_text, display_truncated) = bounded_path_display(relative_text);
+
+    PathArgumentAudit {
+        argument,
+        state: PathAuditState::WorkspaceRelative,
+        workspace_relative_path: Some(relative_text),
+        exists,
+        display_truncated,
+    }
+}
+
+fn path_error_indicates_workspace_escape(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string();
+        message.contains("escapes workspace") || message.contains("outside workspace")
+    })
+}
+
+fn safe_relative_path_display(path: &Path) -> Option<String> {
+    let mut encoded = String::new();
+    for component in path.components() {
+        let std::path::Component::Normal(component) = component else {
+            if matches!(component, std::path::Component::CurDir) {
+                continue;
+            }
+            return None;
+        };
+        if !encoded.is_empty() {
+            encoded.push('/');
+        }
+        for byte in component.to_string_lossy().as_bytes() {
+            if byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'_' | b'-') {
+                encoded.push(*byte as char);
+            } else {
+                use std::fmt::Write as _;
+                let _ = write!(encoded, "%{byte:02X}");
+            }
+        }
+    }
+    if encoded.is_empty() {
+        Some(".".into())
+    } else {
+        Some(encoded)
+    }
+}
+
+fn bounded_path_display(mut path: String) -> (String, bool) {
+    if path.len() <= TOOL_PATH_DISPLAY_LIMIT {
+        return (path, false);
+    }
+    path.truncate(TOOL_PATH_DISPLAY_LIMIT - 3);
+    path.push_str("...");
+    (path, true)
+}
+
+fn audit_bool(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "unknown",
+    }
+}
+
+fn audit_outcome(value: &serde_json::Value) -> (&'static str, &'static str) {
+    match value.as_str() {
+        Some("SUCCESS") => ("SUCCESS", "Tool call completed."),
+        Some("EXPECTED_DENIAL") => ("EXPECTED_DENIAL", "Request denied by policy."),
+        Some("INVALID_REQUEST") => ("INVALID_REQUEST", "Tool request was invalid."),
+        Some("TIMEOUT") => ("TIMEOUT", "Tool execution timed out."),
+        Some("CANCELLED") => ("CANCELLED", "Tool call was cancelled."),
+        Some("UNSUPPORTED") => ("UNSUPPORTED", "Provider tool request is unsupported."),
+        Some("EXECUTION_FAILURE") => ("EXECUTION_FAILURE", "Tool execution failed."),
+        _ => ("PENDING", "Diagnostic unavailable."),
+    }
+}
+
+fn render_path_arguments(value: &serde_json::Value) -> String {
+    let Some(arguments) = value.as_array() else {
+        return "-".into();
+    };
+    arguments
+        .iter()
+        .take(2)
+        .filter_map(|argument| {
+            let name = match argument.get("argument").and_then(serde_json::Value::as_str) {
+                Some("path") => "path",
+                Some("source") => "source",
+                Some("destination") => "destination",
+                _ => return None,
+            };
+            let rendered = match argument.get("state").and_then(serde_json::Value::as_str) {
+                Some("WORKSPACE_RELATIVE") => {
+                    let Some(path) = argument
+                        .get("workspace_relative_path")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|path| safe_audit_relative_path(path))
+                    else {
+                        return Some(format!("{name}=INVALID_PATH"));
+                    };
+                    let exists =
+                        audit_bool(argument.get("exists").and_then(serde_json::Value::as_bool));
+                    format!("{name}=WORKSPACE_RELATIVE({path}; exists={exists})")
+                }
+                Some("OUTSIDE_WORKSPACE_REDACTED") => {
+                    format!("{name}=OUTSIDE_WORKSPACE_REDACTED")
+                }
+                Some("UNNORMALIZED_GIT_PATH_FILTER") => {
+                    format!("{name}=UNNORMALIZED_GIT_PATH_FILTER")
+                }
+                _ => format!("{name}=INVALID_PATH"),
+            };
+            Some(rendered)
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn safe_audit_relative_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= TOOL_PATH_DISPLAY_LIMIT
+        && !path.starts_with('/')
+        && path.is_ascii()
+        && path.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/' | b'%')
+        })
+        && path.split('/').all(|component| component != "..")
+}
+
+/// Renders only bounded, allowlisted audit fields; provider payloads are never shown.
+pub fn render_tool_call_audit(metadata: &serde_json::Value) -> String {
+    let Some(audit) = metadata.get("tool_call_audit") else {
+        return "Tool-call audit unavailable.".into();
+    };
+    let summary = audit.get("summary");
+    let count = |name| {
+        summary
+            .and_then(|summary| summary.get(name))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
+    let entries = audit
+        .get("entries")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let omitted = audit
+        .get("omitted_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let provider_titles_omitted = audit
+        .get("provider_tool_names_omitted")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let mut report = format!(
+        "Tool-call audit: total={}, successful={}, unsuccessful={}, mutating={}, denied={}, unmatched={}, omitted={omitted}, provider titles omitted={provider_titles_omitted}\n",
+        count("total"),
+        count("successful"),
+        count("unsuccessful"),
+        count("mutating"),
+        count("denied"),
+        count("unmatched_provider_calls")
+    );
+    report.push_str("seq | provider title from session/update | mapping | canonical | advertised | role allowed | outcome | error code | mutation applied | later callback observed | turn complete | paths | detail\n");
+
+    for entry in entries.iter().take(TOOL_CALL_AUDIT_LIMIT) {
+        let string = |name| {
+            entry
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+        };
+        let provider = codex_provider_tool_name(string("provider_tool_name"))
+            .map_or("unknown", |name| name.provider_tool_name);
+        let canonical =
+            crate::tool_surface::CanonicalToolName::from_canonical(string("canonical_tool_name"))
+                .map_or("unknown", |tool| tool.as_str());
+        let mapping = match string("provider_name_mapping") {
+            "MATCH" => "MATCH",
+            "MISMATCH" => "MISMATCH",
+            "UNMATCHED" => "UNMATCHED",
+            _ => "UNKNOWN",
+        };
+        let (outcome, detail) =
+            audit_outcome(entry.get("outcome").unwrap_or(&serde_json::Value::Null));
+        let error_code = known_tool_error_code(string("error_code")).unwrap_or("-");
+        let mutating = audit_bool(entry.get("mutating").and_then(serde_json::Value::as_bool));
+        let applied = audit_bool(
+            entry
+                .get("mutation_applied")
+                .and_then(serde_json::Value::as_bool),
+        );
+        let later = audit_bool(
+            entry
+                .get("later_callback_observed")
+                .and_then(serde_json::Value::as_bool),
+        );
+        let complete = audit_bool(
+            entry
+                .get("turn_completed")
+                .and_then(serde_json::Value::as_bool),
+        );
+        let paths = render_path_arguments(
+            entry
+                .get("path_arguments")
+                .unwrap_or(&serde_json::Value::Null),
+        );
+        report.push_str(&format!(
+            "{} | {provider} | {mapping} | {canonical} | {} | {} | {outcome} | {error_code} | {mutating}/{applied} | {later} | {complete} | {paths} | {}\n",
+            entry.get("sequence").and_then(serde_json::Value::as_u64).unwrap_or(0),
+            audit_bool(entry.get("advertised_to_provider").and_then(serde_json::Value::as_bool)),
+            audit_bool(entry.get("role_allowed").and_then(serde_json::Value::as_bool)),
+            detail,
+        ));
+    }
+    report
 }
 
 fn extract_text_from_json(val: &serde_json::Value, out: &mut String) {
@@ -2236,8 +3098,10 @@ pub async fn handle_acp_message(
         if method == "session/update" {
             if let Some(params) = message.get("params") {
                 if let Some(update) = params.get("update") {
+                    state.tool_call_audit.observe_provider_tool_name(update);
                     extract_text_from_json(update, &mut state.agent_output);
                 } else {
+                    state.tool_call_audit.observe_provider_tool_name(params);
                     extract_text_from_json(params, &mut state.agent_output);
                 }
             }
@@ -2250,7 +3114,22 @@ pub async fn handle_acp_message(
             .unwrap_or(serde_json::Value::Null);
 
         let canonical = crate::tool_surface::CanonicalToolName::from_wire(method);
+        state.tool_calls = state.tool_calls.saturating_add(1);
+        state.tool_call_audit.set_role_id(state.role_id.as_deref());
+        let audit_sequence = state.tool_call_audit.begin_call(
+            state.tool_calls,
+            canonical,
+            state.tool_successes,
+            state.tool_failures,
+        );
         let Some(tool) = canonical else {
+            state.tool_failures = state.tool_failures.saturating_add(1);
+            *state.tool_counts.entry("unsupported".into()).or_insert(0) += 1;
+            state.tool_call_audit.finish_call(
+                audit_sequence,
+                ToolCallOutcome::Unsupported,
+                Some(crate::tool_surface::ERR_UNSUPPORTED_TOOL),
+            );
             if let Some(id) = message.get("id").cloned() {
                 wire.response_error(
                     id,
@@ -2262,7 +3141,6 @@ pub async fn handle_acp_message(
             return Ok(());
         };
 
-        state.tool_calls = state.tool_calls.saturating_add(1);
         *state
             .tool_counts
             .entry(tool.legacy_name().into())
@@ -2273,6 +3151,9 @@ pub async fn handle_acp_message(
             .get("params")
             .cloned()
             .unwrap_or(serde_json::json!({}));
+        state
+            .tool_call_audit
+            .record_path_arguments(audit_sequence, tool, &params, state.repo_path);
 
         if matches!(
             tool,
@@ -2282,7 +3163,12 @@ pub async fn handle_acp_message(
                 | crate::tool_surface::CanonicalToolName::TerminalKill
                 | crate::tool_surface::CanonicalToolName::TerminalRelease
         ) {
-            state.tool_failures += 1;
+            state.tool_failures = state.tool_failures.saturating_add(1);
+            state.tool_call_audit.finish_call(
+                audit_sequence,
+                ToolCallOutcome::ExpectedDenial,
+                Some("CLI_WORKFLOW_TERMINAL_DISABLED"),
+            );
             wire.response_error(req_id, -32603, ERR_CLI_WORKFLOW_TERMINAL_DISABLED)
                 .await?;
             return Ok(());
@@ -2299,7 +3185,13 @@ pub async fn handle_acp_message(
         ) {
             Ok(metadata) => metadata,
             Err(error) => {
-                state.tool_failures += 1;
+                state.tool_failures = state.tool_failures.saturating_add(1);
+                let error_text = error.to_string();
+                state.tool_call_audit.finish_call(
+                    audit_sequence,
+                    ToolCallOutcome::ExpectedDenial,
+                    Some(known_tool_error_code(&error_text).unwrap_or("TOOL_AUTHORIZATION_DENIED")),
+                );
                 wire.response_error(req_id, -32603, &error.to_string())
                     .await?;
                 return Ok(());
@@ -2312,7 +3204,12 @@ pub async fn handle_acp_message(
             let (Some(pool), Some(att_id), Some(role_id)) =
                 (state.pool, &state.wf_attempt_id, &state.role_exec_id)
             else {
-                state.tool_failures += 1;
+                state.tool_failures = state.tool_failures.saturating_add(1);
+                state.tool_call_audit.finish_call(
+                    audit_sequence,
+                    ToolCallOutcome::ExpectedDenial,
+                    Some(crate::tool_surface::ERR_MUTATION_LOCK_REQUIRED),
+                );
                 wire.response_error(
                     req_id,
                     -32603,
@@ -2327,7 +3224,12 @@ pub async fn handle_acp_message(
                 .await
                 .unwrap_or(false);
             if !lock_held {
-                state.tool_failures += 1;
+                state.tool_failures = state.tool_failures.saturating_add(1);
+                state.tool_call_audit.finish_call(
+                    audit_sequence,
+                    ToolCallOutcome::ExpectedDenial,
+                    Some(crate::tool_surface::ERR_MUTATION_LOCK_REQUIRED),
+                );
                 wire.response_error(
                     req_id,
                     -32603,
@@ -2364,6 +3266,9 @@ pub async fn handle_acp_message(
                             .await?;
                         }
                         Err(e) => {
+                            state
+                                .tool_call_audit
+                                .record_operation_error(audit_sequence, &e);
                             state.tool_failures += 1;
                             wire.response_ok(
                             req_id,
@@ -2387,6 +3292,9 @@ pub async fn handle_acp_message(
                             wire.response_ok(req_id, serde_json::json!({})).await?;
                         }
                         Err(e) => {
+                            state
+                                .tool_call_audit
+                                .record_operation_error(audit_sequence, &e);
                             state.tool_failures += 1;
                             wire.response_error(
                                 req_id,
@@ -2424,6 +3332,9 @@ pub async fn handle_acp_message(
                             wire.response_ok(req_id, serde_json::to_value(res)?).await?;
                         }
                         Err(e) => {
+                            state
+                                .tool_call_audit
+                                .record_operation_error(audit_sequence, &e);
                             state.tool_failures += 1;
                             wire.response_error(req_id, -32603, &e.to_string()).await?;
                         }
@@ -2456,6 +3367,9 @@ pub async fn handle_acp_message(
                             wire.response_ok(req_id, serde_json::to_value(res)?).await?;
                         }
                         Err(e) => {
+                            state
+                                .tool_call_audit
+                                .record_operation_error(audit_sequence, &e);
                             state.tool_failures += 1;
                             wire.response_error(req_id, -32603, &e.to_string()).await?;
                         }
@@ -2485,6 +3399,9 @@ pub async fn handle_acp_message(
                             wire.response_ok(req_id, serde_json::to_value(res)?).await?;
                         }
                         Err(e) => {
+                            state
+                                .tool_call_audit
+                                .record_operation_error(audit_sequence, &e);
                             state.tool_failures += 1;
                             wire.response_error(req_id, -32603, &e.to_string()).await?;
                         }
@@ -2522,6 +3439,9 @@ pub async fn handle_acp_message(
                             wire.response_ok(req_id, serde_json::to_value(res)?).await?;
                         }
                         Err(e) => {
+                            state
+                                .tool_call_audit
+                                .record_operation_error(audit_sequence, &e);
                             state.tool_failures += 1;
                             wire.response_error(req_id, -32603, &e.to_string()).await?;
                         }
@@ -2548,6 +3468,9 @@ pub async fn handle_acp_message(
                         .await?;
                         }
                         Err(e) => {
+                            state
+                                .tool_call_audit
+                                .record_operation_error(audit_sequence, &e);
                             state.tool_failures += 1;
                             wire.response_ok(
                                 req_id,
@@ -2579,6 +3502,9 @@ pub async fn handle_acp_message(
                         })).await?;
                         }
                         Err(e) => {
+                            state
+                                .tool_call_audit
+                                .record_operation_error(audit_sequence, &e);
                             state.tool_failures += 1;
                             wire.response_ok(
                                 req_id,
@@ -2615,6 +3541,9 @@ pub async fn handle_acp_message(
                             wire.response_ok(req_id, serde_json::to_value(res)?).await?;
                         }
                         Err(e) => {
+                            state
+                                .tool_call_audit
+                                .record_operation_error(audit_sequence, &e);
                             state.tool_failures += 1;
                             wire.response_error(req_id, -32603, &e.to_string()).await?;
                         }
@@ -2637,6 +3566,9 @@ pub async fn handle_acp_message(
                             .await?;
                         }
                         Err(e) => {
+                            state
+                                .tool_call_audit
+                                .record_operation_error(audit_sequence, &e);
                             state.tool_failures += 1;
                             wire.response_ok(
                                 req_id,
@@ -2671,6 +3603,9 @@ pub async fn handle_acp_message(
                         .await?;
                         }
                         Err(e) => {
+                            state
+                                .tool_call_audit
+                                .record_operation_error(audit_sequence, &e);
                             state.tool_failures += 1;
                             wire.response_ok(
                                 req_id,
@@ -2693,6 +3628,9 @@ pub async fn handle_acp_message(
                             wire.response_ok(req_id, serde_json::to_value(res)?).await?;
                         }
                         Err(e) => {
+                            state
+                                .tool_call_audit
+                                .record_operation_error(audit_sequence, &e);
                             state.tool_failures += 1;
                             wire.response_error(req_id, -32603, &e.to_string()).await?;
                         }
@@ -2725,6 +3663,9 @@ pub async fn handle_acp_message(
                             wire.response_ok(req_id, serde_json::to_value(res)?).await?;
                         }
                         Err(e) => {
+                            state
+                                .tool_call_audit
+                                .record_operation_error(audit_sequence, &e);
                             state.tool_failures += 1;
                             wire.response_error(req_id, -32603, &e.to_string()).await?;
                         }
@@ -2745,6 +3686,9 @@ pub async fn handle_acp_message(
                             wire.response_ok(req_id, serde_json::to_value(res)?).await?;
                         }
                         Err(e) => {
+                            state
+                                .tool_call_audit
+                                .record_operation_error(audit_sequence, &e);
                             state.tool_failures += 1;
                             wire.response_error(req_id, -32603, &e.to_string()).await?;
                         }
@@ -2760,6 +3704,9 @@ pub async fn handle_acp_message(
                         match crate::fs_tools::confine_path(state.repo_path, cwd_str, true, true) {
                             Ok(p) => p,
                             Err(e) => {
+                                state
+                                    .tool_call_audit
+                                    .record_operation_error(audit_sequence, &e);
                                 state.tool_failures += 1;
                                 wire.response_error(
                                     req_id,
@@ -2809,6 +3756,9 @@ pub async fn handle_acp_message(
                                 .await?;
                         }
                         Err(e) => {
+                            state
+                                .tool_call_audit
+                                .record_operation_error(audit_sequence, &e);
                             state.tool_failures += 1;
                             wire.response_error(req_id, -32603, &e.to_string()).await?;
                         }
@@ -2862,6 +3812,9 @@ pub async fn handle_acp_message(
                                 .await?;
                             }
                             Err(e) => {
+                                state
+                                    .tool_call_audit
+                                    .record_operation_error(audit_sequence, &e);
                                 state.tool_failures += 1;
                                 wire.response_error(req_id, -32603, &e.to_string()).await?;
                             }
@@ -2920,18 +3873,45 @@ pub async fn handle_acp_message(
         match tokio::time::timeout(Duration::from_secs(meta.default_timeout_seconds), operation)
             .await
         {
-            Ok(result) => result?,
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                state.tool_call_audit.settle_counters(
+                    audit_sequence,
+                    &mut state.tool_successes,
+                    &mut state.tool_failures,
+                    false,
+                );
+                state.tool_call_audit.finish_call(
+                    audit_sequence,
+                    ToolCallOutcome::ExecutionFailure,
+                    Some("TOOL_RESPONSE_FAILED"),
+                );
+                return Err(error);
+            }
             Err(_) => {
-                state.tool_failures += 1;
+                state.tool_failures = state.tool_failures.saturating_add(1);
+                state.tool_call_audit.settle_counters(
+                    audit_sequence,
+                    &mut state.tool_successes,
+                    &mut state.tool_failures,
+                    false,
+                );
+                state.tool_call_audit.finish_call(
+                    audit_sequence,
+                    ToolCallOutcome::Timeout,
+                    Some(crate::tool_surface::ERR_COMMAND_TIMEOUT),
+                );
                 wire.response_error(
                     timeout_request_id,
                     -32603,
                     crate::tool_surface::ERR_COMMAND_TIMEOUT,
                 )
                 .await?;
+                return Ok(());
             }
         }
-        if wire.take_response_limit_hit() {
+        let response_limit_hit = wire.take_response_limit_hit();
+        if response_limit_hit {
             if state.tool_successes > successes_before {
                 state.tool_successes -= 1;
             }
@@ -2939,6 +3919,31 @@ pub async fn handle_acp_message(
                 state.tool_failures += 1;
             }
         }
+
+        let succeeded = !response_limit_hit
+            && state.tool_successes > successes_before
+            && state.tool_failures == failures_before;
+        let outcome = if succeeded {
+            (ToolCallOutcome::Success, None)
+        } else if response_limit_hit {
+            (
+                ToolCallOutcome::ExecutionFailure,
+                Some(crate::tool_surface::ERR_OUTPUT_LIMIT),
+            )
+        } else if !tool_request_has_valid_required_args(tool, &params) {
+            (ToolCallOutcome::InvalidRequest, Some("INVALID_REQUEST"))
+        } else {
+            (ToolCallOutcome::ExecutionFailure, None)
+        };
+        state.tool_call_audit.settle_counters(
+            audit_sequence,
+            &mut state.tool_successes,
+            &mut state.tool_failures,
+            succeeded,
+        );
+        state
+            .tool_call_audit
+            .finish_call(audit_sequence, outcome.0, outcome.1);
         Ok(())
     } else {
         Ok(())
@@ -3395,6 +4400,7 @@ async fn execute_real_acp_turn(
         tool_successes: 0,
         tool_failures: 0,
         tool_counts: BTreeMap::new(),
+        tool_call_audit: ToolCallAudit::with_context(Some(&role.role_id), Some(&allowed_tools)),
         terminals: BTreeMap::new(),
         wf_attempt_id: Some(wf_run.attempt_id.clone()),
         role_exec_id: Some(role_exec.id.clone()),
@@ -3549,6 +4555,14 @@ async fn execute_real_acp_turn(
     if let Err(error) = validate_role_turn_completion(&state.agent_output, &evidence) {
         failure.get_or_insert(error);
     }
+    state.tool_call_audit.finish_interrupted_call(
+        &mut state.tool_successes,
+        &mut state.tool_failures,
+        failure.as_ref(),
+    );
+    state
+        .tool_call_audit
+        .set_turn_completion(failure.is_none(), state.tool_calls);
     let status_text = if failure.is_some() {
         "FAILED"
     } else {
@@ -3567,6 +4581,10 @@ async fn execute_real_acp_turn(
         }
     });
     let model_evidence = role_model_evidence(target, None);
+    let tool_call_audit =
+        state
+            .tool_call_audit
+            .metadata(state.tool_calls, state.tool_successes, state.tool_failures);
     store
         .insert_agent_execution(
             &agent_exec_id,
@@ -3588,7 +4606,12 @@ async fn execute_real_acp_turn(
             state.tool_successes as i64,
             state.tool_failures as i64,
             &serde_json::to_value(&state.tool_counts)?,
-            &serde_json::json!({ "provider": target.provider, "cleanup_confirmed": evidence.cleanup_confirmed, "observed_model": null }),
+            &serde_json::json!({
+                "provider": target.provider,
+                "cleanup_confirmed": evidence.cleanup_confirmed,
+                "observed_model": null,
+                "tool_call_audit": tool_call_audit,
+            }),
         )
         .await?;
     store
@@ -3912,6 +4935,465 @@ mod tests {
         assert_eq!(state.tool_successes, 0);
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn tool_call_audit_records_safe_read_failures_and_provider_mapping() -> Result<()> {
+        let repo = tempdir()?;
+        let path = repo.path();
+        let marker = "synthetic-provider-payload-marker";
+        std::fs::write(path.join("fixture.txt"), marker)?;
+        let (mut server, mut client) = make_test_wire();
+        let allowed = vec!["read_file".to_string()];
+        let mut state = AcpTurnState::new(path, WorkspaceAccess::ReadWrite);
+        state.role_id = Some("implementer".into());
+        state.workspace_identity = Some(path.canonicalize()?.to_string_lossy().into_owned());
+        state
+            .tool_call_audit
+            .set_context(Some("implementer"), Some(&allowed));
+
+        for (id, file) in [(1, "fixture.txt"), (2, "missing-private-name.txt")] {
+            handle_acp_message(
+                &mut server,
+                &mut state,
+                serde_json::json!({
+                    "method": "session/update",
+                    "params": {"update": {"sessionUpdate": "tool_call", "title": "orbit_read_file"}}
+                }),
+            )
+            .await?;
+            handle_acp_message(
+                &mut server,
+                &mut state,
+                serde_json::json!({
+                    "id": id,
+                    "method": "fs/read_text_file",
+                    "params": {"path": file}
+                }),
+            )
+            .await?;
+            let _ = client.read().await?;
+        }
+        state
+            .tool_call_audit
+            .set_turn_completion(true, state.tool_calls);
+        let audit = state.tool_call_audit.metadata(
+            state.tool_calls,
+            state.tool_successes,
+            state.tool_failures,
+        );
+        let entries = audit["entries"].as_array().unwrap();
+        assert_eq!(entries[0]["provider_tool_name"], "orbit_read_file");
+        assert_eq!(entries[0]["provider_name_mapping"], "MATCH");
+        assert_eq!(entries[0]["advertised_to_provider"], true);
+        assert_eq!(entries[0]["role_allowed"], true);
+        assert_eq!(entries[0]["mutation_applied"], false);
+        assert_eq!(entries[0]["later_callback_observed"], true);
+        assert_eq!(entries[1]["outcome"], "EXECUTION_FAILURE");
+        assert_eq!(entries[1]["error_code"], "PATH_NOT_FOUND");
+        assert_eq!(
+            entries[0]["path_arguments"][0]["state"],
+            "WORKSPACE_RELATIVE"
+        );
+        assert_eq!(
+            entries[0]["path_arguments"][0]["workspace_relative_path"],
+            "fixture.txt"
+        );
+        assert_eq!(entries[0]["path_arguments"][0]["exists"], true);
+        assert_eq!(
+            entries[1]["path_arguments"][0]["state"],
+            "WORKSPACE_RELATIVE"
+        );
+        assert_eq!(
+            entries[1]["path_arguments"][0]["workspace_relative_path"],
+            "missing-private-name.txt"
+        );
+        assert_eq!(entries[1]["path_arguments"][0]["exists"], false);
+        let encoded = audit.to_string();
+        let report = render_tool_call_audit(&serde_json::json!({"tool_call_audit": audit}));
+        assert!(!encoded.contains(marker));
+        assert!(!report.contains(marker));
+        for safe_path in ["fixture.txt", "missing-private-name.txt"] {
+            assert!(report.contains(safe_path));
+        }
+        assert!(report.contains("WORKSPACE_RELATIVE(fixture.txt; exists=true)"));
+        assert!(report.contains("WORKSPACE_RELATIVE(missing-private-name.txt; exists=false)"));
+
+        for private_value in [marker, "synthetic-provider-payload-marker"] {
+            assert!(!encoded.contains(private_value));
+            assert!(!report.contains(private_value));
+        }
+        assert!(report.contains("PATH_NOT_FOUND"));
+        Ok(())
+    }
+
+    #[test]
+    fn tool_call_audit_redacts_host_paths_and_invalid_path_arguments() -> Result<()> {
+        use crate::tool_surface::CanonicalToolName as Tool;
+
+        let repo = tempdir()?;
+        let outside = tempdir()?;
+        let host_path = outside.path().join("private-host-secret.txt");
+        std::fs::write(&host_path, "synthetic")?;
+        std::os::unix::fs::symlink(outside.path(), repo.path().join("outside-link"))?;
+        let allowed = vec!["read_file".to_string()];
+        let mut audit = ToolCallAudit::with_context(Some("implementer"), Some(&allowed));
+        let cases = [
+            serde_json::json!({"path": host_path.to_string_lossy()}),
+            serde_json::json!({"path": "../private-host-secret.txt"}),
+            serde_json::json!({"path": 17}),
+            serde_json::json!({"path": "outside-link/private-host-secret.txt"}),
+        ];
+        for (index, params) in cases.iter().enumerate() {
+            let sequence = index as u64 + 1;
+            audit.begin_call(sequence, Some(Tool::FsReadTextFile), 0, sequence - 1);
+            audit.record_path_arguments(sequence, Tool::FsReadTextFile, params, repo.path());
+            audit.finish_call(
+                sequence,
+                ToolCallOutcome::InvalidRequest,
+                Some("INVALID_REQUEST"),
+            );
+        }
+
+        assert_eq!(
+            audit.entries[0].path_arguments[0].state,
+            PathAuditState::OutsideWorkspaceRedacted
+        );
+        assert_eq!(
+            audit.entries[0].path_arguments[0].workspace_relative_path,
+            None
+        );
+        assert_eq!(
+            audit.entries[1].path_arguments[0].state,
+            PathAuditState::InvalidPath
+        );
+        assert_eq!(
+            audit.entries[2].path_arguments[0].state,
+            PathAuditState::InvalidPath
+        );
+        assert_eq!(
+            audit.entries[3].path_arguments[0].state,
+            PathAuditState::OutsideWorkspaceRedacted
+        );
+        assert_eq!(
+            audit.entries[3].path_arguments[0].workspace_relative_path,
+            None
+        );
+
+        let metadata = serde_json::json!({
+            "tool_call_audit": audit.metadata(4, 0, 4)
+        });
+        let encoded = metadata.to_string();
+        let report = render_tool_call_audit(&metadata);
+        assert!(!encoded.contains(&host_path.to_string_lossy().to_string()));
+        assert!(!report.contains(&host_path.to_string_lossy().to_string()));
+        assert!(!encoded.contains("private-host-secret.txt"));
+        assert!(!report.contains("private-host-secret.txt"));
+        assert!(report.contains("OUTSIDE_WORKSPACE_REDACTED"));
+        assert!(report.contains("INVALID_PATH"));
+        Ok(())
+    }
+
+    #[test]
+    fn tool_call_audit_normalizes_and_bounds_workspace_paths() -> Result<()> {
+        use crate::tool_surface::CanonicalToolName as Tool;
+
+        let repo = tempdir()?;
+        std::fs::write(repo.path().join("virtual.txt"), "virtual")?;
+        std::fs::write(repo.path().join("absolute.txt"), "absolute")?;
+        let canonical_repo = repo.path().canonicalize()?;
+        let long_relative_path = format!("{}.txt", "x".repeat(TOOL_PATH_DISPLAY_LIMIT + 32));
+        let over_limit_path = "s".repeat(TOOL_PATH_INPUT_LIMIT + 1);
+        let cases = [
+            serde_json::json!({"path": "/orbit/home/workspace/virtual.txt"}),
+            serde_json::json!({"path": canonical_repo.join("absolute.txt").to_string_lossy()}),
+            serde_json::json!({"path": long_relative_path.clone()}),
+            serde_json::json!({"path": over_limit_path.clone()}),
+        ];
+        let allowed = vec!["read_file".to_string()];
+        let mut audit = ToolCallAudit::with_context(Some("implementer"), Some(&allowed));
+        for (index, params) in cases.iter().enumerate() {
+            let sequence = index as u64 + 1;
+            audit.begin_call(sequence, Some(Tool::FsReadTextFile), 0, sequence - 1);
+            audit.record_path_arguments(sequence, Tool::FsReadTextFile, params, repo.path());
+            audit.finish_call(sequence, ToolCallOutcome::Success, None);
+        }
+
+        assert_eq!(
+            audit.entries[0].path_arguments[0].state,
+            PathAuditState::WorkspaceRelative
+        );
+        assert_eq!(
+            audit.entries[0].path_arguments[0]
+                .workspace_relative_path
+                .as_deref(),
+            Some("virtual.txt")
+        );
+        assert_eq!(audit.entries[0].path_arguments[0].exists, Some(true));
+        assert_eq!(
+            audit.entries[1].path_arguments[0].state,
+            PathAuditState::WorkspaceRelative
+        );
+        assert_eq!(
+            audit.entries[1].path_arguments[0]
+                .workspace_relative_path
+                .as_deref(),
+            Some("absolute.txt")
+        );
+        assert_eq!(audit.entries[1].path_arguments[0].exists, Some(true));
+
+        let long_path = &audit.entries[2].path_arguments[0];
+        assert_eq!(long_path.state, PathAuditState::WorkspaceRelative);
+        assert!(long_path.display_truncated);
+        let stored_path = long_path.workspace_relative_path.as_deref().unwrap();
+        assert_eq!(stored_path.len(), TOOL_PATH_DISPLAY_LIMIT);
+        assert!(stored_path.ends_with("..."));
+        let rendered_path =
+            render_path_arguments(&serde_json::to_value(&audit.entries[2].path_arguments)?);
+        let rendered_start = rendered_path
+            .find("WORKSPACE_RELATIVE(")
+            .context("rendered path state is missing")?
+            + "WORKSPACE_RELATIVE(".len();
+        let rendered_end = rendered_path
+            .find("; exists=")
+            .context("rendered path existence marker is missing")?;
+        let rendered_relative_path = &rendered_path[rendered_start..rendered_end];
+        assert_eq!(rendered_relative_path, stored_path);
+        assert!(rendered_relative_path.len() <= TOOL_PATH_DISPLAY_LIMIT);
+
+        assert_eq!(
+            audit.entries[3].path_arguments[0].state,
+            PathAuditState::InvalidPath
+        );
+        assert_eq!(
+            audit.entries[3].path_arguments[0].workspace_relative_path,
+            None
+        );
+        let metadata = serde_json::json!({
+            "tool_call_audit": audit.metadata(4, 4, 0)
+        });
+        let encoded = metadata.to_string();
+        let report = render_tool_call_audit(&metadata);
+        assert!(report.contains("WORKSPACE_RELATIVE(virtual.txt; exists=true)"));
+        assert!(report.contains("WORKSPACE_RELATIVE(absolute.txt; exists=true)"));
+        assert!(report.contains("INVALID_PATH"));
+        assert!(!encoded.contains(&canonical_repo.to_string_lossy().to_string()));
+        assert!(!report.contains(&canonical_repo.to_string_lossy().to_string()));
+        assert!(!encoded.contains(&over_limit_path));
+        assert!(!report.contains(&over_limit_path));
+        Ok(())
+    }
+
+    #[test]
+    fn git_path_filter_audit_does_not_claim_workspace_normalization() -> Result<()> {
+        use crate::tool_surface::CanonicalToolName as Tool;
+
+        let repo = tempdir()?;
+        let relative_filter = "./private-filter.txt";
+        let absolute_filter = repo
+            .path()
+            .join("private filter name.txt")
+            .to_string_lossy()
+            .into_owned();
+        let mut audit = ToolCallAudit::default();
+        let cases = [
+            (
+                1,
+                Tool::GitStatus,
+                serde_json::json!({"path": relative_filter}),
+            ),
+            (
+                2,
+                Tool::GitDiff,
+                serde_json::json!({"path": absolute_filter.clone()}),
+            ),
+            (3, Tool::GitStatus, serde_json::json!({"path": 987654321})),
+            (4, Tool::GitDiff, serde_json::json!({})),
+        ];
+        for (sequence, tool, params) in cases {
+            audit.begin_call(sequence, Some(tool), sequence - 1, 0);
+            audit.record_path_arguments(sequence, tool, &params, repo.path());
+            audit.finish_call(sequence, ToolCallOutcome::Success, None);
+        }
+
+        for entry in audit.entries.iter().take(2) {
+            assert_eq!(
+                entry.path_arguments[0].state,
+                PathAuditState::UnnormalizedGitPathFilter
+            );
+            assert_eq!(entry.path_arguments[0].workspace_relative_path, None);
+            assert_eq!(entry.path_arguments[0].exists, None);
+        }
+        assert_eq!(
+            audit.entries[2].path_arguments[0].state,
+            PathAuditState::InvalidPath
+        );
+        assert_eq!(
+            audit.entries[2].path_arguments[0].workspace_relative_path,
+            None
+        );
+        assert!(audit.entries[3].path_arguments.is_empty());
+        let metadata = serde_json::json!({
+            "tool_call_audit": audit.metadata(4, 4, 0)
+        });
+        let encoded = metadata.to_string();
+        let report = render_tool_call_audit(&metadata);
+        assert!(!encoded.contains(relative_filter));
+        assert!(!report.contains(relative_filter));
+        assert!(!encoded.contains(&absolute_filter));
+        assert!(!report.contains(&absolute_filter));
+        assert!(!encoded.contains("private-filter.txt"));
+        assert!(!report.contains("private-filter.txt"));
+        assert!(!encoded.contains("private filter name.txt"));
+        assert!(!report.contains("private filter name.txt"));
+        assert!(!encoded.contains("987654321"));
+        assert!(!report.contains("987654321"));
+        assert!(report.contains("UNNORMALIZED_GIT_PATH_FILTER"));
+        assert!(report.contains("path=INVALID_PATH"));
+        assert!(!report.contains("WORKSPACE_RELATIVE("));
+        let absent_filter_row = report.lines().find(|line| line.starts_with("4 |"));
+        assert!(absent_filter_row.is_some_and(|line| line.contains("|  | Tool call completed.")));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_grep_query_is_recorded_as_invalid_request() -> Result<()> {
+        let repo = tempdir()?;
+        let (mut server, mut client) = make_test_wire();
+        let mut state = AcpTurnState::new(repo.path(), WorkspaceAccess::ReadWrite);
+        state.role_id = Some("implementer".into());
+        state.workspace_identity = Some(repo.path().canonicalize()?.to_string_lossy().into_owned());
+
+        handle_acp_message(
+            &mut server,
+            &mut state,
+            serde_json::json!({
+                "id": 1,
+                "method": "search/grep",
+                "params": {"query": ""}
+            }),
+        )
+        .await?;
+        let _ = client.read().await?;
+        state
+            .tool_call_audit
+            .set_turn_completion(true, state.tool_calls);
+        let audit = state.tool_call_audit.metadata(
+            state.tool_calls,
+            state.tool_successes,
+            state.tool_failures,
+        );
+        assert_eq!(audit["entries"][0]["outcome"], "INVALID_REQUEST");
+        assert_eq!(audit["entries"][0]["error_code"], "INVALID_REQUEST");
+        Ok(())
+    }
+
+    #[test]
+    fn tool_call_audit_keeps_typed_failure_outcomes() {
+        let mut audit = ToolCallAudit::default();
+        let outcomes = [
+            (ToolCallOutcome::ExpectedDenial, "READ_ONLY_ROLE"),
+            (ToolCallOutcome::InvalidRequest, "INVALID_REQUEST"),
+            (ToolCallOutcome::ExecutionFailure, "TOOL_EXECUTION_FAILED"),
+            (ToolCallOutcome::Unsupported, "UNSUPPORTED_TOOL"),
+        ];
+        for (index, (outcome, code)) in outcomes.into_iter().enumerate() {
+            let sequence = index as u64 + 1;
+            let call = audit.begin_call(sequence, None, 0, sequence - 1);
+            audit.finish_call(call, outcome, Some(code));
+            assert_eq!(audit.entries[index].outcome, Some(outcome));
+            assert_eq!(audit.entries[index].error_code, Some(code));
+        }
+        for (sequence, failure, expected) in [
+            (5, "ROLE_SUPERVISOR_TIMEOUT", ToolCallOutcome::Timeout),
+            (6, "ROLE_EXECUTION_CANCELLED", ToolCallOutcome::Cancelled),
+        ] {
+            audit.begin_call(sequence, None, 0, sequence - 1);
+            let mut successes = 0;
+            let mut failures = sequence - 1;
+            audit.finish_interrupted_call(
+                &mut successes,
+                &mut failures,
+                Some(&anyhow::anyhow!(failure)),
+            );
+            assert_eq!(
+                audit.entries[(sequence - 1) as usize].outcome,
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn tool_call_audit_bounds_rows_and_counts_unmatched_calls() {
+        use crate::tool_surface::CanonicalToolName as Tool;
+
+        let allowed = vec!["read_file".to_string()];
+        let mut audit = ToolCallAudit::with_context(Some("planner"), Some(&allowed));
+        for sequence in 1..=62 {
+            let call = audit.begin_call(sequence, Some(Tool::FsReadTextFile), sequence - 1, 0);
+            audit.finish_call(call, ToolCallOutcome::Success, None);
+        }
+        audit.observe_provider_tool_name(&serde_json::json!({
+            "sessionUpdate": "tool_call", "title": "orbit_write_file"
+        }));
+        let denied = audit.begin_call(63, Some(Tool::FsWriteTextFile), 62, 0);
+        audit.finish_call(
+            denied,
+            ToolCallOutcome::ExpectedDenial,
+            Some(crate::tool_surface::ERR_READ_ONLY_ROLE),
+        );
+        audit.observe_provider_tool_name(&serde_json::json!({
+            "sessionUpdate": "tool_call", "title": "orbit_write_file"
+        }));
+        audit.observe_provider_tool_name(&serde_json::json!({
+            "sessionUpdate": "tool_call", "title": "synthetic-secret-title"
+        }));
+        audit.set_turn_completion(true, 63);
+
+        let entries = &audit.entries;
+        assert_eq!(entries.len(), TOOL_CALL_AUDIT_LIMIT);
+        assert_eq!(entries[62].advertised_to_provider, Some(false));
+        assert_eq!(entries[62].role_allowed, Some(false));
+        assert_eq!(entries[62].mutation_applied, Some(false));
+        assert_eq!(entries[63].provider_tool_name, "orbit_write_file");
+        assert_eq!(entries[63].provider_name_mapping, "UNMATCHED");
+        assert_eq!(entries[63].advertised_to_provider, Some(false));
+        assert_eq!(entries[63].role_allowed, Some(false));
+        assert_eq!(entries[63].error_code, Some("PROVIDER_CALLBACK_UNRESOLVED"));
+        assert_eq!(audit.omitted_count, 1);
+        assert_eq!(audit.mutating_count, 2);
+        assert_eq!(audit.mutating_unknown_count, 1);
+        assert_eq!(audit.denied_count, 1);
+
+        let metadata = serde_json::json!({
+            "tool_call_audit": audit.metadata(63, 62, 1)
+        });
+        let summary = &metadata["tool_call_audit"]["summary"];
+        assert_eq!(summary["total"], 65);
+        assert_eq!(summary["successful"], 62);
+        assert_eq!(summary["unsuccessful"], 3);
+        assert_eq!(summary["mutating"], 2);
+        assert_eq!(summary["denied"], 1);
+        assert_eq!(summary["unmatched_provider_calls"], 2);
+        let encoded = metadata.to_string();
+        let report = render_tool_call_audit(&metadata);
+        assert!(!encoded.contains("synthetic-secret-title"));
+        assert!(!report.contains("synthetic-secret-title"));
+        assert!(report.contains("orbit_write_file"));
+        assert!(report.contains("omitted=1"));
+        assert!(report.len() < 16 * 1024);
+
+        let mut overflow = ToolCallAudit::default();
+        for _ in 0..=PROVIDER_TOOL_NAME_QUEUE_LIMIT {
+            overflow.observe_provider_tool_name(&serde_json::json!({
+                "sessionUpdate": "tool_call", "title": "orbit_read_file"
+            }));
+        }
+        overflow.set_turn_completion(true, 0);
+        let overflow_report = render_tool_call_audit(&serde_json::json!({
+            "tool_call_audit": overflow.metadata(0, 0, 0)
+        }));
+        assert!(overflow_report.contains("provider titles omitted=1"));
     }
 
     #[test]

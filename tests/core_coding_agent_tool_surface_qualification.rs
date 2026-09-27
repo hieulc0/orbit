@@ -322,9 +322,9 @@ async fn finish_test_context(ctx: TestContext, fixture_result: Result<()>) -> Re
 async fn load_agent_tool_audit(
     pool: &PgPool,
     execution_id: &str,
-) -> Result<(String, i64, i64, i64, serde_json::Value)> {
+) -> Result<(String, i64, i64, i64, serde_json::Value, serde_json::Value)> {
     sqlx::query_as(
-        "SELECT status, tool_call_count, tool_success_count, tool_failure_count, tool_counts \
+        "SELECT status, tool_call_count, tool_success_count, tool_failure_count, tool_counts, metadata \
          FROM orbit_agent_executions WHERE id = $1",
     )
     .bind(execution_id)
@@ -333,37 +333,220 @@ async fn load_agent_tool_audit(
     .context("failed to read persisted agent tool audit")
 }
 
+async fn load_role_tool_audits(
+    pool: &PgPool,
+    role_execution_id: &str,
+) -> Result<Vec<(String, String, i64, i64, i64, serde_json::Value)>> {
+    sqlx::query_as(
+        "SELECT id, status, tool_call_count, tool_success_count, tool_failure_count, metadata \
+         FROM orbit_agent_executions \
+         WHERE role_execution_id = $1 ORDER BY started_at_ms, id",
+    )
+    .bind(role_execution_id)
+    .fetch_all(pool)
+    .await
+    .context("failed to read role tool-call audit")
+}
+
+fn render_live_fixture_audit(
+    role_execution_id: &str,
+    agent_execution_id: &str,
+    status: &str,
+    tool_call_count: i64,
+    tool_success_count: i64,
+    tool_failure_count: i64,
+    metadata: &serde_json::Value,
+) -> String {
+    let safe_id = |value: &str| {
+        if value.len() <= 96
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            value.to_owned()
+        } else {
+            "redacted".to_owned()
+        }
+    };
+    let safe_status = match status {
+        "SUCCEEDED" | "FAILED" | "CANCELLED" | "TIMEOUT" | "RUNNING" => status,
+        _ => "UNKNOWN",
+    };
+    let summary = &metadata["tool_call_audit"]["summary"];
+    let count = |field: &str| summary[field].as_i64().unwrap_or(0);
+    format!(
+        "RoleExecution ID: {}\nAgentExecution ID: {}\nExecution status: {safe_status}\nAggregate tool counts: total={tool_call_count}, success={tool_success_count}, failure={tool_failure_count}, mutating={}, denied={}, unmatched={}\n{}",
+        safe_id(role_execution_id),
+        safe_id(agent_execution_id),
+        count("mutating"),
+        count("denied"),
+        count("unmatched_provider_calls"),
+        render_tool_call_audit(metadata),
+    )
+}
+
+async fn print_live_fixture_audit(pool: &PgPool, role_execution_id: Option<&str>) {
+    println!("Live fixture execution audit:");
+    let Some(role_execution_id) = role_execution_id else {
+        println!("Tool-call audit unavailable.");
+        return;
+    };
+    match load_role_tool_audits(pool, role_execution_id).await {
+        Ok(execution_rows) if !execution_rows.is_empty() => {
+            for (execution_id, status, calls, successes, failures, metadata) in execution_rows {
+                println!(
+                    "{}",
+                    render_live_fixture_audit(
+                        role_execution_id,
+                        &execution_id,
+                        &status,
+                        calls,
+                        successes,
+                        failures,
+                        &metadata,
+                    )
+                );
+            }
+        }
+        _ => println!("Tool-call audit unavailable."),
+    }
+}
+
+#[test]
+fn live_fixture_audit_report_includes_ids_counts_and_bounded_safe_details() {
+    let entries = (1..=100)
+        .map(|sequence| {
+            json!({
+                "sequence": sequence,
+                "provider_tool_name": "orbit_read_file",
+                "provider_name_mapping": "MATCH",
+                "canonical_tool_name": "fs.read_text_file",
+                "advertised_to_provider": true,
+                "role_allowed": true,
+                "outcome": "SUCCESS",
+                "error_code": null,
+                "mutating": false,
+                "mutation_applied": false,
+                "later_callback_observed": false,
+                "turn_completed": true,
+                "path_arguments": [{
+                    "argument": "path",
+                    "state": "WORKSPACE_RELATIVE",
+                    "workspace_relative_path": "/private/host/path",
+                    "exists": true,
+                    "display_truncated": false
+                }]
+            })
+        })
+        .collect::<Vec<_>>();
+    let metadata = json!({
+        "tool_call_audit": {
+            "summary": {
+                "total": 100,
+                "successful": 100,
+                "unsuccessful": 0,
+                "mutating": 2,
+                "mutating_unknown": 0,
+                "denied": 0,
+                "unmatched_provider_calls": 0
+            },
+            "entries": entries,
+            "omitted_count": 36,
+            "provider_tool_names_omitted": 0
+        }
+    });
+
+    let report = render_live_fixture_audit(
+        "role-execution-123",
+        "agent-execution-456",
+        "SUCCEEDED",
+        100,
+        100,
+        0,
+        &metadata,
+    );
+
+    assert!(report.contains("RoleExecution ID: role-execution-123"));
+    assert!(report.contains("AgentExecution ID: agent-execution-456"));
+    assert!(report.contains("Execution status: SUCCEEDED"));
+    assert!(report.contains(
+        "Aggregate tool counts: total=100, success=100, failure=0, mutating=2, denied=0, unmatched=0"
+    ));
+    assert!(report.contains("provider titles omitted=0"));
+    assert!(report.contains("path=INVALID_PATH"));
+    assert!(!report.contains("/private/host/path"));
+    assert!(report.matches("orbit_read_file | MATCH").count() <= 64);
+    assert!(report.len() < 20_000);
+}
+
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
 async fn agent_tool_audit_reads_persisted_counter_columns() -> Result<()> {
     let ctx = setup_test().await?;
     let fixture_result = async {
         let execution_id = format!("execution-{}", id());
-        let tool_counts = json!({
-            "fs.write_text_file": 1,
-            "fs.edit_file": 1,
-            "fs.read_text_file": 1
+        let tool_counts = json!({"fs.read_text_file": 1});
+        let metadata = json!({
+            "tool_call_audit": {
+                "summary": {
+                    "total": 1,
+                    "successful": 1,
+                    "unsuccessful": 0,
+                    "mutating": 0,
+                    "mutating_unknown": 0,
+                    "denied": 0,
+                    "unmatched_provider_calls": 0
+                },
+                "entries": [{
+                    "sequence": 1,
+                    "provider_tool_name": "orbit_read_file",
+                    "provider_name_mapping": "MATCH",
+                    "canonical_tool_name": "fs.read_text_file",
+                    "advertised_to_provider": true,
+                    "role_allowed": true,
+                    "outcome": "SUCCESS",
+                    "error_code": null,
+                    "mutating": false,
+                    "mutation_applied": false,
+                    "later_callback_observed": false,
+                    "turn_completed": true
+                }],
+                "omitted_count": 0,
+                "provider_tool_names_omitted": 0
+            }
         });
         sqlx::query(
             "INSERT INTO orbit_agent_executions \
              (id, agent_type, started_at_ms, status, tool_call_count, tool_success_count, \
-              tool_failure_count, tool_counts) \
-             VALUES ($1, 'fixture', 1, 'SUCCEEDED', 3, 3, 0, $2)",
+              tool_failure_count, tool_counts, metadata) \
+             VALUES ($1, 'fixture', 1, 'SUCCEEDED', 1, 1, 0, $2, $3)",
         )
         .bind(&execution_id)
         .bind(&tool_counts)
+        .bind(&metadata)
         .execute(&ctx.engine.pool)
         .await?;
 
-        let (status, calls, successes, failures, persisted_tool_counts) =
+        let (status, calls, successes, failures, persisted_tool_counts, persisted_metadata) =
             load_agent_tool_audit(&ctx.engine.pool, &execution_id).await?;
         ensure!(
-            status == "SUCCEEDED" && calls == 3 && successes == 3 && failures == 0,
+            status == "SUCCEEDED" && calls == 1 && successes == 1 && failures == 0,
             "agent tool audit returned incorrect synthetic counters"
         );
         ensure!(
             persisted_tool_counts == tool_counts,
             "agent tool audit returned incorrect synthetic tool counts"
+        );
+        ensure!(
+            persisted_metadata == metadata,
+            "agent tool audit returned incorrect synthetic metadata"
+        );
+        let report = render_tool_call_audit(&persisted_metadata);
+        ensure!(
+            report.contains("orbit_read_file | MATCH | fs.read_text_file")
+                && report.contains("SUCCESS")
+                && !report.contains("provider-secret"),
+            "tool-call audit renderer returned incorrect synthetic report"
         );
         Ok(())
     }
@@ -1011,22 +1194,12 @@ async fn attempt_mutation_lock_enforcement() -> Result<()> {
         .create_role_execution(&wf.id, &role, "IMPLEMENTING", 0, None, None)
         .await?;
 
-    let mut state = AcpTurnState {
-        repo_path: repo.path(),
-        workspace_access: WorkspaceAccess::ReadWrite,
-        role_id: Some("implementer".into()),
-        workspace_identity: Some(repo.path().canonicalize()?.to_string_lossy().into_owned()),
-        tool_call_limit: 64,
-        agent_output: String::new(),
-        tool_calls: 0,
-        tool_successes: 0,
-        tool_failures: 0,
-        tool_counts: BTreeMap::new(),
-        terminals: BTreeMap::new(),
-        wf_attempt_id: Some(att_id.clone()),
-        role_exec_id: Some(role_exec.id.clone()),
-        pool: Some(&ctx.engine.pool),
-    };
+    let mut state = AcpTurnState::new(repo.path(), WorkspaceAccess::ReadWrite);
+    state.role_id = Some("implementer".into());
+    state.workspace_identity = Some(repo.path().canonicalize()?.to_string_lossy().into_owned());
+    state.wf_attempt_id = Some(att_id.clone());
+    state.role_exec_id = Some(role_exec.id.clone());
+    state.pool = Some(&ctx.engine.pool);
 
     // 1. Without lock: mutating call denied with ERR_MUTATION_LOCK_REQUIRED
     let msg1 = json!({
@@ -1421,22 +1594,12 @@ async fn coordinator_wire_dispatch_enforces_cli_workflow_gates() -> Result<()> {
     let mut server_wire = Wire::new(server_in, server_out, 16 * 1024 * 1024);
     let mut client_wire = Wire::new(client_in, client_out, 16 * 1024 * 1024);
 
-    let mut state = AcpTurnState {
-        repo_path: p,
-        workspace_access: WorkspaceAccess::ReadWrite,
-        role_id: Some("implementer".into()),
-        workspace_identity: Some(p.canonicalize()?.to_string_lossy().into_owned()),
-        tool_call_limit: 64,
-        agent_output: String::new(),
-        tool_calls: 0,
-        tool_successes: 0,
-        tool_failures: 0,
-        tool_counts: BTreeMap::new(),
-        terminals: BTreeMap::new(),
-        wf_attempt_id: Some(attempt_id.clone()),
-        role_exec_id: Some(role_execution.id.clone()),
-        pool: Some(&ctx.engine.pool),
-    };
+    let mut state = AcpTurnState::new(p, WorkspaceAccess::ReadWrite);
+    state.role_id = Some("implementer".into());
+    state.workspace_identity = Some(p.canonicalize()?.to_string_lossy().into_owned());
+    state.wf_attempt_id = Some(attempt_id.clone());
+    state.role_exec_id = Some(role_execution.id.clone());
+    state.pool = Some(&ctx.engine.pool);
 
     // 1. fs/create_directory
     handle_acp_message(
@@ -1633,6 +1796,7 @@ async fn real_codex_coding_fixture() -> Result<()> {
             return Err(error);
         }
     };
+    let mut audit_role_execution_id = None;
     let fixture_result = async {
         ensure_live_catalog_is_separate(
             &credential_catalog_pool,
@@ -1702,6 +1866,7 @@ async fn real_codex_coding_fixture() -> Result<()> {
             .store
             .create_role_execution(&wf.id, &role, "IMPLEMENTING", 0, None, None)
             .await?;
+        audit_role_execution_id = Some(role_exec.id.clone());
 
         ctx.store
             .acquire_workspace_mutation_lock(&attempt_id, &role_exec.id)
@@ -1753,12 +1918,21 @@ async fn real_codex_coding_fixture() -> Result<()> {
             tool_success_count,
             tool_failure_count,
             tool_counts,
+            execution_metadata,
         ) = load_agent_tool_audit(&ctx.engine.pool, execution_id).await?;
         ensure!(
             execution_status == "SUCCEEDED"
                 && tool_failure_count == 0
                 && tool_success_count == tool_call_count,
             "implementer execution evidence includes an unsuccessful tool call"
+        );
+        let audit_summary = &execution_metadata["tool_call_audit"]["summary"];
+        ensure!(
+            audit_summary["total"].as_i64() == Some(tool_call_count)
+                && audit_summary["successful"].as_i64() == Some(tool_success_count)
+                && audit_summary["unsuccessful"] == 0
+                && audit_summary["unmatched_provider_calls"] == 0,
+            "implementer execution has unsuccessful or unresolved provider tool calls"
         );
         let file_mutation_calls = ["fs.write_text_file", "fs.edit_file"]
             .iter()
@@ -1780,6 +1954,7 @@ async fn real_codex_coding_fixture() -> Result<()> {
     }
     .await;
 
+    print_live_fixture_audit(&ctx.engine.pool, audit_role_execution_id.as_deref()).await;
     finish_live_fixture(credential_catalog_pool, ctx, fixture_result).await
 }
 
@@ -1794,6 +1969,7 @@ async fn real_antigravity_review_fixture() -> Result<()> {
             return Err(error);
         }
     };
+    let mut audit_role_execution_id = None;
     let fixture_result = async {
         ensure_live_catalog_is_separate(
             &credential_catalog_pool,
@@ -1859,6 +2035,7 @@ async fn real_antigravity_review_fixture() -> Result<()> {
             .store
             .create_role_execution(&wf.id, &role, "REVIEWING", 0, None, None)
             .await?;
+        audit_role_execution_id = Some(role_exec.id.clone());
 
         let outcome = RealAcpRoleExecutor
             .execute_role_with_credential_catalog(
@@ -1896,5 +2073,6 @@ async fn real_antigravity_review_fixture() -> Result<()> {
     }
     .await;
 
+    print_live_fixture_audit(&ctx.engine.pool, audit_role_execution_id.as_deref()).await;
     finish_live_fixture(credential_catalog_pool, ctx, fixture_result).await
 }
