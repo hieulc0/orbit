@@ -1036,6 +1036,19 @@ pub(crate) fn safe_git_command(repo_path: &Path, args: &[&str]) -> tokio::proces
     command
 }
 
+fn confined_git_path_filter(repo_path: &Path, path_filter: &str) -> Result<PathBuf> {
+    let confined = confine_path(repo_path, path_filter, false, true)?;
+    let root = repo_path.canonicalize()?;
+    let relative = confined
+        .strip_prefix(&root)
+        .context("Git path filter did not resolve inside the repository")?;
+    if relative.as_os_str().is_empty() {
+        Ok(PathBuf::from("."))
+    } else {
+        Ok(relative.to_path_buf())
+    }
+}
+
 /// 18. GIT STATUS (`git/status`)
 pub async fn git_status(repo_path: &Path, path_filter: Option<&str>) -> Result<GitStatusResult> {
     ensure!(repo_path.exists(), "repository path does not exist");
@@ -1056,8 +1069,7 @@ pub async fn git_status(repo_path: &Path, path_filter: Option<&str>) -> Result<G
     let mut cmd = safe_git_command(repo_path, &["status", "--porcelain=v1"]);
 
     if let Some(p) = path_filter {
-        let _ = confine_path(repo_path, p, false, true)?;
-        cmd.arg("--").arg(p);
+        cmd.arg("--").arg(confined_git_path_filter(repo_path, p)?);
     }
 
     let out = cmd.output().await.context("failed to execute git status")?;
@@ -1141,8 +1153,7 @@ pub async fn git_diff(
     }
 
     if let Some(p) = path_filter {
-        let _ = confine_path(repo_path, p, false, true)?;
-        cmd.arg("--").arg(p);
+        cmd.arg("--").arg(confined_git_path_filter(repo_path, p)?);
     }
 
     let out = cmd.output().await.context("failed to execute git diff")?;
@@ -1532,6 +1543,18 @@ mod tests {
         assert!(diff.diff.contains("-baseline"));
         let show = git_show(repo.path(), "HEAD", Some("tracked.txt"), 65536).await?;
         assert!(show.content.contains("baseline"));
+        let virtual_filter = format!("{}/tracked.txt", crate::acp_runtime::WORKSPACE);
+        let filtered_status = git_status(repo.path(), Some(&virtual_filter)).await?;
+        assert!(
+            filtered_status
+                .modified
+                .iter()
+                .any(|path| path == "tracked.txt")
+        );
+        let filtered_diff =
+            git_diff(repo.path(), None, Some(&virtual_filter), None, false, 65536).await?;
+        assert!(filtered_diff.diff.contains("+updated"));
+        assert!(filtered_diff.diff.contains("-baseline"));
         assert!(!fsmonitor_marker.exists());
         assert!(!external_diff_marker.exists());
         assert!(!textconv_marker.exists());

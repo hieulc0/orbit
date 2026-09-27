@@ -442,8 +442,16 @@ pub fn tool_definitions(names: &[String]) -> Result<Vec<Value>> {
             "grep" => ("Search text across workspace files.", json!({"query":{"type":"string"},"path":{"type":"string"},"case_sensitive":{"type":"boolean"}}), vec!["query"]),
             "edit_file" => ("Targeted file editing replacing exact match text.", json!({"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"},"replace_all":{"type":"boolean"}}), vec!["path","old_text","new_text"]),
             "copy" => ("Copy a file or directory inside the repository workspace.", json!({"source":{"type":"string"},"destination":{"type":"string"},"recursive":{"type":"boolean"}}), vec!["source","destination"]),
-            "git_status" => ("Get git status of the repository workspace.", json!({"path":{"type":"string"}}), vec![]),
-            "git_diff" => ("Inspect git diff in the repository workspace.", json!({"base":{"type":"string"},"path":{"type":"string"}}), vec![]),
+            "git_status" => (
+                "Get git status of the repository workspace, optionally filtered to a workspace path.",
+                json!({"path":{"type":"string","description":"Optional workspace-relative path filter. Absolute paths under the virtual workspace root are also accepted."}}),
+                vec![],
+            ),
+            "git_diff" => (
+                "Inspect git diff in the repository workspace, optionally filtered to a workspace path.",
+                json!({"base":{"type":"string"},"path":{"type":"string","description":"Optional workspace-relative path filter. Absolute paths under the virtual workspace root are also accepted."}}),
+                vec![],
+            ),
             "git_show" => ("Show git commit details or object content.", json!({"revision":{"type":"string"},"path":{"type":"string"}}), vec!["revision"]),
             _ => anyhow::bail!("unsupported coding tool"),
         };
@@ -710,7 +718,21 @@ pub fn tool_command(name: &str, arguments: &Value, timeout: u64) -> Result<Comma
 
 #[cfg(test)]
 mod tests {
-    use super::durable_tool_result;
+    use super::{durable_tool_result, tool_definitions};
+
+    #[test]
+    fn git_path_filter_schema_explains_workspace_relative_contract() -> anyhow::Result<()> {
+        let definitions = tool_definitions(&["git_status".into(), "git_diff".into()])?;
+        for definition in definitions {
+            let description = definition["parameters"]["properties"]["path"]["description"]
+                .as_str()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            assert!(description.contains("workspace-relative path filter"));
+            assert!(description.contains("absolute paths under the virtual workspace root"));
+        }
+        Ok(())
+    }
 
     #[test]
     fn durable_tool_result_excludes_child_output() {

@@ -106,7 +106,8 @@ The CLI ACP repository callback checks the role and canonical workspace identity
 for every tool call. Mutations require the persisted role execution's database
 lock, and callback calls, output, and runtime are bounded by tool metadata.
 Filesystem mutations use directory-relative handles to reject traversal and
-symlink replacement. CLI workflow terminal calls remain denied.
+symlink replacement. Git status/diff path filters are normalized to repository
+relative pathspecs before host Git runs. CLI workflow terminal calls remain denied.
 Role prompts identify the ACP virtual workspace root and require
 workspace-relative repository tool paths; the host repository path is not
 exposed to the role.

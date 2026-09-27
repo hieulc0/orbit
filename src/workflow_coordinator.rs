@@ -2261,7 +2261,6 @@ const TOOL_PATH_DISPLAY_LIMIT: usize = 192;
 enum PathAuditState {
     WorkspaceRelative,
     OutsideWorkspaceRedacted,
-    UnnormalizedGitPathFilter,
     InvalidPath,
 }
 
@@ -2809,18 +2808,6 @@ fn path_arguments_for_tool(
             if !required && value.is_none_or(serde_json::Value::is_null) {
                 return None;
             }
-            if matches!(tool, Tool::GitStatus | Tool::GitDiff) {
-                return Some(match value.and_then(serde_json::Value::as_str) {
-                    Some(_) => PathArgumentAudit {
-                        argument,
-                        state: PathAuditState::UnnormalizedGitPathFilter,
-                        workspace_relative_path: None,
-                        exists: None,
-                        display_truncated: false,
-                    },
-                    None => invalid_path_argument(argument),
-                });
-            }
             Some(match value.and_then(serde_json::Value::as_str) {
                 Some(value) => classify_path_argument(argument, value, repo_path),
                 None => invalid_path_argument(argument),
@@ -3000,9 +2987,8 @@ fn render_path_arguments(value: &serde_json::Value) -> String {
                 Some("OUTSIDE_WORKSPACE_REDACTED") => {
                     format!("{name}=OUTSIDE_WORKSPACE_REDACTED")
                 }
-                Some("UNNORMALIZED_GIT_PATH_FILTER") => {
-                    format!("{name}=UNNORMALIZED_GIT_PATH_FILTER")
-                }
+                // Preserve a safe label for audit rows written by older candidates.
+                Some("UNNORMALIZED_GIT_PATH_FILTER") => format!("{name}=INVALID_PATH"),
                 _ => format!("{name}=INVALID_PATH"),
             };
             Some(rendered)
@@ -5315,34 +5301,52 @@ mod tests {
     }
 
     #[test]
-    fn git_path_filter_audit_does_not_claim_workspace_normalization() -> Result<()> {
+    fn git_path_filter_audit_records_only_safe_workspace_paths() -> Result<()> {
         use crate::tool_surface::CanonicalToolName as Tool;
 
         let repo = tempdir()?;
+        let virtual_filter = format!("{}/private-filter.txt", crate::acp_runtime::WORKSPACE);
         let relative_filter = "./private-filter.txt";
         let absolute_filter = repo
             .path()
             .join("private filter name.txt")
             .to_string_lossy()
             .into_owned();
+        let outside_filter = "/private/orbit-audit-secret/provider-token";
+        let traversal_filter = "../orbit-audit-secret/provider-token";
         let mut audit = ToolCallAudit::default();
         let cases = [
             (
                 1,
                 Tool::GitStatus,
-                serde_json::json!({"path": relative_filter}),
+                serde_json::json!({"path": virtual_filter}),
             ),
             (
                 2,
+                Tool::GitStatus,
+                serde_json::json!({"path": relative_filter}),
+            ),
+            (
+                3,
                 Tool::GitDiff,
                 serde_json::json!({"path": absolute_filter.clone()}),
             ),
-            (3, Tool::GitStatus, serde_json::json!({"path": 987654321})),
-            (4, Tool::GitDiff, serde_json::json!({})),
-            (5, Tool::GitDiff, serde_json::json!({"path": null})),
-            (6, Tool::FsListDirectory, serde_json::json!({"path": null})),
-            (7, Tool::FsFindPath, serde_json::json!({"path": null})),
-            (8, Tool::GitShow, serde_json::json!({"path": null})),
+            (
+                4,
+                Tool::GitStatus,
+                serde_json::json!({"path": outside_filter}),
+            ),
+            (
+                5,
+                Tool::GitDiff,
+                serde_json::json!({"path": traversal_filter}),
+            ),
+            (6, Tool::GitStatus, serde_json::json!({"path": 987654321})),
+            (7, Tool::GitDiff, serde_json::json!({})),
+            (8, Tool::GitDiff, serde_json::json!({"path": null})),
+            (9, Tool::FsListDirectory, serde_json::json!({"path": null})),
+            (10, Tool::FsFindPath, serde_json::json!({"path": null})),
+            (11, Tool::GitShow, serde_json::json!({"path": null})),
         ];
         for (sequence, tool, params) in cases {
             audit.begin_call(sequence, Some(tool), sequence - 1, 0);
@@ -5350,46 +5354,80 @@ mod tests {
             audit.finish_call(sequence, ToolCallOutcome::Success, None);
         }
 
-        for entry in audit.entries.iter().take(2) {
+        for entry in audit.entries.iter().take(3) {
             assert_eq!(
                 entry.path_arguments[0].state,
-                PathAuditState::UnnormalizedGitPathFilter
+                PathAuditState::WorkspaceRelative
             );
-            assert_eq!(entry.path_arguments[0].workspace_relative_path, None);
-            assert_eq!(entry.path_arguments[0].exists, None);
         }
         assert_eq!(
-            audit.entries[2].path_arguments[0].state,
+            audit.entries[0].path_arguments[0]
+                .workspace_relative_path
+                .as_deref(),
+            Some("private-filter.txt")
+        );
+        assert_eq!(audit.entries[0].path_arguments[0].exists, Some(false));
+        assert_eq!(
+            audit.entries[1].path_arguments[0]
+                .workspace_relative_path
+                .as_deref(),
+            Some("private-filter.txt")
+        );
+        assert_eq!(
+            audit.entries[2].path_arguments[0]
+                .workspace_relative_path
+                .as_deref(),
+            Some("private%20filter%20name.txt")
+        );
+        assert_eq!(
+            audit.entries[3].path_arguments[0].state,
+            PathAuditState::OutsideWorkspaceRedacted
+        );
+        assert_eq!(
+            audit.entries[3].path_arguments[0].workspace_relative_path,
+            None
+        );
+        assert_eq!(
+            audit.entries[4].path_arguments[0].state,
             PathAuditState::InvalidPath
         );
         assert_eq!(
-            audit.entries[2].path_arguments[0].workspace_relative_path,
+            audit.entries[5].path_arguments[0].state,
+            PathAuditState::InvalidPath
+        );
+        assert_eq!(
+            audit.entries[5].path_arguments[0].workspace_relative_path,
             None
         );
-        for entry in audit.entries.iter().skip(3) {
+        for entry in audit.entries.iter().skip(6) {
             assert!(entry.path_arguments.is_empty());
         }
         let metadata = serde_json::json!({
-            "tool_call_audit": audit.metadata(8, 8, 0)
+            "tool_call_audit": audit.metadata(11, 11, 0)
         });
         let encoded = metadata.to_string();
         let report = render_tool_call_audit(&metadata);
+        assert!(!encoded.contains(&virtual_filter));
+        assert!(!report.contains(&virtual_filter));
         assert!(!encoded.contains(relative_filter));
         assert!(!report.contains(relative_filter));
         assert!(!encoded.contains(&absolute_filter));
         assert!(!report.contains(&absolute_filter));
-        assert!(!encoded.contains("private-filter.txt"));
-        assert!(!report.contains("private-filter.txt"));
+        assert!(!encoded.contains(outside_filter));
+        assert!(!report.contains(outside_filter));
+        assert!(!encoded.contains(traversal_filter));
+        assert!(!report.contains(traversal_filter));
+        assert!(report.contains("WORKSPACE_RELATIVE(private-filter.txt; exists=false)"));
+        assert!(report.contains("private%20filter%20name.txt"));
+        assert!(report.contains("path=OUTSIDE_WORKSPACE_REDACTED"));
+        assert!(report.contains("path=INVALID_PATH"));
         assert!(!encoded.contains("private filter name.txt"));
         assert!(!report.contains("private filter name.txt"));
         assert!(!encoded.contains("987654321"));
         assert!(!report.contains("987654321"));
-        assert!(report.contains("UNNORMALIZED_GIT_PATH_FILTER"));
-        assert!(report.contains("path=INVALID_PATH"));
-        assert!(!report.contains("WORKSPACE_RELATIVE("));
-        let absent_filter_row = report.lines().find(|line| line.starts_with("4 |"));
+        let absent_filter_row = report.lines().find(|line| line.starts_with("7 |"));
         assert!(absent_filter_row.is_some_and(|line| line.contains("|  | Tool call completed.")));
-        for sequence in 5..=8 {
+        for sequence in 8..=11 {
             let row = report
                 .lines()
                 .find(|line| line.starts_with(&format!("{sequence} |")));
