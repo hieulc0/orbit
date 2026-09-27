@@ -74,7 +74,7 @@ pub async fn perform(
                 Ok(result) => result,
                 Err(error) => {
                     let failure = coding_runtime_failure(&error);
-                    let diagnostic = coding_runtime_failure_log(&failure)?;
+                    let diagnostic = coding_runtime_failure_log(&error, &failure)?;
                     let logs = client.upload(a, "logs", diagnostic).await?;
                     return Ok((false, vec![logs], Some(failure)));
                 }
@@ -170,13 +170,22 @@ fn coding_runtime_failure(error: &anyhow::Error) -> Failure {
     }
 }
 
-fn coding_runtime_failure_log(failure: &Failure) -> Result<Vec<u8>> {
-    Ok(serde_json::to_vec(&json!({
+fn coding_runtime_failure_log(error: &anyhow::Error, failure: &Failure) -> Result<Vec<u8>> {
+    let mut log = json!({
         "kind": "coding_runtime_failure",
         "category": failure.category,
         "code": failure.code,
         "side_effect_status": failure.side_effect_status,
-    }))?)
+    });
+    // A TurnTimeout diagnostic is assembled from the broker's bounded,
+    // payload-free protocol state. Preserve it so an unresolved model call is
+    // distinguishable from a timeout with no pending call. Never persist
+    // arbitrary runtime/provider error text here.
+    if let Some(timeout) = error.downcast_ref::<crate::acp_runtime::TurnTimeout>() {
+        let diagnostic = timeout.diagnostic.chars().take(2048).collect::<String>();
+        log["timeout_diagnostic"] = json!(diagnostic);
+    }
+    Ok(serde_json::to_vec(&log)?)
 }
 
 const VALIDATION_LOG_LIMIT: usize = 1024 * 1024;
@@ -673,12 +682,31 @@ mod validation_tests {
 
     #[test]
     fn coding_runtime_failure_log_is_structural() -> Result<()> {
-        let failure = coding_runtime_failure(&anyhow::anyhow!(
-            "Authorization: Bearer ORBIT_SECRET_SENTINEL"
-        ));
-        let log = String::from_utf8(coding_runtime_failure_log(&failure)?)?;
+        let error = anyhow::anyhow!("Authorization: Bearer ORBIT_SECRET_SENTINEL");
+        let failure = coding_runtime_failure(&error);
+        let log = String::from_utf8(coding_runtime_failure_log(&error, &failure)?)?;
         assert!(!log.contains("ORBIT_SECRET_SENTINEL"));
+        assert!(!log.contains("Authorization"));
         assert!(log.contains("coding_agent_failed"));
+        Ok(())
+    }
+
+    #[test]
+    fn coding_runtime_timeout_log_preserves_bounded_pending_call_evidence() -> Result<()> {
+        for pending_model_call in [false, true] {
+            let error = anyhow::Error::new(crate::acp_runtime::TurnTimeout {
+                diagnostic: format!(
+                    "session_digest=abc pending_model_call={pending_model_call} pending_tool_reservations=0 supervisor_state=running"
+                ),
+            })
+            .context("cleanup confirmed");
+            let failure = coding_runtime_failure(&error);
+            let log = String::from_utf8(coding_runtime_failure_log(&error, &failure)?)?;
+            assert!(log.contains(&format!("pending_model_call={pending_model_call}")));
+            assert!(log.contains("supervisor_state=running"));
+            assert!(log.len() < 8192);
+            assert!(!log.contains("Authorization"));
+        }
         Ok(())
     }
 

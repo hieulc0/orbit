@@ -142,6 +142,7 @@ pub struct WorkflowCoordinator {
     executor: Arc<dyn RoleAgentExecutor>,
     active_cancellations: Arc<Mutex<BTreeMap<String, tokio::sync::watch::Sender<bool>>>>,
     quota_selection_policy: RuntimeQuotaSelectionPolicy,
+    verification_environment: Option<EnvironmentIdentity>,
 }
 
 impl WorkflowCoordinator {
@@ -157,6 +158,7 @@ impl WorkflowCoordinator {
             executor,
             active_cancellations: Arc::new(Mutex::new(BTreeMap::new())),
             quota_selection_policy: RuntimeQuotaSelectionPolicy::default(),
+            verification_environment: None,
         }
     }
 
@@ -166,6 +168,18 @@ impl WorkflowCoordinator {
     ) -> Result<Self> {
         policy.validate()?;
         self.quota_selection_policy = policy;
+        Ok(self)
+    }
+
+    /// Pin the isolated execution environment used by workflow verification.
+    ///
+    /// Without an explicitly supplied profile, verification remains fail-closed.
+    pub fn with_verification_environment(
+        mut self,
+        environment: EnvironmentIdentity,
+    ) -> Result<Self> {
+        crate::verification::validate_pinned_verification_profile(&environment)?;
+        self.verification_environment = Some(environment);
         Ok(self)
     }
 
@@ -211,6 +225,7 @@ impl WorkflowCoordinator {
             executor: Arc::clone(&self.executor),
             active_cancellations: Arc::clone(&self.active_cancellations),
             quota_selection_policy: self.quota_selection_policy,
+            verification_environment: self.verification_environment.clone(),
         };
         let (cancel_tx, _cancel_rx) = tokio::sync::watch::channel(false);
         self.active_cancellations
@@ -1554,7 +1569,7 @@ impl WorkflowCoordinator {
         sel_policy: Option<&SelectionPolicy>,
     ) -> Result<VerificationRun> {
         let repo_path = workflow_repo_path(wf)?;
-        let env = EnvironmentIdentity::default();
+        let env = self.verification_environment.clone().unwrap_or_default();
         crate::verification::validate_pinned_verification_profile(&env)?;
 
         if let Some(sp) = sel_policy {
