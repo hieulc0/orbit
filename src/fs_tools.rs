@@ -126,7 +126,7 @@ pub fn confine_path(
 /// Create a directory within `repo_path`.
 pub fn create_directory(repo_path: &Path, path_str: &str, recursive: bool) -> Result<PathBuf> {
     let root = RootedRepo::open(repo_path)?;
-    let relative = root.relative(path_str)?;
+    let relative = root.relative_for_mutation(path_str)?;
     root.create_directory(&relative, recursive)?;
     Ok(root.path.join(relative))
 }
@@ -138,8 +138,8 @@ pub fn move_path(
     destination_str: &str,
 ) -> Result<(PathBuf, PathBuf)> {
     let root = RootedRepo::open(repo_path)?;
-    let src = root.relative(source_str)?;
-    let dst = root.relative(destination_str)?;
+    let src = root.relative_for_mutation(source_str)?;
+    let dst = root.relative_for_mutation(destination_str)?;
     root.move_path(&src, &dst)?;
     Ok((root.path.join(src), root.path.join(dst)))
 }
@@ -147,7 +147,7 @@ pub fn move_path(
 /// Delete a single file within `repo_path`.
 pub fn delete_file(repo_path: &Path, path_str: &str) -> Result<PathBuf> {
     let root = RootedRepo::open(repo_path)?;
-    let relative = root.relative(path_str)?;
+    let relative = root.relative_for_mutation(path_str)?;
     root.delete_file(&relative)?;
     Ok(root.path.join(relative))
 }
@@ -155,7 +155,7 @@ pub fn delete_file(repo_path: &Path, path_str: &str) -> Result<PathBuf> {
 /// Delete a directory within `repo_path`.
 pub fn delete_directory(repo_path: &Path, path_str: &str, recursive: bool) -> Result<PathBuf> {
     let root = RootedRepo::open(repo_path)?;
-    let relative = root.relative(path_str)?;
+    let relative = root.relative_for_mutation(path_str)?;
     root.delete_directory(&relative, recursive)?;
     Ok(root.path.join(relative))
 }
@@ -194,6 +194,33 @@ impl RootedRepo {
                 && !relative.as_os_str().is_empty(),
             "repository mutation path must have normal components"
         );
+        Ok(relative)
+    }
+
+    fn relative_for_mutation(&self, requested: &str) -> Result<PathBuf> {
+        let relative = self.relative(requested)?;
+        ensure!(
+            !relative
+                .components()
+                .any(|component| component.as_os_str() == OsStr::new(".git")),
+            "repository Git metadata is read-only"
+        );
+
+        let git_metadata = self.path.join(".git").canonicalize().ok();
+        let mut candidate = self.path.join(&relative);
+        loop {
+            if let (Some(git_metadata), Ok(canonical)) =
+                (git_metadata.as_ref(), candidate.canonicalize())
+            {
+                ensure!(
+                    !canonical.starts_with(git_metadata),
+                    "repository Git metadata is read-only"
+                );
+            }
+            if candidate == self.path || !candidate.pop() {
+                break;
+            }
+        }
         Ok(relative)
     }
 
@@ -529,7 +556,7 @@ pub fn read_text_confined(repo_path: &Path, path_str: &str) -> Result<String> {
 
 pub fn write_text_confined(repo_path: &Path, path_str: &str, content: &str) -> Result<()> {
     let root = RootedRepo::open(repo_path)?;
-    let relative = root.relative(path_str)?;
+    let relative = root.relative_for_mutation(path_str)?;
     root.write_file(&relative, content.as_bytes())
 }
 
@@ -540,8 +567,8 @@ pub fn copy_path_confined(
     recursive: bool,
 ) -> Result<()> {
     let root = RootedRepo::open(repo_path)?;
-    let source = root.relative(source_str)?;
-    let destination = root.relative(destination_str)?;
+    let source = root.relative_for_mutation(source_str)?;
+    let destination = root.relative_for_mutation(destination_str)?;
     root.copy_path(&source, &destination, recursive)
 }
 
@@ -657,6 +684,60 @@ mod tests {
                 .contains("escapes workspace")
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn git_metadata_is_readable_but_never_a_mutation_target() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let repo = tempfile::tempdir()?;
+        std::fs::create_dir(repo.path().join(".git"))?;
+        std::fs::write(
+            repo.path().join(".git/config"),
+            "[core]\nrepositoryformatversion = 0\n",
+        )?;
+        std::fs::write(repo.path().join("README.md"), "candidate\n")?;
+        symlink(repo.path().join(".git"), repo.path().join("git-alias"))?;
+
+        assert!(
+            read_text_confined(repo.path(), ".git/config")?.contains("repositoryformatversion")
+        );
+        assert!(read_text_confined(repo.path(), "README.md")?.contains("candidate"));
+
+        let absolute_config = repo.path().join(".git/config");
+        let absolute_config = absolute_config.to_string_lossy();
+        for path in [
+            ".git/config",
+            "./.git/config",
+            absolute_config.as_ref(),
+            "/orbit/home/workspace/.git/config",
+        ] {
+            let error = write_text_confined(repo.path(), path, "overwritten").unwrap_err();
+            assert!(error.to_string().contains("Git metadata is read-only"));
+        }
+
+        assert!(write_text_confined(repo.path(), "git-alias/new-config", "bad").is_err());
+        assert!(create_directory(repo.path(), ".git/new-dir", true).is_err());
+        assert!(create_directory(repo.path(), "git-alias/new-dir", true).is_err());
+        assert!(move_path(repo.path(), ".git/config", "config-copy").is_err());
+        assert!(move_path(repo.path(), "README.md", ".git/config-copy").is_err());
+        assert!(copy_path_confined(repo.path(), "README.md", ".git/copied", false).is_err());
+        assert!(copy_path_confined(repo.path(), ".git/config", "config-copy", false).is_err());
+        assert!(delete_file(repo.path(), ".git/config").is_err());
+        assert!(delete_directory(repo.path(), ".git", true).is_err());
+        assert!(
+            crate::tool_surface::edit_file(repo.path(), ".git/config", "[core]", "[unsafe]", false)
+                .is_err()
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join(".git/config"))?,
+            "[core]\nrepositoryformatversion = 0\n"
+        );
+        assert!(!repo.path().join(".git/new-dir").is_dir());
+        assert!(!repo.path().join(".git/copied").exists());
+        assert!(!repo.path().join("config-copy").exists());
         Ok(())
     }
 

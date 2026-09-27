@@ -1644,10 +1644,7 @@ async fn changed_files_for_selection(repo_path: &Path, baseline: &str) -> Result
         vec!["diff", "--name-only", "-z", "--no-renames", baseline, "--"],
         vec!["ls-files", "--others", "--exclude-standard", "-z"],
     ] {
-        let output = tokio::process::Command::new("git")
-            .arg("-C")
-            .arg(repo_path)
-            .args(args)
+        let output = crate::tool_surface::safe_git_command(repo_path, &args)
             .output()
             .await
             .context("start git while collecting verification selection inputs")?;
@@ -1720,10 +1717,7 @@ pub async fn compute_workspace_state(
 }
 
 async fn git_output(repo_path: &Path, args: &[&str]) -> Result<Vec<u8>> {
-    let output = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(repo_path)
-        .args(args)
+    let output = crate::tool_surface::safe_git_command(repo_path, args)
         .output()
         .await
         .context("GIT_WORKSPACE_STATE_FAILED: start git")?;
@@ -1768,10 +1762,9 @@ async fn review_candidate_diff(repo_path: &Path, baseline_revision: &str) -> Res
         .await
         .context("REVIEW_ERROR: tracked diff failed")?;
         for relative in git_untracked_paths(repo_path).await? {
-            let output = tokio::process::Command::new("git")
-                .arg("-C")
-                .arg(repo_path)
-                .args([
+            let output = crate::tool_surface::safe_git_command(
+                repo_path,
+                &[
                     "diff",
                     "--no-index",
                     "--binary",
@@ -1779,11 +1772,12 @@ async fn review_candidate_diff(repo_path: &Path, baseline_revision: &str) -> Res
                     "--full-index",
                     "--",
                     "/dev/null",
-                ])
-                .arg(&relative)
-                .output()
-                .await
-                .context("REVIEW_ERROR: start untracked file diff")?;
+                ],
+            )
+            .arg(&relative)
+            .output()
+            .await
+            .context("REVIEW_ERROR: start untracked file diff")?;
             ensure!(
                 output.status.code() == Some(1) && !output.stdout.is_empty(),
                 "REVIEW_ERROR: untracked diff failed for {}: {}",

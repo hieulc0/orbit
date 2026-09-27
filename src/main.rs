@@ -258,6 +258,14 @@ struct WorkflowArgs {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum WorkflowAction {
+    /// Run Orbit's fixed S8 live qualification against a disposable temporary Git repository.
+    QualifyLive {
+        /// Clean disposable Git repository under temp with committed README.md and fixed test.sh.
+        #[arg(long, value_name = "PATH", required = true)]
+        repo: PathBuf,
+        #[arg(long, env = "ORBIT_DATABASE_URL_FILE", hide_env_values = true)]
+        database_url_file: Option<PathBuf>,
+    },
     /// Start a new workflow run for a task and attempt.
     Start {
         #[arg(value_name = "TASK_ID")]
@@ -654,6 +662,1296 @@ fn ensure_cli_workflow_execution_enabled(action: &WorkflowAction) -> Result<()> 
             "CLI_WORKFLOW_EXECUTION_GATED: workflow start and resume are disabled pending R4 qualification"
         );
     }
+    Ok(())
+}
+
+const S8_LIVE_VERIFICATION_IMAGE: &str = "docker.io/library/alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b";
+const S8_LIVE_README_CONTENT: &str = "ORBIT_R4_S8_QUALIFICATION_OK";
+const S8_LIVE_TEST_MARKER: &str = "ORBIT_R4_S8_QUALIFICATION_CHECK_PASSED";
+const S8_LIVE_TEST_SCRIPT: &str = "#!/bin/sh\nset -eu\nif ! printf '%s\\n' 'ORBIT_R4_S8_QUALIFICATION_OK' | cmp -s - README.md; then\n    printf '%s\\n' 'S8 candidate README contract failed' >&2\n    exit 1\nfi\nprintf '%s\\n' 'ORBIT_R4_S8_QUALIFICATION_CHECK_PASSED'\n";
+
+struct S8LiveQualificationPolicies {
+    verification: orbit::verification::VerificationPolicy,
+    regression: orbit::regression_strategy::RegressionPolicy,
+    selection: orbit::regression_strategy::SelectionPolicy,
+}
+
+fn s8_live_qualification_policies() -> S8LiveQualificationPolicies {
+    use orbit::{
+        regression_strategy::{
+            RegressionFallbackBehavior, RegressionPolicy, SelectionPolicy, VerificationCheck,
+            VerificationTier,
+        },
+        verification::{AllowedCommand, VerificationPolicy},
+    };
+
+    let mut verification = VerificationPolicy::new(
+        "orbit-r4-s8-live-verification-v1",
+        "Fixed Orbit R4 S8 live qualification check",
+    );
+    verification.required_steps = vec!["s8-candidate-contract".into()];
+    verification.allowed_commands = vec![AllowedCommand::with_prefix("sh", vec!["test.sh".into()])];
+    verification.network_policy = orbit::verification::VerificationNetworkPolicy::None;
+    verification.cache_policy = orbit::verification::VerificationCachePolicy::Clean;
+
+    let mut selection = SelectionPolicy::new(
+        "orbit-r4-s8-live-selection-v1",
+        "Fixed Orbit R4 S8 live qualification selection",
+    );
+    let mut check = VerificationCheck::new_command(
+        "s8-candidate-contract",
+        "Check the S8 qualification candidate",
+        vec![
+            VerificationTier::Fast,
+            VerificationTier::Standard,
+            VerificationTier::Full,
+        ],
+        vec!["sh".into(), "test.sh".into()],
+    );
+    check.always_run = true;
+    selection.checks.push(check);
+
+    let mut regression = RegressionPolicy::new(
+        "orbit-r4-s8-live-regression-v1",
+        "Fixed Orbit R4 S8 live qualification regression",
+    );
+    regression.fallback_behavior = RegressionFallbackBehavior::FailClosed;
+    regression.selection_policy_id = Some(selection.id.clone());
+    regression.selection_policy_version = Some(selection.version);
+    regression.selection_policy_digest = Some(selection.digest());
+
+    S8LiveQualificationPolicies {
+        verification,
+        regression,
+        selection,
+    }
+}
+
+struct S8LiveRepository {
+    path: PathBuf,
+    base_revision: String,
+}
+
+const S8_ALLOWED_LOCAL_GIT_CONFIG_KEYS: &[&str] = &[
+    "core.repositoryformatversion",
+    "core.filemode",
+    "core.bare",
+    "core.logallrefupdates",
+    "user.name",
+    "user.email",
+];
+
+fn s8_local_git_config_keys(repository: &Path) -> Result<Vec<String>> {
+    let keys = git_readonly_output(
+        repository,
+        &[
+            "config",
+            "--local",
+            "--no-includes",
+            "--null",
+            "--name-only",
+            "--list",
+        ],
+    )?;
+    Ok(keys
+        .split('\0')
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+fn s8_validate_local_git_config(repository: &Path) -> Result<()> {
+    let keys = s8_local_git_config_keys(repository)?;
+    for key in &keys {
+        anyhow::ensure!(
+            S8_ALLOWED_LOCAL_GIT_CONFIG_KEYS.contains(&key.as_str()),
+            "qualification repository Git configuration contains an unsupported setting"
+        );
+    }
+    anyhow::ensure!(
+        keys.iter().any(|key| key == "core.repositoryformatversion")
+            && keys.iter().any(|key| key == "core.bare"),
+        "qualification repository Git configuration is incomplete"
+    );
+    Ok(())
+}
+
+fn validate_s8_live_repository(path: &Path) -> Result<S8LiveRepository> {
+    let canonical = path
+        .canonicalize()
+        .context("qualification repository path must exist")?;
+    anyhow::ensure!(
+        canonical.is_dir(),
+        "qualification repository must be a directory"
+    );
+    let temp_root = std::env::temp_dir()
+        .canonicalize()
+        .context("operating system temp directory is unavailable")?;
+    anyhow::ensure!(
+        canonical != temp_root && canonical.starts_with(&temp_root),
+        "qualification repository must be under the operating system temp directory"
+    );
+    let source_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .canonicalize()
+        .context("Orbit source checkout path is unavailable")?;
+    anyhow::ensure!(
+        !canonical.starts_with(&source_root) && !source_root.starts_with(&canonical),
+        "qualification repository cannot be the Orbit source checkout or its parent"
+    );
+
+    let mut has_git_directory = false;
+    let mut has_readme = false;
+    let mut has_test_script = false;
+    for entry in fs::read_dir(&canonical)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        match entry.file_name().to_str() {
+            Some(".git") => {
+                anyhow::ensure!(
+                    file_type.is_dir(),
+                    "qualification repository must be a standalone Git repository"
+                );
+                has_git_directory = true;
+            }
+            Some("README.md") => {
+                anyhow::ensure!(
+                    file_type.is_file(),
+                    "qualification repository README.md must be a regular file"
+                );
+                anyhow::ensure!(
+                    fs::metadata(entry.path())?.len() <= 4096,
+                    "qualification repository README.md exceeds 4 KiB"
+                );
+                let readme = fs::read_to_string(entry.path())
+                    .context("qualification repository README.md must be UTF-8 text")?;
+                anyhow::ensure!(
+                    readme.trim() != S8_LIVE_README_CONTENT,
+                    "qualification repository README.md must require a candidate mutation"
+                );
+                has_readme = true;
+            }
+            Some("test.sh") => {
+                anyhow::ensure!(
+                    file_type.is_file()
+                        && fs::read(entry.path())? == S8_LIVE_TEST_SCRIPT.as_bytes(),
+                    "qualification repository must contain the fixed S8 contract test.sh"
+                );
+                has_test_script = true;
+            }
+            _ => anyhow::bail!(
+                "qualification repository may contain only .git, README.md and the fixed test.sh before the run"
+            ),
+        }
+    }
+    anyhow::ensure!(
+        has_git_directory && has_readme && has_test_script,
+        "qualification repository must contain a Git directory, README.md and fixed test.sh"
+    );
+
+    let hooks_path = canonical.join(".git/hooks");
+    let hooks_metadata = fs::symlink_metadata(&hooks_path)
+        .context("qualification repository Git hooks directory is unavailable")?;
+    anyhow::ensure!(
+        hooks_metadata.is_dir() && !hooks_metadata.file_type().is_symlink(),
+        "qualification repository Git hooks directory must be local"
+    );
+    for entry in fs::read_dir(&hooks_path)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let metadata = fs::symlink_metadata(entry.path())?;
+        anyhow::ensure!(
+            name.to_str().is_some_and(|name| name.ends_with(".sample"))
+                && metadata.is_file()
+                && !metadata.file_type().is_symlink(),
+            "qualification repository must not contain active or custom Git hooks"
+        );
+    }
+    s8_validate_local_git_config(&canonical)?;
+
+    let top_level = git_readonly_output(&canonical, &["rev-parse", "--show-toplevel"])?;
+    anyhow::ensure!(
+        Path::new(&top_level).canonicalize()? == canonical,
+        "qualification path must be the Git repository root"
+    );
+    let tracked_files = git_readonly_output(&canonical, &["ls-files", "-z"])?;
+    let tracked_files: Vec<&str> = tracked_files
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .collect();
+    anyhow::ensure!(
+        tracked_files == ["README.md", "test.sh"],
+        "qualification repository must track README.md and the fixed test.sh"
+    );
+    anyhow::ensure!(
+        git_readonly_output(
+            &canonical,
+            &["status", "--porcelain=v1", "--untracked-files=all"]
+        )?
+        .is_empty(),
+        "qualification repository must have a clean worktree"
+    );
+    let base_revision = git_readonly_output(&canonical, &["rev-parse", "--verify", "HEAD"])?;
+    anyhow::ensure!(
+        (base_revision.len() == 40 || base_revision.len() == 64)
+            && base_revision.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "qualification repository must have a committed Git baseline"
+    );
+
+    Ok(S8LiveRepository {
+        path: canonical,
+        base_revision,
+    })
+}
+
+fn git_readonly_output(repository: &Path, args: &[&str]) -> Result<String> {
+    let output = s8_git_readonly_command(repository, args)
+        .output()
+        .context("could not start Git while validating the qualification repository")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "qualification repository failed Git validation"
+    );
+    String::from_utf8(output.stdout)
+        .context("qualification repository Git metadata was not UTF-8")
+        .map(|value| value.trim().to_owned())
+}
+
+fn s8_git_readonly_command(repository: &Path, args: &[&str]) -> std::process::Command {
+    let path = std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into());
+    let mut command = std::process::Command::new("git");
+    command
+        .env_clear()
+        .env("PATH", path)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_COUNT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_EXTERNAL_DIFF", "")
+        .env("GIT_PAGER", "cat")
+        .env("PAGER", "cat")
+        .args([
+            "--no-pager",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "diff.external=",
+            "-c",
+            "core.pager=cat",
+        ])
+        .arg("-C")
+        .arg(repository);
+    if args.first() == Some(&"diff") {
+        command.args(["diff", "--no-ext-diff", "--no-textconv"]);
+        command.args(&args[1..]);
+    } else {
+        command.args(args);
+    }
+    command
+}
+
+fn s8_live_environment_from_image_id(
+    image_id: &str,
+) -> Result<orbit::verification::EnvironmentIdentity> {
+    let image_id = image_id
+        .trim()
+        .strip_prefix("sha256:")
+        .unwrap_or(image_id.trim());
+    anyhow::ensure!(
+        image_id.len() == 64 && image_id.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "local Podman verification image identity is invalid"
+    );
+    anyhow::ensure!(
+        std::env::consts::OS == "linux",
+        "S8 live qualification requires Linux rootless Podman"
+    );
+    Ok(orbit::verification::EnvironmentIdentity {
+        execution_profile: "sandboxed-container".into(),
+        isolation: "rootless-podman".into(),
+        runtime_image: Some(S8_LIVE_VERIFICATION_IMAGE.into()),
+        runtime_image_digest: Some(format!("sha256:{image_id}")),
+        oci_runtime: Some("podman".into()),
+        network_policy: orbit::verification::VerificationNetworkPolicy::None,
+        cache_policy: orbit::verification::VerificationCachePolicy::Clean,
+        environment_policy_digest: None,
+        integration_environment_digest: None,
+        browser_verification_digest: None,
+        browser_runtime_image_digest: None,
+        regression_policy_digest: None,
+        selection_digest: None,
+        architecture: std::env::consts::ARCH.into(),
+        os: std::env::consts::OS.into(),
+        orbit_version: env!("CARGO_PKG_VERSION").into(),
+    })
+}
+
+fn s8_reset_aware_evidence(reason: &str) -> serde_json::Value {
+    let fields: std::collections::BTreeMap<&str, &str> = reason
+        .split("; ")
+        .filter_map(|field| field.split_once('='))
+        .collect();
+    let rank = reason
+        .strip_prefix("reset-aware rank=")
+        .and_then(|tail| tail.split_once(';'))
+        .map(|(rank, _)| rank.trim())
+        .filter(|rank| rank.bytes().all(|byte| byte.is_ascii_digit()));
+    let weekly_reset_rank = match reason.split("; ").nth(1) {
+        Some("known_weekly_reset") => Some("known_weekly_reset"),
+        Some("weekly_reset_unknown_or_not_applicable") => {
+            Some("weekly_reset_unknown_or_not_applicable")
+        }
+        _ => None,
+    };
+    let availability = fields.get("availability").filter(|value| {
+        matches!(
+            **value,
+            "Ready"
+                | "Limited"
+                | "Cooldown"
+                | "RateLimited"
+                | "QuotaExhausted"
+                | "AuthFailed"
+                | "RuntimeUnavailable"
+                | "CapabilityMismatch"
+                | "Unknown"
+        )
+    });
+    let five_hour_remaining = fields
+        .get("5h_remaining")
+        .copied()
+        .filter(|value| s8_is_safe_quota_percent(value));
+    let seven_day_remaining = fields
+        .get("7d_remaining")
+        .copied()
+        .filter(|value| s8_is_safe_quota_percent(value));
+    let seven_day_reset_at_ms = fields
+        .get("7d_reset_at_ms")
+        .filter(|value| **value == "unknown" || value.bytes().all(|byte| byte.is_ascii_digit()));
+    let provider_preference_rank = fields
+        .get("provider_preference_rank")
+        .filter(|value| value.bytes().all(|byte| byte.is_ascii_digit()));
+    let tie_break = fields
+        .get("tie_break")
+        .filter(|value| **value == "provider_preference_then_stable_account_id");
+    let rejected_summary_items = reason
+        .split_once("; rejected=")
+        .and_then(|(_, summary)| summary.strip_prefix('['))
+        .and_then(|summary| summary.strip_suffix(']'))
+        .map(|summary| {
+            if summary.is_empty() {
+                0
+            } else {
+                summary
+                    .matches("codex:")
+                    .count()
+                    .saturating_add(summary.matches("antigravity:").count())
+                    .min(16)
+            }
+        });
+    serde_json::json!({
+        "ranking": if reason.starts_with("reset-aware rank=") { "reset-aware" } else { "other_or_unknown" },
+        "rank": rank,
+        "weekly_reset_rank": weekly_reset_rank,
+        "availability": availability,
+        "five_hour_remaining": five_hour_remaining,
+        "seven_day_remaining": seven_day_remaining,
+        "seven_day_reset_at_ms": seven_day_reset_at_ms,
+        "five_hour_reset_at_ms": null,
+        "provider_preference_rank": provider_preference_rank,
+        "tie_break": tie_break,
+        "rejected_candidate_summary_items": rejected_summary_items,
+        "selection_reason": {
+            "ranking": if reason.starts_with("reset-aware rank=") { "reset-aware" } else { "other_or_unknown" },
+            "rank": rank,
+            "weekly_reset_rank": weekly_reset_rank,
+            "availability": availability,
+            "five_hour_remaining": five_hour_remaining,
+            "seven_day_remaining": seven_day_remaining,
+            "seven_day_reset_at_ms": seven_day_reset_at_ms,
+            "provider_preference_rank": provider_preference_rank,
+            "tie_break": tie_break
+        }
+    })
+}
+
+fn s8_is_safe_quota_percent(value: &str) -> bool {
+    value == "unknown"
+        || (!value.is_empty()
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'.' | b'%')))
+}
+
+fn s8_safe_quota_percent(value: Option<f64>) -> Option<f64> {
+    value.filter(|value| value.is_finite() && (0.0..=100.0).contains(value))
+}
+
+fn s8_bounded_tool_counts(value: &serde_json::Value) -> serde_json::Value {
+    const SAFE_TOOL_NAMES: &[&str] = &[
+        "read_file",
+        "write_file",
+        "edit_file",
+        "list_directory",
+        "find_path",
+        "create_directory",
+        "move",
+        "copy",
+        "delete_file",
+        "delete_directory",
+        "grep",
+        "shell",
+        "terminal/output",
+        "terminal/wait_for_exit",
+        "terminal/kill",
+        "terminal/release",
+        "git_status",
+        "git_diff",
+        "git_show",
+        "fs.read_text_file",
+        "fs.write_text_file",
+        "fs.edit_file",
+        "fs.list_directory",
+        "fs.find_path",
+        "fs.create_directory",
+        "fs.move",
+        "fs.copy",
+        "fs.delete_file",
+        "fs.delete_directory",
+        "search.grep",
+        "terminal.create",
+        "terminal.output",
+        "terminal.wait_for_exit",
+        "terminal.kill",
+        "terminal.release",
+        "git.status",
+        "git.diff",
+        "git.show",
+    ];
+    let Some(counts) = value.as_object() else {
+        return serde_json::json!({});
+    };
+    let bounded = counts
+        .iter()
+        .filter(|(name, _)| SAFE_TOOL_NAMES.contains(&name.as_str()))
+        .filter_map(|(name, count)| {
+            count
+                .as_u64()
+                .map(|count| (name.clone(), serde_json::Value::from(count)))
+        })
+        .take(SAFE_TOOL_NAMES.len())
+        .collect::<serde_json::Map<_, _>>();
+    serde_json::Value::Object(bounded)
+}
+
+fn s8_tool_count(counts: &serde_json::Value, names: &[&str]) -> u64 {
+    names
+        .iter()
+        .filter_map(|name| counts.get(*name).and_then(serde_json::Value::as_u64))
+        .fold(0, u64::saturating_add)
+}
+
+async fn s8_selected_credential_quota_evidence(
+    pool: &sqlx::PgPool,
+    target: &orbit::workflow::ResolvedExecutionTarget,
+) -> Result<serde_json::Value> {
+    let Some(reference) = target.credential_id.as_deref() else {
+        return Ok(serde_json::json!({"state":"unknown", "quota_windows":[]}));
+    };
+    let credential = orbit::credential_registry::CredentialStore::new(pool)
+        .get(reference)
+        .await?;
+    let Some(credential) = credential else {
+        return Ok(serde_json::json!({"state":"unknown", "quota_windows":[]}));
+    };
+    if credential.provider != target.provider
+        || target.credential_generation != u32::try_from(credential.generation).ok()
+    {
+        return Ok(serde_json::json!({
+            "state":"identity_or_generation_mismatch",
+            "five_hour_reset_at_ms":null,
+            "quota_windows":[]
+        }));
+    }
+    let snapshot = orbit::availability::AvailabilityStore::new(pool)
+        .current_for_credential(&credential.identity())
+        .await?;
+    let Some(snapshot) = snapshot else {
+        return Ok(serde_json::json!({"state":"unknown", "quota_windows":[]}));
+    };
+
+    let now_ms = unix_time_ms()?;
+    let fresh = snapshot.observed_at_ms <= now_ms && now_ms < snapshot.expires_at_ms;
+    let mut windows = Vec::new();
+    let mut append_window = |duration_minutes: Option<i64>,
+                             remaining_percent: Option<f64>,
+                             resets_at_ms: Option<i64>,
+                             exhausted: Option<bool>| {
+        if windows.len() >= 64 {
+            return;
+        }
+        let duration_minutes = duration_minutes.filter(|minutes| (0..=525_600).contains(minutes));
+        let window_kind = match duration_minutes {
+            Some(300) => "five_hour",
+            Some(10_080) => "seven_day",
+            Some(_) => "other_duration",
+            None => "unknown_duration",
+        };
+        windows.push(serde_json::json!({
+            "window_kind": window_kind,
+            "duration_minutes": duration_minutes,
+            "remaining_percent": s8_safe_quota_percent(remaining_percent),
+            "resets_at_ms": resets_at_ms.filter(|reset| *reset >= 0),
+            "exhausted": exhausted
+        }));
+    };
+    for window in snapshot.quota_windows.iter().take(32) {
+        append_window(
+            window.duration_minutes,
+            window
+                .remaining_percent
+                .or_else(|| window.used_percent.map(|used| 100.0 - used)),
+            window.resets_at_ms,
+            window.exhausted,
+        );
+    }
+    for bucket in snapshot.quota_buckets.iter().take(16) {
+        for window in bucket.windows.iter().take(16) {
+            append_window(
+                window.duration_minutes,
+                window
+                    .remaining_percent
+                    .or_else(|| window.remaining_fraction.map(|fraction| fraction * 100.0))
+                    .or_else(|| window.used_percent.map(|used| 100.0 - used)),
+                window.resets_at_ms,
+                window.exhausted,
+            );
+        }
+    }
+    Ok(serde_json::json!({
+        "state": if fresh { "fresh" } else { "stale" },
+        "availability": snapshot.state,
+        "observed_at_ms": snapshot.observed_at_ms,
+        "expires_at_ms": snapshot.expires_at_ms,
+        "five_hour_reset_at_ms": null,
+        "five_hour_reset_attribution": "unknown_without_exact_selected_model_group",
+        "quota_windows": windows
+    }))
+}
+
+fn s8_selection_contains_required_check(
+    selection: Option<&orbit::regression_strategy::VerificationSelection>,
+    workspace_state_id: &str,
+    tier: orbit::regression_strategy::VerificationTier,
+) -> bool {
+    selection.is_some_and(|selection| {
+        selection.workspace_state_id == workspace_state_id
+            && selection.requested_tier == tier
+            && selection
+                .selected_checks
+                .iter()
+                .any(|check| check.check_id == "s8-candidate-contract")
+    })
+}
+
+fn s8_run_executed_fixed_check(
+    run: Option<&orbit::verification::VerificationRun>,
+    expected_environment: &orbit::verification::EnvironmentIdentity,
+) -> bool {
+    let Some(run) = run else { return false };
+    let check = run
+        .step_runs
+        .iter()
+        .find(|step| step.step_id == "s8-candidate-contract");
+    let planned_command = run.plan_snapshot.steps.iter().any(|step| {
+        step.id == "s8-candidate-contract"
+            && step.argv == ["sh".to_owned(), "test.sh".to_owned()]
+            && step.required
+    });
+    run.overall_result == Some(orbit::verification::VerificationRunResult::Passed)
+        && check.is_some_and(|step| {
+            step.status == orbit::verification::VerificationStepStatus::Passed
+                && step.exit_code == Some(0)
+                && step
+                    .stdout_preview
+                    .as_deref()
+                    .is_some_and(|stdout| stdout.contains(S8_LIVE_TEST_MARKER))
+        })
+        && planned_command
+        && run.environment_identity.execution_profile == expected_environment.execution_profile
+        && run.environment_identity.isolation == expected_environment.isolation
+        && run.environment_identity.runtime_image == expected_environment.runtime_image
+        && run.environment_identity.runtime_image_digest
+            == expected_environment.runtime_image_digest
+        && run.environment_identity.oci_runtime == expected_environment.oci_runtime
+        && run.environment_identity.network_policy == expected_environment.network_policy
+        && run.environment_identity.cache_policy == expected_environment.cache_policy
+}
+
+fn s8_candidate_contract_evidence(repository: &S8LiveRepository) -> serde_json::Value {
+    let expected_readme = format!("{S8_LIVE_README_CONTENT}\n");
+    let readme_is_exact = fs::read_to_string(repository.path.join("README.md"))
+        .is_ok_and(|readme| readme == expected_readme);
+    let fixed_harness_unchanged = fs::read(repository.path.join("test.sh"))
+        .is_ok_and(|script| script == S8_LIVE_TEST_SCRIPT.as_bytes());
+    let changed_tracked_files = git_readonly_output(
+        &repository.path,
+        &[
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            &repository.base_revision,
+            "--",
+        ],
+    )
+    .ok()
+    .map(|paths| {
+        paths
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    })
+    .unwrap_or_default();
+    let untracked_file_count = git_readonly_output(
+        &repository.path,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+    )
+    .ok()
+    .map(|paths| paths.split('\0').filter(|path| !path.is_empty()).count());
+    let repository_shape_valid = fs::read_dir(&repository.path).is_ok_and(|entries| {
+        entries.into_iter().all(|entry| {
+            let Ok(entry) = entry else { return false };
+            let name = entry.file_name();
+            let Ok(file_type) = entry.file_type() else {
+                return false;
+            };
+            matches!(name.to_str(), Some(".git") if file_type.is_dir())
+                || matches!(name.to_str(), Some("README.md" | "test.sh") if file_type.is_file())
+        })
+    });
+    let only_expected_readme_change = changed_tracked_files == ["README.md"]
+        && untracked_file_count == Some(0)
+        && repository_shape_valid
+        && readme_is_exact
+        && fixed_harness_unchanged;
+    serde_json::json!({
+        "readme_is_exact": readme_is_exact,
+        "fixed_harness_unchanged": fixed_harness_unchanged,
+        "changed_tracked_files": changed_tracked_files,
+        "untracked_file_count": untracked_file_count,
+        "repository_shape_valid": repository_shape_valid,
+        "only_expected_readme_change": only_expected_readme_change
+    })
+}
+
+async fn pinned_s8_live_verification_environment()
+-> Result<orbit::verification::EnvironmentIdentity> {
+    anyhow::ensure!(
+        unsafe { libc::geteuid() } != 0,
+        "S8 live qualification requires rootless Podman"
+    );
+    let rootless = tokio::process::Command::new("podman")
+        .args([
+            "--remote=false",
+            "info",
+            "--format",
+            "{{.Host.Security.Rootless}}",
+        ])
+        .output()
+        .await
+        .context("could not inspect the local rootless Podman runtime")?;
+    anyhow::ensure!(
+        rootless.status.success() && String::from_utf8_lossy(&rootless.stdout).trim() == "true",
+        "S8 live qualification requires a working rootless Podman runtime"
+    );
+    let image = tokio::process::Command::new("podman")
+        .args([
+            "--remote=false",
+            "image",
+            "inspect",
+            S8_LIVE_VERIFICATION_IMAGE,
+            "--format",
+            "{{.Id}}",
+        ])
+        .output()
+        .await
+        .context("could not inspect the locally pinned S8 verification image")?;
+    anyhow::ensure!(
+        image.status.success(),
+        "locally pinned S8 verification image is unavailable in rootless Podman"
+    );
+    let image_id = String::from_utf8(image.stdout)
+        .context("Podman returned a non-UTF-8 verification image identity")?;
+    s8_live_environment_from_image_id(&image_id)
+}
+
+async fn run_s8_live_qualification(
+    repository_path: &Path,
+    database_url_file: Option<&Path>,
+    output_format: Output,
+) -> Result<()> {
+    let repository = validate_s8_live_repository(repository_path)?;
+    let verification_environment = pinned_s8_live_verification_environment().await?;
+    let database_url = read_private_database_url(database_url_file).await?;
+    let (engine, scratch) = connect_durable_catalog_engine(database_url.as_str()).await?;
+    let workflow_store = orbit::workflow::WorkflowStore::new(engine.pool.clone());
+    let verification_store = orbit::verification::VerificationStore::new(engine.pool.clone());
+    let regression_store = orbit::regression_strategy::RegressionStore::new(engine.pool.clone());
+    let policies = s8_live_qualification_policies();
+
+    verification_store
+        .save_policy(&policies.verification)
+        .await?;
+    regression_store
+        .insert_selection_policy(&policies.selection)
+        .await?;
+    regression_store
+        .insert_regression_policy(&policies.regression)
+        .await?;
+
+    let task_id = format!("task-s8-live-qualification-{}", orbit::model::id());
+    let attempt_id = format!("attempt-s8-live-qualification-{}", orbit::model::id());
+    let task = format!(
+        "This is the fixed Orbit R4 S8 live qualification task. In this disposable repository, replace README.md with exactly one line containing `{S8_LIVE_README_CONTENT}`. The committed `test.sh` is a fixed qualification harness: do not modify it or any other file. Return a structured implementation handoff."
+    );
+    let workflow = workflow_store
+        .create_workflow_run_full(
+            &task_id,
+            &attempt_id,
+            2,
+            Some(&policies.verification),
+            Some(&policies.regression),
+            Some(&policies.selection),
+            Some(&task),
+            Some(
+                repository
+                    .path
+                    .to_str()
+                    .context("qualification repository path is not UTF-8")?,
+            ),
+            Some(&repository.base_revision),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("S8 qualification workflow could not be created"))?;
+
+    let coordinator = orbit::workflow_coordinator::WorkflowCoordinator::new(
+        engine.pool.clone(),
+        std::sync::Arc::new(orbit::workflow_coordinator::RealAcpRoleExecutor),
+    )
+    .with_verification_environment(verification_environment.clone())?;
+    let observed_lock_owners = std::sync::Arc::new(tokio::sync::Mutex::new(
+        std::collections::BTreeSet::<String>::new(),
+    ));
+    let lock_observer_pool = engine.pool.clone();
+    let lock_observer_attempt_id = attempt_id.clone();
+    let lock_observer_owners = observed_lock_owners.clone();
+    let lock_observer = tokio::spawn(async move {
+        loop {
+            if let Ok(Some(owner)) = sqlx::query_scalar::<_, String>(
+                "SELECT holder_role_execution_id FROM orbit_attempt_workspace_locks WHERE attempt_id = $1 AND revoked_at_ms IS NULL",
+            )
+            .bind(&lock_observer_attempt_id)
+            .fetch_optional(&lock_observer_pool)
+            .await
+            {
+                lock_observer_owners.lock().await.insert(owner);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    });
+    let coordinator_error = coordinator.run_to_completion(&workflow.id).await.is_err();
+    lock_observer.abort();
+    let _ = lock_observer.await;
+    let observed_lock_owners = observed_lock_owners.lock().await.clone();
+    drop(coordinator);
+
+    let final_workflow = workflow_store
+        .get_workflow_run(&workflow.id)
+        .await?
+        .context("S8 qualification workflow record disappeared")?;
+    let role_executions = workflow_store.list_role_executions(&workflow.id).await?;
+    let latest_review = workflow_store
+        .get_latest_handoff_of_type(&workflow.id, orbit::workflow::HandoffType::Review)
+        .await?;
+    let review = latest_review.as_ref().and_then(|handoff| {
+        serde_json::from_value::<orbit::workflow::ReviewDecision>(
+            handoff.structured_payload.clone(),
+        )
+        .ok()
+        .map(|decision| (handoff, decision))
+    });
+    let verification_runs = verification_store.list_runs(&attempt_id).await?;
+    let final_candidate_id = final_workflow.current_workspace_state_id.as_deref();
+    let run_for_tier = |tier| {
+        verification_runs.iter().find(|run| {
+            run.tier == Some(tier) && Some(run.workspace_state_id.as_str()) == final_candidate_id
+        })
+    };
+    let fast_run = run_for_tier(orbit::regression_strategy::VerificationTier::Fast);
+    let standard_run = run_for_tier(orbit::regression_strategy::VerificationTier::Standard);
+    let full_run = run_for_tier(orbit::regression_strategy::VerificationTier::Full);
+    let fast_selection =
+        if let Some(selection_id) = fast_run.and_then(|run| run.selection_id.as_deref()) {
+            regression_store.get_selection(selection_id).await?
+        } else {
+            None
+        };
+    let standard_selection =
+        if let Some(selection_id) = standard_run.and_then(|run| run.selection_id.as_deref()) {
+            regression_store.get_selection(selection_id).await?
+        } else {
+            None
+        };
+    let full_selection =
+        if let Some(selection_id) = full_run.and_then(|run| run.selection_id.as_deref()) {
+            regression_store.get_selection(selection_id).await?
+        } else {
+            None
+        };
+    let disk_workspace_state = orbit::workflow_coordinator::compute_workspace_state(
+        &repository.path,
+        &repository.base_revision,
+    )
+    .await
+    .ok();
+    let candidate_contract = s8_candidate_contract_evidence(&repository);
+    let candidate_contract_passed =
+        candidate_contract["only_expected_readme_change"] == serde_json::Value::Bool(true);
+
+    let mut all_agent_executions_terminal = true;
+    let mut all_agent_cleanup_confirmed = true;
+    let mut all_supervisor_exits_checked = true;
+    let mut all_supervisor_exits_successful = true;
+    let mut nonzero_supervisor_exit_count = 0u64;
+    let mut missing_supervisor_exit_count = 0u64;
+    let mut all_successful_agent_target_correlations = true;
+    let mut all_role_agent_rows_linked = true;
+    let mut all_successful_targets_have_credential_generation = true;
+    let mut implementer_mutation_tool_calls = 0u64;
+    let mut implementer_tool_success_count = 0u64;
+    let mut implementer_tool_failure_count = 0u64;
+    let mut planner_reviewer_mutation_tool_calls = 0u64;
+    let mut role_evidence = Vec::with_capacity(role_executions.len());
+    let mut failed_agent_attempts = Vec::new();
+    let mut observed_implementer_owner_ids = Vec::new();
+    for role in &role_executions {
+        let agents = sqlx::query(
+            r#"
+            SELECT id, role_execution_id, status, termination_reason, exit_code, provider,
+                   requested_model, resolved_model, actual_model,
+                   COALESCE(tool_call_count, 0) AS tool_call_count,
+                   COALESCE(tool_success_count, 0) AS tool_success_count,
+                   COALESCE(tool_failure_count, 0) AS tool_failure_count,
+                   COALESCE(tool_counts, '{}'::jsonb) AS tool_counts,
+                   metadata->>'cleanup_confirmed' AS cleanup_confirmed
+            FROM orbit_agent_executions
+            WHERE role_execution_id = $1
+            ORDER BY started_at_ms, id
+            "#,
+        )
+        .bind(&role.id)
+        .fetch_all(&engine.pool)
+        .await?;
+        let mut agent_evidence = Vec::with_capacity(agents.len());
+        for agent in agents {
+            let id: String = agent.get("id");
+            let linked_role_execution_id: Option<String> = agent.get("role_execution_id");
+            let status: String = agent.get("status");
+            let termination_reason: Option<String> = agent.get("termination_reason");
+            let exit_code: Option<i32> = agent.get("exit_code");
+            let provider: Option<String> = agent.get("provider");
+            let requested_model: Option<String> = agent.get("requested_model");
+            let resolved_model: Option<String> = agent.get("resolved_model");
+            let actual_model: Option<String> = agent.get("actual_model");
+            let tool_call_count: i64 = agent.get("tool_call_count");
+            let tool_success_count: i64 = agent.get("tool_success_count");
+            let tool_failure_count: i64 = agent.get("tool_failure_count");
+            let raw_tool_counts: serde_json::Value = agent.get("tool_counts");
+            let tool_counts = s8_bounded_tool_counts(&raw_tool_counts);
+            let cleanup_confirmed: Option<String> = agent.get("cleanup_confirmed");
+            let cleanup_confirmed = cleanup_confirmed.as_deref() == Some("true");
+            let role_agent_id_linked = role.agent_execution_ids.contains(&id);
+            let selected_target_correlation = role.resolved_target.as_ref().is_some_and(|target| {
+                role_agent_id_linked
+                    && linked_role_execution_id.as_deref() == Some(role.id.as_str())
+                    && provider.as_deref() == Some(target.provider.as_str())
+                    && requested_model == target.requested_model
+                    && resolved_model == target.resolved_model
+            });
+            all_agent_executions_terminal &=
+                matches!(status.as_str(), "SUCCEEDED" | "FAILED" | "CANCELLED");
+            all_agent_cleanup_confirmed &= cleanup_confirmed;
+            all_role_agent_rows_linked &= role_agent_id_linked
+                && linked_role_execution_id.as_deref() == Some(role.id.as_str());
+            all_supervisor_exits_checked &= exit_code.is_some();
+            all_supervisor_exits_successful &= exit_code == Some(0);
+            if exit_code.is_some_and(|code| code != 0) {
+                nonzero_supervisor_exit_count = nonzero_supervisor_exit_count.saturating_add(1);
+            } else if exit_code.is_none() {
+                missing_supervisor_exit_count = missing_supervisor_exit_count.saturating_add(1);
+            }
+            if status == "SUCCEEDED" {
+                all_successful_agent_target_correlations &= selected_target_correlation;
+                all_successful_targets_have_credential_generation &=
+                    role.resolved_target.as_ref().is_some_and(|target| {
+                        target
+                            .credential_id
+                            .as_deref()
+                            .is_some_and(|reference| !reference.is_empty())
+                            && target.credential_generation.is_some()
+                    });
+            }
+            if role.role_id == "implementer" {
+                implementer_mutation_tool_calls = implementer_mutation_tool_calls.saturating_add(
+                    s8_tool_count(&tool_counts, &["fs.write_text_file", "fs.edit_file"]),
+                );
+                implementer_tool_success_count = implementer_tool_success_count
+                    .saturating_add(u64::try_from(tool_success_count.max(0)).unwrap_or(0));
+                implementer_tool_failure_count = implementer_tool_failure_count
+                    .saturating_add(u64::try_from(tool_failure_count.max(0)).unwrap_or(0));
+                if role_agent_id_linked
+                    && selected_target_correlation
+                    && observed_lock_owners.contains(&role.id)
+                    && s8_tool_count(&tool_counts, &["fs.write_text_file", "fs.edit_file"]) > 0
+                {
+                    observed_implementer_owner_ids.push(role.id.clone());
+                }
+            } else if matches!(role.role_id.as_str(), "planner" | "reviewer") {
+                planner_reviewer_mutation_tool_calls = planner_reviewer_mutation_tool_calls
+                    .saturating_add(s8_tool_count(
+                        &tool_counts,
+                        &["fs.write_text_file", "fs.edit_file"],
+                    ));
+            }
+            if status != "SUCCEEDED" {
+                failed_agent_attempts.push(serde_json::json!({
+                    "role_execution_id": role.id,
+                    "agent_execution_id": id,
+                    "provider": provider,
+                    "requested_model": requested_model,
+                    "resolved_model": resolved_model,
+                    "actual_model_observed": actual_model,
+                    "tool_call_count": tool_call_count,
+                    "tool_success_count": tool_success_count,
+                    "tool_failure_count": tool_failure_count,
+                    "attempt_status": status,
+                    "supervisor_exit_code": exit_code,
+                    "cleanup_confirmed": cleanup_confirmed,
+                    "classification": "failed_agent_attempt; no fallback inferred from failure alone"
+                }));
+            }
+            agent_evidence.push(serde_json::json!({
+                "id": id,
+                "status": status,
+                "termination": if termination_reason.as_deref() == Some("completed") { "completed" } else { "not_completed_or_unknown" },
+                "supervisor_exit_code": exit_code,
+                "provider": provider,
+                "requested_model": requested_model,
+                "resolved_model": resolved_model,
+                "actual_model_observed": actual_model,
+                "cleanup_confirmed": cleanup_confirmed,
+                "tool_call_count": tool_call_count,
+                "tool_success_count": tool_success_count,
+                "tool_failure_count": tool_failure_count,
+                "tool_counts": tool_counts,
+                "role_execution_id_linked": linked_role_execution_id.as_deref() == Some(role.id.as_str()) && role_agent_id_linked,
+                "selected_target_correlation": selected_target_correlation
+            }));
+        }
+        all_role_agent_rows_linked &= !role.agent_execution_ids.is_empty()
+            && role.agent_execution_ids.len() == agent_evidence.len();
+        let (target, credential_quota_observations) = if let Some(target) =
+            role.resolved_target.as_ref()
+        {
+            (
+                Some(serde_json::json!({
+                    "provider": target.provider,
+                    "account_reference": target.credential_id,
+                    "credential_generation": target.credential_generation,
+                    "runtime_interface": target.runtime_interface,
+                    "requested_model": target.requested_model,
+                    "resolved_model": target.resolved_model,
+                    "reasoning_effort": {
+                        "requested": "not_configured",
+                        "actual": "unknown_not_observed"
+                    },
+                    "quota_and_availability_selection": s8_reset_aware_evidence(&target.resolution_reason)
+                })),
+                s8_selected_credential_quota_evidence(&engine.pool, target).await?,
+            )
+        } else {
+            (
+                None,
+                serde_json::json!({"state":"unknown", "quota_windows":[]}),
+            )
+        };
+        role_evidence.push(serde_json::json!({
+            "role_execution_id": role.id,
+            "role": role.role_id,
+            "stage": role.stage,
+            "status": role.status.as_str(),
+            "input_workspace_state_id": role.input_workspace_state_id,
+            "output_workspace_state_id": role.output_workspace_state_id,
+            "resolved_target": target,
+            "credential_quota_observations": credential_quota_observations,
+            "agent_executions": agent_evidence
+        }));
+    }
+
+    let review_workspace_state_id = latest_review
+        .as_ref()
+        .and_then(|handoff| handoff.workspace_state_id.as_deref());
+    let reviewer_role_execution_id = latest_review
+        .as_ref()
+        .and_then(|handoff| handoff.role_execution_id.as_deref());
+    let reviewer_role = reviewer_role_execution_id.and_then(|id| {
+        role_executions
+            .iter()
+            .find(|role| role.id == id && role.role_id == "reviewer")
+    });
+    let reviewer_bound_to_reviewed_state = reviewer_role.is_some_and(|role| {
+        role.status == orbit::workflow::RoleExecutionStatus::Succeeded
+            && role.input_workspace_state_id.as_deref() == review_workspace_state_id
+            && !role.agent_execution_ids.is_empty()
+    });
+    let review_approved = review.as_ref().is_some_and(|(_, decision)| {
+        decision.decision == orbit::workflow::ReviewDecisionStatus::Approve
+    }) && reviewer_bound_to_reviewed_state;
+    let review_decision = review
+        .as_ref()
+        .map(|(_, decision)| match decision.decision {
+            orbit::workflow::ReviewDecisionStatus::Approve => "APPROVE",
+            orbit::workflow::ReviewDecisionStatus::ChangesRequested => "CHANGES_REQUESTED",
+            orbit::workflow::ReviewDecisionStatus::Blocked => "BLOCKED",
+        });
+    let full_run_workspace_state_id = full_run.map(|run| run.workspace_state_id.as_str());
+    let final_workspace_state_id = final_workflow.current_workspace_state_id.as_deref();
+    let disk_workspace_state_id = disk_workspace_state
+        .as_ref()
+        .map(|state| state.state_id.as_str());
+    let fast_passed = s8_run_executed_fixed_check(fast_run, &verification_environment)
+        && fast_run.is_some_and(|run| {
+            s8_selection_contains_required_check(
+                fast_selection.as_ref(),
+                &run.workspace_state_id,
+                orbit::regression_strategy::VerificationTier::Fast,
+            )
+        });
+    let standard_passed = s8_run_executed_fixed_check(standard_run, &verification_environment)
+        && standard_run.is_some_and(|run| {
+            s8_selection_contains_required_check(
+                standard_selection.as_ref(),
+                &run.workspace_state_id,
+                orbit::regression_strategy::VerificationTier::Standard,
+            )
+        });
+    let full_passed = s8_run_executed_fixed_check(full_run, &verification_environment)
+        && full_run.is_some_and(|run| {
+            run.tier == Some(orbit::regression_strategy::VerificationTier::Full)
+                && s8_selection_contains_required_check(
+                    full_selection.as_ref(),
+                    &run.workspace_state_id,
+                    orbit::regression_strategy::VerificationTier::Full,
+                )
+        });
+
+    let active_lock_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM orbit_attempt_workspace_locks WHERE attempt_id = $1 AND revoked_at_ms IS NULL",
+    )
+    .bind(&attempt_id)
+    .fetch_one(&engine.pool)
+    .await?;
+    let step_owner_id: Option<String> =
+        sqlx::query_scalar("SELECT step_owner_id FROM orbit_workflow_runs WHERE id = $1")
+            .bind(&workflow.id)
+            .fetch_one(&engine.pool)
+            .await?;
+
+    let states_match = review_workspace_state_id.is_some()
+        && reviewer_role.is_some_and(|role| {
+            role.input_workspace_state_id.as_deref() == review_workspace_state_id
+        })
+        && review_workspace_state_id == full_run_workspace_state_id
+        && full_run_workspace_state_id == final_workspace_state_id
+        && final_workspace_state_id == disk_workspace_state_id;
+    let expected_roles = ["planner", "implementer", "reviewer"];
+    let roles_succeeded = expected_roles.iter().all(|expected| {
+        role_executions.iter().any(|role| {
+            role.role_id == *expected
+                && role.status == orbit::workflow::RoleExecutionStatus::Succeeded
+        })
+    });
+    let all_role_executions_succeeded = role_executions
+        .iter()
+        .all(|role| role.status == orbit::workflow::RoleExecutionStatus::Succeeded);
+    let repair_iteration_count = role_executions
+        .iter()
+        .filter(|role| role.role_id == "implementer" && role.stage == "REPAIRING")
+        .count();
+    let implementer_role_ids = role_executions
+        .iter()
+        .filter(|role| role.role_id == "implementer")
+        .map(|role| role.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let observed_implementer_owner_role_execution_ids = observed_implementer_owner_ids
+        .into_iter()
+        .filter(|id| {
+            observed_lock_owners.contains(id) && implementer_role_ids.contains(id.as_str())
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let implementer_mutation_owner_observed = !observed_implementer_owner_role_execution_ids
+        .is_empty()
+        && implementer_mutation_tool_calls > 0
+        && implementer_tool_success_count > 0;
+    let read_only_roles_had_no_mutation_calls = planner_reviewer_mutation_tool_calls == 0;
+    let reset_aware_targets_recorded = expected_roles.iter().all(|expected| {
+        role_executions
+            .iter()
+            .filter(|role| role.role_id == *expected)
+            .any(|role| {
+                role.resolved_target
+                    .as_ref()
+                    .is_some_and(|target| target.resolution_reason.starts_with("reset-aware rank="))
+            })
+    });
+    let cleanup_confirmed = all_agent_executions_terminal
+        && all_agent_cleanup_confirmed
+        && all_supervisor_exits_checked
+        && all_supervisor_exits_successful
+        && role_executions
+            .iter()
+            .all(|role| !role.agent_execution_ids.is_empty());
+    let accepted = !coordinator_error
+        && final_workflow.status == orbit::workflow::WorkflowStage::Completed
+        && review_approved
+        && candidate_contract_passed
+        && reset_aware_targets_recorded
+        && fast_passed
+        && standard_passed
+        && full_passed
+        && states_match
+        && roles_succeeded
+        && all_role_executions_succeeded
+        && reviewer_bound_to_reviewed_state
+        && all_successful_agent_target_correlations
+        && all_successful_targets_have_credential_generation
+        && all_role_agent_rows_linked
+        && implementer_mutation_owner_observed
+        && read_only_roles_had_no_mutation_calls
+        && cleanup_confirmed
+        && active_lock_count == 0
+        && step_owner_id.is_none();
+
+    let verification_evidence: Vec<_> = verification_runs
+        .iter()
+        .map(|run| {
+            serde_json::json!({
+                "id": run.id,
+                "tier": run.tier,
+                "result": run.overall_result,
+                "workspace_state_id": run.workspace_state_id,
+                "selection_id": run.selection_id,
+                "environment": {
+                    "execution_profile": run.environment_identity.execution_profile,
+                    "isolation": run.environment_identity.isolation,
+                    "runtime_image": run.environment_identity.runtime_image,
+                    "runtime_image_digest": run.environment_identity.runtime_image_digest,
+                    "oci_runtime": run.environment_identity.oci_runtime,
+                    "network_policy": run.environment_identity.network_policy,
+                    "cache_policy": run.environment_identity.cache_policy
+                },
+                "steps": run.step_runs.iter().map(|step| serde_json::json!({
+                    "id": step.id,
+                    "step_id": step.step_id,
+                    "status": step.status,
+                    "exit_code": step.exit_code,
+                    "stdout_marker_observed": step.stdout_preview.as_deref().is_some_and(|stdout| stdout.contains(S8_LIVE_TEST_MARKER))
+                })).collect::<Vec<_>>()
+            })
+        })
+        .collect();
+    let report = serde_json::json!({
+        "qualification": "ORBIT_R4_S8_LIVE",
+        "task_id": task_id,
+        "attempt_id": attempt_id,
+        "workflow_id": workflow.id,
+        "workflow_status": final_workflow.status,
+        "coordinator_error": coordinator_error,
+        "role_executions": role_evidence,
+        "reset_aware_targets_recorded": reset_aware_targets_recorded,
+        "fallback_events": [],
+        "fallback_behavior": "The current coordinator resolves one target per role and has no execution-time fallback loop; failed agent attempts are listed separately.",
+        "failed_agent_attempts": failed_agent_attempts,
+        "repair_iteration_count": repair_iteration_count,
+        "agent_target_correlations": {
+            "all_successful_agent_targets_match_persisted_role_targets": all_successful_agent_target_correlations,
+            "all_successful_targets_have_selected_credential_generation": all_successful_targets_have_credential_generation,
+            "all_role_agent_rows_linked_to_durable_role_execution_ids": all_role_agent_rows_linked,
+            "credential_identity_and_generation_source": "persisted RoleExecution.resolved_target linked to each AgentExecution by role_execution_id and agent_execution_ids"
+        },
+        "mutation_authority": {
+            "observed_active_lock_owner_role_execution_ids": observed_lock_owners,
+            "implementer_mutation_owner_role_execution_ids": observed_implementer_owner_role_execution_ids,
+            "implementer_write_or_edit_tool_calls": implementer_mutation_tool_calls,
+            "implementer_tool_success_count": implementer_tool_success_count,
+            "implementer_tool_failure_count": implementer_tool_failure_count,
+            "implementer_agent_record_correlated_to_observed_lock_owner": implementer_mutation_owner_observed,
+            "planner_reviewer_mutation_tool_calls": planner_reviewer_mutation_tool_calls,
+            "planner_reviewer_read_only_tool_calls_observed": read_only_roles_had_no_mutation_calls
+        },
+        "review": {
+            "artifact_id": latest_review.as_ref().map(|handoff| handoff.id.as_str()),
+            "reviewer_role_execution_id": reviewer_role_execution_id,
+            "reviewer_input_workspace_state_id": reviewer_role.and_then(|role| role.input_workspace_state_id.as_deref()),
+            "reviewer_bound_to_reviewed_workspace_state": reviewer_bound_to_reviewed_state,
+            "decision": review_decision,
+            "workspace_state_id": review_workspace_state_id
+        },
+        "candidate_contract": candidate_contract,
+        "verification_runs": verification_evidence,
+        "tier_acceptance": {
+            "fast": {"run_id": fast_run.map(|run| run.id.as_str()), "passed": fast_passed, "selection_id": fast_selection.as_ref().map(|selection| selection.id.as_str())},
+            "standard": {"run_id": standard_run.map(|run| run.id.as_str()), "passed": standard_passed, "selection_id": standard_selection.as_ref().map(|selection| selection.id.as_str())},
+            "full": {"run_id": full_run.map(|run| run.id.as_str()), "passed": full_passed, "selection_id": full_selection.as_ref().map(|selection| selection.id.as_str())}
+        },
+        "full_selection": full_selection.as_ref().map(|selection| serde_json::json!({
+            "id": selection.id,
+            "requested_tier": selection.requested_tier,
+            "workspace_state_id": selection.workspace_state_id,
+            "selected_checks": selection.selected_checks.iter().map(|check| &check.check_id).collect::<Vec<_>>()
+        })),
+        "workspace_state_ids": {
+            "reviewed": review_workspace_state_id,
+            "full": full_run_workspace_state_id,
+            "workflow_final": final_workspace_state_id,
+            "on_disk": disk_workspace_state_id
+        },
+        "cleanup": {
+            "all_agent_executions_terminal": all_agent_executions_terminal,
+            "all_supervisor_exits_checked": all_supervisor_exits_checked,
+            "all_supervisor_exits_successful": all_supervisor_exits_successful,
+            "nonzero_supervisor_exit_count": nonzero_supervisor_exit_count,
+            "missing_supervisor_exit_count": missing_supervisor_exit_count,
+            "all_role_cleanup_receipts_confirmed": all_agent_cleanup_confirmed,
+            "no_active_role_processes_confirmed_by_terminal_supervisor_receipts": cleanup_confirmed,
+            "verification_container_cleanup_confirmed_by_passing_isolated_commands": fast_passed && standard_passed && full_passed,
+            "active_workspace_mutation_locks": active_lock_count,
+            "active_workflow_step_owner": step_owner_id
+        },
+        "accepted": accepted
+    });
+
+    engine.pool.close().await;
+    drop(scratch);
+    match output_format {
+        Output::Json | Output::Text => println!("{}", serde_json::to_string_pretty(&report)?),
+        Output::Jsonl => println!("{}", serde_json::to_string(&report)?),
+    }
+    anyhow::ensure!(
+        accepted,
+        "S8 live qualification did not satisfy acceptance; inspect sanitized evidence"
+    );
     Ok(())
 }
 
@@ -1289,6 +2587,14 @@ async fn main() -> Result<()> {
     if let Commands::Workflow(WorkflowArgs { action }) = &cli.command {
         ensure_cli_workflow_execution_enabled(action)?;
         match action {
+            WorkflowAction::QualifyLive {
+                repo,
+                database_url_file,
+            } => {
+                run_s8_live_qualification(repo, database_url_file.as_deref(), output_format)
+                    .await?;
+                return Ok(());
+            }
             WorkflowAction::Start {
                 pos_task_id,
                 pos_attempt_id,
@@ -3005,12 +4311,353 @@ mod workflow_execution_gate_tests {
             workflow_run_id: "wf-1".into(),
             database_url_file: None,
         };
+        let qualify_live = WorkflowAction::QualifyLive {
+            repo: PathBuf::from("/tmp/orbit-s8-candidate"),
+            database_url_file: None,
+        };
 
         for action in [&start, &resume] {
             let error = ensure_cli_workflow_execution_enabled(action).unwrap_err();
             assert!(error.to_string().contains("CLI_WORKFLOW_EXECUTION_GATED"));
         }
         assert!(ensure_cli_workflow_execution_enabled(&show).is_ok());
+        assert!(ensure_cli_workflow_execution_enabled(&qualify_live).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod s8_live_qualification_tests {
+    use super::*;
+
+    fn git(repository: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repository)
+            .args(args)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .output()
+            .expect("git should be installed for repository safety tests");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn clean_temp_git_repository(parent: &Path) -> PathBuf {
+        let repository = parent.join("candidate");
+        fs::create_dir(&repository).expect("create test repository");
+        let init = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&repository)
+            .output()
+            .expect("git init should run");
+        assert!(init.status.success());
+        git(
+            &repository,
+            &["config", "user.name", "S8 Qualification Test"],
+        );
+        git(
+            &repository,
+            &["config", "user.email", "s8-qualification@example.invalid"],
+        );
+        fs::write(repository.join("README.md"), "Disposable S8 candidate\n")
+            .expect("write qualification README");
+        fs::write(repository.join("test.sh"), S8_LIVE_TEST_SCRIPT)
+            .expect("write fixed S8 contract script");
+        git(&repository, &["add", "README.md", "test.sh"]);
+        git(
+            &repository,
+            &["commit", "--quiet", "-m", "fixture baseline"],
+        );
+        repository
+    }
+
+    #[test]
+    fn qualify_live_parser_requires_repository_and_has_no_task_or_policy_overrides() {
+        let parsed = Cli::try_parse_from([
+            "orbit",
+            "workflow",
+            "qualify-live",
+            "--repo",
+            "/tmp/orbit-r4-s8-candidate",
+        ]);
+        assert!(parsed.is_ok());
+
+        let missing_repository = Cli::try_parse_from(["orbit", "workflow", "qualify-live"]);
+        assert!(missing_repository.is_err());
+
+        let caller_override = Cli::try_parse_from([
+            "orbit",
+            "workflow",
+            "qualify-live",
+            "--repo",
+            "/tmp/orbit-r4-s8-candidate",
+            "--task",
+            "weaker check",
+        ]);
+        assert!(caller_override.is_err());
+    }
+
+    #[test]
+    fn fixed_live_policies_require_the_same_real_check_at_every_tier() {
+        let policies = s8_live_qualification_policies();
+        assert_eq!(
+            policies.verification.required_steps,
+            vec!["s8-candidate-contract".to_owned()]
+        );
+        assert_eq!(policies.verification.allowed_commands[0].executable, "sh");
+        assert_eq!(
+            policies.verification.allowed_commands[0].args_prefix,
+            vec!["test.sh".to_owned()]
+        );
+        assert_eq!(
+            policies.selection.checks.len(),
+            1,
+            "the qualification selection is fixed to one authoritative check"
+        );
+        let check = &policies.selection.checks[0];
+        assert!(check.required && check.always_run);
+        assert_eq!(check.check_id, "s8-candidate-contract");
+        assert_eq!(
+            check.command.as_ref().unwrap(),
+            &vec!["sh".to_owned(), "test.sh".to_owned()]
+        );
+        assert_eq!(
+            check.tiers,
+            [
+                orbit::regression_strategy::VerificationTier::Fast,
+                orbit::regression_strategy::VerificationTier::Standard,
+                orbit::regression_strategy::VerificationTier::Full,
+            ]
+        );
+        assert_eq!(
+            policies.regression.selection_policy_digest.as_deref(),
+            Some(policies.selection.digest().as_str())
+        );
+        assert_eq!(
+            policies.regression.fallback_behavior,
+            orbit::regression_strategy::RegressionFallbackBehavior::FailClosed
+        );
+    }
+
+    #[test]
+    fn local_image_identity_requires_sha256_and_is_pinned_to_rootless_profile() {
+        let digest = "a".repeat(64);
+        let environment = s8_live_environment_from_image_id(&format!("sha256:{digest}"))
+            .expect("valid local Podman image ID");
+        assert_eq!(
+            environment.runtime_image.as_deref(),
+            Some(S8_LIVE_VERIFICATION_IMAGE)
+        );
+        assert_eq!(
+            environment.runtime_image_digest.as_deref(),
+            Some(format!("sha256:{digest}").as_str())
+        );
+        assert_eq!(environment.execution_profile, "sandboxed-container");
+        assert_eq!(environment.isolation, "rootless-podman");
+        assert_eq!(environment.oci_runtime.as_deref(), Some("podman"));
+        assert!(s8_live_environment_from_image_id("not-a-digest").is_err());
+    }
+
+    #[test]
+    fn quota_report_preserves_reset_aware_selection_facts() {
+        let facts = s8_reset_aware_evidence(
+            "reset-aware rank=1; known_weekly_reset; availability=Ready; 5h_remaining=82.0%; 7d_remaining=61.0%; 7d_reset_at_ms=1780000000000; provider_preference_rank=0; tie_break=provider_preference_then_stable_account_id; rejected=[codex:private-account:quota_exhausted(5h=unknown,7d=unknown,7d_reset=unknown),antigravity:another-private-account:auth_failed(5h=unknown,7d=unknown,7d_reset=unknown)]",
+        );
+        assert_eq!(facts["ranking"], "reset-aware");
+        assert_eq!(facts["rank"], "1");
+        assert_eq!(facts["weekly_reset_rank"], "known_weekly_reset");
+        assert_eq!(facts["availability"], "Ready");
+        assert_eq!(facts["five_hour_remaining"], "82.0%");
+        assert_eq!(facts["seven_day_remaining"], "61.0%");
+        assert_eq!(facts["seven_day_reset_at_ms"], "1780000000000");
+        assert_eq!(facts["five_hour_reset_at_ms"], serde_json::Value::Null);
+        assert_eq!(facts["rejected_candidate_summary_items"], 2);
+        let projected = serde_json::to_string(&facts).unwrap();
+        assert!(!projected.contains("private-account"));
+        assert!(!projected.contains("another-private-account"));
+    }
+
+    #[test]
+    fn tool_telemetry_is_bounded_to_known_names_and_canonical_mutations() {
+        let counts = s8_bounded_tool_counts(&serde_json::json!({
+            "write_file": 2,
+            "fs.write_text_file": 2,
+            "fs.read_text_file": 3,
+            "untrusted-secret-shaped-tool-name": 99
+        }));
+        assert_eq!(counts.as_object().unwrap().len(), 3);
+        assert_eq!(
+            s8_tool_count(&counts, &["fs.write_text_file", "fs.edit_file"]),
+            2
+        );
+        assert!(counts.get("untrusted-secret-shaped-tool-name").is_none());
+    }
+
+    #[test]
+    fn quota_percentages_are_bounded_before_reporting() {
+        assert_eq!(s8_safe_quota_percent(Some(42.5)), Some(42.5));
+        assert_eq!(s8_safe_quota_percent(Some(f64::NAN)), None);
+        assert_eq!(s8_safe_quota_percent(Some(101.0)), None);
+    }
+
+    #[test]
+    fn qualification_repository_must_be_clean_and_narrowly_shaped_under_temp() {
+        let temp = tempfile::tempdir().expect("temporary root");
+        let repository = clean_temp_git_repository(temp.path());
+        let validated = validate_s8_live_repository(&repository).expect("valid fixture repo");
+        assert_eq!(validated.path, repository.canonicalize().unwrap());
+        assert_eq!(validated.base_revision.len(), 40);
+
+        fs::write(repository.join("test.sh"), "echo unsafe\n").unwrap();
+        assert!(validate_s8_live_repository(&repository).is_err());
+    }
+
+    #[test]
+    fn candidate_contract_accepts_only_readme_mutation_with_fixed_harness() {
+        let temp = tempfile::tempdir().expect("temporary root");
+        let repository_path = clean_temp_git_repository(temp.path());
+        let repository = validate_s8_live_repository(&repository_path).expect("fixture repo");
+        fs::write(
+            repository.path.join("README.md"),
+            format!("{S8_LIVE_README_CONTENT}\n"),
+        )
+        .unwrap();
+        let valid = s8_candidate_contract_evidence(&repository);
+        assert_eq!(valid["only_expected_readme_change"], true);
+        assert_eq!(valid["fixed_harness_unchanged"], true);
+
+        fs::write(repository.path.join(".env"), "not part of the candidate\n").unwrap();
+        let extra_file = s8_candidate_contract_evidence(&repository);
+        assert_eq!(extra_file["only_expected_readme_change"], false);
+        fs::remove_file(repository.path.join(".env")).unwrap();
+
+        fs::write(repository.path.join("test.sh"), "echo forged pass\n").unwrap();
+        let forged = s8_candidate_contract_evidence(&repository);
+        assert_eq!(forged["only_expected_readme_change"], false);
+        assert_eq!(forged["fixed_harness_unchanged"], false);
+    }
+
+    #[test]
+    fn qualification_repository_rejects_dirty_non_git_and_source_roots() {
+        let temp = tempfile::tempdir().expect("temporary root");
+        let repository = clean_temp_git_repository(temp.path());
+        fs::write(repository.join("README.md"), "modified after commit\n").unwrap();
+        assert!(validate_s8_live_repository(&repository).is_err());
+
+        let non_git = temp.path().join("plain");
+        fs::create_dir(&non_git).unwrap();
+        fs::write(non_git.join("README.md"), "plain\n").unwrap();
+        assert!(validate_s8_live_repository(&non_git).is_err());
+
+        assert!(validate_s8_live_repository(Path::new(env!("CARGO_MANIFEST_DIR"))).is_err());
+        assert!(validate_s8_live_repository(temp.path()).is_err());
+    }
+
+    #[test]
+    fn qualification_repository_rejects_custom_git_hooks() {
+        let temp = tempfile::tempdir().expect("temporary root");
+        let repository = clean_temp_git_repository(temp.path());
+        fs::write(
+            repository.join(".git/hooks/pre-commit"),
+            "#!/bin/sh\nexit 0\n",
+        )
+        .unwrap();
+        assert!(validate_s8_live_repository(&repository).is_err());
+    }
+
+    #[test]
+    fn qualification_git_inspection_ignores_executable_config_and_rejects_its_shape() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("temporary root");
+        let repository = clean_temp_git_repository(temp.path());
+        let fsmonitor_marker = temp.path().join("fsmonitor-ran");
+        let diff_marker = temp.path().join("external-diff-ran");
+        let fsmonitor_script = temp.path().join("fsmonitor.sh");
+        let diff_script = temp.path().join("external-diff.sh");
+        fs::write(
+            &fsmonitor_script,
+            format!(
+                "#!/bin/sh\ntouch '{}'\nprintf 'token'\n",
+                fsmonitor_marker.display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &diff_script,
+            format!("#!/bin/sh\ntouch '{}'\n", diff_marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&fsmonitor_script, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&diff_script, fs::Permissions::from_mode(0o700)).unwrap();
+        let set_config = |key: &str, value: &Path| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repository)
+                .args(["config", "--local", key])
+                .arg(value)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .expect("set fixture Git config");
+            assert!(output.status.success());
+        };
+        set_config("core.fsmonitor", &fsmonitor_script);
+        set_config("diff.external", &diff_script);
+
+        let keys = s8_local_git_config_keys(&repository).unwrap();
+        assert!(keys.iter().any(|key| key == "core.fsmonitor"));
+        assert!(keys.iter().any(|key| key == "diff.external"));
+        assert!(s8_validate_local_git_config(&repository).is_err());
+        let status = s8_git_readonly_command(&repository, &["status", "--short"])
+            .output()
+            .expect("run hardened status inspection");
+        assert!(status.status.success());
+        let diff = s8_git_readonly_command(&repository, &["diff", "--name-only", "HEAD", "--"])
+            .output()
+            .expect("run hardened diff inspection");
+        assert!(diff.status.success());
+        assert!(!fsmonitor_marker.exists());
+        assert!(!diff_marker.exists());
+    }
+
+    #[test]
+    fn qualification_git_config_include_is_rejected_without_loading_external_file() {
+        let temp = tempfile::tempdir().expect("temporary root");
+        let repository = clean_temp_git_repository(temp.path());
+        let marker = temp.path().join("included-config-executed");
+        let script = temp.path().join("included-helper.sh");
+        fs::write(
+            &script,
+            format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let included_config = temp.path().join("external.gitconfig");
+        fs::write(
+            &included_config,
+            format!("[diff \"external\"]\ntextconv = {}\n", script.display()),
+        )
+        .unwrap();
+        let mut local_config = fs::read_to_string(repository.join(".git/config")).unwrap();
+        local_config.push_str(&format!(
+            "\n[include]\npath = {}\n",
+            included_config.display()
+        ));
+        fs::write(repository.join(".git/config"), local_config).unwrap();
+
+        let keys = s8_local_git_config_keys(&repository).unwrap();
+        assert!(keys.iter().any(|key| key == "include.path"));
+        assert!(!keys.iter().any(|key| key == "diff.external.textconv"));
+        assert!(s8_validate_local_git_config(&repository).is_err());
+        assert!(!marker.exists());
     }
 }
 

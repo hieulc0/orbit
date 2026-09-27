@@ -996,17 +996,52 @@ fn validate_git_ref(git_ref: &str) -> Result<()> {
     Ok(())
 }
 
+/// Build a non-interactive local Git inspection command with executable helpers
+/// disabled. Qualification repositories additionally validate and protect their
+/// local Git configuration before workflow execution begins.
+pub(crate) fn safe_git_command(repo_path: &Path, args: &[&str]) -> tokio::process::Command {
+    let path = std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into());
+    let mut command = tokio::process::Command::new("git");
+    command
+        .env_clear()
+        .env("PATH", path)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_COUNT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_EXTERNAL_DIFF", "")
+        .env("GIT_PAGER", "cat")
+        .env("PAGER", "cat")
+        .args([
+            "--no-pager",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "diff.external=",
+            "-c",
+            "core.pager=cat",
+        ])
+        .arg("-C")
+        .arg(repo_path);
+    if args
+        .first()
+        .is_some_and(|subcommand| matches!(*subcommand, "diff" | "show"))
+    {
+        command.args([args[0], "--no-ext-diff", "--no-textconv"]);
+        command.args(&args[1..]);
+    } else {
+        command.args(args);
+    }
+    command
+}
+
 /// 18. GIT STATUS (`git/status`)
 pub async fn git_status(repo_path: &Path, path_filter: Option<&str>) -> Result<GitStatusResult> {
     ensure!(repo_path.exists(), "repository path does not exist");
 
     // Get current branch
-    let branch_out = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(repo_path)
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+    let branch_out = safe_git_command(repo_path, &["rev-parse", "--abbrev-ref", "HEAD"])
         .output()
         .await;
 
@@ -1018,12 +1053,7 @@ pub async fn git_status(repo_path: &Path, path_filter: Option<&str>) -> Result<G
         }
     });
 
-    let mut cmd = tokio::process::Command::new("git");
-    cmd.arg("-C")
-        .arg(repo_path)
-        .args(["status", "--porcelain=v1"])
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null");
+    let mut cmd = safe_git_command(repo_path, &["status", "--porcelain=v1"]);
 
     if let Some(p) = path_filter {
         let _ = confine_path(repo_path, p, false, true)?;
@@ -1096,13 +1126,7 @@ pub async fn git_diff(
     ensure!(repo_path.exists(), "repository path does not exist");
     let bound = max_bytes.clamp(1024, 65536);
 
-    let mut cmd = tokio::process::Command::new("git");
-    cmd.arg("-C")
-        .arg(repo_path)
-        .arg("diff")
-        .arg("--no-ext-diff")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null");
+    let mut cmd = safe_git_command(repo_path, &["diff"]);
 
     if stat_only {
         cmd.arg("--stat");
@@ -1159,13 +1183,7 @@ pub async fn git_show(
     validate_git_ref(revision)?;
     let bound = max_bytes.clamp(1024, 65536);
 
-    let mut cmd = tokio::process::Command::new("git");
-    cmd.arg("-C")
-        .arg(repo_path)
-        .arg("show")
-        .arg("--no-ext-diff")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null");
+    let mut cmd = safe_git_command(repo_path, &["show"]);
 
     if let Some(p) = path_filter {
         let confined = confine_path(repo_path, p, false, true)?;
@@ -1417,6 +1435,107 @@ mod tests {
             Some(CanonicalToolName::GitStatus)
         );
         assert_eq!(CanonicalToolName::from_wire("invalid_xyz"), None);
+    }
+
+    #[tokio::test]
+    async fn git_read_tools_and_repository_reads_remain_available() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = tempdir()?;
+        let run_git = |args: &[&str]| -> Result<String> {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(args)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()?;
+            anyhow::ensure!(
+                output.status.success(),
+                "git fixture failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+        };
+
+        run_git(&["init", "--quiet"])?;
+        run_git(&["config", "user.name", "Orbit Tool Surface Test"])?;
+        run_git(&["config", "user.email", "orbit@example.invalid"])?;
+        std::fs::write(
+            repo.path().join(".gitattributes"),
+            "tracked.txt diff=orbit-test\n",
+        )?;
+        std::fs::write(repo.path().join("tracked.txt"), "baseline\n")?;
+        std::fs::write(
+            repo.path().join("README.md"),
+            "tool surface repository fixture\n",
+        )?;
+        run_git(&["add", "tracked.txt"])?;
+        run_git(&["add", ".gitattributes", "README.md"])?;
+        run_git(&["commit", "--quiet", "-m", "baseline"])?;
+
+        let fsmonitor_marker = repo.path().join("fsmonitor-ran");
+        let external_diff_marker = repo.path().join("external-diff-ran");
+        let textconv_marker = repo.path().join("textconv-ran");
+        let fsmonitor_script = repo.path().join("fsmonitor.sh");
+        let external_diff_script = repo.path().join("external-diff.sh");
+        let textconv_script = repo.path().join("textconv.sh");
+        std::fs::write(
+            &fsmonitor_script,
+            format!(
+                "#!/bin/sh\ntouch '{}'\nprintf 'token'\n",
+                fsmonitor_marker.display()
+            ),
+        )?;
+        std::fs::write(
+            &external_diff_script,
+            format!("#!/bin/sh\ntouch '{}'\n", external_diff_marker.display()),
+        )?;
+        std::fs::write(
+            &textconv_script,
+            format!(
+                "#!/bin/sh\ntouch '{}'\ncat \"$1\"\n",
+                textconv_marker.display()
+            ),
+        )?;
+        for script in [&fsmonitor_script, &external_diff_script, &textconv_script] {
+            std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o700))?;
+        }
+        run_git(&[
+            "config",
+            "--local",
+            "core.fsmonitor",
+            fsmonitor_script.to_str().unwrap(),
+        ])?;
+        run_git(&[
+            "config",
+            "--local",
+            "diff.external",
+            external_diff_script.to_str().unwrap(),
+        ])?;
+        run_git(&[
+            "config",
+            "--local",
+            "diff.orbit-test.textconv",
+            textconv_script.to_str().unwrap(),
+        ])?;
+        std::fs::write(repo.path().join("tracked.txt"), "updated\n")?;
+
+        assert!(
+            crate::fs_tools::read_text_confined(repo.path(), ".git/config")?
+                .contains("repositoryformatversion")
+        );
+        let status = git_status(repo.path(), None).await?;
+        assert!(status.modified.iter().any(|path| path == "tracked.txt"));
+        let diff = git_diff(repo.path(), None, None, None, false, 65536).await?;
+        assert!(diff.diff.contains("+updated"));
+        assert!(diff.diff.contains("-baseline"));
+        let show = git_show(repo.path(), "HEAD", Some("tracked.txt"), 65536).await?;
+        assert!(show.content.contains("baseline"));
+        assert!(!fsmonitor_marker.exists());
+        assert!(!external_diff_marker.exists());
+        assert!(!textconv_marker.exists());
+        Ok(())
     }
 
     #[test]
