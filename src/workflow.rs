@@ -1710,102 +1710,511 @@ impl WorkflowStore {
 /// Runtime resolver mapping RoleExecution requirements to a concrete execution target.
 pub struct RoleRuntimeResolver;
 
+/// Small, configurable safety thresholds used while ranking runtime targets.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeQuotaSelectionPolicy {
+    #[serde(default = "default_min_5h_remaining_percent")]
+    pub min_5h_remaining_percent: f64,
+    #[serde(default = "default_min_7d_remaining_percent")]
+    pub min_7d_remaining_percent: f64,
+}
+
+const fn default_min_5h_remaining_percent() -> f64 {
+    15.0
+}
+
+const fn default_min_7d_remaining_percent() -> f64 {
+    5.0
+}
+
+impl Default for RuntimeQuotaSelectionPolicy {
+    fn default() -> Self {
+        Self {
+            min_5h_remaining_percent: default_min_5h_remaining_percent(),
+            min_7d_remaining_percent: default_min_7d_remaining_percent(),
+        }
+    }
+}
+
+impl RuntimeQuotaSelectionPolicy {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.min_5h_remaining_percent.is_finite()
+                && (0.0..=100.0).contains(&self.min_5h_remaining_percent),
+            "invalid minimum 5h quota remaining percentage"
+        );
+        ensure!(
+            self.min_7d_remaining_percent.is_finite()
+                && (0.0..=100.0).contains(&self.min_7d_remaining_percent),
+            "invalid minimum 7d quota remaining percentage"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct RuntimeQuotaFacts {
+    five_hour_remaining: Option<f64>,
+    seven_day_remaining: Option<f64>,
+    seven_day_reset_at_ms: Option<i64>,
+    explicitly_exhausted: bool,
+}
+
+type NormalizedQuotaWindow = (Option<i64>, String, Option<f64>, Option<i64>, Option<bool>);
+
+#[derive(Clone, Debug)]
+struct RuntimeCandidate {
+    target: ResolvedExecutionTarget,
+    provider_preference_rank: usize,
+    credential_reference: String,
+    credential_id: String,
+    quota: RuntimeQuotaFacts,
+    availability: crate::availability::AvailabilityState,
+}
+
+fn quota_percent(
+    remaining_percent: Option<f64>,
+    remaining_fraction: Option<f64>,
+    used_percent: Option<f64>,
+) -> Option<f64> {
+    remaining_percent
+        .or_else(|| remaining_fraction.map(|fraction| fraction * 100.0))
+        .or_else(|| used_percent.map(|used| 100.0 - used))
+        .filter(|percent| percent.is_finite() && (0.0..=100.0).contains(percent))
+}
+
+fn quota_window_kind(duration_minutes: Option<i64>, identifier: &str) -> Option<bool> {
+    if duration_minutes == Some(300) {
+        return Some(true);
+    }
+    if duration_minutes == Some(10_080) {
+        return Some(false);
+    }
+    let identifier = identifier
+        .rsplit('.')
+        .next()
+        .unwrap_or(identifier)
+        .to_ascii_lowercase();
+    match identifier.as_str() {
+        "5h" | "5hr" | "5hours" => Some(true),
+        "7d" | "weekly" | "1w" | "7days" => Some(false),
+        _ => None,
+    }
+}
+
+fn normalized_model_membership(value: &str) -> std::collections::BTreeSet<String> {
+    value
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty() && !word.bytes().all(|byte| byte.is_ascii_digit()))
+        .map(str::to_ascii_lowercase)
+        .filter(|word| !matches!(word.as_str(), "high" | "low" | "medium" | "max" | "preview"))
+        .collect()
+}
+
+fn is_codex_default_bucket(provider_label: Option<&str>) -> bool {
+    provider_label.is_some_and(|label| label.eq_ignore_ascii_case("default"))
+}
+
+fn is_codex_default_flat_window(label: &str) -> bool {
+    label
+        .split('.')
+        .next()
+        .is_some_and(|bucket| bucket.eq_ignore_ascii_case("default"))
+}
+
+fn quota_facts_for_candidate(
+    snapshot: Option<&crate::availability::AvailabilitySnapshot>,
+    provider: &str,
+    model: &str,
+    now_ms: i64,
+) -> RuntimeQuotaFacts {
+    let Some(snapshot) = snapshot
+        .filter(|snapshot| snapshot.observed_at_ms <= now_ms && now_ms < snapshot.expires_at_ms)
+    else {
+        return RuntimeQuotaFacts::default();
+    };
+
+    let mut windows: Vec<NormalizedQuotaWindow> = Vec::new();
+    if !snapshot.quota_buckets.is_empty() {
+        let applicable_buckets: std::collections::BTreeSet<&str> = if provider == "codex" {
+            // The configured Luna target uses Codex's `default` bucket.
+            // `gpt-reserve` must not supply its headroom or reset order.
+            snapshot
+                .quota_buckets
+                .iter()
+                .filter(|bucket| {
+                    bucket.scope.is_none()
+                        && is_codex_default_bucket(bucket.provider_label.as_deref())
+                })
+                .map(|bucket| bucket.provider_bucket_fingerprint.as_str())
+                .collect()
+        } else if snapshot.quota_groups.is_empty() {
+            std::collections::BTreeSet::new()
+        } else {
+            let model_membership = normalized_model_membership(model);
+            snapshot
+                .quota_groups
+                .iter()
+                .filter(|group| {
+                    group.members.iter().any(|member| {
+                        normalized_model_membership(&member.provider_label) == model_membership
+                    })
+                })
+                .flat_map(|group| group.bucket_fingerprints.iter().map(String::as_str))
+                .collect()
+        };
+
+        for bucket in &snapshot.quota_buckets {
+            if !applicable_buckets.contains(bucket.provider_bucket_fingerprint.as_str()) {
+                continue;
+            }
+            for window in &bucket.windows {
+                windows.push((
+                    window.duration_minutes,
+                    window.provider_window_id.clone(),
+                    quota_percent(
+                        window.remaining_percent,
+                        window.remaining_fraction,
+                        window.used_percent,
+                    ),
+                    window.resets_at_ms,
+                    window.exhausted,
+                ));
+            }
+        }
+    } else {
+        // Opaque historical Codex bucket hashes stay unknown rather than
+        // being guessed to represent the selected model.
+        windows.extend(
+            snapshot
+                .quota_windows
+                .iter()
+                .filter(|window| provider != "codex" || is_codex_default_flat_window(&window.label))
+                .map(|window| {
+                    (
+                        window.duration_minutes,
+                        window.label.clone(),
+                        quota_percent(window.remaining_percent, None, window.used_percent),
+                        window.resets_at_ms,
+                        window.exhausted,
+                    )
+                }),
+        );
+    }
+
+    let mut facts = RuntimeQuotaFacts::default();
+    let mut short_values = Vec::new();
+    let mut weekly_values = Vec::new();
+    let mut weekly_resets = Vec::new();
+    for (duration, identifier, remaining, reset_at_ms, exhausted) in windows {
+        // A reset has passed: its old percentage describes the previous
+        // window and is not current headroom for V1 selection.
+        if reset_at_ms.is_some_and(|reset| reset <= now_ms) {
+            continue;
+        }
+        facts.explicitly_exhausted |= exhausted == Some(true);
+        let Some(is_short) = quota_window_kind(duration, &identifier) else {
+            continue;
+        };
+        if is_short {
+            short_values.extend(remaining);
+        } else {
+            if let Some(remaining) = remaining {
+                weekly_values.push(remaining);
+                weekly_resets.extend(reset_at_ms);
+            }
+        }
+    }
+    facts.five_hour_remaining = short_values.into_iter().reduce(f64::min);
+    facts.seven_day_remaining = weekly_values.into_iter().reduce(f64::min);
+    facts.seven_day_reset_at_ms = weekly_resets.into_iter().min();
+    facts
+}
+
+fn availability_blocks_candidate(state: crate::availability::AvailabilityState) -> bool {
+    matches!(
+        state,
+        crate::availability::AvailabilityState::Cooldown
+            | crate::availability::AvailabilityState::RateLimited
+            | crate::availability::AvailabilityState::QuotaExhausted
+            | crate::availability::AvailabilityState::AuthFailed
+            | crate::availability::AvailabilityState::RuntimeUnavailable
+            | crate::availability::AvailabilityState::CapabilityMismatch
+    )
+}
+
+fn candidate_rejection(
+    availability: crate::availability::AvailabilityState,
+    quota: RuntimeQuotaFacts,
+    policy: RuntimeQuotaSelectionPolicy,
+) -> Option<&'static str> {
+    if availability_blocks_candidate(availability) {
+        return Some("explicitly_blocked_availability");
+    }
+    if quota.explicitly_exhausted {
+        return Some("explicitly_exhausted_quota_window");
+    }
+    if quota
+        .five_hour_remaining
+        .is_some_and(|remaining| remaining < policy.min_5h_remaining_percent)
+    {
+        return Some("below_min_5h_remaining");
+    }
+    if quota
+        .seven_day_remaining
+        .is_some_and(|remaining| remaining < policy.min_7d_remaining_percent)
+    {
+        return Some("below_min_7d_remaining");
+    }
+    None
+}
+
+fn credential_has_valid_acp_representation(
+    inspection: &crate::credential_registry::CredentialInspection,
+) -> bool {
+    inspection.credential.has_secret
+        && inspection.representations.iter().any(|representation| {
+            representation.current_generation
+                && representation.generation == inspection.credential.generation
+                && representation.interface == "acp"
+                && representation.validation == "valid"
+                && representation.has_secret
+        })
+}
+
+fn sort_runtime_candidates(candidates: &mut [RuntimeCandidate]) {
+    let reset_rank = |candidate: &RuntimeCandidate| match (
+        candidate.quota.seven_day_remaining,
+        candidate.quota.seven_day_reset_at_ms,
+    ) {
+        (Some(_), Some(reset)) => (0u8, reset),
+        _ => (1u8, i64::MAX),
+    };
+    candidates.sort_by(|left, right| {
+        reset_rank(left)
+            .cmp(&reset_rank(right))
+            .then_with(|| {
+                left.provider_preference_rank
+                    .cmp(&right.provider_preference_rank)
+            })
+            .then_with(|| left.credential_id.cmp(&right.credential_id))
+            .then_with(|| left.credential_reference.cmp(&right.credential_reference))
+    });
+}
+
+fn format_quota_percent(percent: Option<f64>) -> String {
+    percent
+        .map(|value| format!("{value:.1}%"))
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn summarize_candidate_diagnostics(rejected: &[String]) -> String {
+    const MAX_DIAGNOSTICS: usize = 8;
+    let displayed = rejected
+        .iter()
+        .take(MAX_DIAGNOSTICS)
+        .cloned()
+        .collect::<Vec<_>>();
+    let omitted = rejected.len().saturating_sub(displayed.len());
+    if omitted == 0 {
+        format!("[{}]", displayed.join(","))
+    } else {
+        format!("[{},+{omitted}_omitted]", displayed.join(","))
+    }
+}
+
 impl RoleRuntimeResolver {
-    /// Resolves execution target based on role preferences and simulated or live provider availability.
+    /// Resolve the first target using the default reset-aware quota policy.
     pub async fn resolve_target_live(
         pool: &sqlx::PgPool,
         role: &RoleDefinition,
         simulate_quota_exhausted_for: Option<&str>,
     ) -> Result<ResolvedExecutionTarget> {
+        Self::resolve_target_live_with_policy(
+            pool,
+            role,
+            simulate_quota_exhausted_for,
+            RuntimeQuotaSelectionPolicy::default(),
+        )
+        .await
+    }
+
+    pub async fn resolve_target_live_with_policy(
+        pool: &sqlx::PgPool,
+        role: &RoleDefinition,
+        simulate_quota_exhausted_for: Option<&str>,
+        policy: RuntimeQuotaSelectionPolicy,
+    ) -> Result<ResolvedExecutionTarget> {
+        Self::resolve_ranked_targets_live(pool, role, simulate_quota_exhausted_for, policy)
+            .await?
+            .into_iter()
+            .next()
+            .context("runtime candidate ranking returned no eligible target")
+    }
+
+    /// Return every currently eligible target in deterministic selection order.
+    /// This leaves continuation policy to the caller while giving retries the
+    /// same ranked candidates in the same order.
+    pub async fn resolve_ranked_targets_live(
+        pool: &sqlx::PgPool,
+        role: &RoleDefinition,
+        simulate_quota_exhausted_for: Option<&str>,
+        policy: RuntimeQuotaSelectionPolicy,
+    ) -> Result<Vec<ResolvedExecutionTarget>> {
+        policy.validate()?;
         let cred_store = crate::credential_registry::CredentialStore::new(pool);
         let credentials = cred_store.list().await?;
+        let availability_store = crate::availability::AvailabilityStore::new(pool);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis() as i64;
+        let mut candidates = Vec::new();
+        let mut rejected = Vec::new();
 
-        for pref in &role.runtime_preferences {
+        for (preference_rank, pref) in role.runtime_preferences.iter().enumerate() {
             if simulate_quota_exhausted_for == Some(pref.as_str()) {
+                rejected.push(format!("preference={pref}:simulated_quota_exhausted"));
                 continue;
             }
 
-            if pref.contains("codex") {
-                let avail_store = crate::availability::AvailabilityStore::new(pool);
-                for cred in credentials.iter().filter(|c| {
-                    c.provider == "codex"
-                        && c.status == crate::credential_registry::CredentialStatus::Enrolled
-                }) {
-                    let is_exhausted = matches!(
-                        avail_store.current_for_credential(&cred.identity()).await,
-                        Ok(Some(avail))
-                            if matches!(
-                                avail.state,
-                                crate::availability::AvailabilityState::QuotaExhausted
-                                    | crate::availability::AvailabilityState::RateLimited
-                                    | crate::availability::AvailabilityState::Cooldown
-                                    | crate::availability::AvailabilityState::RuntimeUnavailable
-                            )
-                    );
-                    if is_exhausted {
-                        continue;
-                    }
+            let (provider, runtime_interface, model, runtime_image_digest) =
+                if pref.contains("codex") {
+                    (
+                        "codex",
+                        "codex-acp",
+                        "gpt-6-luna",
+                        crate::codex_credential_enrollment::CODEX_IMAGE_DIGEST,
+                    )
+                } else if pref.contains("antigravity") {
+                    (
+                        "antigravity",
+                        "antigravity-acp",
+                        "gemini-3.8-flash",
+                        crate::credential_enrollment::ANTIGRAVITY_DIGEST,
+                    )
+                } else {
+                    continue;
+                };
 
-                    return Ok(ResolvedExecutionTarget {
-                        provider: "codex".into(),
-                        runtime_interface: "codex-acp".into(),
-                        credential_id: Some(cred.reference.clone()),
-                        credential_generation: Some(cred.generation as u32),
-                        requested_model: Some("gpt-6-luna".into()),
-                        resolved_model: Some("gpt-6-luna".into()),
-                        runtime_image_digest: Some(
-                            crate::codex_credential_enrollment::CODEX_IMAGE_DIGEST.into(),
-                        ),
-                        resolution_reason: format!(
-                            "enrolled ready credential {} matching preference {}",
-                            cred.reference, pref
-                        ),
-                    });
+            for credential in credentials.iter().filter(|credential| {
+                credential.provider == provider
+                    && credential.status == crate::credential_registry::CredentialStatus::Enrolled
+            }) {
+                let inspection = cred_store
+                    .inspect(&credential.reference)
+                    .await?
+                    .context("credential disappeared during runtime resolution")?;
+                if inspection.credential.generation != credential.generation
+                    || inspection.credential.status
+                        != crate::credential_registry::CredentialStatus::Enrolled
+                {
+                    rejected.push(format!(
+                        "{provider}:{}:credential_changed_during_resolution",
+                        credential.reference
+                    ));
+                    continue;
                 }
-            } else if pref.contains("antigravity") {
-                let avail_store = crate::availability::AvailabilityStore::new(pool);
-                for cred in credentials.iter().filter(|c| {
-                    c.provider == "antigravity"
-                        && c.status == crate::credential_registry::CredentialStatus::Enrolled
-                }) {
-                    let is_exhausted = matches!(
-                        avail_store.current_for_credential(&cred.identity()).await,
-                        Ok(Some(avail))
-                            if matches!(
-                                avail.state,
-                                crate::availability::AvailabilityState::QuotaExhausted
-                                    | crate::availability::AvailabilityState::RateLimited
-                                    | crate::availability::AvailabilityState::Cooldown
-                                    | crate::availability::AvailabilityState::RuntimeUnavailable
-                            )
-                    );
-                    if is_exhausted {
-                        continue;
-                    }
+                if !credential_has_valid_acp_representation(&inspection) {
+                    rejected.push(format!(
+                        "{provider}:{}:missing_or_invalid_current_acp_representation",
+                        credential.reference
+                    ));
+                    continue;
+                }
 
-                    return Ok(ResolvedExecutionTarget {
-                        provider: "antigravity".into(),
-                        runtime_interface: "antigravity-acp".into(),
-                        credential_id: Some(cred.reference.clone()),
-                        credential_generation: Some(cred.generation as u32),
-                        requested_model: Some("gemini-3.8-flash".into()),
-                        resolved_model: Some("gemini-3.8-flash".into()),
-                        runtime_image_digest: Some(
-                            crate::credential_enrollment::ANTIGRAVITY_DIGEST.into(),
-                        ),
-                        resolution_reason: format!(
-                            "enrolled ready credential {} matching preference {}",
-                            cred.reference, pref
-                        ),
-                    });
+                let snapshot = availability_store
+                    .current_for_credential(&credential.identity())
+                    .await?;
+                let snapshot_is_fresh = snapshot.as_ref().is_some_and(|snapshot| {
+                    snapshot.observed_at_ms <= now_ms && now_ms < snapshot.expires_at_ms
+                });
+                let availability = if snapshot_is_fresh {
+                    snapshot.as_ref().unwrap().state
+                } else {
+                    crate::availability::AvailabilityState::Unknown
+                };
+                let quota = quota_facts_for_candidate(
+                    snapshot.as_ref().filter(|_| snapshot_is_fresh),
+                    provider,
+                    model,
+                    now_ms,
+                );
+                if let Some(reason) = candidate_rejection(availability, quota, policy) {
+                    rejected.push(format!(
+                        "{provider}:{}:{reason}(5h={},7d={},7d_reset={})",
+                        credential.reference,
+                        format_quota_percent(quota.five_hour_remaining),
+                        format_quota_percent(quota.seven_day_remaining),
+                        quota
+                            .seven_day_reset_at_ms
+                            .map(|reset| reset.to_string())
+                            .unwrap_or_else(|| "unknown".into())
+                    ));
+                    continue;
                 }
+
+                let generation = u32::try_from(credential.generation)
+                    .context("credential generation exceeds runtime target range")?;
+                candidates.push(RuntimeCandidate {
+                    target: ResolvedExecutionTarget {
+                        provider: provider.into(),
+                        runtime_interface: runtime_interface.into(),
+                        credential_id: Some(credential.reference.clone()),
+                        credential_generation: Some(generation),
+                        requested_model: Some(model.into()),
+                        resolved_model: Some(model.into()),
+                        runtime_image_digest: Some(runtime_image_digest.into()),
+                        resolution_reason: String::new(),
+                    },
+                    provider_preference_rank: preference_rank,
+                    credential_reference: credential.reference.clone(),
+                    credential_id: credential.id.clone(),
+                    quota,
+                    availability,
+                });
             }
         }
 
-        bail!(
-            "failed to resolve live execution target for role {}: all preferences exhausted or no eligible credentials enrolled in CredentialStore",
-            role.role_id
-        )
+        sort_runtime_candidates(&mut candidates);
+
+        if candidates.is_empty() {
+            let rejected = summarize_candidate_diagnostics(&rejected);
+            bail!(
+                "failed to resolve live execution target for role {}: all preferences exhausted or no eligible credentials enrolled in CredentialStore; rejected={rejected}",
+                role.role_id
+            );
+        }
+
+        let rejected = summarize_candidate_diagnostics(&rejected);
+        Ok(candidates
+            .into_iter()
+            .enumerate()
+            .map(|(rank, mut candidate)| {
+                let weekly_reset_rank = if candidate.quota.seven_day_remaining.is_some()
+                    && candidate.quota.seven_day_reset_at_ms.is_some()
+                {
+                    "known_weekly_reset"
+                } else {
+                    "weekly_reset_unknown_or_not_applicable"
+                };
+                candidate.target.resolution_reason = format!(
+                    "reset-aware rank={}; {}; availability={:?}; 5h_remaining={}; 7d_remaining={}; 7d_reset_at_ms={}; provider_preference_rank={}; tie_break=provider_preference_then_stable_account_id; rejected={rejected}",
+                    rank + 1,
+                    weekly_reset_rank,
+                    candidate.availability,
+                    format_quota_percent(candidate.quota.five_hour_remaining),
+                    format_quota_percent(candidate.quota.seven_day_remaining),
+                    candidate
+                        .quota
+                        .seven_day_reset_at_ms
+                        .map(|reset| reset.to_string())
+                        .unwrap_or_else(|| "unknown".into()),
+                    candidate.provider_preference_rank
+                );
+                candidate.target
+            })
+            .collect())
     }
 
     pub fn resolve_target(
@@ -1914,6 +2323,61 @@ pub fn format_workflow_show(wf: &WorkflowRun, roles: &[RoleExecution]) -> String
 mod tests {
     use super::*;
 
+    fn candidate(
+        provider: &str,
+        reference: &str,
+        account_id: &str,
+        provider_preference_rank: usize,
+        quota: RuntimeQuotaFacts,
+    ) -> RuntimeCandidate {
+        RuntimeCandidate {
+            target: ResolvedExecutionTarget {
+                provider: provider.into(),
+                runtime_interface: format!("{provider}-acp"),
+                credential_id: Some(reference.into()),
+                credential_generation: Some(1),
+                requested_model: Some("test-model".into()),
+                resolved_model: Some("test-model".into()),
+                runtime_image_digest: Some("sha256:test".into()),
+                resolution_reason: String::new(),
+            },
+            provider_preference_rank,
+            credential_reference: reference.into(),
+            credential_id: account_id.into(),
+            quota,
+            availability: crate::availability::AvailabilityState::Ready,
+        }
+    }
+
+    fn quota_snapshot(
+        provider: &str,
+        now_ms: i64,
+        quota_windows: Vec<crate::availability::QuotaWindow>,
+    ) -> crate::availability::AvailabilitySnapshot {
+        crate::availability::AvailabilitySnapshot {
+            applies_to: crate::availability::AvailabilityScope::Credential(
+                crate::availability::CredentialIdentity {
+                    provider: provider.into(),
+                    reference: "fixture-account".into(),
+                    generation: "1".into(),
+                    catalog_id: None,
+                },
+            ),
+            observed_at_ms: now_ms - 100,
+            expires_at_ms: now_ms + 10_000,
+            state: crate::availability::AvailabilityState::Unknown,
+            quota_windows,
+            quota_buckets: Vec::new(),
+            quota_groups: Vec::new(),
+            source: crate::availability::EvidenceSource::ProviderNativeStatus,
+            confidence: crate::availability::EvidenceConfidence::AuthoritativeNative,
+            source_revision: "fixture".into(),
+            evidence_digest: format!("sha256:{}", "a".repeat(64)),
+            provider_observed_at_ms: None,
+            provider_status_observation: None,
+        }
+    }
+
     #[test]
     fn test_role_definitions_and_digests() {
         let planner = RoleDefinition::planner_v1();
@@ -1946,6 +2410,448 @@ mod tests {
         let tgt2 = RoleRuntimeResolver::resolve_target(&reviewer, Some("antigravity-acp")).unwrap();
         assert_eq!(tgt2.provider, "codex");
         assert_eq!(tgt2.runtime_interface, "codex-acp");
+    }
+
+    #[test]
+    fn reset_aware_candidate_policy_covers_thresholds_ranking_and_ties() {
+        let policy = RuntimeQuotaSelectionPolicy::default();
+        let early = candidate(
+            "codex",
+            "account-a",
+            "id-a",
+            1,
+            RuntimeQuotaFacts {
+                five_hour_remaining: Some(30.0),
+                seven_day_remaining: Some(70.0),
+                seven_day_reset_at_ms: Some(1_000),
+                explicitly_exhausted: false,
+            },
+        );
+        let later = candidate(
+            "antigravity",
+            "account-b",
+            "id-b",
+            0,
+            RuntimeQuotaFacts {
+                five_hour_remaining: Some(80.0),
+                seven_day_remaining: Some(90.0),
+                seven_day_reset_at_ms: Some(5_000),
+                explicitly_exhausted: false,
+            },
+        );
+        let mut ranked = vec![later.clone(), early.clone()];
+        sort_runtime_candidates(&mut ranked);
+        assert_eq!(ranked[0].credential_reference, "account-a");
+
+        let low_short = RuntimeQuotaFacts {
+            five_hour_remaining: Some(14.0),
+            seven_day_remaining: Some(60.0),
+            seven_day_reset_at_ms: Some(500),
+            explicitly_exhausted: false,
+        };
+        assert_eq!(
+            candidate_rejection(
+                crate::availability::AvailabilityState::Ready,
+                low_short,
+                policy
+            ),
+            Some("below_min_5h_remaining")
+        );
+        assert_eq!(
+            candidate_rejection(
+                crate::availability::AvailabilityState::Ready,
+                RuntimeQuotaFacts {
+                    five_hour_remaining: Some(15.0),
+                    ..RuntimeQuotaFacts::default()
+                },
+                policy
+            ),
+            None,
+            "the 5h threshold is inclusive"
+        );
+        assert_eq!(
+            candidate_rejection(
+                crate::availability::AvailabilityState::Ready,
+                RuntimeQuotaFacts {
+                    five_hour_remaining: Some(80.0),
+                    seven_day_remaining: Some(4.0),
+                    ..RuntimeQuotaFacts::default()
+                },
+                policy
+            ),
+            Some("below_min_7d_remaining")
+        );
+        assert_eq!(
+            candidate_rejection(
+                crate::availability::AvailabilityState::Ready,
+                RuntimeQuotaFacts {
+                    seven_day_remaining: Some(5.0),
+                    ..RuntimeQuotaFacts::default()
+                },
+                policy
+            ),
+            None,
+            "the 7d reserve threshold is inclusive"
+        );
+
+        let mut rejected_early = vec![
+            candidate("codex", "low-short-early", "id-c", 0, low_short),
+            later.clone(),
+        ];
+        rejected_early.retain(|candidate| {
+            candidate_rejection(candidate.availability, candidate.quota, policy).is_none()
+        });
+        sort_runtime_candidates(&mut rejected_early);
+        assert_eq!(rejected_early[0].credential_reference, "account-b");
+
+        let unknown_reset = candidate(
+            "codex",
+            "unknown-reset",
+            "id-d",
+            0,
+            RuntimeQuotaFacts {
+                five_hour_remaining: Some(20.0),
+                seven_day_remaining: Some(40.0),
+                seven_day_reset_at_ms: None,
+                explicitly_exhausted: false,
+            },
+        );
+        let mut known_beats_unknown = vec![unknown_reset.clone(), early.clone()];
+        sort_runtime_candidates(&mut known_beats_unknown);
+        assert_eq!(known_beats_unknown[0].credential_reference, "account-a");
+
+        let unknown_weekly = candidate(
+            "codex",
+            "unknown-weekly",
+            "id-e",
+            0,
+            RuntimeQuotaFacts {
+                five_hour_remaining: Some(20.0),
+                ..RuntimeQuotaFacts::default()
+            },
+        );
+        assert_eq!(
+            candidate_rejection(unknown_weekly.availability, unknown_weekly.quota, policy),
+            None,
+            "unknown or absent windows remain eligible under the existing policy"
+        );
+        let no_reset_codex = candidate(
+            "codex",
+            "tie-codex",
+            "id-f",
+            0,
+            RuntimeQuotaFacts {
+                seven_day_remaining: Some(30.0),
+                ..RuntimeQuotaFacts::default()
+            },
+        );
+        let no_reset_antigravity = candidate(
+            "antigravity",
+            "tie-antigravity",
+            "id-g",
+            1,
+            RuntimeQuotaFacts {
+                seven_day_remaining: Some(30.0),
+                ..RuntimeQuotaFacts::default()
+            },
+        );
+        let mut both_unknown = vec![no_reset_antigravity.clone(), no_reset_codex.clone()];
+        sort_runtime_candidates(&mut both_unknown);
+        assert_eq!(both_unknown[0].target.provider, "codex");
+
+        let same_reset_antigravity = candidate(
+            "antigravity",
+            "same-reset-antigravity",
+            "id-h",
+            0,
+            RuntimeQuotaFacts {
+                seven_day_remaining: Some(30.0),
+                seven_day_reset_at_ms: Some(3_000),
+                ..RuntimeQuotaFacts::default()
+            },
+        );
+        let same_reset_codex = candidate(
+            "codex",
+            "same-reset-codex",
+            "id-i",
+            1,
+            RuntimeQuotaFacts {
+                seven_day_remaining: Some(30.0),
+                seven_day_reset_at_ms: Some(3_000),
+                ..RuntimeQuotaFacts::default()
+            },
+        );
+        let mut reviewer_tie = vec![same_reset_codex.clone(), same_reset_antigravity.clone()];
+        sort_runtime_candidates(&mut reviewer_tie);
+        assert_eq!(reviewer_tie[0].target.provider, "antigravity");
+
+        let planner_codex = candidate("codex", "planner-codex", "id-j", 0, same_reset_codex.quota);
+        let planner_antigravity = candidate(
+            "antigravity",
+            "planner-antigravity",
+            "id-k",
+            1,
+            same_reset_antigravity.quota,
+        );
+        let mut planner_tie = vec![planner_antigravity, planner_codex];
+        sort_runtime_candidates(&mut planner_tie);
+        assert_eq!(planner_tie[0].target.provider, "codex");
+
+        let stable_id_later_ref = candidate("codex", "codex-a", "id-z", 0, same_reset_codex.quota);
+        let stable_id_first_ref = candidate("codex", "codex-z", "id-a", 0, same_reset_codex.quota);
+        let mut account_tie = vec![stable_id_later_ref, stable_id_first_ref];
+        sort_runtime_candidates(&mut account_tie);
+        assert_eq!(account_tie[0].credential_reference, "codex-z");
+
+        let mut same_provider_reset = vec![later, early];
+        sort_runtime_candidates(&mut same_provider_reset);
+        assert_eq!(same_provider_reset[0].credential_reference, "account-a");
+
+        for blocked in [
+            crate::availability::AvailabilityState::QuotaExhausted,
+            crate::availability::AvailabilityState::RateLimited,
+            crate::availability::AvailabilityState::AuthFailed,
+            crate::availability::AvailabilityState::RuntimeUnavailable,
+            crate::availability::AvailabilityState::CapabilityMismatch,
+            crate::availability::AvailabilityState::Cooldown,
+        ] {
+            assert_eq!(
+                candidate_rejection(blocked, same_reset_antigravity.quota, policy),
+                Some("explicitly_blocked_availability")
+            );
+        }
+
+        let invalid_policy = RuntimeQuotaSelectionPolicy {
+            min_5h_remaining_percent: f64::NAN,
+            ..policy
+        };
+        assert!(invalid_policy.validate().is_err());
+    }
+
+    #[test]
+    fn reset_aware_quota_facts_reuse_fresh_normalized_windows() {
+        let now_ms = 10_000;
+        let snapshot = quota_snapshot(
+            "codex",
+            now_ms,
+            vec![
+                crate::availability::QuotaWindow {
+                    label: "default.5h".into(),
+                    duration_minutes: Some(300),
+                    used_percent: None,
+                    remaining_percent: Some(30.0),
+                    resets_at_ms: Some(20_000),
+                    exhausted: None,
+                },
+                crate::availability::QuotaWindow {
+                    label: "default.weekly".into(),
+                    duration_minutes: Some(10_080),
+                    used_percent: None,
+                    remaining_percent: Some(74.0),
+                    resets_at_ms: Some(30_000),
+                    exhausted: None,
+                },
+                crate::availability::QuotaWindow {
+                    label: "gpt-reserve.weekly".into(),
+                    duration_minutes: Some(10_080),
+                    used_percent: None,
+                    remaining_percent: Some(1.0),
+                    resets_at_ms: Some(15_000),
+                    exhausted: None,
+                },
+            ],
+        );
+        assert_eq!(
+            quota_facts_for_candidate(Some(&snapshot), "codex", "gpt-6-luna", now_ms),
+            RuntimeQuotaFacts {
+                five_hour_remaining: Some(30.0),
+                seven_day_remaining: Some(74.0),
+                seven_day_reset_at_ms: Some(30_000),
+                explicitly_exhausted: false,
+            }
+        );
+
+        let stale = quota_snapshot(
+            "codex",
+            now_ms,
+            vec![crate::availability::QuotaWindow {
+                label: "default.5h".into(),
+                duration_minutes: Some(300),
+                used_percent: None,
+                remaining_percent: Some(90.0),
+                resets_at_ms: Some(9_000),
+                exhausted: None,
+            }],
+        );
+        assert_eq!(
+            quota_facts_for_candidate(Some(&stale), "codex", "gpt-6-luna", now_ms),
+            RuntimeQuotaFacts::default(),
+            "past-reset or expired snapshot values are unknown, not current headroom"
+        );
+    }
+
+    #[test]
+    fn codex_quota_selection_uses_default_and_ignores_gpt_reserve() {
+        let now_ms = 10_000;
+        let window = |provider_window_id: &str,
+                      duration_minutes: i64,
+                      remaining_percent: f64,
+                      resets_at_ms: i64| {
+            crate::availability::QuotaBucketWindow {
+                provider_window_id: provider_window_id.into(),
+                duration_minutes: Some(duration_minutes),
+                used_percent: Some(100.0 - remaining_percent),
+                remaining_percent: Some(remaining_percent),
+                remaining_fraction: None,
+                resets_at_ms: Some(resets_at_ms),
+                provider_reset_time: None,
+                exhausted: None,
+            }
+        };
+        let bucket = |fingerprint: &str,
+                      provider_label: &str,
+                      five_hour_remaining: f64,
+                      weekly_remaining: f64,
+                      weekly_reset_at_ms: i64| {
+            crate::availability::QuotaBucket {
+                provider_bucket_fingerprint: format!("qb1:{fingerprint}"),
+                provider_label: Some(provider_label.into()),
+                scope: None,
+                windows: vec![
+                    window("primary", 300, five_hour_remaining, now_ms + 20_000),
+                    window("secondary", 10_080, weekly_remaining, weekly_reset_at_ms),
+                ],
+            }
+        };
+        let mut snapshot = quota_snapshot("codex", now_ms, Vec::new());
+        snapshot.quota_buckets = vec![
+            bucket(&"a".repeat(64), "default", 30.0, 74.0, now_ms + 30_000),
+            bucket(&"b".repeat(64), "gpt-reserve", 1.0, 1.0, now_ms + 1_000),
+        ];
+
+        let quota = quota_facts_for_candidate(Some(&snapshot), "codex", "gpt-6-luna", now_ms);
+        assert_eq!(
+            quota,
+            RuntimeQuotaFacts {
+                five_hour_remaining: Some(30.0),
+                seven_day_remaining: Some(74.0),
+                seven_day_reset_at_ms: Some(now_ms + 30_000),
+                explicitly_exhausted: false,
+            }
+        );
+        assert_eq!(
+            candidate_rejection(
+                crate::availability::AvailabilityState::Ready,
+                quota,
+                RuntimeQuotaSelectionPolicy::default()
+            ),
+            None,
+            "the low, earlier-reset gpt-reserve bucket does not apply to the Luna target"
+        );
+    }
+
+    #[test]
+    fn antigravity_quota_selection_uses_the_matching_provider_model_group() {
+        let now_ms = 10_000;
+        let gemini_bucket = "qb1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let claude_bucket = "qb1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let snapshot = crate::availability::AvailabilitySnapshot {
+            applies_to: crate::availability::AvailabilityScope::Credential(
+                crate::availability::CredentialIdentity {
+                    provider: "antigravity".into(),
+                    reference: "fixture-account".into(),
+                    generation: "1".into(),
+                    catalog_id: None,
+                },
+            ),
+            observed_at_ms: now_ms - 100,
+            expires_at_ms: now_ms + 10_000,
+            state: crate::availability::AvailabilityState::Unknown,
+            quota_windows: Vec::new(),
+            quota_buckets: vec![
+                crate::availability::QuotaBucket {
+                    provider_bucket_fingerprint: gemini_bucket.into(),
+                    provider_label: None,
+                    scope: None,
+                    windows: vec![
+                        crate::availability::QuotaBucketWindow {
+                            provider_window_id: "5h".into(),
+                            duration_minutes: None,
+                            used_percent: None,
+                            remaining_percent: None,
+                            remaining_fraction: Some(0.30),
+                            resets_at_ms: Some(20_000),
+                            provider_reset_time: None,
+                            exhausted: None,
+                        },
+                        crate::availability::QuotaBucketWindow {
+                            provider_window_id: "weekly".into(),
+                            duration_minutes: None,
+                            used_percent: None,
+                            remaining_percent: None,
+                            remaining_fraction: Some(0.70),
+                            resets_at_ms: Some(30_000),
+                            provider_reset_time: None,
+                            exhausted: None,
+                        },
+                    ],
+                },
+                crate::availability::QuotaBucket {
+                    provider_bucket_fingerprint: claude_bucket.into(),
+                    provider_label: None,
+                    scope: None,
+                    windows: vec![crate::availability::QuotaBucketWindow {
+                        provider_window_id: "weekly".into(),
+                        duration_minutes: None,
+                        used_percent: None,
+                        remaining_percent: Some(1.0),
+                        remaining_fraction: None,
+                        resets_at_ms: Some(11_000),
+                        provider_reset_time: None,
+                        exhausted: None,
+                    }],
+                },
+            ],
+            quota_groups: vec![
+                crate::availability::ProviderQuotaGroup {
+                    fingerprint: format!("qg1:{}", "c".repeat(64)),
+                    identity_basis: crate::availability::ProviderQuotaGroupIdentityBasis::MemberSet,
+                    provider_display_name: Some("Gemini Models".into()),
+                    provider_description: None,
+                    members: vec![crate::availability::ProviderQuotaMember {
+                        provider_label: "Gemini Flash".into(),
+                        provider_key_fingerprint: None,
+                    }],
+                    bucket_fingerprints: vec![gemini_bucket.into()],
+                },
+                crate::availability::ProviderQuotaGroup {
+                    fingerprint: format!("qg1:{}", "d".repeat(64)),
+                    identity_basis: crate::availability::ProviderQuotaGroupIdentityBasis::MemberSet,
+                    provider_display_name: Some("Claude and GPT models".into()),
+                    provider_description: None,
+                    members: vec![crate::availability::ProviderQuotaMember {
+                        provider_label: "Claude Sonnet".into(),
+                        provider_key_fingerprint: None,
+                    }],
+                    bucket_fingerprints: vec![claude_bucket.into()],
+                },
+            ],
+            source: crate::availability::EvidenceSource::ProviderNativeStatus,
+            confidence: crate::availability::EvidenceConfidence::AuthoritativeNative,
+            source_revision: "fixture".into(),
+            evidence_digest: format!("sha256:{}", "a".repeat(64)),
+            provider_observed_at_ms: None,
+            provider_status_observation: None,
+        };
+        assert_eq!(
+            quota_facts_for_candidate(Some(&snapshot), "antigravity", "gemini-3.8-flash", now_ms),
+            RuntimeQuotaFacts {
+                five_hour_remaining: Some(30.0),
+                seven_day_remaining: Some(70.0),
+                seven_day_reset_at_ms: Some(30_000),
+                explicitly_exhausted: false,
+            }
+        );
     }
 
     #[test]

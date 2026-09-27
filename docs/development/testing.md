@@ -99,6 +99,34 @@ The coordinator checks the selected credential generation again before launch;
 `actual_model` remains unset unless the runtime reports an observed model. A
 missing cleanup receipt leaves the mutation lock fenced for reconciliation.
 
+Role runtime resolution applies reset-aware account selection over fresh,
+credential-scoped availability evidence. The default safety thresholds are 15%
+for a known 5-hour window and 5% for a known 7-day window; exact-threshold
+observations remain eligible. Eligible accounts with known safe weekly quota are
+ordered by earliest reset, then the role's provider preference, then stable
+catalog credential ID and reference. Unknown or inapplicable quota windows remain
+eligible under the existing availability policy and rank after known weekly
+resets. Codex's configured Luna target uses the `default` bucket and ignores
+`gpt-reserve`; Antigravity's Gemini target uses the Gemini group and ignores the
+Claude/GPT group. Embedders can override the narrow defaults with
+`WorkflowCoordinator::with_quota_selection_policy` and
+`RuntimeQuotaSelectionPolicy`. Resolution reasons include observed headroom,
+reset, rank and bounded rejection details. This change does not add automatic
+runtime re-resolution after an execution quota failure; existing recovery
+behavior remains unchanged.
+
+Focused deterministic policy checks:
+
+```sh
+cargo test --locked --lib reset_aware
+cargo test --locked --lib codex_quota_selection_uses_default_and_ignores_gpt_reserve
+cargo test --locked --lib antigravity_quota_selection_uses_the_matching_provider_model_group
+```
+
+The database-backed resolver ranking case is `b31_08_reset_aware_resolver_prefers_earlier_weekly_reset`
+in `workflow_orchestration_qualification`; run it with the disposable
+`ORBIT_TEST_DATABASE_URL` described below.
+
 ```sh
 ORBIT_TEST_DATABASE_URL=postgres://orbit:orbit-local-test@127.0.0.1:55439/orbit \
 cargo test --locked --test workflow_qualification -- --ignored --test-threads=1

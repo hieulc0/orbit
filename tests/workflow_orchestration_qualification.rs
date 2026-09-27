@@ -2,7 +2,7 @@
 //! Verifies complete autonomous execution, live credential resolution, read-only enforcement,
 //! mutation locking, multi-tier verification triggering, repair loops, fallback, and CLI invocation.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use orbit::{model::id, verification::*, workflow::*, workflow_coordinator::*};
 use sqlx::PgPool;
 use std::{collections::BTreeMap, ops::Deref, sync::Arc};
@@ -78,6 +78,15 @@ async fn enroll_sample_credentials(pool: &PgPool) -> Result<()> {
         .bind(&cred_id1)
         .bind(&locator1)
         .execute(&mut *tx).await?;
+    let representation_id1 = id();
+    let representation_locator1 =
+        format!("credential://{cred_id1}/generation/1/{representation_id1}");
+    sqlx::query("INSERT INTO orbit_credential_representations(id, credential_id, generation, interface, auth_type, state, secret_locator, last_validated_at) VALUES($1, $2, 1, 'acp', 'local-session', 'stored', $3, clock_timestamp())")
+        .bind(&representation_id1)
+        .bind(&cred_id1)
+        .bind(&representation_locator1)
+        .execute(&mut *tx)
+        .await?;
 
     let cred_id2 = id();
     let secret_id2 = id();
@@ -89,6 +98,15 @@ async fn enroll_sample_credentials(pool: &PgPool) -> Result<()> {
         .bind(&cred_id2)
         .bind(&locator2)
         .execute(&mut *tx).await?;
+    let representation_id2 = id();
+    let representation_locator2 =
+        format!("credential://{cred_id2}/generation/1/{representation_id2}");
+    sqlx::query("INSERT INTO orbit_credential_representations(id, credential_id, generation, interface, auth_type, state, secret_locator, last_validated_at) VALUES($1, $2, 1, 'acp', 'oauth', 'stored', $3, clock_timestamp())")
+        .bind(&representation_id2)
+        .bind(&cred_id2)
+        .bind(&representation_locator2)
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
     Ok(())
 }
@@ -192,6 +210,135 @@ async fn b31_05_live_runtime_capability_resolution() -> Result<()> {
     let target = RoleRuntimeResolver::resolve_target_live(&ctx.engine.pool, &role, None).await?;
     assert_eq!(target.provider, "codex");
     assert!(target.runtime_image_digest.is_some());
+
+    teardown_test(ctx).await
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
+async fn b31_08_reset_aware_resolver_prefers_earlier_weekly_reset() -> Result<()> {
+    let ctx = setup_test().await?;
+    enroll_sample_credentials(&ctx.engine.pool).await?;
+    let credentials = orbit::credential_registry::CredentialStore::new(&ctx.engine.pool)
+        .list()
+        .await?;
+    let codex = credentials
+        .iter()
+        .find(|credential| credential.reference == "codex-main")
+        .context("Codex fixture credential missing")?;
+    let antigravity = credentials
+        .iter()
+        .find(|credential| credential.reference == "antigravity-ch9b2013")
+        .context("Antigravity fixture credential missing")?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis() as i64;
+
+    let codex_snapshot = orbit::availability::AvailabilitySnapshot {
+        applies_to: orbit::availability::AvailabilityScope::Credential(codex.identity()),
+        observed_at_ms: now_ms,
+        expires_at_ms: now_ms + 60 * 60 * 1000,
+        state: orbit::availability::AvailabilityState::Ready,
+        quota_windows: vec![
+            orbit::availability::QuotaWindow {
+                label: "default.5h".into(),
+                duration_minutes: Some(300),
+                used_percent: Some(20.0),
+                remaining_percent: Some(80.0),
+                resets_at_ms: Some(now_ms + 2 * 60 * 60 * 1000),
+                exhausted: None,
+            },
+            orbit::availability::QuotaWindow {
+                label: "default.weekly".into(),
+                duration_minutes: Some(10_080),
+                used_percent: Some(10.0),
+                remaining_percent: Some(90.0),
+                resets_at_ms: Some(now_ms + 5 * 24 * 60 * 60 * 1000),
+                exhausted: None,
+            },
+        ],
+        quota_buckets: vec![],
+        quota_groups: vec![],
+        source: orbit::availability::EvidenceSource::ProviderNativeStatus,
+        confidence: orbit::availability::EvidenceConfidence::AuthoritativeNative,
+        source_revision: "reset-fixture".into(),
+        evidence_digest: format!("sha256:{}", "a".repeat(64)),
+        provider_observed_at_ms: Some(now_ms),
+        provider_status_observation: None,
+    };
+    let antigravity_bucket = format!("qb1:{}", "b".repeat(64));
+    let antigravity_snapshot = orbit::availability::AvailabilitySnapshot {
+        applies_to: orbit::availability::AvailabilityScope::Credential(antigravity.identity()),
+        observed_at_ms: now_ms,
+        expires_at_ms: now_ms + 60 * 60 * 1000,
+        state: orbit::availability::AvailabilityState::Ready,
+        quota_windows: vec![],
+        quota_buckets: vec![orbit::availability::QuotaBucket {
+            provider_bucket_fingerprint: antigravity_bucket.clone(),
+            provider_label: None,
+            scope: None,
+            windows: vec![
+                orbit::availability::QuotaBucketWindow {
+                    provider_window_id: "5h".into(),
+                    duration_minutes: None,
+                    used_percent: None,
+                    remaining_percent: None,
+                    remaining_fraction: Some(0.30),
+                    resets_at_ms: Some(now_ms + 2 * 60 * 60 * 1000),
+                    provider_reset_time: None,
+                    exhausted: None,
+                },
+                orbit::availability::QuotaBucketWindow {
+                    provider_window_id: "weekly".into(),
+                    duration_minutes: None,
+                    used_percent: None,
+                    remaining_percent: None,
+                    remaining_fraction: Some(0.70),
+                    resets_at_ms: Some(now_ms + 60 * 60 * 1000),
+                    provider_reset_time: None,
+                    exhausted: None,
+                },
+            ],
+        }],
+        quota_groups: vec![orbit::availability::ProviderQuotaGroup {
+            fingerprint: format!("qg1:{}", "c".repeat(64)),
+            identity_basis: orbit::availability::ProviderQuotaGroupIdentityBasis::MemberSet,
+            provider_display_name: Some("Gemini Models".into()),
+            provider_description: None,
+            members: vec![orbit::availability::ProviderQuotaMember {
+                provider_label: "Gemini Flash".into(),
+                provider_key_fingerprint: None,
+            }],
+            bucket_fingerprints: vec![antigravity_bucket],
+        }],
+        source: orbit::availability::EvidenceSource::ProviderNativeStatus,
+        confidence: orbit::availability::EvidenceConfidence::AuthoritativeNative,
+        source_revision: "reset-fixture".into(),
+        evidence_digest: format!("sha256:{}", "d".repeat(64)),
+        provider_observed_at_ms: Some(now_ms),
+        provider_status_observation: None,
+    };
+    let availability = orbit::availability::AvailabilityStore::new(&ctx.engine.pool);
+    availability.record(&codex_snapshot).await?;
+    availability.record(&antigravity_snapshot).await?;
+
+    // Planner ordinarily prefers Codex. A safe, earlier Antigravity weekly
+    // reset must move that account ahead in the actual resolver result.
+    let ranked = RoleRuntimeResolver::resolve_ranked_targets_live(
+        &ctx.engine.pool,
+        &RoleDefinition::planner_v1(),
+        None,
+        RuntimeQuotaSelectionPolicy::default(),
+    )
+    .await?;
+    assert_eq!(ranked[0].provider, "antigravity");
+    assert_eq!(
+        ranked[0].credential_id.as_deref(),
+        Some("antigravity-ch9b2013")
+    );
+    assert_eq!(ranked[1].provider, "codex");
+    assert!(ranked[0].resolution_reason.contains("known_weekly_reset"));
+    assert!(ranked[0].resolution_reason.contains("7d_remaining=70.0%"));
 
     teardown_test(ctx).await
 }

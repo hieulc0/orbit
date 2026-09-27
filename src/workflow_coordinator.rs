@@ -141,6 +141,7 @@ pub struct WorkflowCoordinator {
     regression_store: RegressionStore,
     executor: Arc<dyn RoleAgentExecutor>,
     active_cancellations: Arc<Mutex<BTreeMap<String, tokio::sync::watch::Sender<bool>>>>,
+    quota_selection_policy: RuntimeQuotaSelectionPolicy,
 }
 
 impl WorkflowCoordinator {
@@ -155,7 +156,17 @@ impl WorkflowCoordinator {
             regression_store,
             executor,
             active_cancellations: Arc::new(Mutex::new(BTreeMap::new())),
+            quota_selection_policy: RuntimeQuotaSelectionPolicy::default(),
         }
+    }
+
+    pub fn with_quota_selection_policy(
+        mut self,
+        policy: RuntimeQuotaSelectionPolicy,
+    ) -> Result<Self> {
+        policy.validate()?;
+        self.quota_selection_policy = policy;
+        Ok(self)
     }
 
     pub fn store(&self) -> &WorkflowStore {
@@ -199,6 +210,7 @@ impl WorkflowCoordinator {
             regression_store: RegressionStore::new(self.pool.clone()),
             executor: Arc::clone(&self.executor),
             active_cancellations: Arc::clone(&self.active_cancellations),
+            quota_selection_policy: self.quota_selection_policy,
         };
         let (cancel_tx, _cancel_rx) = tokio::sync::watch::channel(false);
         self.active_cancellations
@@ -290,8 +302,13 @@ impl WorkflowCoordinator {
 
             WorkflowStage::Planning => {
                 let role = RoleDefinition::planner_v1();
-                let target =
-                    RoleRuntimeResolver::resolve_target_live(&self.pool, &role, None).await?;
+                let target = RoleRuntimeResolver::resolve_target_live_with_policy(
+                    &self.pool,
+                    &role,
+                    None,
+                    self.quota_selection_policy,
+                )
+                .await?;
 
                 let role_exec = self
                     .store
@@ -435,8 +452,13 @@ impl WorkflowCoordinator {
 
             WorkflowStage::Implementing => {
                 let role = RoleDefinition::implementer_v1();
-                let target =
-                    RoleRuntimeResolver::resolve_target_live(&self.pool, &role, None).await?;
+                let target = RoleRuntimeResolver::resolve_target_live_with_policy(
+                    &self.pool,
+                    &role,
+                    None,
+                    self.quota_selection_policy,
+                )
+                .await?;
 
                 let plan_handoff = self
                     .store
@@ -734,8 +756,13 @@ impl WorkflowCoordinator {
                     .await?;
 
                 let role = RoleDefinition::implementer_v1();
-                let target =
-                    RoleRuntimeResolver::resolve_target_live(&self.pool, &role, None).await?;
+                let target = RoleRuntimeResolver::resolve_target_live_with_policy(
+                    &self.pool,
+                    &role,
+                    None,
+                    self.quota_selection_policy,
+                )
+                .await?;
 
                 let failure_handoff = self
                     .store
@@ -938,8 +965,13 @@ impl WorkflowCoordinator {
                     return Ok(WorkflowStepResult::Terminal(WorkflowStage::Failed));
                 }
                 let role = RoleDefinition::reviewer_v1();
-                let target =
-                    RoleRuntimeResolver::resolve_target_live(&self.pool, &role, None).await?;
+                let target = RoleRuntimeResolver::resolve_target_live_with_policy(
+                    &self.pool,
+                    &role,
+                    None,
+                    self.quota_selection_policy,
+                )
+                .await?;
 
                 let impl_handoff = self
                     .store
