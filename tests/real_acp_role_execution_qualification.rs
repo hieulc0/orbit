@@ -7,79 +7,41 @@
 //! 5. Fail-safe verification policy: workflows without authoritative policies fail safely.
 //! 6. Simulated execution is explicitly injected and cannot be selected by environment.
 
-use anyhow::Result;
-use orbit::{engine::Engine, model::id, workflow::*, workflow_coordinator::*};
+use anyhow::{Context, Result, ensure};
+use orbit::{acp_wire::Wire, model::id, workflow::*, workflow_coordinator::*};
 use sqlx::PgPool;
-use std::collections::BTreeMap;
-use std::path::Path;
-use std::sync::Arc;
+use std::{
+    collections::BTreeMap,
+    ops::Deref,
+    path::Path,
+    sync::{Arc, Mutex},
+};
+
+#[allow(dead_code)] // shared test helpers are used by different qualification binaries
+#[path = "common/mod.rs"]
+mod common;
 
 struct TestContext {
-    engine: Engine,
+    database: common::DisposablePgTestContext,
     store: WorkflowStore,
-    schema: String,
-    url: String,
-    _home: tempfile::TempDir,
 }
 
-async fn setup_test() -> Result<Option<TestContext>> {
-    let base = if let Ok(url) = std::env::var("ORBIT_TEST_DATABASE_URL") {
-        url
-    } else if let Ok(url_file) = std::env::var("ORBIT_DATABASE_URL_FILE") {
-        tokio::fs::read_to_string(url_file)
-            .await
-            .unwrap_or_default()
-            .trim()
-            .to_string()
-    } else if let Ok(home) = std::env::var("HOME") {
-        let p = format!("{}/.orbit/private/database/control-plane-url", home);
-        tokio::fs::read_to_string(p)
-            .await
-            .unwrap_or_default()
-            .trim()
-            .to_string()
-    } else {
-        String::new()
-    };
+impl Deref for TestContext {
+    type Target = common::DisposablePgTestContext;
 
-    if base.is_empty() {
-        return Ok(None);
+    fn deref(&self) -> &Self::Target {
+        &self.database
     }
+}
 
-    let admin = match PgPool::connect(&base).await {
-        Ok(pool) => pool,
-        Err(_) => return Ok(None),
-    };
-
-    let schema = format!("orbit_b32_qual_{}", id().replace('-', ""));
-    sqlx::query(&format!("CREATE SCHEMA {schema}"))
-        .execute(&admin)
-        .await?;
-
-    let separator = if base.contains('?') { '&' } else { '?' };
-    let url = format!("{base}{separator}options=-csearch_path%3D{schema}");
-    let home = tempfile::tempdir()?;
-
-    let engine = Engine::connect(&url, home.path().join("artifacts"), 3).await?;
-    let store = WorkflowStore::new(engine.pool.clone());
-
-    Ok(Some(TestContext {
-        engine,
-        store,
-        schema,
-        url,
-        _home: home,
-    }))
+async fn setup_test() -> Result<TestContext> {
+    let database = common::DisposablePgTestContext::create("b32", 3).await?;
+    let store = WorkflowStore::new(database.engine.pool.clone());
+    Ok(TestContext { database, store })
 }
 
 async fn teardown_test(ctx: TestContext) -> Result<()> {
-    let base = ctx.url.split('?').next().unwrap_or(&ctx.url);
-    ctx.engine.pool.close().await;
-    let admin = PgPool::connect(base).await?;
-    sqlx::query(&format!("DROP SCHEMA IF EXISTS {} CASCADE", ctx.schema))
-        .execute(&admin)
-        .await?;
-    Ok(())
+    ctx.database.teardown().await
 }
 
 async fn enroll_sample_credentials(pool: &PgPool) -> Result<()> {
@@ -109,12 +71,193 @@ async fn enroll_sample_credentials(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
+struct OfflineRoleCallbacks {
+    role_id: String,
+    read_response: serde_json::Value,
+    write_response: serde_json::Value,
+    tool_calls: u64,
+    tool_successes: u64,
+    tool_failures: u64,
+}
+
+#[derive(Default)]
+struct DeterministicAcpTransport {
+    callbacks: Mutex<Vec<OfflineRoleCallbacks>>,
+}
+
+impl DeterministicAcpTransport {
+    async fn run_role(
+        &self,
+        pool: &PgPool,
+        wf_run: &WorkflowRun,
+        role_exec: &RoleExecution,
+        role: &RoleDefinition,
+        repo_path: &Path,
+    ) -> Result<String> {
+        let (orbit_read, peer_write) = tokio::io::duplex(65_536);
+        let (peer_read, orbit_write) = tokio::io::duplex(65_536);
+        let mut orbit_wire = Wire::new(orbit_read, orbit_write, 65_536);
+        let mut peer_wire = Wire::new(peer_read, peer_write, 65_536);
+
+        let mut state = AcpTurnState::new(repo_path, role.workspace_access);
+        state.pool = Some(pool);
+        state.wf_attempt_id = Some(wf_run.attempt_id.clone());
+        state.role_exec_id = Some(role_exec.id.clone());
+
+        let read_response = Self::dispatch_callback(
+            &mut orbit_wire,
+            &mut peer_wire,
+            &mut state,
+            "fixture-read",
+            "fs/read_text_file",
+            serde_json::json!({"path":"README.md"}),
+        )
+        .await?;
+        let read_content = read_response["result"]["content"]
+            .as_str()
+            .context("offline ACP read callback did not return file content")?;
+        ensure!(
+            read_content.contains("offline fixture baseline"),
+            "offline ACP callback did not read the fixture repository"
+        );
+
+        let write_response = Self::dispatch_callback(
+            &mut orbit_wire,
+            &mut peer_wire,
+            &mut state,
+            "fixture-write",
+            "fs/write_text_file",
+            serde_json::json!({"path":"README.md","content":"must be denied\n"}),
+        )
+        .await?;
+
+        let payload = match role.role_id.as_str() {
+            "planner" => serde_json::to_value(PlanHandoff {
+                summary: "Inspected the fixture repository".into(),
+                affected_areas: vec!["README.md".into()],
+                implementation_steps: vec!["Keep the fixture unchanged".into()],
+                expected_files: vec![],
+                risks: vec![],
+                verification_notes: vec!["Verification remains profile-gated".into()],
+                open_questions: vec![],
+            })?,
+            "implementer" => serde_json::to_value(ImplementationHandoff {
+                summary: "Completed the no-change offline fixture turn".into(),
+                changed_files: vec![],
+                tests_added_or_modified: vec![],
+                exploratory_commands: vec![],
+                known_limitations: vec!["Mutation authorization denied this callback".into()],
+                verification_notes: vec!["Verification remains profile-gated".into()],
+            })?,
+            other => anyhow::bail!("unexpected role in offline ACP fixture: {other}"),
+        };
+        let handoff = format!(
+            "{ORBIT_HANDOFF_START}\n{}\n{ORBIT_HANDOFF_END}",
+            serde_json::to_string(&payload)?
+        );
+        peer_wire
+            .notify(
+                "session/update",
+                serde_json::json!({"update":{"text":handoff}}),
+            )
+            .await?;
+        let update = orbit_wire.read().await?;
+        handle_acp_message(&mut orbit_wire, &mut state, update).await?;
+
+        self.callbacks
+            .lock()
+            .expect("offline ACP callback audit mutex poisoned")
+            .push(OfflineRoleCallbacks {
+                role_id: role.role_id.clone(),
+                read_response,
+                write_response,
+                tool_calls: state.tool_calls,
+                tool_successes: state.tool_successes,
+                tool_failures: state.tool_failures,
+            });
+
+        Ok(state.agent_output)
+    }
+
+    async fn dispatch_callback(
+        orbit_wire: &mut Wire,
+        peer_wire: &mut Wire,
+        state: &mut AcpTurnState<'_>,
+        request_id: &str,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        peer_wire
+            .send(serde_json::json!({
+                "jsonrpc":"2.0",
+                "id":request_id,
+                "method":method,
+                "params":params
+            }))
+            .await?;
+        let callback = orbit_wire.read().await?;
+        handle_acp_message(orbit_wire, state, callback).await?;
+        peer_wire.read().await
+    }
+}
+
+struct OfflineAcpRoleExecutor {
+    transport: Arc<DeterministicAcpTransport>,
+}
+
+impl OfflineAcpRoleExecutor {
+    fn new(transport: Arc<DeterministicAcpTransport>) -> Self {
+        Self { transport }
+    }
+}
+
+#[async_trait::async_trait]
+impl RoleAgentExecutor for OfflineAcpRoleExecutor {
+    async fn execute_role(
+        &self,
+        pool: &PgPool,
+        wf_run: &WorkflowRun,
+        role_exec: &RoleExecution,
+        role: &RoleDefinition,
+        target: &ResolvedExecutionTarget,
+        _task_text: &str,
+        repo_path: &Path,
+        input_handoff: Option<&HandoffArtifact>,
+    ) -> Result<RoleExecutionOutcome> {
+        ensure!(
+            target.runtime_interface.ends_with("-acp"),
+            "offline fixture expected an ACP runtime target"
+        );
+        if role.role_id == "planner" {
+            ensure!(
+                input_handoff.is_none(),
+                "planner received an unexpected handoff"
+            );
+        } else {
+            let handoff = input_handoff.context("implementer did not receive its durable plan")?;
+            ensure!(
+                handoff.handoff_type == HandoffType::Plan,
+                "implementer received a non-plan handoff"
+            );
+        }
+
+        let raw_output = self
+            .transport
+            .run_role(pool, wf_run, role_exec, role, repo_path)
+            .await?;
+        Ok(RoleExecutionOutcome {
+            raw_output,
+            agent_execution_ids: vec![],
+            termination_reason: Some("deterministic offline ACP peer".into()),
+        })
+    }
+}
+
 #[tokio::test]
+#[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
 async fn b32_01_agent_executions_schema_persists_durable_metrics() -> Result<()> {
-    let ctx = match setup_test().await? {
-        Some(c) => c,
-        None => return Ok(()),
-    };
+    let ctx = setup_test().await?;
 
     let wf = ctx
         .store
@@ -263,11 +406,9 @@ async fn b32_03_role_permission_enforcement_read_only_vs_read_write() -> Result<
 }
 
 #[tokio::test]
+#[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
 async fn b32_04_host_verification_is_blocked_without_pinned_profile() -> Result<()> {
-    let ctx = match setup_test().await? {
-        Some(c) => c,
-        None => return Ok(()),
-    };
+    let ctx = setup_test().await?;
     enroll_sample_credentials(&ctx.engine.pool).await?;
 
     let empty_dir = tempfile::tempdir()?;
@@ -319,11 +460,9 @@ async fn b32_04_host_verification_is_blocked_without_pinned_profile() -> Result<
 }
 
 #[tokio::test]
+#[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
 async fn b32_05_simulation_is_explicitly_injected() -> Result<()> {
-    let ctx = match setup_test().await? {
-        Some(c) => c,
-        None => return Ok(()),
-    };
+    let ctx = setup_test().await?;
 
     let wf = ctx
         .store
@@ -477,5 +616,154 @@ async fn b32_06_orbit_mock_acp_cannot_switch_the_real_executor() -> Result<()> {
         outcome.is_err(),
         "real executor reached real credential lookup"
     );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
+async fn b32_07_full_coordinator_offline_acp_callbacks_handoffs_and_verification_gate() -> Result<()>
+{
+    let ctx = setup_test().await?;
+    enroll_sample_credentials(&ctx.engine.pool).await?;
+
+    let repo = common::TemporaryGitRepo::create()?;
+    let repo_path = repo.path().to_string_lossy().into_owned();
+    let attempt_id = format!("att-{}", id());
+    let wf = ctx
+        .store
+        .create_workflow_run_full(
+            "b32-offline-acp",
+            &attempt_id,
+            2,
+            None,
+            None,
+            None,
+            Some("Inspect the fixture and return a no-change handoff"),
+            Some(&repo_path),
+            Some(repo.baseline_revision()),
+        )
+        .await?;
+
+    let transport = Arc::new(DeterministicAcpTransport::default());
+    let executor = Arc::new(OfflineAcpRoleExecutor::new(transport.clone()));
+    let coordinator = WorkflowCoordinator::new(ctx.engine.pool.clone(), executor);
+
+    assert_eq!(
+        coordinator.step(&wf.id).await?,
+        WorkflowStepResult::Advanced {
+            from: WorkflowStage::Created,
+            to: WorkflowStage::Planning,
+        }
+    );
+    assert_eq!(
+        coordinator.step(&wf.id).await?,
+        WorkflowStepResult::Advanced {
+            from: WorkflowStage::Planning,
+            to: WorkflowStage::Implementing,
+        }
+    );
+    assert_eq!(
+        coordinator.step(&wf.id).await?,
+        WorkflowStepResult::Advanced {
+            from: WorkflowStage::Implementing,
+            to: WorkflowStage::Verifying,
+        }
+    );
+
+    let run = ctx
+        .store
+        .get_workflow_run(&wf.id)
+        .await?
+        .context("workflow disappeared")?;
+    assert_eq!(run.status, WorkflowStage::Verifying);
+    let workspace_state_id = run
+        .current_workspace_state_id
+        .as_deref()
+        .context("implementer did not persist a workspace state")?;
+
+    let plan_artifact = ctx
+        .store
+        .get_latest_handoff_of_type(&wf.id, HandoffType::Plan)
+        .await?
+        .context("coordinator did not persist the planner handoff")?;
+    let plan: PlanHandoff = serde_json::from_value(plan_artifact.structured_payload)?;
+    assert_eq!(plan.summary, "Inspected the fixture repository");
+
+    let implementation_artifact = ctx
+        .store
+        .get_latest_handoff_of_type(&wf.id, HandoffType::Implementation)
+        .await?
+        .context("coordinator did not persist the implementation handoff")?;
+    assert_eq!(
+        implementation_artifact.workspace_state_id.as_deref(),
+        Some(workspace_state_id)
+    );
+    let implementation: ImplementationHandoff =
+        serde_json::from_value(implementation_artifact.structured_payload)?;
+    assert_eq!(
+        implementation.summary,
+        "Completed the no-change offline fixture turn"
+    );
+
+    {
+        let callback_evidence = transport
+            .callbacks
+            .lock()
+            .expect("offline ACP callback audit mutex poisoned");
+        assert_eq!(
+            callback_evidence.len(),
+            2,
+            "both coordinator role turns ran"
+        );
+        assert_eq!(callback_evidence[0].role_id, "planner");
+        assert_eq!(callback_evidence[1].role_id, "implementer");
+        for evidence in callback_evidence.iter() {
+            assert!(
+                evidence.read_response["result"]["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("offline fixture baseline")),
+                "the ACP read callback must reach repository tools"
+            );
+            assert_eq!(evidence.tool_calls, 2);
+            assert_eq!(evidence.tool_successes, 1);
+            assert_eq!(evidence.tool_failures, 1);
+        }
+        assert!(
+            callback_evidence[0].write_response["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(orbit::tool_surface::ERR_READ_ONLY_ROLE)),
+            "planner mutation must be denied by role authorization"
+        );
+        assert!(
+            callback_evidence[1].write_response["error"]["message"]
+                .as_str()
+                .is_some_and(|message| {
+                    message.contains(orbit::tool_surface::ERR_MUTATION_LOCK_REQUIRED)
+                }),
+            "implementer mutation without matching callback authority must be denied"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("README.md"))?,
+        "offline fixture baseline\n",
+        "denied ACP writes must leave the repository unchanged"
+    );
+
+    let verify = coordinator.step(&wf.id).await.unwrap_err();
+    assert!(
+        format!("{verify:#}").contains("VERIFICATION_PROFILE_REQUIRED"),
+        "verification must fail closed without a pinned profile: {verify:#}"
+    );
+    assert_eq!(
+        ctx.store
+            .get_workflow_run(&wf.id)
+            .await?
+            .context("workflow disappeared")?
+            .status,
+        WorkflowStage::Verifying,
+        "a denied verification transition must retain its current stage"
+    );
+
+    teardown_test(ctx).await?;
     Ok(())
 }

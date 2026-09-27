@@ -52,6 +52,37 @@ silently skip prerequisites. Test schemas and `target/qualification-alpha` are
 retained. Use a targeted `cargo test --locked --test kernel NAME -- --ignored`
 for a database-only case; pass `fault-injection` for transaction-barrier tests.
 
+## R4 workflow qualification (B3–B3.4)
+
+The B3 workflow tests that need PostgreSQL are explicitly ignored in regular
+`cargo test`; invoke them with the disposable database URL below. Setup errors
+fail the selected test, and no workflow suite reads an operator database URL
+from a private home-directory file. B3 verification tests also require the
+pinned Alpine image provisioned above. B3.2 uses an explicitly injected offline
+ACP transport and makes no provider calls. Do not use `--ignored` for the whole
+B3.4 target: its real Codex and Antigravity fixtures require separate live
+account authorization.
+
+```sh
+ORBIT_TEST_DATABASE_URL=postgres://orbit:orbit-local-test@127.0.0.1:55439/orbit \
+cargo test --locked --test workflow_qualification -- --ignored --test-threads=1
+
+ORBIT_TEST_DATABASE_URL=postgres://orbit:orbit-local-test@127.0.0.1:55439/orbit \
+cargo test --locked --test workflow_orchestration_qualification -- --ignored --test-threads=1
+
+ORBIT_TEST_DATABASE_URL=postgres://orbit:orbit-local-test@127.0.0.1:55439/orbit \
+cargo test --locked --test real_acp_role_execution_qualification -- --ignored --test-threads=1
+
+cargo test --locked --test repository_filesystem_mutation_qualification
+cargo test --locked --test core_coding_agent_tool_surface_qualification
+
+ORBIT_TEST_DATABASE_URL=postgres://orbit:orbit-local-test@127.0.0.1:55439/orbit \
+cargo test --locked --test core_coding_agent_tool_surface_qualification b34_05 -- --ignored
+
+ORBIT_TEST_DATABASE_URL=postgres://orbit:orbit-local-test@127.0.0.1:55439/orbit \
+cargo test --locked --test core_coding_agent_tool_surface_qualification b34_13 -- --ignored
+```
+
 Qualification defaults to two concurrent cases (`RUST_TEST_THREADS=2`); each case
 may launch several servers/workers/containers. Override that variable only for a
 host with sufficient capacity. Lease, cleanup and fault deadlines are unchanged.

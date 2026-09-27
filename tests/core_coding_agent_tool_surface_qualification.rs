@@ -27,11 +27,10 @@
 //! - Real Codex implementer fixture: real tool execution, repo inspection, targeted edits, git inspection, telemetry.
 //! - Real Antigravity reviewer fixture: real review execution using inspection tools over modified workspace.
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use orbit::{
     acp_wire::Wire,
     coding_agent,
-    engine::Engine,
     fs_tools::*,
     model::id,
     secret_backend::{LocalPrivateSecretBackend, SecretBackend, SecretLocator},
@@ -44,114 +43,109 @@ use orbit::{
     workflow_coordinator::*,
 };
 use serde_json::json;
-use sqlx::PgPool;
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
-use tempfile::{TempDir, tempdir};
+use std::{collections::BTreeMap, ops::Deref};
+use tempfile::tempdir;
 
 struct TestContext {
-    engine: Engine,
+    database: common::DisposablePgTestContext,
     store: WorkflowStore,
-    schema: String,
-    url: String,
-    _home: TempDir,
 }
 
-async fn setup_test() -> Result<Option<TestContext>> {
-    let base = if let Ok(url) = std::env::var("ORBIT_TEST_DATABASE_URL") {
-        url
-    } else if let Ok(url_file) = std::env::var("ORBIT_DATABASE_URL_FILE") {
-        tokio::fs::read_to_string(url_file)
-            .await
-            .unwrap_or_default()
-            .trim()
-            .to_string()
-    } else if let Ok(home) = std::env::var("HOME") {
-        let p = format!("{}/.orbit/private/database/control-plane-url", home);
-        tokio::fs::read_to_string(p)
-            .await
-            .unwrap_or_default()
-            .trim()
-            .to_string()
-    } else {
-        String::new()
-    };
+#[allow(dead_code)] // shared test helpers are used by different qualification binaries
+#[path = "common/mod.rs"]
+mod common;
 
-    if base.is_empty() {
-        return Ok(None);
+impl Deref for TestContext {
+    type Target = common::DisposablePgTestContext;
+
+    fn deref(&self) -> &Self::Target {
+        &self.database
     }
+}
 
-    let admin = match PgPool::connect(&base).await {
-        Ok(pool) => pool,
-        Err(_) => return Ok(None),
-    };
+async fn setup_test() -> Result<TestContext> {
+    let database = common::DisposablePgTestContext::create("b34", 3).await?;
+    let store = WorkflowStore::new(database.engine.pool.clone());
+    Ok(TestContext { database, store })
+}
 
-    let schema = format!("orbit_b34_qual_{}", id().replace('-', ""));
-    sqlx::query(&format!("CREATE SCHEMA {schema}"))
-        .execute(&admin)
+async fn stage_live_test_credential(
+    pool: &sqlx::PgPool,
+    provider: &str,
+    reference: &str,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET CONSTRAINTS ALL DEFERRED")
+        .execute(&mut *tx)
         .await?;
+    let source: Option<(String, i64)> = sqlx::query_as(
+        "SELECT id, current_generation FROM public.orbit_credentials \
+         WHERE scope_key='operator' AND provider=$1 AND reference=$2 AND status='enrolled'",
+    )
+    .bind(provider)
+    .bind(reference)
+    .fetch_optional(&mut *tx)
+    .await
+    .context("failed reading the explicitly selected live test credential")?;
+    let (credential_id, generation) = source.context(format!(
+        "required live test credential {provider}/{reference} is not enrolled in public"
+    ))?;
 
-    let separator = if base.contains('?') { '&' } else { '?' };
-    let url = format!("{base}{separator}options=-csearch_path%3D{schema}");
-    let home = tempfile::tempdir()?;
+    let inserted = sqlx::query(
+        "INSERT INTO orbit_credentials SELECT * FROM public.orbit_credentials WHERE id=$1",
+    )
+    .bind(&credential_id)
+    .execute(&mut *tx)
+    .await
+    .context("failed staging the selected live test credential metadata")?;
+    ensure!(
+        inserted.rows_affected() == 1,
+        "selected credential row was not staged"
+    );
 
-    let engine = Engine::connect(&url, home.path().join("artifacts"), 3).await?;
-    let store = WorkflowStore::new(engine.pool.clone());
+    let inserted = sqlx::query(
+        "INSERT INTO orbit_credential_generations \
+         SELECT * FROM public.orbit_credential_generations \
+         WHERE credential_id=$1 AND generation=$2",
+    )
+    .bind(&credential_id)
+    .bind(generation)
+    .execute(&mut *tx)
+    .await
+    .context("failed staging the selected live test credential generation")?;
+    ensure!(
+        inserted.rows_affected() == 1,
+        "selected credential generation was not staged"
+    );
 
-    // Copy enrolled credentials from public inside transaction with deferred constraints
-    let copy_res: Result<(), sqlx::Error> = async {
-        let mut tx = engine.pool.begin().await?;
-        sqlx::query("SET CONSTRAINTS ALL DEFERRED").execute(&mut *tx).await?;
-        sqlx::query("INSERT INTO orbit_credentials SELECT * FROM public.orbit_credentials ON CONFLICT DO NOTHING").execute(&mut *tx).await?;
-        sqlx::query("INSERT INTO orbit_credential_generations SELECT * FROM public.orbit_credential_generations ON CONFLICT DO NOTHING").execute(&mut *tx).await?;
-        sqlx::query("INSERT INTO orbit_credential_representations SELECT * FROM public.orbit_credential_representations ON CONFLICT DO NOTHING").execute(&mut *tx).await?;
-        tx.commit().await?;
-        Ok(())
-    }.await;
-    if let Err(e) = copy_res {
-        eprintln!("Notice: failed copying credentials from public: {e}");
-    }
+    let inserted = sqlx::query(
+        "INSERT INTO orbit_credential_representations \
+         SELECT * FROM public.orbit_credential_representations \
+         WHERE credential_id=$1 AND generation=$2",
+    )
+    .bind(&credential_id)
+    .bind(generation)
+    .execute(&mut *tx)
+    .await
+    .context("failed staging selected live test credential representations")?;
+    ensure!(
+        inserted.rows_affected() > 0,
+        "selected credential has no staged runtime representation"
+    );
 
-    Ok(Some(TestContext {
-        engine,
-        store,
-        schema,
-        url,
-        _home: home,
-    }))
+    tx.commit().await?;
+    Ok(())
 }
 
 async fn teardown_test(ctx: TestContext) -> Result<()> {
-    let base = ctx.url.split('?').next().unwrap_or(&ctx.url);
-    ctx.engine.pool.close().await;
-    let admin = PgPool::connect(base).await?;
-    sqlx::query(&format!("DROP SCHEMA IF EXISTS {} CASCADE", ctx.schema))
-        .execute(&admin)
-        .await?;
-    Ok(())
+    ctx.database.teardown().await
 }
 
 fn init_git_repo(path: &Path) -> Result<()> {
-    let run = |args: &[&str]| -> Result<()> {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .current_dir(path)
-            .output()?;
-        ensure!(
-            out.status.success(),
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&out.stderr)
-        );
-        Ok(())
-    };
-
-    run(&["init"])?;
-    run(&["config", "user.email", "orbit-test@example.com"])?;
-    run(&["config", "user.name", "Orbit Tester"])?;
-    Ok(())
+    common::init_git_repo(path)
 }
 
 // -----------------------------------------------------------------------------
@@ -663,11 +657,9 @@ async fn b34_04_cli_terminal_create_is_denied() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
 async fn b34_05_attempt_mutation_lock_enforcement() -> Result<()> {
-    let ctx = match setup_test().await? {
-        Some(c) => c,
-        None => return Ok(()),
-    };
+    let ctx = setup_test().await?;
 
     let repo = tempdir()?;
     let (server_in, client_out) = tokio::io::duplex(65536);
@@ -1067,10 +1059,9 @@ async fn b34_12_terminal_lifecycle_and_bounded_preview() -> Result<()> {
 // -----------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
 async fn b34_13_coordinator_wire_dispatch_enforces_s1_gates() -> Result<()> {
-    let Some(ctx) = setup_test().await? else {
-        return Ok(());
-    };
+    let ctx = setup_test().await?;
     let repo = tempdir()?;
     let p = repo.path();
     init_git_repo(p)?;
@@ -1304,27 +1295,12 @@ async fn b34_13_coordinator_wire_dispatch_enforces_s1_gates() -> Result<()> {
 // -----------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "requires explicitly staged provider credentials and a live ACP runtime"]
 async fn b34_real_codex_coding_fixture() -> Result<()> {
-    let ctx = match setup_test().await? {
-        Some(c) => c,
-        None => {
-            eprintln!(
-                "Skipping b34_real_codex_coding_fixture: control-plane database not configured"
-            );
-            return Ok(());
-        }
-    };
-
-    let backend = match LocalPrivateSecretBackend::default_for_operator() {
-        Ok(b) => b,
-        Err(_) => {
-            eprintln!(
-                "Skipping b34_real_codex_coding_fixture: LocalPrivateSecretBackend unavailable"
-            );
-            teardown_test(ctx).await?;
-            return Ok(());
-        }
-    };
+    let ctx = setup_test().await?;
+    stage_live_test_credential(&ctx.engine.pool, "codex", "codex-main").await?;
+    let backend = LocalPrivateSecretBackend::default_for_operator()
+        .context("required local credential backend is unavailable")?;
 
     // Verify enrolled codex credential is registered
     let cred_opt: Option<(String, String)> = sqlx::query_as(
@@ -1333,28 +1309,16 @@ async fn b34_real_codex_coding_fixture() -> Result<()> {
     .fetch_optional(&ctx.engine.pool)
     .await?;
 
-    let (_cred_id, cred_ref) = match cred_opt {
-        Some(c) => c,
-        None => {
-            eprintln!(
-                "Skipping b34_real_codex_coding_fixture: codex-main credential not enrolled in DB"
-            );
-            teardown_test(ctx).await?;
-            return Ok(());
-        }
-    };
+    let (_cred_id, cred_ref) =
+        cred_opt.context("required codex-main credential is not enrolled in the test schema")?;
 
-    let auth_diag = orbit::codex_credential_enrollment::registered_auth_diagnostic(
+    orbit::codex_credential_enrollment::registered_auth_diagnostic(
         &ctx.engine.pool,
         &backend,
         &cred_ref,
     )
-    .await;
-    if auth_diag.is_err() {
-        eprintln!("Skipping b34_real_codex_coding_fixture: codex-main auth token not staged");
-        teardown_test(ctx).await?;
-        return Ok(());
-    }
+    .await
+    .context("required codex-main auth token is not staged")?;
 
     let repo = tempdir()?;
     let p = repo.path();
@@ -1462,27 +1426,12 @@ async fn b34_real_codex_coding_fixture() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires explicitly staged provider credentials and a live ACP runtime"]
 async fn b34_real_antigravity_review_fixture() -> Result<()> {
-    let ctx = match setup_test().await? {
-        Some(c) => c,
-        None => {
-            eprintln!(
-                "Skipping b34_real_antigravity_review_fixture: control-plane database not configured"
-            );
-            return Ok(());
-        }
-    };
-
-    let backend = match LocalPrivateSecretBackend::default_for_operator() {
-        Ok(b) => b,
-        Err(_) => {
-            eprintln!(
-                "Skipping b34_real_antigravity_review_fixture: LocalPrivateSecretBackend unavailable"
-            );
-            teardown_test(ctx).await?;
-            return Ok(());
-        }
-    };
+    let ctx = setup_test().await?;
+    stage_live_test_credential(&ctx.engine.pool, "antigravity", "antigravity-ch9b2013").await?;
+    let backend = LocalPrivateSecretBackend::default_for_operator()
+        .context("required local credential backend is unavailable")?;
 
     // Verify enrolled antigravity credential is registered
     let cred_opt: Option<(String, String)> = sqlx::query_as(
@@ -1491,16 +1440,8 @@ async fn b34_real_antigravity_review_fixture() -> Result<()> {
     .fetch_optional(&ctx.engine.pool)
     .await?;
 
-    let (cred_id, _cred_ref) = match cred_opt {
-        Some(c) => c,
-        None => {
-            eprintln!(
-                "Skipping b34_real_antigravity_review_fixture: antigravity-ch9b2013 credential not enrolled in DB"
-            );
-            teardown_test(ctx).await?;
-            return Ok(());
-        }
-    };
+    let (cred_id, _cred_ref) = cred_opt
+        .context("required antigravity-ch9b2013 credential is not enrolled in the test schema")?;
 
     // Verify auth secret is readable
     let locator_opt: Option<String> = sqlx::query_scalar(
@@ -1510,30 +1451,14 @@ async fn b34_real_antigravity_review_fixture() -> Result<()> {
     .fetch_optional(&ctx.engine.pool)
     .await?;
 
-    if let Some(locator) = locator_opt {
-        let loc = match SecretLocator::parse(&locator) {
-            Ok(l) => l,
-            Err(_) => {
-                eprintln!("Skipping b34_real_antigravity_review_fixture: invalid secret locator");
-                teardown_test(ctx).await?;
-                return Ok(());
-            }
-        };
-        let secret = backend.read(loc).await;
-        if secret.is_err() {
-            eprintln!(
-                "Skipping b34_real_antigravity_review_fixture: antigravity secret token not readable"
-            );
-            teardown_test(ctx).await?;
-            return Ok(());
-        }
-    } else {
-        eprintln!(
-            "Skipping b34_real_antigravity_review_fixture: antigravity secret generation missing"
-        );
-        teardown_test(ctx).await?;
-        return Ok(());
-    }
+    let locator = locator_opt
+        .context("required antigravity credential generation is missing from the test schema")?;
+    let locator =
+        SecretLocator::parse(&locator).context("invalid test credential secret locator")?;
+    backend
+        .read(locator)
+        .await
+        .context("required antigravity auth token is not readable")?;
 
     let repo = tempdir()?;
     let p = repo.path();

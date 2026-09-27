@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result, ensure};
 use orbit::{
     engine::Engine,
     model::id,
@@ -13,54 +13,31 @@ use orbit::{
         RoleRuntimeResolver, WorkflowStage, WorkflowStore, WorkspaceAccess,
     },
 };
-use sqlx::PgPool;
 use std::collections::BTreeMap;
+use std::ops::Deref;
 
 struct TestContext {
-    engine: Engine,
+    database: common::DisposablePgTestContext,
     store: WorkflowStore,
-    _schema: String,
-    url: String,
-    _home: tempfile::TempDir,
+}
+
+#[allow(dead_code)] // shared test helpers are used by different qualification binaries
+#[path = "common/mod.rs"]
+mod common;
+
+impl Deref for TestContext {
+    type Target = common::DisposablePgTestContext;
+
+    fn deref(&self) -> &Self::Target {
+        &self.database
+    }
 }
 
 async fn setup_workflow_test() -> Result<TestContext> {
-    let base = if let Ok(url) = std::env::var("ORBIT_TEST_DATABASE_URL") {
-        url
-    } else if let Ok(home) = std::env::var("HOME") {
-        let p = format!("{}/.orbit/private/database/control-plane-url", home);
-        tokio::fs::read_to_string(p)
-            .await
-            .unwrap_or_default()
-            .trim()
-            .to_string()
-    } else {
-        String::new()
-    };
+    let database = common::DisposablePgTestContext::create("b3", 3).await?;
+    let store = WorkflowStore::new(database.engine.pool.clone());
 
-    if base.is_empty() {
-        anyhow::bail!("disposable database URL required for workflow qualification test");
-    }
-
-    let admin = PgPool::connect(&base).await?;
-    let schema = format!("orbit_qual_wf_{}", id().replace('-', ""));
-    sqlx::query(&format!("CREATE SCHEMA {schema}"))
-        .execute(&admin)
-        .await?;
-    let separator = if base.contains('?') { '&' } else { '?' };
-    let url = format!("{base}{separator}options=-csearch_path%3D{schema}");
-    let home = tempfile::tempdir()?;
-
-    let engine = Engine::connect(&url, home.path().join("artifacts"), 3).await?;
-    let store = WorkflowStore::new(engine.pool.clone());
-
-    Ok(TestContext {
-        engine,
-        store,
-        _schema: schema,
-        url,
-        _home: home,
-    })
+    Ok(TestContext { database, store })
 }
 
 fn sample_policy() -> VerificationPolicy {
@@ -82,13 +59,38 @@ fn sample_policy() -> VerificationPolicy {
     }
 }
 
-fn sample_environment() -> EnvironmentIdentity {
-    EnvironmentIdentity {
-        execution_profile: "test".into(),
-        isolation: "trusted".into(),
-        runtime_image: Some("alpine:latest".into()),
-        runtime_image_digest: None,
-        oci_runtime: None,
+const TEST_VERIFICATION_IMAGE_REF: &str = "docker.io/library/alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b";
+
+async fn sample_environment() -> Result<EnvironmentIdentity> {
+    let image = tokio::process::Command::new("podman")
+        .args([
+            "--remote=false",
+            "image",
+            "inspect",
+            TEST_VERIFICATION_IMAGE_REF,
+            "--format",
+            "{{.Id}}",
+        ])
+        .output()
+        .await
+        .context("cannot inspect the pinned rootless Podman verification image")?;
+    ensure!(
+        image.status.success(),
+        "pinned rootless Podman verification image is not available locally"
+    );
+    let image_id = String::from_utf8(image.stdout)?.trim().to_owned();
+    ensure!(
+        image_id.len() == 64 && image_id.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "Podman returned an invalid local image ID for the pinned verification image"
+    );
+    let runtime_image_digest = format!("sha256:{image_id}");
+
+    Ok(EnvironmentIdentity {
+        execution_profile: "sandboxed-container".into(),
+        isolation: "rootless-podman".into(),
+        runtime_image: Some(TEST_VERIFICATION_IMAGE_REF.into()),
+        runtime_image_digest: Some(runtime_image_digest),
+        oci_runtime: Some("podman".into()),
         network_policy: VerificationNetworkPolicy::None,
         cache_policy: VerificationCachePolicy::Clean,
         environment_policy_digest: None,
@@ -100,11 +102,11 @@ fn sample_environment() -> EnvironmentIdentity {
         browser_runtime_image_digest: None,
         regression_policy_digest: None,
         selection_digest: None,
-    }
+    })
 }
 
 #[tokio::test]
-#[ignore = "requires database URL"]
+#[ignore = "requires disposable PostgreSQL and pinned rootless Podman Alpine image; see docs/development/testing.md"]
 async fn test_b3_happy_path() -> Result<()> {
     let ctx = setup_workflow_test().await?;
     let policy = sample_policy();
@@ -234,12 +236,17 @@ async fn test_b3_happy_path() -> Result<()> {
         &ws_a,
         &plan_def,
         ws_dir.path(),
-        sample_environment(),
+        sample_environment().await?,
         Some(&policy),
         None,
     )
     .await?;
-    assert_eq!(run.overall_result, Some(VerificationRunResult::Passed));
+    assert_eq!(
+        run.overall_result,
+        Some(VerificationRunResult::Passed),
+        "verification step evidence: {:#?}",
+        run.step_runs
+    );
 
     // 5. Reviewing stage
     wf = ctx
@@ -291,7 +298,7 @@ async fn test_b3_happy_path() -> Result<()> {
         &ws_a,
         &plan_def,
         ws_dir.path(),
-        sample_environment(),
+        sample_environment().await?,
         Some(&policy),
         None,
     )
@@ -309,11 +316,12 @@ async fn test_b3_happy_path() -> Result<()> {
     assert_eq!(wf.status, WorkflowStage::Completed);
     assert!(wf.status.is_terminal());
 
+    ctx.database.teardown().await?;
     Ok(())
 }
 
 #[tokio::test]
-#[ignore = "requires database URL"]
+#[ignore = "requires disposable PostgreSQL and pinned rootless Podman Alpine image; see docs/development/testing.md"]
 async fn test_b3_verification_failure_and_repair() -> Result<()> {
     let ctx = setup_workflow_test().await?;
     let policy = sample_policy();
@@ -374,7 +382,7 @@ async fn test_b3_verification_failure_and_repair() -> Result<()> {
         &ws_a,
         &plan_def,
         ws_dir.path(),
-        sample_environment(),
+        sample_environment().await?,
         Some(&policy),
         None,
     )
@@ -414,10 +422,11 @@ async fn test_b3_verification_failure_and_repair() -> Result<()> {
     assert_ne!(ws_a.state_id, ws_b.state_id);
 
     // Old verification run(A) cannot qualify ws_b
+    let env_for_old_qualification = sample_environment().await?;
     let qual_b_with_old_run = ctx
         .store
         .verification_store()
-        .check_workspace_qualification(&ws_b.state_id, &policy, Some(&sample_environment()))
+        .check_workspace_qualification(&ws_b.state_id, &policy, Some(&env_for_old_qualification))
         .await?;
     assert!(qual_b_with_old_run.is_none());
 
@@ -438,25 +447,32 @@ async fn test_b3_verification_failure_and_repair() -> Result<()> {
         &ws_b,
         &plan_def,
         ws_dir.path(),
-        sample_environment(),
+        sample_environment().await?,
         Some(&policy),
         None,
     )
     .await?;
-    assert_eq!(run_b.overall_result, Some(VerificationRunResult::Passed));
+    assert_eq!(
+        run_b.overall_result,
+        Some(VerificationRunResult::Passed),
+        "verification step evidence: {:#?}",
+        run_b.step_runs
+    );
 
+    let env_for_qualification = sample_environment().await?;
     let qual_b = ctx
         .store
         .verification_store()
-        .check_workspace_qualification(&ws_b.state_id, &policy, Some(&sample_environment()))
+        .check_workspace_qualification(&ws_b.state_id, &policy, Some(&env_for_qualification))
         .await?;
     assert!(qual_b.is_some());
 
+    ctx.database.teardown().await?;
     Ok(())
 }
 
 #[tokio::test]
-#[ignore = "requires database URL"]
+#[ignore = "requires disposable PostgreSQL and pinned rootless Podman Alpine image; see docs/development/testing.md"]
 async fn test_b3_review_changes_requested_and_repair() -> Result<()> {
     let ctx = setup_workflow_test().await?;
     let policy = sample_policy();
@@ -514,12 +530,17 @@ async fn test_b3_review_changes_requested_and_repair() -> Result<()> {
         &ws_a,
         &plan_def,
         ws_dir.path(),
-        sample_environment(),
+        sample_environment().await?,
         Some(&policy),
         None,
     )
     .await?;
-    assert_eq!(run.overall_result, Some(VerificationRunResult::Passed));
+    assert_eq!(
+        run.overall_result,
+        Some(VerificationRunResult::Passed),
+        "verification step evidence: {:#?}",
+        run.step_runs
+    );
 
     // Reviewing requests changes
     wf = ctx
@@ -583,12 +604,17 @@ async fn test_b3_review_changes_requested_and_repair() -> Result<()> {
         &ws_b,
         &plan_def,
         ws_dir.path(),
-        sample_environment(),
+        sample_environment().await?,
         Some(&policy),
         None,
     )
     .await?;
-    assert_eq!(run_b.overall_result, Some(VerificationRunResult::Passed));
+    assert_eq!(
+        run_b.overall_result,
+        Some(VerificationRunResult::Passed),
+        "verification step evidence: {:#?}",
+        run_b.step_runs
+    );
 
     // New review on ws_b with APPROVE
     wf = ctx
@@ -624,11 +650,12 @@ async fn test_b3_review_changes_requested_and_repair() -> Result<()> {
         .await?;
     assert_eq!(wf.status, WorkflowStage::Completed);
 
+    ctx.database.teardown().await?;
     Ok(())
 }
 
 #[tokio::test]
-#[ignore = "requires database URL"]
+#[ignore = "requires disposable PostgreSQL and pinned rootless Podman Alpine image; see docs/development/testing.md"]
 async fn test_b3_final_regression_failure() -> Result<()> {
     let ctx = setup_workflow_test().await?;
     let policy = sample_policy();
@@ -686,7 +713,7 @@ async fn test_b3_final_regression_failure() -> Result<()> {
         &ws_a,
         &plan_def,
         ws_dir.path(),
-        sample_environment(),
+        sample_environment().await?,
         Some(&policy),
         None,
     )
@@ -728,7 +755,7 @@ async fn test_b3_final_regression_failure() -> Result<()> {
         &ws_a,
         &plan_def,
         ws_dir.path(),
-        sample_environment(),
+        sample_environment().await?,
         Some(&policy),
         None,
     )
@@ -748,11 +775,12 @@ async fn test_b3_final_regression_failure() -> Result<()> {
         .await?;
     assert_eq!(wf.status, WorkflowStage::Repairing);
 
+    ctx.database.teardown().await?;
     Ok(())
 }
 
 #[tokio::test]
-#[ignore = "requires database URL"]
+#[ignore = "requires disposable PostgreSQL; see docs/development/testing.md"]
 async fn test_b3_provider_fallback_preserves_role_identity() -> Result<()> {
     let ctx = setup_workflow_test().await?;
     let reviewer = RoleDefinition::reviewer_v1();
@@ -810,11 +838,12 @@ async fn test_b3_provider_fallback_preserves_role_identity() -> Result<()> {
         "agent-exec-codex-success"
     );
 
+    ctx.database.teardown().await?;
     Ok(())
 }
 
 #[tokio::test]
-#[ignore = "requires database URL"]
+#[ignore = "requires disposable PostgreSQL; see docs/development/testing.md"]
 async fn test_b3_session_independence() -> Result<()> {
     let ctx = setup_workflow_test().await?;
     let wf = ctx
@@ -852,6 +881,7 @@ async fn test_b3_session_independence() -> Result<()> {
     let loaded_plan: PlanHandoff = serde_json::from_value(loaded_plan_art.structured_payload)?;
     assert_eq!(loaded_plan.summary, "Plan 1");
 
+    ctx.database.teardown().await?;
     Ok(())
 }
 
@@ -876,7 +906,7 @@ async fn test_b3_read_only_reviewer() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires database URL"]
+#[ignore = "requires disposable PostgreSQL; see docs/development/testing.md"]
 async fn test_b3_single_mutator_lock() -> Result<()> {
     let ctx = setup_workflow_test().await?;
     let attempt_id = format!("att-{}", id());
@@ -906,11 +936,12 @@ async fn test_b3_single_mutator_lock() -> Result<()> {
         .release_workspace_mutation_lock(&attempt_id, "role-exec-2")
         .await?;
 
+    ctx.database.teardown().await?;
     Ok(())
 }
 
 #[tokio::test]
-#[ignore = "requires database URL"]
+#[ignore = "requires disposable PostgreSQL; see docs/development/testing.md"]
 async fn test_b3_iteration_exhaustion() -> Result<()> {
     let ctx = setup_workflow_test().await?;
     let mut wf = ctx
@@ -957,11 +988,12 @@ async fn test_b3_iteration_exhaustion() -> Result<()> {
     assert_eq!(wf.status, WorkflowStage::Exhausted);
     assert!(wf.status.is_terminal());
 
+    ctx.database.teardown().await?;
     Ok(())
 }
 
 #[tokio::test]
-#[ignore = "requires database URL"]
+#[ignore = "requires disposable PostgreSQL; see docs/development/testing.md"]
 async fn test_b3_stale_review_invalidation() -> Result<()> {
     let ctx = setup_workflow_test().await?;
     let task_id = format!("task-{}", id());
@@ -1014,11 +1046,12 @@ async fn test_b3_stale_review_invalidation() -> Result<()> {
     let err_str = res.unwrap_err().to_string();
     assert!(err_str.contains("stale review"));
 
+    ctx.database.teardown().await?;
     Ok(())
 }
 
 #[tokio::test]
-#[ignore = "requires database URL"]
+#[ignore = "requires disposable PostgreSQL; see docs/development/testing.md"]
 async fn test_b3_restart_durability() -> Result<()> {
     let ctx = setup_workflow_test().await?;
     let task_id = format!("task-{}", id());
@@ -1080,7 +1113,7 @@ async fn test_b3_restart_durability() -> Result<()> {
     assert_eq!(loaded_plan.summary, "Durable plan");
 
     new_engine.pool.close().await;
-    ctx.engine.pool.close().await;
+    ctx.database.teardown().await?;
 
     Ok(())
 }
