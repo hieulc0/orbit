@@ -107,6 +107,9 @@ for every tool call. Mutations require the persisted role execution's database
 lock, and callback calls, output, and runtime are bounded by tool metadata.
 Filesystem mutations use directory-relative handles to reject traversal and
 symlink replacement. CLI workflow terminal calls remain denied.
+Role prompts identify the ACP virtual workspace root and require
+workspace-relative repository tool paths; the host repository path is not
+exposed to the role.
 
 Workflow steps now claim a persisted owner and generation before work. Stage,
 handoff, and role writes check that claim; cancellation fences the generation

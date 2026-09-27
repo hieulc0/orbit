@@ -2139,6 +2139,7 @@ fn build_role_prompt(
     git_diff: Option<&str>,
 ) -> String {
     let orbit_acp_tool_names = repository_tools_for_role(role).join(", ");
+    let workspace_path = crate::acp_runtime::WORKSPACE;
     let mut doc_files = Vec::new();
     let docs_dir = repo_path.join("docs");
     if docs_dir.is_dir() {
@@ -2155,8 +2156,8 @@ fn build_role_prompt(
 
     let prompt = match role.role_id.as_str() {
         "planner" => format!(
-            "You are the PLANNER role in an Orbit automated software change workflow.\n            Your responsibility is to analyze the task, inspect the repository using read-only tools, and produce a clear, structured implementation plan.\n\n            TASK OBJECTIVE:\n{task_text}\n\n            REPOSITORY CONTEXT:\n            Repository Path: {repo_path}\n            Base Revision: {base_revision}{docs_manifest}\n            WORKSPACE PERMISSIONS:\n            You have READ-ONLY workspace access. You can inspect the repository using:\n            - fs/read_text_file (or read_file): read file content\n            - fs/list_directory: inspect workspace directory entries\n            - fs/find_path: search for files matching patterns\n            - search/grep: regex or text search across files\n            - git/status, git/diff, git/show: inspect git working tree and commit history\n            You CANNOT write or edit files, and CANNOT create terminals.\n\n            INSTRUCTIONS:\n            1. Inspect existing files, search patterns, and repository structure using the read-only tools.\n            2. Formulate a concrete step-by-step implementation plan.\n            3. You MUST end your response with a structured JSON plan handoff block inside the exact delimiters:\n            <<<ORBIT_HANDOFF_START>>>\n            {{\n              \"summary\": \"Concise summary of the plan\",\n              \"affected_areas\": [\"area1\", \"area2\"],\n              \"implementation_steps\": [\"step 1\", \"step 2\"],\n              \"expected_files\": [\"docs/file1.md\"],\n              \"risks\": [],\n              \"verification_notes\": [\"verification instructions\"],\n              \"open_questions\": []\n            }}\n            <<<ORBIT_HANDOFF_END>>>\n",
-            repo_path = repo_path.display(),
+            "You are the PLANNER role in an Orbit automated software change workflow.\n            Your responsibility is to analyze the task, inspect the repository using read-only tools, and produce a clear, structured implementation plan.\n\n            TASK OBJECTIVE:\n{task_text}\n\n            REPOSITORY CONTEXT:\n            Repository Workspace: {workspace_path}\n            Repository tool paths are relative to this workspace.\n            Base Revision: {base_revision}{docs_manifest}\n            WORKSPACE PERMISSIONS:\n            You have READ-ONLY workspace access. You can inspect the repository using:\n            - fs/read_text_file (or read_file): read file content\n            - fs/list_directory: inspect workspace directory entries\n            - fs/find_path: search for files matching patterns\n            - search/grep: regex or text search across files\n            - git/status, git/diff, git/show: inspect git working tree and commit history\n            You CANNOT write or edit files, and CANNOT create terminals.\n\n            INSTRUCTIONS:\n            1. Inspect existing files, search patterns, and repository structure using the read-only tools.\n            2. Formulate a concrete step-by-step implementation plan.\n            3. You MUST end your response with a structured JSON plan handoff block inside the exact delimiters:\n            <<<ORBIT_HANDOFF_START>>>\n            {{\n              \"summary\": \"Concise summary of the plan\",\n              \"affected_areas\": [\"area1\", \"area2\"],\n              \"implementation_steps\": [\"step 1\", \"step 2\"],\n              \"expected_files\": [\"docs/file1.md\"],\n              \"risks\": [],\n              \"verification_notes\": [\"verification instructions\"],\n              \"open_questions\": []\n            }}\n            <<<ORBIT_HANDOFF_END>>>\n",
+            workspace_path = workspace_path,
             base_revision = base_revision,
             task_text = task_text,
             docs_manifest = docs_manifest,
@@ -2166,8 +2167,8 @@ fn build_role_prompt(
                 .map(|h| h.structured_payload.to_string())
                 .unwrap_or_else(|| "No prior plan provided.".to_string());
             format!(
-                "You are the IMPLEMENTER role in an Orbit automated software change workflow.\n                Your responsibility is to execute the implementation plan by modifying project files and verifying your work.\n\n                TASK OBJECTIVE:\n{task_text}\n\n                PLANNER SPECIFICATION:\n{plan_summary}\n\n                REPOSITORY CONTEXT:\n                Repository Path: {repo_path}\n                Base Revision: {base_revision}{docs_manifest}\n                WORKSPACE PERMISSIONS:\n                You have FULL READ-WRITE coding agent workspace access. Tools available to you:\n                - fs/read_text_file: read file contents\n                - fs/write_text_file: write complete file contents\n                - fs/edit_file: perform targeted text replacements (old_text -> new_text, replace_all)\n                - fs/list_directory: list directory contents\n                - fs/find_path: search workspace file paths by pattern\n                - fs/create_directory: create a new directory\n                - fs/move: move or rename files/directories\n                - fs/copy: copy files or directories\n                - fs/delete_file: remove a single file\n                - fs/delete_directory: remove a directory\n                - search/grep: ripgrep workspace code\n                - git/status, git/diff, git/show: inspect git status, diffs, and commits\n                - terminal/create, terminal/output, terminal/wait_for_exit, terminal/kill, terminal/release: run tests or commands\n\n                INSTRUCTIONS:\n                1. Implement all required changes and directory reorganization per the planner specification.\n                2. Use fs/edit_file for surgical modifications and fs/write_text_file for new files.\n                3. You MUST end your response with a structured JSON implementation handoff block inside the exact delimiters:\n                <<<ORBIT_HANDOFF_START>>>\n                {{\n                  \"summary\": \"Concise summary of changes implemented\",\n                  \"changed_files\": [\"docs/file1.md\"],\n                  \"tests_added_or_modified\": [],\n                  \"exploratory_commands\": [],\n                  \"known_limitations\": [],\n                  \"verification_notes\": [\"self-verification details\"]\n                }}\n                <<<ORBIT_HANDOFF_END>>>\n",
-                repo_path = repo_path.display(),
+                "You are the IMPLEMENTER role in an Orbit automated software change workflow.\n                Your responsibility is to execute the implementation plan by modifying project files and verifying your work.\n\n                TASK OBJECTIVE:\n{task_text}\n\n                PLANNER SPECIFICATION:\n{plan_summary}\n\n                REPOSITORY CONTEXT:\n                Repository Workspace: {workspace_path}\n                Repository tool paths are relative to this workspace.\n                Base Revision: {base_revision}{docs_manifest}\n                WORKSPACE PERMISSIONS:\n                You have FULL READ-WRITE coding agent workspace access. Tools available to you:\n                - fs/read_text_file: read file contents\n                - fs/write_text_file: write complete file contents\n                - fs/edit_file: perform targeted text replacements (old_text -> new_text, replace_all)\n                - fs/list_directory: list directory contents\n                - fs/find_path: search workspace file paths by pattern\n                - fs/create_directory: create a new directory\n                - fs/move: move or rename files/directories\n                - fs/copy: copy files or directories\n                - fs/delete_file: remove a single file\n                - fs/delete_directory: remove a directory\n                - search/grep: ripgrep workspace code\n                - git/status, git/diff, git/show: inspect git status, diffs, and commits\n                - terminal/create, terminal/output, terminal/wait_for_exit, terminal/kill, terminal/release: run tests or commands\n\n                INSTRUCTIONS:\n                1. Implement all required changes and directory reorganization per the planner specification.\n                2. Use fs/edit_file for surgical modifications and fs/write_text_file for new files.\n                3. You MUST end your response with a structured JSON implementation handoff block inside the exact delimiters:\n                <<<ORBIT_HANDOFF_START>>>\n                {{\n                  \"summary\": \"Concise summary of changes implemented\",\n                  \"changed_files\": [\"docs/file1.md\"],\n                  \"tests_added_or_modified\": [],\n                  \"exploratory_commands\": [],\n                  \"known_limitations\": [],\n                  \"verification_notes\": [\"self-verification details\"]\n                }}\n                <<<ORBIT_HANDOFF_END>>>\n",
+                workspace_path = workspace_path,
                 base_revision = base_revision,
                 task_text = task_text,
                 plan_summary = plan_summary,
@@ -4822,6 +4823,35 @@ mod tests {
                 assert!(prompt.contains("Discover paths with list_directory, find_path, or grep"));
                 assert!(prompt.contains("PATH_NOT_FOUND"));
             }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn role_prompt_uses_virtual_workspace_instead_of_host_repository_path() -> Result<()> {
+        let host_repository = tempdir()?;
+        let host_path = host_repository.path().to_string_lossy().into_owned();
+
+        for role in [
+            RoleDefinition::planner_v1(),
+            RoleDefinition::implementer_v1(),
+        ] {
+            let prompt = build_role_prompt(
+                &role,
+                "Inspect and update the repository",
+                host_repository.path(),
+                "HEAD",
+                None,
+                None,
+            );
+
+            assert!(prompt.contains(&format!(
+                "Repository Workspace: {}",
+                crate::acp_runtime::WORKSPACE
+            )));
+            assert!(prompt.contains("Repository tool paths are relative to this workspace."));
+            assert!(!prompt.contains(&host_path));
         }
 
         Ok(())
