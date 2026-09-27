@@ -24,6 +24,18 @@ pub struct WorkspaceState {
     pub baseline_revision: String,
     pub head_revision: String,
     pub diff_sha256: Option<String>,
+    #[serde(
+        default = "legacy_workspace_digest_version",
+        skip_serializing_if = "is_legacy_workspace_digest_version"
+    )]
+    pub digest_version: u32,
+}
+
+fn legacy_workspace_digest_version() -> u32 {
+    1
+}
+fn is_legacy_workspace_digest_version(version: &u32) -> bool {
+    *version == 1
 }
 
 impl WorkspaceState {
@@ -39,6 +51,7 @@ impl WorkspaceState {
             baseline_revision: snapshot.baseline_revision.clone(),
             head_revision: snapshot.head_revision.clone(),
             diff_sha256: snapshot.diff_sha256.clone(),
+            digest_version: 1,
         }
     }
 
@@ -51,6 +64,20 @@ impl WorkspaceState {
             baseline_revision: baseline.to_string(),
             head_revision: head.to_string(),
             diff_sha256: diff_sha256.map(|s| s.to_string()),
+            digest_version: 1,
+        }
+    }
+
+    /// Disk candidates use a separate identity domain from immutable legacy
+    /// snapshot and plan digests.
+    pub fn compute_candidate_v2(baseline: &str, head: &str, candidate_sha256: &str) -> Self {
+        let raw = format!("orbit-workspace-candidate-v2\0{baseline}\0{head}\0{candidate_sha256}");
+        Self {
+            state_id: format!("ws-v2-{}", crate::model::digest(raw.as_bytes())),
+            baseline_revision: baseline.to_string(),
+            head_revision: head.to_string(),
+            diff_sha256: Some(candidate_sha256.to_string()),
+            digest_version: 2,
         }
     }
 }
@@ -675,6 +702,22 @@ impl Drop for ScopedProcessGroup {
     }
 }
 
+async fn confirm_verification_container_removed(name: &str) -> Result<()> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(20),
+        tokio::process::Command::new("podman")
+            .args(["--remote=false", "container", "exists", name])
+            .output(),
+    )
+    .await
+    .context("verification container cleanup check timed out")??;
+    ensure!(
+        output.status.code() == Some(1),
+        "VERIFICATION_CLEANUP_UNCONFIRMED: container still exists or runtime check failed"
+    );
+    Ok(())
+}
+
 /// Bounded output capture result.
 #[derive(Debug)]
 pub struct CommandOutputCapture {
@@ -986,12 +1029,19 @@ pub async fn execute_verification_command_isolated_with_network(
                 "-f",
                 cname,
             ]);
-            let _ = stop_cmd.output().await;
+            tokio::time::timeout(Duration::from_secs(30), stop_cmd.output())
+                .await
+                .context("VERIFICATION_CLEANUP_UNCONFIRMED: container removal timed out")??;
         }
-        let _ = child.wait().await;
+        tokio::time::timeout(Duration::from_secs(10), child.wait())
+            .await
+            .context("VERIFICATION_CLEANUP_UNCONFIRMED: verification process did not exit")??;
+        confirm_verification_container_removed(container_name.as_deref().unwrap()).await?;
         if cancelled {
             bail!("verification command cancelled");
         }
+    } else {
+        confirm_verification_container_removed(container_name.as_deref().unwrap()).await?;
     }
 
     let duration_ms = start_instant.elapsed().as_millis() as i64;
@@ -2634,6 +2684,25 @@ mod tests {
 
         assert_eq!(ws_a1, ws_a2);
         assert_ne!(ws_a1.state_id, ws_b.state_id);
+    }
+
+    #[test]
+    fn disk_candidate_identity_has_new_version_without_changing_legacy_encoding() {
+        let legacy = WorkspaceState::compute_from_parts("base", "head", Some("diff"));
+        let candidate = WorkspaceState::compute_candidate_v2("base", "head", "diff");
+        assert_ne!(legacy.state_id, candidate.state_id);
+        assert_eq!(legacy.digest_version, 1);
+        assert_eq!(candidate.digest_version, 2);
+        assert!(
+            serde_json::to_value(&legacy)
+                .unwrap()
+                .get("digest_version")
+                .is_none()
+        );
+        assert_eq!(
+            serde_json::to_value(&candidate).unwrap()["digest_version"],
+            2
+        );
     }
 
     #[test]

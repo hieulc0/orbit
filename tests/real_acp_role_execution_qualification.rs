@@ -101,6 +101,8 @@ impl DeterministicAcpTransport {
         let mut peer_wire = Wire::new(peer_read, peer_write, 65_536);
 
         let mut state = AcpTurnState::new(repo_path, role.workspace_access);
+        state.role_id = Some(role.role_id.clone());
+        state.workspace_identity = wf_run.repository_path.clone();
         state.pool = Some(pool);
         state.wf_attempt_id = Some(wf_run.attempt_id.clone());
         state.role_exec_id = Some(role_exec.id.clone());
@@ -128,7 +130,7 @@ impl DeterministicAcpTransport {
             &mut state,
             "fixture-write",
             "fs/write_text_file",
-            serde_json::json!({"path":"README.md","content":"must be denied\n"}),
+            serde_json::json!({"path":"README.md","content":"offline fixture baseline\n"}),
         )
         .await?;
 
@@ -147,7 +149,7 @@ impl DeterministicAcpTransport {
                 changed_files: vec![],
                 tests_added_or_modified: vec![],
                 exploratory_commands: vec![],
-                known_limitations: vec!["Mutation authorization denied this callback".into()],
+                known_limitations: vec![],
                 verification_notes: vec!["Verification remains profile-gated".into()],
             })?,
             other => anyhow::bail!("unexpected role in offline ACP fixture: {other}"),
@@ -224,6 +226,7 @@ impl RoleAgentExecutor for OfflineAcpRoleExecutor {
         _task_text: &str,
         repo_path: &Path,
         input_handoff: Option<&HandoffArtifact>,
+        _cancellation: tokio::sync::watch::Receiver<bool>,
     ) -> Result<RoleExecutionOutcome> {
         ensure!(
             target.runtime_interface.ends_with("-acp"),
@@ -506,6 +509,7 @@ async fn b32_05_simulation_is_explicitly_injected() -> Result<()> {
             "mock task",
             Path::new("."),
             None,
+            tokio::sync::watch::channel(false).1,
         )
         .await?;
 
@@ -602,6 +606,7 @@ async fn b32_06_orbit_mock_acp_cannot_switch_the_real_executor() -> Result<()> {
             "must not be simulated",
             Path::new("."),
             None,
+            tokio::sync::watch::channel(false).1,
         )
         .await;
 
@@ -725,8 +730,13 @@ async fn b32_07_full_coordinator_offline_acp_callbacks_handoffs_and_verification
                 "the ACP read callback must reach repository tools"
             );
             assert_eq!(evidence.tool_calls, 2);
-            assert_eq!(evidence.tool_successes, 1);
-            assert_eq!(evidence.tool_failures, 1);
+            if evidence.role_id == "planner" {
+                assert_eq!(evidence.tool_successes, 1);
+                assert_eq!(evidence.tool_failures, 1);
+            } else {
+                assert_eq!(evidence.tool_successes, 2);
+                assert_eq!(evidence.tool_failures, 0);
+            }
         }
         assert!(
             callback_evidence[0].write_response["error"]["message"]
@@ -735,12 +745,8 @@ async fn b32_07_full_coordinator_offline_acp_callbacks_handoffs_and_verification
             "planner mutation must be denied by role authorization"
         );
         assert!(
-            callback_evidence[1].write_response["error"]["message"]
-                .as_str()
-                .is_some_and(|message| {
-                    message.contains(orbit::tool_surface::ERR_MUTATION_LOCK_REQUIRED)
-                }),
-            "implementer mutation without matching callback authority must be denied"
+            callback_evidence[1].write_response.get("result").is_some(),
+            "implementer with the persisted role execution lock must be allowed"
         );
     }
     assert_eq!(

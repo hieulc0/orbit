@@ -486,6 +486,9 @@ async fn b34_04_role_matrix_planner_denial_and_implementer_allowance() -> Result
 
     // 1. Planner (ReadOnly): Mutating tools must be denied
     let mut read_only_state = AcpTurnState::new(repo.path(), WorkspaceAccess::ReadOnly);
+    read_only_state.role_id = Some("planner".into());
+    read_only_state.workspace_identity =
+        Some(repo.path().canonicalize()?.to_string_lossy().into_owned());
     let mutating_methods = [
         (
             "fs/write_text_file",
@@ -527,7 +530,10 @@ async fn b34_04_role_matrix_planner_denial_and_implementer_allowance() -> Result
         );
         let msg_str = resp["error"]["message"].as_str().unwrap();
         assert!(
-            msg_str.contains("read-only") || msg_str.contains(ERR_READ_ONLY_ROLE),
+            msg_str.contains("read-only")
+                || msg_str.contains(ERR_READ_ONLY_ROLE)
+                || (*method == "terminal/create"
+                    && msg_str.contains("CLI_WORKFLOW_TERMINAL_DISABLED")),
             "expected read-only denial error for {method}, got: {msg_str}"
         );
     }
@@ -602,6 +608,8 @@ async fn b34_04_missing_mutation_lock_context_is_denied() -> Result<()> {
     let mut server_wire = Wire::new(server_in, server_out, 16 * 1024 * 1024);
     let mut client_wire = Wire::new(client_in, client_out, 16 * 1024 * 1024);
     let mut state = AcpTurnState::new(repo.path(), WorkspaceAccess::ReadWrite);
+    state.role_id = Some("implementer".into());
+    state.workspace_identity = Some(repo.path().canonicalize()?.to_string_lossy().into_owned());
 
     handle_acp_message(
         &mut server_wire,
@@ -622,6 +630,92 @@ async fn b34_04_missing_mutation_lock_context_is_denied() -> Result<()> {
             .contains(ERR_MUTATION_LOCK_REQUIRED)
     );
     assert!(!repo.path().join("must-not-exist.txt").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn s5_dispatch_enforces_reviewer_identity_call_and_output_limits() -> Result<()> {
+    let repo = tempdir()?;
+    fs::write(repo.path().join("large.txt"), "x".repeat(70_000))?;
+    let (server_in, client_out) = tokio::io::duplex(131_072);
+    let (client_in, server_out) = tokio::io::duplex(131_072);
+    let mut server_wire = Wire::new(server_in, server_out, 16 * 1024 * 1024);
+    let mut client_wire = Wire::new(client_in, client_out, 16 * 1024 * 1024);
+    let mut state = AcpTurnState::new(repo.path(), WorkspaceAccess::ReadOnly);
+    state.role_id = Some("reviewer".into());
+    state.workspace_identity = Some(repo.path().canonicalize()?.to_string_lossy().into_owned());
+
+    handle_acp_message(
+        &mut server_wire,
+        &mut state,
+        json!({
+            "jsonrpc":"2.0", "id":1, "method":"fs/write_text_file",
+            "params":{"path":"denied.txt", "content":"bad"}
+        }),
+    )
+    .await?;
+    let response = client_wire.read().await?;
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(ERR_READ_ONLY_ROLE)
+    );
+    assert!(!repo.path().join("denied.txt").exists());
+
+    state.workspace_identity = None;
+    handle_acp_message(
+        &mut server_wire,
+        &mut state,
+        json!({
+            "jsonrpc":"2.0", "id":2, "method":"fs/read_text_file",
+            "params":{"path":"large.txt"}
+        }),
+    )
+    .await?;
+    let response = client_wire.read().await?;
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("WORKSPACE_IDENTITY_REQUIRED")
+    );
+
+    state.workspace_identity = Some(repo.path().canonicalize()?.to_string_lossy().into_owned());
+    handle_acp_message(
+        &mut server_wire,
+        &mut state,
+        json!({
+            "jsonrpc":"2.0", "id":3, "method":"fs/read_text_file",
+            "params":{"path":"large.txt"}
+        }),
+    )
+    .await?;
+    let response = client_wire.read().await?;
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("OUTPUT_LIMIT")
+    );
+
+    state.tool_call_limit = state.tool_calls;
+    handle_acp_message(
+        &mut server_wire,
+        &mut state,
+        json!({
+            "jsonrpc":"2.0", "id":4, "method":"fs/read_text_file",
+            "params":{"path":"large.txt"}
+        }),
+    )
+    .await?;
+    let response = client_wire.read().await?;
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("TOOL_CALL_LIMIT")
+    );
     Ok(())
 }
 
@@ -678,7 +772,7 @@ async fn b34_05_attempt_mutation_lock_enforcement() -> Result<()> {
             None,
             None,
             Some("mutation lock test"),
-            None,
+            Some(repo.path().to_str().unwrap()),
             None,
         )
         .await?;
@@ -692,6 +786,9 @@ async fn b34_05_attempt_mutation_lock_enforcement() -> Result<()> {
     let mut state = AcpTurnState {
         repo_path: repo.path(),
         workspace_access: WorkspaceAccess::ReadWrite,
+        role_id: Some("implementer".into()),
+        workspace_identity: Some(repo.path().canonicalize()?.to_string_lossy().into_owned()),
+        tool_call_limit: 64,
         agent_output: String::new(),
         tool_calls: 0,
         tool_successes: 0,
@@ -1099,6 +1196,9 @@ async fn b34_13_coordinator_wire_dispatch_enforces_s1_gates() -> Result<()> {
     let mut state = AcpTurnState {
         repo_path: p,
         workspace_access: WorkspaceAccess::ReadWrite,
+        role_id: Some("implementer".into()),
+        workspace_identity: Some(p.canonicalize()?.to_string_lossy().into_owned()),
+        tool_call_limit: 64,
         agent_output: String::new(),
         tool_calls: 0,
         tool_successes: 0,
@@ -1394,6 +1494,7 @@ async fn b34_real_codex_coding_fixture() -> Result<()> {
             "Add a multiply function to src/lib.rs and document it in README.md",
             p,
             None,
+            tokio::sync::watch::channel(false).1,
         )
         .await?;
 
@@ -1524,6 +1625,7 @@ async fn b34_real_antigravity_review_fixture() -> Result<()> {
             "Review the newly added multiply function in src.rs",
             p,
             None,
+            tokio::sync::watch::channel(false).1,
         )
         .await?;
 

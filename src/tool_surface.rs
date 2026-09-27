@@ -5,6 +5,7 @@
 //! for repository navigation, targeted editing, filesystem mutation, search, git, and terminal.
 
 use crate::fs_tools::confine_path;
+use crate::workflow::WorkspaceAccess;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -21,6 +22,10 @@ pub const ERR_OUTPUT_TRUNCATED: &str = "OUTPUT_TRUNCATED";
 pub const ERR_COMMAND_TIMEOUT: &str = "COMMAND_TIMEOUT";
 pub const ERR_PROCESS_NOT_FOUND: &str = "PROCESS_NOT_FOUND";
 pub const ERR_UNSUPPORTED_TOOL: &str = "UNSUPPORTED_TOOL";
+pub const ERR_ROLE_NOT_ALLOWED: &str = "ROLE_NOT_ALLOWED";
+pub const ERR_WORKSPACE_IDENTITY_REQUIRED: &str = "WORKSPACE_IDENTITY_REQUIRED";
+pub const ERR_TOOL_CALL_LIMIT: &str = "TOOL_CALL_LIMIT";
+pub const ERR_OUTPUT_LIMIT: &str = "OUTPUT_LIMIT";
 pub const ERR_NO_MATCH: &str = "NO_MATCH";
 pub const ERR_MULTIPLE_MATCHES: &str = "MULTIPLE_MATCHES";
 
@@ -270,6 +275,52 @@ impl ToolMetadata {
     pub fn is_role_allowed(&self, role_id: &str) -> bool {
         self.allowed_roles.iter().any(|r| r == role_id)
     }
+}
+
+/// Shared authorization decision for the CLI repository callback surface.
+/// Lock ownership is checked against PostgreSQL by the coordinator immediately
+/// after this local decision and before a mutating effect.
+pub fn authorize_repository_tool(
+    tool: CanonicalToolName,
+    role_id: Option<&str>,
+    workspace_access: WorkspaceAccess,
+    repository_path: &Path,
+    workspace_identity: Option<&str>,
+    call_number: u64,
+    call_limit: u64,
+) -> Result<ToolMetadata> {
+    let metadata = ToolMetadata::for_tool(tool);
+    ensure!(
+        call_limit > 0 && call_number <= call_limit,
+        "{ERR_TOOL_CALL_LIMIT}"
+    );
+    ensure!(
+        !(metadata.mutating && workspace_access == WorkspaceAccess::ReadOnly),
+        "{ERR_READ_ONLY_ROLE}: workspace is read-only"
+    );
+    let role_id = role_id
+        .filter(|role| !role.is_empty())
+        .context(ERR_ROLE_NOT_ALLOWED)?;
+    ensure!(
+        metadata.is_role_allowed(role_id),
+        "{ERR_ROLE_NOT_ALLOWED}: {role_id} cannot use {}",
+        metadata.canonical_name
+    );
+    ensure!(
+        (role_id == "implementer") == (workspace_access == WorkspaceAccess::ReadWrite),
+        "{ERR_ROLE_NOT_ALLOWED}: role and workspace access disagree"
+    );
+    if metadata.requires_workspace {
+        let identity = workspace_identity.context(ERR_WORKSPACE_IDENTITY_REQUIRED)?;
+        let canonical = repository_path
+            .canonicalize()
+            .context(ERR_WORKSPACE_IDENTITY_REQUIRED)?;
+        ensure!(
+            canonical.to_str() == Some(identity) && repository_path.is_absolute(),
+            "{ERR_WORKSPACE_IDENTITY_REQUIRED}: repository identity changed"
+        );
+    }
+    Ok(metadata)
 }
 
 /// Returns the complete inventory of all canonical Orbit tools (Requirement 1 & 42)
@@ -872,10 +923,7 @@ pub fn edit_file(
     replace_all: bool,
 ) -> Result<EditFileResult> {
     ensure!(!old_text.is_empty(), "old_text cannot be empty");
-    let full = confine_path(repo_path, path_str, true, false)?;
-    ensure!(full.is_file(), "target path is not a regular file");
-
-    let content = std::fs::read_to_string(&full)
+    let content = crate::fs_tools::read_text_confined(repo_path, path_str)
         .with_context(|| format!("{ERR_PATH_NOT_FOUND}: failed to read file: {path_str}"))?;
 
     let count = content.matches(old_text).count();
@@ -905,11 +953,7 @@ pub fn edit_file(
     let byte_delta = (new_content.len() as i64) - (content.len() as i64);
     let replaced_count = if replace_all { count } else { 1 };
 
-    // Atomic write in same directory
-    let parent = full.parent().context("file has no parent")?;
-    let temp_path = parent.join(format!(".orbit-edit-{}", crate::model::id()));
-    std::fs::write(&temp_path, new_content.as_bytes())?;
-    std::fs::rename(&temp_path, &full)?;
+    crate::fs_tools::write_text_confined(repo_path, path_str, &new_content)?;
 
     Ok(EditFileResult {
         path: path_str.to_string(),
@@ -926,31 +970,7 @@ pub fn copy_path(
     destination_str: &str,
     recursive: bool,
 ) -> Result<CopyResult> {
-    let src = confine_path(repo_path, source_str, true, false)?;
-    let dst = confine_path(repo_path, destination_str, false, false)?;
-
-    if dst.symlink_metadata().is_ok() {
-        bail!("{ERR_DESTINATION_EXISTS}: destination already exists: {destination_str}");
-    }
-
-    let src_meta = src
-        .symlink_metadata()
-        .with_context(|| format!("{ERR_PATH_NOT_FOUND}: source path missing"))?;
-
-    if src_meta.is_dir() {
-        ensure!(
-            recursive,
-            "source is a directory; copy requires recursive=true"
-        );
-        copy_dir_recursive(repo_path, &src, &dst)?;
-    } else if src_meta.is_file() {
-        if let Some(parent) = dst.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::copy(&src, &dst)?;
-    } else {
-        bail!("unsupported file type for copy");
-    }
+    crate::fs_tools::copy_path_confined(repo_path, source_str, destination_str, recursive)?;
 
     Ok(CopyResult {
         source: source_str.to_string(),
@@ -958,26 +978,6 @@ pub fn copy_path(
         success: true,
         message: format!("Copied {source_str} to {destination_str} successfully."),
     })
-}
-
-fn copy_dir_recursive(repo_path: &Path, src: &Path, dst: &Path) -> Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)?.flatten() {
-        let entry_path = entry.path();
-        let entry_name = entry.file_name();
-        let target_path = dst.join(entry_name);
-
-        // Verify confinement
-        let _ = confine_path(repo_path, &target_path.to_string_lossy(), false, false)?;
-
-        let meta = entry_path.symlink_metadata()?;
-        if meta.is_dir() {
-            copy_dir_recursive(repo_path, &entry_path, &target_path)?;
-        } else if meta.is_file() {
-            std::fs::copy(&entry_path, &target_path)?;
-        }
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------

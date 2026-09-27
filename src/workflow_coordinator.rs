@@ -26,19 +26,32 @@ use crate::{
     workflow::*,
 };
 use anyhow::{Context, Result, bail, ensure};
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::process::Stdio;
 use std::time::Duration;
 use std::{
     collections::BTreeMap,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 const ERR_CLI_WORKFLOW_TERMINAL_DISABLED: &str =
     "CLI_WORKFLOW_TERMINAL_DISABLED: no qualified confined terminal owner is available";
+
+#[derive(Debug)]
+struct UnconfirmedRoleCleanup(String);
+
+impl std::fmt::Display for UnconfirmedRoleCleanup {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "ROLE_CLEANUP_UNCONFIRMED: {}", self.0)
+    }
+}
+
+impl std::error::Error for UnconfirmedRoleCleanup {}
 
 /// Result of a single coordinator execution step.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,6 +68,43 @@ struct ResolvedWorkflowPolicies {
     verification: Option<VerificationPolicy>,
     regression: Option<RegressionPolicy>,
     selection: Option<SelectionPolicy>,
+}
+
+fn workflow_repo_path(wf: &WorkflowRun) -> Result<&Path> {
+    let stored = wf
+        .repository_path
+        .as_deref()
+        .context("REPOSITORY_IDENTITY_REQUIRED: workflow has no repository pinned at creation")?;
+    let path = Path::new(stored);
+    ensure!(
+        path.is_absolute(),
+        "REPOSITORY_IDENTITY_REQUIRED: stored repository path is relative"
+    );
+    ensure!(
+        path.canonicalize()
+            .context("resolve stored workflow repository")?
+            == path,
+        "REPOSITORY_IDENTITY_MISMATCH: stored repository path no longer resolves to its canonical identity"
+    );
+    Ok(path)
+}
+
+async fn require_candidate_state(
+    wf: &WorkflowRun,
+    expected_state_id: &str,
+) -> Result<WorkspaceState> {
+    let state = compute_workspace_state(
+        workflow_repo_path(wf)?,
+        wf.base_revision.as_deref().unwrap_or("HEAD"),
+    )
+    .await?;
+    ensure!(
+        state.state_id == expected_state_id,
+        "WORKSPACE_MUTATION_VIOLATION: candidate state '{}' differs from recorded state '{}'",
+        state.state_id,
+        expected_state_id
+    );
+    Ok(state)
 }
 
 /// Outcome of a role agent execution.
@@ -79,6 +129,7 @@ pub trait RoleAgentExecutor: Send + Sync {
         task_text: &str,
         repo_path: &Path,
         input_handoff: Option<&HandoffArtifact>,
+        cancellation: tokio::sync::watch::Receiver<bool>,
     ) -> Result<RoleExecutionOutcome>;
 }
 
@@ -89,6 +140,7 @@ pub struct WorkflowCoordinator {
     verification_store: VerificationStore,
     regression_store: RegressionStore,
     executor: Arc<dyn RoleAgentExecutor>,
+    active_cancellations: Arc<Mutex<BTreeMap<String, tokio::sync::watch::Sender<bool>>>>,
 }
 
 impl WorkflowCoordinator {
@@ -102,6 +154,7 @@ impl WorkflowCoordinator {
             verification_store,
             regression_store,
             executor,
+            active_cancellations: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -123,6 +176,53 @@ impl WorkflowCoordinator {
 
     /// Advance the workflow run by one state transition.
     pub async fn step(&self, wf_id: &str) -> Result<WorkflowStepResult> {
+        let mut claim = self.store.claim_workflow_step(wf_id).await?;
+        if claim.is_none() && self.store.recover_orphaned_workflow_step(wf_id).await? {
+            claim = self.store.claim_workflow_step(wf_id).await?;
+        }
+        let Some(claim) = claim else {
+            let workflow = self
+                .store
+                .get_workflow_run(wf_id)
+                .await?
+                .context("workflow run not found")?;
+            return if workflow.status.is_terminal() {
+                Ok(WorkflowStepResult::Terminal(workflow.status))
+            } else {
+                Ok(WorkflowStepResult::Waiting)
+            };
+        };
+        let owned = Self {
+            pool: self.pool.clone(),
+            store: self.store.with_step_claim(claim.clone()),
+            verification_store: VerificationStore::new(self.pool.clone()),
+            regression_store: RegressionStore::new(self.pool.clone()),
+            executor: Arc::clone(&self.executor),
+            active_cancellations: Arc::clone(&self.active_cancellations),
+        };
+        let (cancel_tx, _cancel_rx) = tokio::sync::watch::channel(false);
+        self.active_cancellations
+            .lock()
+            .unwrap()
+            .insert(wf_id.to_owned(), cancel_tx);
+        let result = owned.step_claimed(wf_id).await;
+        self.active_cancellations.lock().unwrap().remove(wf_id);
+        let release = self.store.release_workflow_step(&claim).await;
+        match (result, release) {
+            (Ok(step), Ok(())) => Ok(step),
+            (Err(error), Ok(())) => Err(error),
+            (_, Err(error)) => {
+                let workflow = self.store.get_workflow_run(wf_id).await?;
+                if let Some(workflow) = workflow.filter(|workflow| workflow.status.is_terminal()) {
+                    Ok(WorkflowStepResult::Terminal(workflow.status))
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    async fn step_claimed(&self, wf_id: &str) -> Result<WorkflowStepResult> {
         let wf = self
             .store
             .get_workflow_run(wf_id)
@@ -131,6 +231,27 @@ impl WorkflowCoordinator {
 
         if wf.status.is_terminal() {
             return Ok(WorkflowStepResult::Terminal(wf.status));
+        }
+
+        if let Some(resumed) = self.resume_completed_role_step(&wf).await? {
+            return Ok(resumed);
+        }
+        if self
+            .store
+            .list_role_executions(wf_id)
+            .await?
+            .iter()
+            .any(|role| {
+                role.stage == wf.status.as_str()
+                    && matches!(
+                        role.status,
+                        RoleExecutionStatus::Resolving | RoleExecutionStatus::Running
+                    )
+            })
+        {
+            bail!(
+                "WORKFLOW_ROLE_RECOVERY_REQUIRED: previous role execution has an unconfirmed outcome"
+            );
         }
 
         match wf.status {
@@ -174,8 +295,9 @@ impl WorkflowCoordinator {
                         &role,
                         &target,
                         wf.task_prompt.as_deref().unwrap_or(""),
-                        Path::new(wf.repository_path.as_deref().unwrap_or(".")),
+                        workflow_repo_path(&wf)?,
                         None,
+                        self.cancellation_receiver(wf_id)?,
                     )
                     .await;
 
@@ -289,11 +411,6 @@ impl WorkflowCoordinator {
             }
 
             WorkflowStage::Implementing => {
-                let lock_holder_id = format!("{}-impl-{}", wf.id, wf.iteration);
-                self.store
-                    .acquire_workspace_mutation_lock(&wf.attempt_id, &lock_holder_id)
-                    .await?;
-
                 let role = RoleDefinition::implementer_v1();
                 let target =
                     RoleRuntimeResolver::resolve_target_live(&self.pool, &role, None).await?;
@@ -319,6 +436,11 @@ impl WorkflowCoordinator {
                     .set_role_execution_resolved(&role_exec.id, &target)
                     .await?;
 
+                let lock_holder_id = role_exec.id.clone();
+                self.store
+                    .acquire_workspace_mutation_lock(&wf.attempt_id, &lock_holder_id)
+                    .await?;
+
                 let outcome = self
                     .executor
                     .execute_role(
@@ -328,18 +450,21 @@ impl WorkflowCoordinator {
                         &role,
                         &target,
                         wf.task_prompt.as_deref().unwrap_or(""),
-                        Path::new(wf.repository_path.as_deref().unwrap_or(".")),
+                        workflow_repo_path(&wf)?,
                         plan_handoff.as_ref(),
+                        self.cancellation_receiver(wf_id)?,
                     )
                     .await;
 
                 let outcome = match outcome {
                     Ok(o) => o,
                     Err(e) => {
-                        let _ = self
-                            .store
-                            .release_workspace_mutation_lock(&wf.attempt_id, &lock_holder_id)
-                            .await;
+                        if e.downcast_ref::<UnconfirmedRoleCleanup>().is_none() {
+                            let _ = self
+                                .store
+                                .release_workspace_mutation_lock(&wf.attempt_id, &lock_holder_id)
+                                .await;
+                        }
                         let err_msg = format!("implementer role execution failed: {e:#}");
                         self.store
                             .complete_role_execution_failed(
@@ -422,7 +547,7 @@ impl WorkflowCoordinator {
                     }
                 };
 
-                let repo_path = Path::new(wf.repository_path.as_deref().unwrap_or("."));
+                let repo_path = workflow_repo_path(&wf)?;
                 let baseline = wf.base_revision.as_deref().unwrap_or("HEAD");
                 let new_ws_state = compute_workspace_state(repo_path, baseline).await?;
 
@@ -471,9 +596,7 @@ impl WorkflowCoordinator {
                     .as_deref()
                     .context("missing workspace state in verifying stage")?;
 
-                let repo_path = Path::new(wf.repository_path.as_deref().unwrap_or("."));
-                let baseline = wf.base_revision.as_deref().unwrap_or("HEAD");
-                let ws_state = compute_workspace_state(repo_path, baseline).await?;
+                let ws_state = require_candidate_state(&wf, ws_state_id).await?;
 
                 let policies = self.resolve_workflow_policies(&wf).await?;
 
@@ -488,6 +611,7 @@ impl WorkflowCoordinator {
                         policies.selection.as_ref(),
                     )
                     .await?;
+                require_candidate_state(&wf, ws_state_id).await?;
 
                 if fast_run.overall_result != Some(VerificationRunResult::Passed) {
                     let fail_reason = "Fast tier verification failed".to_string();
@@ -524,6 +648,7 @@ impl WorkflowCoordinator {
                         policies.selection.as_ref(),
                     )
                     .await?;
+                require_candidate_state(&wf, ws_state_id).await?;
 
                 if std_run.overall_result != Some(VerificationRunResult::Passed) {
                     let fail_reason = "Standard tier verification failed".to_string();
@@ -581,15 +706,8 @@ impl WorkflowCoordinator {
                 }
 
                 let next_iteration = wf.iteration + 1;
-                sqlx::query("UPDATE orbit_workflow_runs SET iteration = $1 WHERE id = $2")
-                    .bind(next_iteration as i32)
-                    .bind(wf_id)
-                    .execute(&self.pool)
-                    .await?;
-
-                let lock_holder_id = format!("{}-repair-{}", wf.id, next_iteration);
                 self.store
-                    .acquire_workspace_mutation_lock(&wf.attempt_id, &lock_holder_id)
+                    .advance_repair_iteration(wf_id, wf.iteration, next_iteration)
                     .await?;
 
                 let role = RoleDefinition::implementer_v1();
@@ -617,6 +735,11 @@ impl WorkflowCoordinator {
                     .set_role_execution_resolved(&role_exec.id, &target)
                     .await?;
 
+                let lock_holder_id = role_exec.id.clone();
+                self.store
+                    .acquire_workspace_mutation_lock(&wf.attempt_id, &lock_holder_id)
+                    .await?;
+
                 let outcome = self
                     .executor
                     .execute_role(
@@ -626,18 +749,21 @@ impl WorkflowCoordinator {
                         &role,
                         &target,
                         wf.task_prompt.as_deref().unwrap_or(""),
-                        Path::new(wf.repository_path.as_deref().unwrap_or(".")),
+                        workflow_repo_path(&wf)?,
                         failure_handoff.as_ref(),
+                        self.cancellation_receiver(wf_id)?,
                     )
                     .await;
 
                 let outcome = match outcome {
                     Ok(o) => o,
                     Err(e) => {
-                        let _ = self
-                            .store
-                            .release_workspace_mutation_lock(&wf.attempt_id, &lock_holder_id)
-                            .await;
+                        if e.downcast_ref::<UnconfirmedRoleCleanup>().is_none() {
+                            let _ = self
+                                .store
+                                .release_workspace_mutation_lock(&wf.attempt_id, &lock_holder_id)
+                                .await;
+                        }
                         let err_msg = format!("repair role execution failed: {e:#}");
                         self.store
                             .complete_role_execution_failed(
@@ -720,7 +846,7 @@ impl WorkflowCoordinator {
                     }
                 };
 
-                let repo_path = Path::new(wf.repository_path.as_deref().unwrap_or("."));
+                let repo_path = workflow_repo_path(&wf)?;
                 let baseline = wf.base_revision.as_deref().unwrap_or("HEAD");
                 let new_ws_state = compute_workspace_state(repo_path, baseline).await?;
 
@@ -764,6 +890,30 @@ impl WorkflowCoordinator {
             }
 
             WorkflowStage::Reviewing => {
+                let expected_state_id = wf
+                    .current_workspace_state_id
+                    .as_deref()
+                    .context("missing workspace state in reviewing stage")?;
+                require_candidate_state(&wf, expected_state_id).await?;
+                if let Err(error) = review_candidate_diff(
+                    workflow_repo_path(&wf)?,
+                    wf.base_revision.as_deref().unwrap_or("HEAD"),
+                )
+                .await
+                {
+                    let reason =
+                        format!("REVIEW_ERROR: generate reviewer candidate diff: {error:#}");
+                    self.store
+                        .transition_workflow_stage(
+                            wf_id,
+                            WorkflowStage::Failed,
+                            None,
+                            None,
+                            Some(&reason),
+                        )
+                        .await?;
+                    return Ok(WorkflowStepResult::Terminal(WorkflowStage::Failed));
+                }
                 let role = RoleDefinition::reviewer_v1();
                 let target =
                     RoleRuntimeResolver::resolve_target_live(&self.pool, &role, None).await?;
@@ -798,8 +948,9 @@ impl WorkflowCoordinator {
                         &role,
                         &target,
                         wf.task_prompt.as_deref().unwrap_or(""),
-                        Path::new(wf.repository_path.as_deref().unwrap_or(".")),
+                        workflow_repo_path(&wf)?,
                         impl_handoff.as_ref(),
+                        self.cancellation_receiver(wf_id)?,
                     )
                     .await;
 
@@ -826,6 +977,8 @@ impl WorkflowCoordinator {
                         return Ok(WorkflowStepResult::Terminal(WorkflowStage::Failed));
                     }
                 };
+
+                require_candidate_state(&wf, expected_state_id).await?;
 
                 let review_dec: ReviewDecision = match extract_structured_envelope::<ReviewDecision>(
                     &outcome.raw_output,
@@ -956,9 +1109,9 @@ impl WorkflowCoordinator {
                     .as_deref()
                     .context("missing workspace state in regression stage")?;
 
-                let repo_path = Path::new(wf.repository_path.as_deref().unwrap_or("."));
+                let repo_path = workflow_repo_path(&wf)?;
                 let baseline = wf.base_revision.as_deref().unwrap_or("HEAD");
-                let ws_state = compute_workspace_state(repo_path, baseline).await?;
+                let ws_state = require_candidate_state(&wf, ws_state_id).await?;
 
                 let policies = self.resolve_workflow_policies(&wf).await?;
 
@@ -1033,6 +1186,95 @@ impl WorkflowCoordinator {
         }
     }
 
+    fn cancellation_receiver(&self, wf_id: &str) -> Result<tokio::sync::watch::Receiver<bool>> {
+        self.active_cancellations
+            .lock()
+            .unwrap()
+            .get(wf_id)
+            .map(tokio::sync::watch::Sender::subscribe)
+            .context("WORKFLOW_CANCELLATION_OWNER_MISSING")
+    }
+
+    /// A provider handoff may have been persisted before the stage update.
+    /// Reuse that completed role instead of starting another external turn.
+    async fn resume_completed_role_step(
+        &self,
+        wf: &WorkflowRun,
+    ) -> Result<Option<WorkflowStepResult>> {
+        if !matches!(
+            wf.status,
+            WorkflowStage::Planning
+                | WorkflowStage::Implementing
+                | WorkflowStage::Repairing
+                | WorkflowStage::Reviewing
+        ) {
+            return Ok(None);
+        }
+        let roles = self.store.list_role_executions(&wf.id).await?;
+        let Some(role) = roles.iter().rev().find(|role| {
+            role.stage == wf.status.as_str()
+                && role.iteration == wf.iteration
+                && role.status == RoleExecutionStatus::Succeeded
+                && role.handoff_output_id.is_some()
+        }) else {
+            return Ok(None);
+        };
+        let next = match wf.status {
+            WorkflowStage::Planning => WorkflowStage::Implementing,
+            WorkflowStage::Implementing | WorkflowStage::Repairing => {
+                let state_id = role
+                    .output_workspace_state_id
+                    .as_deref()
+                    .context("completed implementation has no workspace state")?;
+                require_candidate_state(wf, state_id).await?;
+                if self
+                    .store
+                    .check_workspace_mutation_lock(&wf.attempt_id, &role.id)
+                    .await?
+                {
+                    self.store
+                        .release_workspace_mutation_lock(&wf.attempt_id, &role.id)
+                        .await?;
+                }
+                WorkflowStage::Verifying
+            }
+            WorkflowStage::Reviewing => {
+                let state_id = wf
+                    .current_workspace_state_id
+                    .as_deref()
+                    .context("reviewed workspace state missing")?;
+                require_candidate_state(wf, state_id).await?;
+                let handoff = self
+                    .store
+                    .get_handoff_artifact(role.handoff_output_id.as_deref().unwrap())
+                    .await?
+                    .context("completed reviewer handoff missing")?;
+                let decision: ReviewDecision = serde_json::from_value(handoff.structured_payload)?;
+                match decision.decision {
+                    ReviewDecisionStatus::Approve => WorkflowStage::Regression,
+                    ReviewDecisionStatus::ChangesRequested => WorkflowStage::Repairing,
+                    ReviewDecisionStatus::Blocked => WorkflowStage::Failed,
+                }
+            }
+            _ => unreachable!(),
+        };
+        let state_id = role
+            .output_workspace_state_id
+            .as_deref()
+            .or(wf.current_workspace_state_id.as_deref());
+        self.store
+            .transition_workflow_stage(&wf.id, next, state_id, None, None)
+            .await?;
+        Ok(Some(if next.is_terminal() {
+            WorkflowStepResult::Terminal(next)
+        } else {
+            WorkflowStepResult::Advanced {
+                from: wf.status,
+                to: next,
+            }
+        }))
+    }
+
     /// Autonomous loop stepping the workflow until it reaches a terminal state.
     pub async fn run_to_completion(&self, wf_id: &str) -> Result<WorkflowRun> {
         loop {
@@ -1054,48 +1296,43 @@ impl WorkflowCoordinator {
         }
     }
 
-    /// Cancel a workflow run, release any attempt workspace locks, and mark role executions cancelled.
+    /// Cancel atomically and revoke callback authority while external work is accounted for.
     pub async fn cancel_workflow(&self, wf_id: &str, reason: &str) -> Result<WorkflowRun> {
-        let wf = self
-            .store
-            .get_workflow_run(wf_id)
-            .await?
-            .context("workflow run not found")?;
-
-        // Release any workspace mutation locks held for this attempt
-        let _ = sqlx::query("DELETE FROM orbit_attempt_workspace_locks WHERE attempt_id = $1")
-            .bind(&wf.attempt_id)
-            .execute(&self.pool)
-            .await;
-
         let now_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
-
-        // Cancel running role executions
-        let _ = sqlx::query(
-            "UPDATE orbit_role_executions SET status = 'CANCELLED', termination_reason = $1, finished_at_ms = $2 WHERE workflow_run_id = $3 AND status IN ('PENDING', 'RUNNING')",
+        let mut tx = self.pool.begin().await?;
+        let changed = sqlx::query(
+            "UPDATE orbit_workflow_runs SET status = 'CANCELLED', current_stage = 'CANCELLED', cancellation_reason = $2, finished_at_ms = $3, step_owner_id = NULL, step_owner_pid = NULL, step_owner_started_at_ms = NULL, step_generation = step_generation + 1 WHERE id = $1 AND status NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'EXHAUSTED')",
         )
+        .bind(wf_id)
         .bind(reason)
         .bind(now_ms)
-        .bind(wf_id)
-        .execute(&self.pool)
-        .await;
-
-        self.store
-            .transition_workflow_stage(
-                wf_id,
-                WorkflowStage::Cancelled,
-                wf.current_workspace_state_id.as_deref(),
-                None,
-                Some(reason),
+        .execute(&mut *tx)
+        .await?;
+        if changed.rows_affected() == 1 {
+            sqlx::query(
+                "UPDATE orbit_role_executions SET status = 'CANCELLED', termination_reason = $1, finished_at_ms = $2 WHERE workflow_run_id = $3 AND status IN ('PENDING', 'RESOLVING', 'RUNNING')",
             )
+            .bind(reason)
+            .bind(now_ms)
+            .bind(wf_id)
+            .execute(&mut *tx)
             .await?;
-
-        let updated = self
-            .store
+            sqlx::query(
+                "UPDATE orbit_attempt_workspace_locks locks SET revoked_at_ms = $2 FROM orbit_role_executions re WHERE locks.holder_role_execution_id = re.id AND re.workflow_run_id = $1",
+            )
+            .bind(wf_id)
+            .bind(now_ms)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        if let Some(sender) = self.active_cancellations.lock().unwrap().get(wf_id) {
+            let _ = sender.send(true);
+        }
+        self.store
             .get_workflow_run(wf_id)
             .await?
-            .context("workflow run not found after cancel")?;
-        Ok(updated)
+            .context("workflow run not found after cancel")
     }
 
     /// Helper to record failure evidence as a handoff artifact for repair stages.
@@ -1261,7 +1498,7 @@ impl WorkflowCoordinator {
         reg_policy: Option<&RegressionPolicy>,
         sel_policy: Option<&SelectionPolicy>,
     ) -> Result<VerificationRun> {
-        let repo_path = Path::new(wf.repository_path.as_deref().unwrap_or("."));
+        let repo_path = workflow_repo_path(wf)?;
         let env = EnvironmentIdentity::default();
         crate::verification::validate_pinned_verification_profile(&env)?;
 
@@ -1290,7 +1527,7 @@ impl WorkflowCoordinator {
                 repo_path,
                 env,
                 reg_policy,
-                None,
+                Some(self.cancellation_receiver(&wf.id)?),
             )
             .await
         } else {
@@ -1367,69 +1604,210 @@ pub async fn compute_workspace_state(
     repo_path: &Path,
     baseline_revision: &str,
 ) -> Result<WorkspaceState> {
-    if repo_path.exists() && repo_path.join(".git").exists() {
-        let head_out = tokio::process::Command::new("git")
-            .arg("-C")
-            .arg(repo_path)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .await?;
-        let head_revision = String::from_utf8(head_out.stdout)
-            .unwrap_or_else(|_| "HEAD".into())
+    ensure!(
+        repo_path.is_dir(),
+        "workspace repository directory is missing"
+    );
+    if repo_path.join(".git").exists() {
+        let head = git_output(repo_path, &["rev-parse", "--verify", "HEAD"]).await?;
+        let head_revision = String::from_utf8(head)
+            .context("GIT_WORKSPACE_STATE_FAILED: HEAD is not UTF-8")?
             .trim()
             .to_string();
-
-        let diff_out = tokio::process::Command::new("git")
-            .arg("-C")
-            .arg(repo_path)
-            .args([
+        ensure!(
+            !head_revision.is_empty(),
+            "GIT_WORKSPACE_STATE_FAILED: empty HEAD"
+        );
+        let tracked_diff = git_output(
+            repo_path,
+            &[
                 "diff",
                 "--binary",
                 "--no-ext-diff",
                 "--full-index",
+                "--no-renames",
                 baseline_revision,
                 "--",
-            ])
-            .output()
-            .await?;
-
-        let diff_sha256 = if diff_out.stdout.is_empty() {
-            None
-        } else {
-            Some(crate::model::digest(&diff_out.stdout))
-        };
-
-        Ok(WorkspaceState::compute_from_parts(
+            ],
+        )
+        .await?;
+        let untracked = git_untracked_paths(repo_path).await?;
+        let candidate_digest = hash_candidate(repo_path, &tracked_diff, &untracked)?;
+        Ok(WorkspaceState::compute_candidate_v2(
             baseline_revision,
             &head_revision,
-            diff_sha256.as_deref(),
+            &candidate_digest,
         ))
     } else {
-        // Fallback for tests or synthetic directories:
-        // Hash file contents deterministically
-        let mut entries = Vec::new();
-        if let Ok(rd) = std::fs::read_dir(repo_path) {
-            for entry in rd.flatten() {
-                let path = entry.path();
-                if path.is_file() {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    let bytes = std::fs::read(&path).unwrap_or_default();
-                    entries.push(format!("{}:{}", name, digest(&bytes)));
-                }
-            }
-        }
-        entries.sort();
-        let diff_hash = if entries.is_empty() {
-            None
-        } else {
-            Some(digest(entries.join(";").as_bytes()))
-        };
-        Ok(WorkspaceState::compute_from_parts(
+        let paths = non_git_candidate_paths(repo_path)?;
+        let candidate_digest = hash_candidate(repo_path, &[], &paths)?;
+        Ok(WorkspaceState::compute_candidate_v2(
             baseline_revision,
-            "HEAD",
-            diff_hash.as_deref(),
+            "NON_GIT",
+            &candidate_digest,
         ))
     }
+}
+
+async fn git_output(repo_path: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(args)
+        .output()
+        .await
+        .context("GIT_WORKSPACE_STATE_FAILED: start git")?;
+    ensure!(
+        output.status.success(),
+        "GIT_WORKSPACE_STATE_FAILED: git returned {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(output.stdout)
+}
+
+async fn git_untracked_paths(repo_path: &Path) -> Result<Vec<PathBuf>> {
+    let output = git_output(
+        repo_path,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+    )
+    .await?;
+    let mut paths: Vec<PathBuf> = output
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| PathBuf::from(std::ffi::OsStr::from_bytes(path)))
+        .collect();
+    paths.sort();
+    Ok(paths)
+}
+
+async fn review_candidate_diff(repo_path: &Path, baseline_revision: &str) -> Result<String> {
+    let mut diff = if repo_path.join(".git").exists() {
+        let mut diff = git_output(
+            repo_path,
+            &[
+                "diff",
+                "--binary",
+                "--no-ext-diff",
+                "--full-index",
+                "--no-renames",
+                baseline_revision,
+                "--",
+            ],
+        )
+        .await
+        .context("REVIEW_ERROR: tracked diff failed")?;
+        for relative in git_untracked_paths(repo_path).await? {
+            let output = tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(repo_path)
+                .args([
+                    "diff",
+                    "--no-index",
+                    "--binary",
+                    "--no-ext-diff",
+                    "--full-index",
+                    "--",
+                    "/dev/null",
+                ])
+                .arg(&relative)
+                .output()
+                .await
+                .context("REVIEW_ERROR: start untracked file diff")?;
+            ensure!(
+                output.status.code() == Some(1) && !output.stdout.is_empty(),
+                "REVIEW_ERROR: untracked diff failed for {}: {}",
+                relative.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            diff.extend(output.stdout);
+        }
+        diff
+    } else {
+        let mut inventory = Vec::new();
+        for relative in non_git_candidate_paths(repo_path)? {
+            let label = relative
+                .to_str()
+                .context("REVIEW_ERROR: non-UTF-8 candidate path")?;
+            let path = repo_path.join(&relative);
+            let metadata = std::fs::symlink_metadata(&path)?;
+            let bytes = if metadata.file_type().is_symlink() {
+                std::fs::read_link(&path)?.as_os_str().as_bytes().to_vec()
+            } else if metadata.is_file() {
+                std::fs::read(&path)?
+            } else {
+                bail!("REVIEW_ERROR: unsupported candidate file type: {label}");
+            };
+            let content = match String::from_utf8(bytes.clone()) {
+                Ok(text) => text,
+                Err(_) => format!("[binary hex: {}]", hex::encode(bytes)),
+            };
+            inventory.extend(format!("\n=== candidate file: {label} ===\n{content}\n").as_bytes());
+        }
+        inventory
+    };
+    ensure!(!diff.is_empty(), "REVIEW_ERROR: candidate diff is empty");
+    String::from_utf8(std::mem::take(&mut diff))
+        .context("REVIEW_ERROR: candidate diff is not UTF-8")
+}
+
+fn non_git_candidate_paths(repo_path: &Path) -> Result<Vec<PathBuf>> {
+    fn visit(repo_path: &Path, relative: &Path, paths: &mut Vec<PathBuf>) -> Result<()> {
+        for entry in std::fs::read_dir(repo_path.join(relative))? {
+            let entry = entry?;
+            let child = relative.join(entry.file_name());
+            if entry.file_type()?.is_dir() {
+                visit(repo_path, &child, paths)?;
+            } else {
+                paths.push(child);
+            }
+        }
+        Ok(())
+    }
+    let mut paths = Vec::new();
+    visit(repo_path, Path::new(""), &mut paths)?;
+    paths.sort();
+    Ok(paths)
+}
+
+fn hash_candidate(repo_path: &Path, tracked_diff: &[u8], paths: &[PathBuf]) -> Result<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"orbit-workspace-candidate-v2\0");
+    hasher.update((tracked_diff.len() as u64).to_le_bytes());
+    hasher.update(tracked_diff);
+    for relative in paths {
+        ensure!(
+            relative
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_))),
+            "candidate path is not confined to repository"
+        );
+        let name = relative.as_os_str().as_bytes();
+        hasher.update((name.len() as u64).to_le_bytes());
+        hasher.update(name);
+        let path = repo_path.join(relative);
+        let metadata = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("read candidate metadata for {}", relative.display()))?;
+        let (kind, bytes) = if metadata.file_type().is_symlink() {
+            (
+                b's',
+                std::fs::read_link(&path)?.as_os_str().as_bytes().to_vec(),
+            )
+        } else if metadata.is_file() {
+            (
+                b'f',
+                std::fs::read(&path)
+                    .with_context(|| format!("read candidate file {}", relative.display()))?,
+            )
+        } else {
+            bail!("unsupported candidate file type: {}", relative.display());
+        };
+        hasher.update([kind]);
+        hasher.update((metadata.permissions().mode() & 0o7777).to_le_bytes());
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(&bytes);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// Simulated role executor for deterministic unit and qualification testing.
@@ -1536,6 +1914,7 @@ impl RoleAgentExecutor for SimulatedRoleExecutor {
         _task_text: &str,
         repo_path: &Path,
         _input_handoff: Option<&HandoffArtifact>,
+        _cancellation: tokio::sync::watch::Receiver<bool>,
     ) -> Result<RoleExecutionOutcome> {
         self.recorded_roles
             .lock()
@@ -1726,6 +2105,9 @@ fn build_role_prompt(
 pub struct AcpTurnState<'a> {
     pub repo_path: &'a Path,
     pub workspace_access: WorkspaceAccess,
+    pub role_id: Option<String>,
+    pub workspace_identity: Option<String>,
+    pub tool_call_limit: u64,
     pub agent_output: String,
     pub tool_calls: u64,
     pub tool_successes: u64,
@@ -1742,6 +2124,9 @@ impl<'a> AcpTurnState<'a> {
         Self {
             repo_path,
             workspace_access,
+            role_id: None,
+            workspace_identity: None,
+            tool_call_limit: 64,
             agent_output: String::new(),
             tool_calls: 0,
             tool_successes: 0,
@@ -1813,33 +2198,17 @@ pub async fn handle_acp_message(
             return Ok(());
         };
 
-        state.tool_calls += 1;
+        state.tool_calls = state.tool_calls.saturating_add(1);
         *state
             .tool_counts
             .entry(tool.legacy_name().into())
             .or_insert(0) += 1;
         *state.tool_counts.entry(tool.as_str().into()).or_insert(0) += 1;
 
-        let meta = crate::tool_surface::ToolMetadata::for_tool(tool);
         let params = message
             .get("params")
             .cloned()
             .unwrap_or(serde_json::json!({}));
-
-        // Role & workspace access checks
-        if meta.mutating && state.workspace_access == WorkspaceAccess::ReadOnly {
-            state.tool_failures += 1;
-            wire.response_error(
-                req_id,
-                -32603,
-                &format!(
-                    "{}: workspace is read-only",
-                    crate::tool_surface::ERR_READ_ONLY_ROLE
-                ),
-            )
-            .await?;
-            return Ok(());
-        }
 
         if matches!(
             tool,
@@ -1854,6 +2223,25 @@ pub async fn handle_acp_message(
                 .await?;
             return Ok(());
         }
+
+        let meta = match crate::tool_surface::authorize_repository_tool(
+            tool,
+            state.role_id.as_deref(),
+            state.workspace_access,
+            state.repo_path,
+            state.workspace_identity.as_deref(),
+            state.tool_calls,
+            state.tool_call_limit,
+        ) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                state.tool_failures += 1;
+                wire.response_error(req_id, -32603, &error.to_string())
+                    .await?;
+                return Ok(());
+            }
+        };
+        wire.set_response_limit(meta.max_output_bytes);
 
         // Mutation lock enforcement for mutating operations
         if meta.requires_mutation_lock {
@@ -1886,233 +2274,206 @@ pub async fn handle_acp_message(
             }
         }
 
-        match tool {
-            crate::tool_surface::CanonicalToolName::FsReadTextFile => {
-                let rel_path_str = params.get("path").and_then(|p| p.as_str()).unwrap_or("");
-                let full_path = match crate::fs_tools::confine_path(
-                    state.repo_path,
-                    rel_path_str,
-                    false,
-                    false,
-                ) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        state.tool_failures += 1;
-                        wire.response_error(
-                            req_id,
-                            -32603,
-                            &format!("{}: {e}", crate::tool_surface::ERR_PATH_OUTSIDE_WORKSPACE),
-                        )
-                        .await?;
-                        return Ok(());
-                    }
-                };
-
-                match tokio::fs::read_to_string(&full_path).await {
-                    Ok(content) => {
-                        let bounded_content = if content.len() > 65536 {
-                            let mut end = 65536;
-                            while end > 0 && !content.is_char_boundary(end) {
-                                end -= 1;
-                            }
-                            &content[..end]
-                        } else {
-                            &content
-                        };
-                        state.tool_successes += 1;
-                        wire.response_ok(req_id, serde_json::json!({ "content": bounded_content }))
+        let successes_before = state.tool_successes;
+        let failures_before = state.tool_failures;
+        let timeout_request_id = req_id.clone();
+        let operation = async {
+            match tool {
+                crate::tool_surface::CanonicalToolName::FsReadTextFile => {
+                    let rel_path_str = params.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                    match crate::fs_tools::read_text_confined(state.repo_path, rel_path_str) {
+                        Ok(content) => {
+                            let bounded_content = if content.len() > 65536 {
+                                let mut end = 65536;
+                                while end > 0 && !content.is_char_boundary(end) {
+                                    end -= 1;
+                                }
+                                &content[..end]
+                            } else {
+                                &content
+                            };
+                            state.tool_successes += 1;
+                            wire.response_ok(
+                                req_id,
+                                serde_json::json!({ "content": bounded_content }),
+                            )
                             .await?;
-                    }
-                    Err(e) => {
-                        state.tool_failures += 1;
-                        wire.response_ok(
+                        }
+                        Err(e) => {
+                            state.tool_failures += 1;
+                            wire.response_ok(
                             req_id,
                             serde_json::json!({ "content": format!("Error reading file: {e}") }),
                         )
                         .await?;
+                        }
                     }
                 }
-            }
-            crate::tool_surface::CanonicalToolName::FsWriteTextFile => {
-                let rel_path_str = params.get("path").and_then(|p| p.as_str()).unwrap_or("");
-                let content = params.get("content").and_then(|p| p.as_str()).unwrap_or("");
+                crate::tool_surface::CanonicalToolName::FsWriteTextFile => {
+                    let rel_path_str = params.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                    let content = params.get("content").and_then(|p| p.as_str()).unwrap_or("");
 
-                let full_path = match crate::fs_tools::confine_path(
-                    state.repo_path,
-                    rel_path_str,
-                    false,
-                    false,
-                ) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        state.tool_failures += 1;
-                        wire.response_error(
-                            req_id,
-                            -32603,
-                            &format!("{}: {e}", crate::tool_surface::ERR_PATH_OUTSIDE_WORKSPACE),
-                        )
-                        .await?;
-                        return Ok(());
-                    }
-                };
-
-                if let Some(parent) = full_path.parent() {
-                    let _ = tokio::fs::create_dir_all(parent).await;
-                }
-
-                match tokio::fs::write(&full_path, content).await {
-                    Ok(()) => {
-                        state.tool_successes += 1;
-                        wire.response_ok(req_id, serde_json::json!({})).await?;
-                    }
-                    Err(e) => {
-                        state.tool_failures += 1;
-                        wire.response_error(req_id, -32603, &format!("failed to write file: {e}"))
+                    match crate::fs_tools::write_text_confined(
+                        state.repo_path,
+                        rel_path_str,
+                        content,
+                    ) {
+                        Ok(()) => {
+                            state.tool_successes += 1;
+                            wire.response_ok(req_id, serde_json::json!({})).await?;
+                        }
+                        Err(e) => {
+                            state.tool_failures += 1;
+                            wire.response_error(
+                                req_id,
+                                -32603,
+                                &format!("failed to write file: {e}"),
+                            )
                             .await?;
+                        }
                     }
                 }
-            }
-            crate::tool_surface::CanonicalToolName::FsEditFile => {
-                let path_str = params.get("path").and_then(|p| p.as_str()).unwrap_or("");
-                let old_text = params
-                    .get("old_text")
-                    .and_then(|p| p.as_str())
-                    .unwrap_or("");
-                let new_text = params
-                    .get("new_text")
-                    .and_then(|p| p.as_str())
-                    .unwrap_or("");
-                let replace_all = params
-                    .get("replace_all")
-                    .and_then(|p| p.as_bool())
-                    .unwrap_or(false);
+                crate::tool_surface::CanonicalToolName::FsEditFile => {
+                    let path_str = params.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                    let old_text = params
+                        .get("old_text")
+                        .and_then(|p| p.as_str())
+                        .unwrap_or("");
+                    let new_text = params
+                        .get("new_text")
+                        .and_then(|p| p.as_str())
+                        .unwrap_or("");
+                    let replace_all = params
+                        .get("replace_all")
+                        .and_then(|p| p.as_bool())
+                        .unwrap_or(false);
 
-                match crate::tool_surface::edit_file(
-                    state.repo_path,
-                    path_str,
-                    old_text,
-                    new_text,
-                    replace_all,
-                ) {
-                    Ok(res) => {
-                        state.tool_successes += 1;
-                        wire.response_ok(req_id, serde_json::to_value(res)?).await?;
-                    }
-                    Err(e) => {
-                        state.tool_failures += 1;
-                        wire.response_error(req_id, -32603, &e.to_string()).await?;
+                    match crate::tool_surface::edit_file(
+                        state.repo_path,
+                        path_str,
+                        old_text,
+                        new_text,
+                        replace_all,
+                    ) {
+                        Ok(res) => {
+                            state.tool_successes += 1;
+                            wire.response_ok(req_id, serde_json::to_value(res)?).await?;
+                        }
+                        Err(e) => {
+                            state.tool_failures += 1;
+                            wire.response_error(req_id, -32603, &e.to_string()).await?;
+                        }
                     }
                 }
-            }
-            crate::tool_surface::CanonicalToolName::FsListDirectory => {
-                let path_str = params.get("path").and_then(|p| p.as_str()).unwrap_or(".");
-                let recursive = params
-                    .get("recursive")
-                    .and_then(|p| p.as_bool())
-                    .unwrap_or(false);
-                let max_entries = params
-                    .get("max_entries")
-                    .and_then(|p| p.as_u64())
-                    .unwrap_or(100) as usize;
-                let include_hidden = params
-                    .get("include_hidden")
-                    .and_then(|p| p.as_bool())
-                    .unwrap_or(false);
+                crate::tool_surface::CanonicalToolName::FsListDirectory => {
+                    let path_str = params.get("path").and_then(|p| p.as_str()).unwrap_or(".");
+                    let recursive = params
+                        .get("recursive")
+                        .and_then(|p| p.as_bool())
+                        .unwrap_or(false);
+                    let max_entries = params
+                        .get("max_entries")
+                        .and_then(|p| p.as_u64())
+                        .unwrap_or(100) as usize;
+                    let include_hidden = params
+                        .get("include_hidden")
+                        .and_then(|p| p.as_bool())
+                        .unwrap_or(false);
 
-                match crate::tool_surface::list_directory(
-                    state.repo_path,
-                    path_str,
-                    recursive,
-                    max_entries,
-                    include_hidden,
-                ) {
-                    Ok(res) => {
-                        state.tool_successes += 1;
-                        wire.response_ok(req_id, serde_json::to_value(res)?).await?;
-                    }
-                    Err(e) => {
-                        state.tool_failures += 1;
-                        wire.response_error(req_id, -32603, &e.to_string()).await?;
+                    match crate::tool_surface::list_directory(
+                        state.repo_path,
+                        path_str,
+                        recursive,
+                        max_entries,
+                        include_hidden,
+                    ) {
+                        Ok(res) => {
+                            state.tool_successes += 1;
+                            wire.response_ok(req_id, serde_json::to_value(res)?).await?;
+                        }
+                        Err(e) => {
+                            state.tool_failures += 1;
+                            wire.response_error(req_id, -32603, &e.to_string()).await?;
+                        }
                     }
                 }
-            }
-            crate::tool_surface::CanonicalToolName::FsFindPath => {
-                let pattern = params
-                    .get("pattern")
-                    .and_then(|p| p.as_str())
-                    .unwrap_or("*");
-                let path_str = params.get("path").and_then(|p| p.as_str());
-                let max_results = params
-                    .get("max_results")
-                    .and_then(|p| p.as_u64())
-                    .unwrap_or(100) as usize;
+                crate::tool_surface::CanonicalToolName::FsFindPath => {
+                    let pattern = params
+                        .get("pattern")
+                        .and_then(|p| p.as_str())
+                        .unwrap_or("*");
+                    let path_str = params.get("path").and_then(|p| p.as_str());
+                    let max_results = params
+                        .get("max_results")
+                        .and_then(|p| p.as_u64())
+                        .unwrap_or(100) as usize;
 
-                match crate::tool_surface::find_path(
-                    state.repo_path,
-                    path_str,
-                    pattern,
-                    &[],
-                    &[],
-                    max_results,
-                ) {
-                    Ok(res) => {
-                        state.tool_successes += 1;
-                        wire.response_ok(req_id, serde_json::to_value(res)?).await?;
-                    }
-                    Err(e) => {
-                        state.tool_failures += 1;
-                        wire.response_error(req_id, -32603, &e.to_string()).await?;
+                    match crate::tool_surface::find_path(
+                        state.repo_path,
+                        path_str,
+                        pattern,
+                        &[],
+                        &[],
+                        max_results,
+                    ) {
+                        Ok(res) => {
+                            state.tool_successes += 1;
+                            wire.response_ok(req_id, serde_json::to_value(res)?).await?;
+                        }
+                        Err(e) => {
+                            state.tool_failures += 1;
+                            wire.response_error(req_id, -32603, &e.to_string()).await?;
+                        }
                     }
                 }
-            }
-            crate::tool_surface::CanonicalToolName::SearchGrep => {
-                let query = params.get("query").and_then(|p| p.as_str()).unwrap_or("");
-                let path_str = params.get("path").and_then(|p| p.as_str());
-                let case_sensitive = params
-                    .get("case_sensitive")
-                    .and_then(|p| p.as_bool())
-                    .unwrap_or(true);
-                let is_regex = params
-                    .get("is_regex")
-                    .and_then(|p| p.as_bool())
-                    .unwrap_or(false);
-                let max_matches = params
-                    .get("max_matches")
-                    .and_then(|p| p.as_u64())
-                    .unwrap_or(100) as usize;
+                crate::tool_surface::CanonicalToolName::SearchGrep => {
+                    let query = params.get("query").and_then(|p| p.as_str()).unwrap_or("");
+                    let path_str = params.get("path").and_then(|p| p.as_str());
+                    let case_sensitive = params
+                        .get("case_sensitive")
+                        .and_then(|p| p.as_bool())
+                        .unwrap_or(true);
+                    let is_regex = params
+                        .get("is_regex")
+                        .and_then(|p| p.as_bool())
+                        .unwrap_or(false);
+                    let max_matches = params
+                        .get("max_matches")
+                        .and_then(|p| p.as_u64())
+                        .unwrap_or(100) as usize;
 
-                match crate::tool_surface::search_grep(
-                    state.repo_path,
-                    path_str,
-                    query,
-                    case_sensitive,
-                    is_regex,
-                    &[],
-                    &[],
-                    max_matches,
-                    0,
-                ) {
-                    Ok(res) => {
-                        state.tool_successes += 1;
-                        wire.response_ok(req_id, serde_json::to_value(res)?).await?;
-                    }
-                    Err(e) => {
-                        state.tool_failures += 1;
-                        wire.response_error(req_id, -32603, &e.to_string()).await?;
+                    match crate::tool_surface::search_grep(
+                        state.repo_path,
+                        path_str,
+                        query,
+                        case_sensitive,
+                        is_regex,
+                        &[],
+                        &[],
+                        max_matches,
+                        0,
+                    ) {
+                        Ok(res) => {
+                            state.tool_successes += 1;
+                            wire.response_ok(req_id, serde_json::to_value(res)?).await?;
+                        }
+                        Err(e) => {
+                            state.tool_failures += 1;
+                            wire.response_error(req_id, -32603, &e.to_string()).await?;
+                        }
                     }
                 }
-            }
-            crate::tool_surface::CanonicalToolName::FsCreateDirectory => {
-                let path_str = params.get("path").and_then(|p| p.as_str()).unwrap_or("");
-                let recursive = params
-                    .get("recursive")
-                    .and_then(|p| p.as_bool())
-                    .unwrap_or(true);
+                crate::tool_surface::CanonicalToolName::FsCreateDirectory => {
+                    let path_str = params.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                    let recursive = params
+                        .get("recursive")
+                        .and_then(|p| p.as_bool())
+                        .unwrap_or(true);
 
-                match crate::fs_tools::create_directory(state.repo_path, path_str, recursive) {
-                    Ok(_) => {
-                        state.tool_successes += 1;
-                        wire.response_ok(
+                    match crate::fs_tools::create_directory(state.repo_path, path_str, recursive) {
+                        Ok(_) => {
+                            state.tool_successes += 1;
+                            wire.response_ok(
                             req_id,
                             serde_json::json!({
                                 "success": true,
@@ -2121,121 +2482,121 @@ pub async fn handle_acp_message(
                             }),
                         )
                         .await?;
-                    }
-                    Err(e) => {
-                        state.tool_failures += 1;
-                        wire.response_ok(
-                            req_id,
-                            serde_json::json!({
-                                "success": false,
-                                "path": path_str,
-                                "error": format!("{e:#}"),
-                            }),
-                        )
-                        .await?;
+                        }
+                        Err(e) => {
+                            state.tool_failures += 1;
+                            wire.response_ok(
+                                req_id,
+                                serde_json::json!({
+                                    "success": false,
+                                    "path": path_str,
+                                    "error": format!("{e:#}"),
+                                }),
+                            )
+                            .await?;
+                        }
                     }
                 }
-            }
-            crate::tool_surface::CanonicalToolName::FsMove => {
-                let source_str = params.get("source").and_then(|p| p.as_str()).unwrap_or("");
-                let destination_str = params
-                    .get("destination")
-                    .and_then(|p| p.as_str())
-                    .unwrap_or("");
+                crate::tool_surface::CanonicalToolName::FsMove => {
+                    let source_str = params.get("source").and_then(|p| p.as_str()).unwrap_or("");
+                    let destination_str = params
+                        .get("destination")
+                        .and_then(|p| p.as_str())
+                        .unwrap_or("");
 
-                match crate::fs_tools::move_path(state.repo_path, source_str, destination_str) {
-                    Ok(_) => {
-                        state.tool_successes += 1;
-                        wire.response_ok(req_id, serde_json::json!({
+                    match crate::fs_tools::move_path(state.repo_path, source_str, destination_str) {
+                        Ok(_) => {
+                            state.tool_successes += 1;
+                            wire.response_ok(req_id, serde_json::json!({
                             "success": true,
                             "source": source_str,
                             "destination": destination_str,
                             "message": format!("Moved {} to {} successfully.", source_str, destination_str),
                         })).await?;
-                    }
-                    Err(e) => {
-                        state.tool_failures += 1;
-                        wire.response_ok(
-                            req_id,
-                            serde_json::json!({
-                                "success": false,
-                                "source": source_str,
-                                "destination": destination_str,
-                                "error": format!("{e:#}"),
-                            }),
-                        )
-                        .await?;
-                    }
-                }
-            }
-            crate::tool_surface::CanonicalToolName::FsCopy => {
-                let source_str = params.get("source").and_then(|p| p.as_str()).unwrap_or("");
-                let destination_str = params
-                    .get("destination")
-                    .and_then(|p| p.as_str())
-                    .unwrap_or("");
-                let recursive = params
-                    .get("recursive")
-                    .and_then(|p| p.as_bool())
-                    .unwrap_or(false);
-
-                match crate::tool_surface::copy_path(
-                    state.repo_path,
-                    source_str,
-                    destination_str,
-                    recursive,
-                ) {
-                    Ok(res) => {
-                        state.tool_successes += 1;
-                        wire.response_ok(req_id, serde_json::to_value(res)?).await?;
-                    }
-                    Err(e) => {
-                        state.tool_failures += 1;
-                        wire.response_error(req_id, -32603, &e.to_string()).await?;
+                        }
+                        Err(e) => {
+                            state.tool_failures += 1;
+                            wire.response_ok(
+                                req_id,
+                                serde_json::json!({
+                                    "success": false,
+                                    "source": source_str,
+                                    "destination": destination_str,
+                                    "error": format!("{e:#}"),
+                                }),
+                            )
+                            .await?;
+                        }
                     }
                 }
-            }
-            crate::tool_surface::CanonicalToolName::FsDeleteFile => {
-                let path_str = params.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                crate::tool_surface::CanonicalToolName::FsCopy => {
+                    let source_str = params.get("source").and_then(|p| p.as_str()).unwrap_or("");
+                    let destination_str = params
+                        .get("destination")
+                        .and_then(|p| p.as_str())
+                        .unwrap_or("");
+                    let recursive = params
+                        .get("recursive")
+                        .and_then(|p| p.as_bool())
+                        .unwrap_or(false);
 
-                match crate::fs_tools::delete_file(state.repo_path, path_str) {
-                    Ok(_) => {
-                        state.tool_successes += 1;
-                        wire.response_ok(
-                            req_id,
-                            serde_json::json!({
-                                "success": true,
-                                "path": path_str,
-                                "message": format!("File {} deleted successfully.", path_str),
-                            }),
-                        )
-                        .await?;
-                    }
-                    Err(e) => {
-                        state.tool_failures += 1;
-                        wire.response_ok(
-                            req_id,
-                            serde_json::json!({
-                                "success": false,
-                                "path": path_str,
-                                "error": format!("{e:#}"),
-                            }),
-                        )
-                        .await?;
+                    match crate::tool_surface::copy_path(
+                        state.repo_path,
+                        source_str,
+                        destination_str,
+                        recursive,
+                    ) {
+                        Ok(res) => {
+                            state.tool_successes += 1;
+                            wire.response_ok(req_id, serde_json::to_value(res)?).await?;
+                        }
+                        Err(e) => {
+                            state.tool_failures += 1;
+                            wire.response_error(req_id, -32603, &e.to_string()).await?;
+                        }
                     }
                 }
-            }
-            crate::tool_surface::CanonicalToolName::FsDeleteDirectory => {
-                let path_str = params.get("path").and_then(|p| p.as_str()).unwrap_or("");
-                let recursive = params
-                    .get("recursive")
-                    .and_then(|p| p.as_bool())
-                    .unwrap_or(false);
+                crate::tool_surface::CanonicalToolName::FsDeleteFile => {
+                    let path_str = params.get("path").and_then(|p| p.as_str()).unwrap_or("");
 
-                match crate::fs_tools::delete_directory(state.repo_path, path_str, recursive) {
-                    Ok(_) => {
-                        state.tool_successes += 1;
-                        wire.response_ok(
+                    match crate::fs_tools::delete_file(state.repo_path, path_str) {
+                        Ok(_) => {
+                            state.tool_successes += 1;
+                            wire.response_ok(
+                                req_id,
+                                serde_json::json!({
+                                    "success": true,
+                                    "path": path_str,
+                                    "message": format!("File {} deleted successfully.", path_str),
+                                }),
+                            )
+                            .await?;
+                        }
+                        Err(e) => {
+                            state.tool_failures += 1;
+                            wire.response_ok(
+                                req_id,
+                                serde_json::json!({
+                                    "success": false,
+                                    "path": path_str,
+                                    "error": format!("{e:#}"),
+                                }),
+                            )
+                            .await?;
+                        }
+                    }
+                }
+                crate::tool_surface::CanonicalToolName::FsDeleteDirectory => {
+                    let path_str = params.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                    let recursive = params
+                        .get("recursive")
+                        .and_then(|p| p.as_bool())
+                        .unwrap_or(false);
+
+                    match crate::fs_tools::delete_directory(state.repo_path, path_str, recursive) {
+                        Ok(_) => {
+                            state.tool_successes += 1;
+                            wire.response_ok(
                             req_id,
                             serde_json::json!({
                                 "success": true,
@@ -2244,230 +2605,274 @@ pub async fn handle_acp_message(
                             }),
                         )
                         .await?;
-                    }
-                    Err(e) => {
-                        state.tool_failures += 1;
-                        wire.response_ok(
-                            req_id,
-                            serde_json::json!({
-                                "success": false,
-                                "path": path_str,
-                                "error": format!("{e:#}"),
-                            }),
-                        )
-                        .await?;
-                    }
-                }
-            }
-            crate::tool_surface::CanonicalToolName::GitStatus => {
-                let path_str = params.get("path").and_then(|p| p.as_str());
-
-                match crate::tool_surface::git_status(state.repo_path, path_str).await {
-                    Ok(res) => {
-                        state.tool_successes += 1;
-                        wire.response_ok(req_id, serde_json::to_value(res)?).await?;
-                    }
-                    Err(e) => {
-                        state.tool_failures += 1;
-                        wire.response_error(req_id, -32603, &e.to_string()).await?;
-                    }
-                }
-            }
-            crate::tool_surface::CanonicalToolName::GitDiff => {
-                let base = params.get("base").and_then(|p| p.as_str());
-                let path_str = params.get("path").and_then(|p| p.as_str());
-                let stat_only = params
-                    .get("stat_only")
-                    .and_then(|p| p.as_bool())
-                    .unwrap_or(false);
-                let context_lines = params
-                    .get("context_lines")
-                    .and_then(|p| p.as_u64())
-                    .map(|v| v as u32);
-
-                match crate::tool_surface::git_diff(
-                    state.repo_path,
-                    base,
-                    path_str,
-                    context_lines,
-                    stat_only,
-                    65536,
-                )
-                .await
-                {
-                    Ok(res) => {
-                        state.tool_successes += 1;
-                        wire.response_ok(req_id, serde_json::to_value(res)?).await?;
-                    }
-                    Err(e) => {
-                        state.tool_failures += 1;
-                        wire.response_error(req_id, -32603, &e.to_string()).await?;
-                    }
-                }
-            }
-            crate::tool_surface::CanonicalToolName::GitShow => {
-                let revision = params
-                    .get("revision")
-                    .and_then(|p| p.as_str())
-                    .unwrap_or("HEAD");
-                let path_str = params.get("path").and_then(|p| p.as_str());
-
-                match crate::tool_surface::git_show(state.repo_path, revision, path_str, 65536)
-                    .await
-                {
-                    Ok(res) => {
-                        state.tool_successes += 1;
-                        wire.response_ok(req_id, serde_json::to_value(res)?).await?;
-                    }
-                    Err(e) => {
-                        state.tool_failures += 1;
-                        wire.response_error(req_id, -32603, &e.to_string()).await?;
-                    }
-                }
-            }
-            crate::tool_surface::CanonicalToolName::TerminalCreate => {
-                let raw_cmd = params
-                    .get("command")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("sh");
-                let cwd_str = params.get("cwd").and_then(|v| v.as_str()).unwrap_or(".");
-                let cwd = match crate::fs_tools::confine_path(state.repo_path, cwd_str, true, true)
-                {
-                    Ok(p) => p,
-                    Err(e) => {
-                        state.tool_failures += 1;
-                        wire.response_error(
-                            req_id,
-                            -32603,
-                            &format!("{}: {e}", crate::tool_surface::ERR_PATH_OUTSIDE_WORKSPACE),
-                        )
-                        .await?;
-                        return Ok(());
-                    }
-                };
-                let (cmd_bin, cmd_args) =
-                    if let Some(arr) = params.get("args").and_then(|v| v.as_array()) {
-                        let mut v = Vec::new();
-                        for a in arr {
-                            if let Some(s) = a.as_str() {
-                                v.push(s.to_string());
-                            }
                         }
-                        (raw_cmd.to_string(), v)
-                    } else {
-                        (
-                            "sh".to_string(),
-                            vec!["-c".to_string(), raw_cmd.to_string()],
-                        )
-                    };
-                let output_byte_limit = params
-                    .get("output_byte_limit")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(65536)
-                    .min(65536) as usize;
-                match crate::tool_surface::AgentTerminal::spawn(
-                    &cwd,
-                    &cmd_bin,
-                    &cmd_args,
-                    output_byte_limit,
-                ) {
-                    Ok(term) => {
-                        let tid = format!("term-{}", crate::model::id());
-                        state
-                            .terminals
-                            .insert(tid.clone(), std::sync::Arc::new(term));
-                        state.tool_successes += 1;
-                        wire.response_ok(req_id, serde_json::json!({ "terminalId": tid }))
-                            .await?;
-                    }
-                    Err(e) => {
-                        state.tool_failures += 1;
-                        wire.response_error(req_id, -32603, &e.to_string()).await?;
-                    }
-                }
-            }
-            crate::tool_surface::CanonicalToolName::TerminalOutput => {
-                let tid = params
-                    .get("terminalId")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if let Some(term) = state.terminals.get(tid) {
-                    let out = term.output();
-                    let exit_status = out.exit_code.map(|c| serde_json::json!({ "exitCode": c }));
-                    state.tool_successes += 1;
-                    wire.response_ok(
-                        req_id,
-                        serde_json::json!({
-                            "output": out.text(),
-                            "truncated": out.truncated,
-                            "exitStatus": exit_status,
-                        }),
-                    )
-                    .await?;
-                } else {
-                    state.tool_failures += 1;
-                    wire.response_error(req_id, -32603, crate::tool_surface::ERR_PROCESS_NOT_FOUND)
-                        .await?;
-                }
-            }
-            crate::tool_surface::CanonicalToolName::TerminalWaitForExit => {
-                let tid = params
-                    .get("terminalId")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let term_opt = state.terminals.get(tid).cloned();
-                if let Some(term) = term_opt {
-                    match term.wait_for_exit(Duration::from_secs(300)).await {
-                        Ok(code) => {
-                            state.tool_successes += 1;
+                        Err(e) => {
+                            state.tool_failures += 1;
                             wire.response_ok(
                                 req_id,
                                 serde_json::json!({
-                                    "exitStatus": { "exitCode": code }
+                                    "success": false,
+                                    "path": path_str,
+                                    "error": format!("{e:#}"),
                                 }),
                             )
                             .await?;
+                        }
+                    }
+                }
+                crate::tool_surface::CanonicalToolName::GitStatus => {
+                    let path_str = params.get("path").and_then(|p| p.as_str());
+
+                    match crate::tool_surface::git_status(state.repo_path, path_str).await {
+                        Ok(res) => {
+                            state.tool_successes += 1;
+                            wire.response_ok(req_id, serde_json::to_value(res)?).await?;
                         }
                         Err(e) => {
                             state.tool_failures += 1;
                             wire.response_error(req_id, -32603, &e.to_string()).await?;
                         }
                     }
-                } else {
-                    state.tool_failures += 1;
-                    wire.response_error(req_id, -32603, crate::tool_surface::ERR_PROCESS_NOT_FOUND)
+                }
+                crate::tool_surface::CanonicalToolName::GitDiff => {
+                    let base = params.get("base").and_then(|p| p.as_str());
+                    let path_str = params.get("path").and_then(|p| p.as_str());
+                    let stat_only = params
+                        .get("stat_only")
+                        .and_then(|p| p.as_bool())
+                        .unwrap_or(false);
+                    let context_lines = params
+                        .get("context_lines")
+                        .and_then(|p| p.as_u64())
+                        .map(|v| v as u32);
+
+                    match crate::tool_surface::git_diff(
+                        state.repo_path,
+                        base,
+                        path_str,
+                        context_lines,
+                        stat_only,
+                        65536,
+                    )
+                    .await
+                    {
+                        Ok(res) => {
+                            state.tool_successes += 1;
+                            wire.response_ok(req_id, serde_json::to_value(res)?).await?;
+                        }
+                        Err(e) => {
+                            state.tool_failures += 1;
+                            wire.response_error(req_id, -32603, &e.to_string()).await?;
+                        }
+                    }
+                }
+                crate::tool_surface::CanonicalToolName::GitShow => {
+                    let revision = params
+                        .get("revision")
+                        .and_then(|p| p.as_str())
+                        .unwrap_or("HEAD");
+                    let path_str = params.get("path").and_then(|p| p.as_str());
+
+                    match crate::tool_surface::git_show(state.repo_path, revision, path_str, 65536)
+                        .await
+                    {
+                        Ok(res) => {
+                            state.tool_successes += 1;
+                            wire.response_ok(req_id, serde_json::to_value(res)?).await?;
+                        }
+                        Err(e) => {
+                            state.tool_failures += 1;
+                            wire.response_error(req_id, -32603, &e.to_string()).await?;
+                        }
+                    }
+                }
+                crate::tool_surface::CanonicalToolName::TerminalCreate => {
+                    let raw_cmd = params
+                        .get("command")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("sh");
+                    let cwd_str = params.get("cwd").and_then(|v| v.as_str()).unwrap_or(".");
+                    let cwd =
+                        match crate::fs_tools::confine_path(state.repo_path, cwd_str, true, true) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                state.tool_failures += 1;
+                                wire.response_error(
+                                    req_id,
+                                    -32603,
+                                    &format!(
+                                        "{}: {e}",
+                                        crate::tool_surface::ERR_PATH_OUTSIDE_WORKSPACE
+                                    ),
+                                )
+                                .await?;
+                                return Ok(());
+                            }
+                        };
+                    let (cmd_bin, cmd_args) =
+                        if let Some(arr) = params.get("args").and_then(|v| v.as_array()) {
+                            let mut v = Vec::new();
+                            for a in arr {
+                                if let Some(s) = a.as_str() {
+                                    v.push(s.to_string());
+                                }
+                            }
+                            (raw_cmd.to_string(), v)
+                        } else {
+                            (
+                                "sh".to_string(),
+                                vec!["-c".to_string(), raw_cmd.to_string()],
+                            )
+                        };
+                    let output_byte_limit = params
+                        .get("output_byte_limit")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(65536)
+                        .min(65536) as usize;
+                    match crate::tool_surface::AgentTerminal::spawn(
+                        &cwd,
+                        &cmd_bin,
+                        &cmd_args,
+                        output_byte_limit,
+                    ) {
+                        Ok(term) => {
+                            let tid = format!("term-{}", crate::model::id());
+                            state
+                                .terminals
+                                .insert(tid.clone(), std::sync::Arc::new(term));
+                            state.tool_successes += 1;
+                            wire.response_ok(req_id, serde_json::json!({ "terminalId": tid }))
+                                .await?;
+                        }
+                        Err(e) => {
+                            state.tool_failures += 1;
+                            wire.response_error(req_id, -32603, &e.to_string()).await?;
+                        }
+                    }
+                }
+                crate::tool_surface::CanonicalToolName::TerminalOutput => {
+                    let tid = params
+                        .get("terminalId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if let Some(term) = state.terminals.get(tid) {
+                        let out = term.output();
+                        let exit_status =
+                            out.exit_code.map(|c| serde_json::json!({ "exitCode": c }));
+                        state.tool_successes += 1;
+                        wire.response_ok(
+                            req_id,
+                            serde_json::json!({
+                                "output": out.text(),
+                                "truncated": out.truncated,
+                                "exitStatus": exit_status,
+                            }),
+                        )
                         .await?;
+                    } else {
+                        state.tool_failures += 1;
+                        wire.response_error(
+                            req_id,
+                            -32603,
+                            crate::tool_surface::ERR_PROCESS_NOT_FOUND,
+                        )
+                        .await?;
+                    }
+                }
+                crate::tool_surface::CanonicalToolName::TerminalWaitForExit => {
+                    let tid = params
+                        .get("terminalId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let term_opt = state.terminals.get(tid).cloned();
+                    if let Some(term) = term_opt {
+                        match term.wait_for_exit(Duration::from_secs(300)).await {
+                            Ok(code) => {
+                                state.tool_successes += 1;
+                                wire.response_ok(
+                                    req_id,
+                                    serde_json::json!({
+                                        "exitStatus": { "exitCode": code }
+                                    }),
+                                )
+                                .await?;
+                            }
+                            Err(e) => {
+                                state.tool_failures += 1;
+                                wire.response_error(req_id, -32603, &e.to_string()).await?;
+                            }
+                        }
+                    } else {
+                        state.tool_failures += 1;
+                        wire.response_error(
+                            req_id,
+                            -32603,
+                            crate::tool_surface::ERR_PROCESS_NOT_FOUND,
+                        )
+                        .await?;
+                    }
+                }
+                crate::tool_surface::CanonicalToolName::TerminalKill => {
+                    let tid = params
+                        .get("terminalId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if let Some(term) = state.terminals.get(tid) {
+                        let _ = term.kill().await;
+                        state.tool_successes += 1;
+                        wire.response_ok(req_id, serde_json::json!({})).await?;
+                    } else {
+                        state.tool_failures += 1;
+                        wire.response_error(
+                            req_id,
+                            -32603,
+                            crate::tool_surface::ERR_PROCESS_NOT_FOUND,
+                        )
+                        .await?;
+                    }
+                }
+                crate::tool_surface::CanonicalToolName::TerminalRelease => {
+                    let tid = params
+                        .get("terminalId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if let Some(term) = state.terminals.remove(tid) {
+                        let _ = term.kill().await;
+                        state.tool_successes += 1;
+                        wire.response_ok(req_id, serde_json::json!({})).await?;
+                    } else {
+                        state.tool_failures += 1;
+                        wire.response_error(
+                            req_id,
+                            -32603,
+                            crate::tool_surface::ERR_PROCESS_NOT_FOUND,
+                        )
+                        .await?;
+                    }
                 }
             }
-            crate::tool_surface::CanonicalToolName::TerminalKill => {
-                let tid = params
-                    .get("terminalId")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if let Some(term) = state.terminals.get(tid) {
-                    let _ = term.kill().await;
-                    state.tool_successes += 1;
-                    wire.response_ok(req_id, serde_json::json!({})).await?;
-                } else {
-                    state.tool_failures += 1;
-                    wire.response_error(req_id, -32603, crate::tool_surface::ERR_PROCESS_NOT_FOUND)
-                        .await?;
-                }
+            Ok::<(), anyhow::Error>(())
+        };
+        match tokio::time::timeout(Duration::from_secs(meta.default_timeout_seconds), operation)
+            .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                state.tool_failures += 1;
+                wire.response_error(
+                    timeout_request_id,
+                    -32603,
+                    crate::tool_surface::ERR_COMMAND_TIMEOUT,
+                )
+                .await?;
             }
-            crate::tool_surface::CanonicalToolName::TerminalRelease => {
-                let tid = params
-                    .get("terminalId")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if let Some(term) = state.terminals.remove(tid) {
-                    let _ = term.kill().await;
-                    state.tool_successes += 1;
-                    wire.response_ok(req_id, serde_json::json!({})).await?;
-                } else {
-                    state.tool_failures += 1;
-                    wire.response_error(req_id, -32603, crate::tool_surface::ERR_PROCESS_NOT_FOUND)
-                        .await?;
-                }
+        }
+        if wire.take_response_limit_hit() {
+            if state.tool_successes > successes_before {
+                state.tool_successes -= 1;
+            }
+            if state.tool_failures == failures_before {
+                state.tool_failures += 1;
             }
         }
         Ok(())
@@ -2493,6 +2898,114 @@ async fn acp_call(
     }
 }
 
+fn validate_role_credential_target(
+    target: &ResolvedExecutionTarget,
+    credential: &crate::credential_registry::Credential,
+) -> Result<()> {
+    let generation = target
+        .credential_generation
+        .context("CREDENTIAL_PIN_REQUIRED")?;
+    ensure!(
+        target.credential_id.as_deref() == Some(credential.reference.as_str())
+            && credential.provider == target.provider
+            && credential.generation == u64::from(generation)
+            && credential.status == crate::credential_registry::CredentialStatus::Enrolled,
+        "CREDENTIAL_GENERATION_CHANGED: selected credential reference, provider, status, or generation changed before execution"
+    );
+    Ok(())
+}
+
+struct RoleModelEvidence<'a> {
+    requested: Option<&'a str>,
+    configured: Option<&'a str>,
+    observed: Option<&'a str>,
+}
+
+fn role_model_evidence<'a>(
+    target: &'a ResolvedExecutionTarget,
+    observed: Option<&'a str>,
+) -> RoleModelEvidence<'a> {
+    RoleModelEvidence {
+        requested: target.requested_model.as_deref(),
+        configured: target.resolved_model.as_deref(),
+        observed,
+    }
+}
+
+#[derive(Debug)]
+struct SupervisorEvidence {
+    exit_code: Option<i32>,
+    cleanup_confirmed: bool,
+    failure: Option<String>,
+}
+
+fn classify_supervisor_evidence(
+    status: std::process::ExitStatus,
+    cleanup: Result<i32>,
+) -> SupervisorEvidence {
+    use std::os::unix::process::ExitStatusExt;
+    let exit_code = status
+        .code()
+        .or_else(|| status.signal().map(|signal| 128 + signal));
+    let mut failure = (!status.success()).then(|| format!("ROLE_SUPERVISOR_EXIT_FAILED: {status}"));
+    let cleanup_confirmed = match cleanup {
+        Ok(receipt_code) if Some(receipt_code) == exit_code => true,
+        Ok(receipt_code) => {
+            failure.get_or_insert_with(|| format!(
+                "ROLE_CLEANUP_UNCONFIRMED: supervisor exit {exit_code:?} differs from receipt {receipt_code}"
+            ));
+            false
+        }
+        Err(error) => {
+            failure.get_or_insert_with(|| format!("ROLE_CLEANUP_UNCONFIRMED: {error:#}"));
+            false
+        }
+    };
+    SupervisorEvidence {
+        exit_code,
+        cleanup_confirmed,
+        failure,
+    }
+}
+
+fn validate_role_turn_completion(output: &str, evidence: &SupervisorEvidence) -> Result<()> {
+    if let Some(reason) = evidence.failure.as_deref() {
+        bail!("{reason}");
+    }
+    ensure!(evidence.cleanup_confirmed, "ROLE_CLEANUP_UNCONFIRMED");
+    ensure!(
+        output.contains(ORBIT_HANDOFF_START) && output.contains(ORBIT_HANDOFF_END),
+        "ROLE_OUTPUT_INVALID: missing structured handoff block"
+    );
+    Ok(())
+}
+
+async fn wait_cli_supervisor(
+    child: &mut tokio::process::Child,
+    wait_timeout: Duration,
+    kill_timeout: Duration,
+) -> Result<std::process::ExitStatus> {
+    match tokio::time::timeout(wait_timeout, child.wait()).await {
+        Ok(Ok(status)) => Ok(status),
+        Ok(Err(error)) => {
+            Err(UnconfirmedRoleCleanup(format!("supervisor wait failed: {error}")).into())
+        }
+        Err(_) => {
+            if let Some(pid) = child.id() {
+                unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+            }
+            child.start_kill().map_err(|error| {
+                UnconfirmedRoleCleanup(format!("kill timed-out supervisor failed: {error}"))
+            })?;
+            tokio::time::timeout(kill_timeout, child.wait())
+                .await
+                .map_err(|_| UnconfirmedRoleCleanup("supervisor did not exit after kill".into()))?
+                .map_err(|error| UnconfirmedRoleCleanup(format!("supervisor reap failed: {error}")))
+                .map_err(Into::into)
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_real_acp_turn(
     pool: &PgPool,
@@ -2503,31 +3016,21 @@ async fn execute_real_acp_turn(
     task_text: &str,
     repo_path: &Path,
     input_handoff: Option<&HandoffArtifact>,
+    mut cancellation: tokio::sync::watch::Receiver<bool>,
 ) -> Result<RoleExecutionOutcome> {
     let agent_exec_id = format!("acp-exec-{}", id());
     let started_at_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
 
     let cred_store = CredentialStore::new(pool);
-    let credential = if let Some(cid) = &target.credential_id {
-        cred_store
-            .get(cid)
-            .await?
-            .context("target credential not found")?
-    } else {
-        let cred_view = cred_store
-            .list()
-            .await?
-            .into_iter()
-            .find(|c| {
-                c.provider == target.provider
-                    && c.status == crate::credential_registry::CredentialStatus::Enrolled
-            })
-            .context("no enrolled credential found for provider")?;
-        cred_store
-            .get(&cred_view.reference)
-            .await?
-            .context("credential not found")?
-    };
+    let credential_ref = target
+        .credential_id
+        .as_deref()
+        .context("CREDENTIAL_PIN_REQUIRED")?;
+    let credential = cred_store
+        .get(credential_ref)
+        .await?
+        .context("target credential not found")?;
+    validate_role_credential_target(target, &credential)?;
 
     let backend = LocalPrivateSecretBackend::default_for_operator()?;
 
@@ -2759,6 +3262,11 @@ async fn execute_real_acp_turn(
     };
 
     let request_path = scratch_dir.path().join("request.json");
+    let current_credential = cred_store
+        .get(credential_ref)
+        .await?
+        .context("target credential disappeared before execution")?;
+    validate_role_credential_target(target, &current_credential)?;
     let req = crate::acp_process::Request {
         runtime,
         attempt_id: id(),
@@ -2787,6 +3295,7 @@ async fn execute_real_acp_turn(
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
+    command.process_group(0);
 
     if let Some(val) = std::env::var_os("XDG_RUNTIME_DIR") {
         command.env("XDG_RUNTIME_DIR", val);
@@ -2801,6 +3310,9 @@ async fn execute_real_acp_turn(
     let mut state = AcpTurnState {
         repo_path,
         workspace_access: role.workspace_access,
+        role_id: Some(role.role_id.clone()),
+        workspace_identity: wf_run.repository_path.clone(),
+        tool_call_limit: 64,
         agent_output: String::new(),
         tool_calls: 0,
         tool_successes: 0,
@@ -2812,6 +3324,8 @@ async fn execute_real_acp_turn(
         pool: Some(pool),
     };
 
+    let turn = tokio::select! {
+        result = async {
     let _init_res = acp_call(
         &mut wire,
         &mut state,
@@ -2882,17 +3396,10 @@ async fn execute_real_acp_turn(
     }
 
     let git_diff = if role.role_id == "reviewer" {
-        let base = wf_run.base_revision.as_deref().unwrap_or("HEAD");
-        let out = tokio::process::Command::new("git")
-            .arg("-C")
-            .arg(repo_path)
-            .args(["diff", "--no-ext-diff", base, "--"])
-            .output()
-            .await;
-        match out {
-            Ok(o) => String::from_utf8(o.stdout).ok(),
-            Err(_) => None,
-        }
+        Some(
+            review_candidate_diff(repo_path, wf_run.base_revision.as_deref().unwrap_or("HEAD"))
+                .await?,
+        )
     } else {
         None
     };
@@ -2927,53 +3434,58 @@ async fn execute_real_acp_turn(
     if !state.agent_output.contains(ORBIT_HANDOFF_START) {
         extract_text_from_json(&prompt_res, &mut state.agent_output);
     }
+    Ok::<(), anyhow::Error>(())
+        } => result,
+        _ = async {
+            if *cancellation.borrow() { return; }
+            while cancellation.changed().await.is_ok() {
+                if *cancellation.borrow() { return; }
+            }
+            std::future::pending::<()>().await;
+        } => Err(anyhow::anyhow!("ROLE_EXECUTION_CANCELLED")),
+        _ = tokio::time::sleep(Duration::from_secs(600)) => Err(anyhow::anyhow!("ROLE_SUPERVISOR_TIMEOUT")),
+    };
 
     drop(wire);
-    let status = child.wait().await?;
-    let exit_code = status.code().unwrap_or(0);
+    let wait_limit = if turn.is_err() { 5 } else { 60 };
+    let status = wait_cli_supervisor(
+        &mut child,
+        Duration::from_secs(wait_limit),
+        Duration::from_secs(10),
+    )
+    .await?;
+    let evidence = classify_supervisor_evidence(
+        status,
+        crate::acp_process::read_cleanup(&request_path, Some(&req.attempt_id)),
+    );
     for (_tid, term) in std::mem::take(&mut state.terminals) {
-        let _ = term.kill().await;
+        term.kill()
+            .await
+            .map_err(|error| UnconfirmedRoleCleanup(format!("terminal cleanup failed: {error}")))?;
     }
 
     let finished_at_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
 
     let store = WorkflowStore::new(pool.clone());
 
-    if !state.agent_output.contains(ORBIT_HANDOFF_START)
-        || !state.agent_output.contains(ORBIT_HANDOFF_END)
-    {
-        let _ = store
-            .insert_agent_execution(
-                &agent_exec_id,
-                &role_exec.id,
-                &format!("{}-acp", target.provider),
-                Some(&target.provider),
-                target.resolved_model.as_deref(),
-                started_at_ms,
-                Some(finished_at_ms),
-                "FAILED",
-                Some("ROLE_OUTPUT_INVALID"),
-                Some(exit_code),
-                Some("Missing structured handoff block in agent output"),
-                target.resolved_model.as_deref(),
-                target.resolved_model.as_deref(),
-                target.resolved_model.as_deref(),
-                1,
-                state.tool_calls as i64,
-                state.tool_successes as i64,
-                state.tool_failures as i64,
-                &serde_json::to_value(&state.tool_counts)?,
-                &serde_json::json!({ "provider": target.provider }),
-            )
-            .await;
-        let _ = store
-            .record_agent_execution(&role_exec.id, &agent_exec_id)
-            .await;
-        bail!(
-            "ROLE_OUTPUT_INVALID: missing structured handoff block <<<ORBIT_HANDOFF_START>>> in ACP agent output"
-        );
+    let mut failure = turn.err();
+    if let Err(error) = validate_role_turn_completion(&state.agent_output, &evidence) {
+        failure.get_or_insert(error);
     }
-
+    let status_text = if failure.is_some() {
+        "FAILED"
+    } else {
+        "SUCCEEDED"
+    };
+    let reason = if failure.is_some() {
+        "local execution unconfirmed"
+    } else {
+        "completed"
+    };
+    let failure_message = failure
+        .as_ref()
+        .map(|error| error.to_string().chars().take(512).collect::<String>());
+    let model_evidence = role_model_evidence(target, None);
     store
         .insert_agent_execution(
             &agent_exec_id,
@@ -2983,24 +3495,35 @@ async fn execute_real_acp_turn(
             target.resolved_model.as_deref(),
             started_at_ms,
             Some(finished_at_ms),
-            "SUCCEEDED",
-            Some("completed"),
-            Some(exit_code),
-            None,
-            target.resolved_model.as_deref(),
-            target.resolved_model.as_deref(),
-            target.resolved_model.as_deref(),
+            status_text,
+            Some(reason),
+            evidence.exit_code,
+            failure_message.as_deref(),
+            model_evidence.requested,
+            model_evidence.configured,
+            model_evidence.observed,
             1,
             state.tool_calls as i64,
             state.tool_successes as i64,
             state.tool_failures as i64,
             &serde_json::to_value(&state.tool_counts)?,
-            &serde_json::json!({ "provider": target.provider }),
+            &serde_json::json!({ "provider": target.provider, "cleanup_confirmed": evidence.cleanup_confirmed, "observed_model": null }),
         )
         .await?;
     store
         .record_agent_execution(&role_exec.id, &agent_exec_id)
         .await?;
+
+    if !evidence.cleanup_confirmed {
+        return Err(UnconfirmedRoleCleanup(
+            failure_message.unwrap_or_else(|| "missing matching cleanup receipt".into()),
+        )
+        .into());
+    }
+
+    if let Some(error) = failure {
+        return Err(error);
+    }
 
     Ok(RoleExecutionOutcome {
         raw_output: state.agent_output,
@@ -3024,6 +3547,7 @@ impl RoleAgentExecutor for RealAcpRoleExecutor {
         task_text: &str,
         repo_path: &Path,
         input_handoff: Option<&HandoffArtifact>,
+        cancellation: tokio::sync::watch::Receiver<bool>,
     ) -> Result<RoleExecutionOutcome> {
         // Enforce role permissions and capabilities:
         // Planner & Reviewer: read-only, only read_file tool.
@@ -3050,6 +3574,7 @@ impl RoleAgentExecutor for RealAcpRoleExecutor {
             task_text,
             repo_path,
             input_handoff,
+            cancellation,
         )
         .await
     }
@@ -3059,6 +3584,98 @@ impl RoleAgentExecutor for RealAcpRoleExecutor {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn git_fixture(repo: &Path, args: &[&str]) -> Result<String> {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "git fixture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(String::from_utf8(output.stdout)?.trim().to_string())
+    }
+
+    #[tokio::test]
+    async fn candidate_v2_accounts_for_tracked_and_untracked_changes() -> Result<()> {
+        let repo = tempdir()?;
+        git_fixture(repo.path(), &["init", "-q"])?;
+        git_fixture(
+            repo.path(),
+            &["config", "user.email", "orbit@example.invalid"],
+        )?;
+        git_fixture(repo.path(), &["config", "user.name", "Orbit fixture"])?;
+        std::fs::write(repo.path().join("tracked.txt"), b"original")?;
+        git_fixture(repo.path(), &["add", "tracked.txt"])?;
+        git_fixture(repo.path(), &["commit", "-qm", "base"])?;
+        let baseline = git_fixture(repo.path(), &["rev-parse", "HEAD"])?;
+        let clean = compute_workspace_state(repo.path(), &baseline).await?;
+        assert_eq!(clean.digest_version, 2);
+
+        std::fs::write(repo.path().join("new.txt"), b"first")?;
+        let untracked = compute_workspace_state(repo.path(), &baseline).await?;
+        assert_ne!(clean.state_id, untracked.state_id);
+        std::fs::write(repo.path().join("new.txt"), b"second")?;
+        let changed_untracked = compute_workspace_state(repo.path(), &baseline).await?;
+        assert_ne!(untracked.state_id, changed_untracked.state_id);
+
+        git_fixture(repo.path(), &["add", "new.txt"])?;
+        let staged_addition = compute_workspace_state(repo.path(), &baseline).await?;
+        assert_ne!(staged_addition.state_id, clean.state_id);
+        std::fs::remove_file(repo.path().join("tracked.txt"))?;
+        let deletion = compute_workspace_state(repo.path(), &baseline).await?;
+        assert_ne!(staged_addition.state_id, deletion.state_id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn git_failure_and_non_git_read_failure_cannot_look_clean() -> Result<()> {
+        let bad_git = tempdir()?;
+        std::fs::create_dir(bad_git.path().join(".git"))?;
+        assert!(
+            compute_workspace_state(bad_git.path(), "HEAD")
+                .await
+                .is_err()
+        );
+
+        let plain = tempdir()?;
+        std::fs::create_dir(plain.path().join("nested"))?;
+        std::fs::write(plain.path().join("nested/file.txt"), b"one")?;
+        let first = compute_workspace_state(plain.path(), "base").await?;
+        std::fs::write(plain.path().join("nested/file.txt"), b"two")?;
+        let second = compute_workspace_state(plain.path(), "base").await?;
+        assert_ne!(first.state_id, second.state_id);
+        assert!(hash_candidate(plain.path(), &[], &[PathBuf::from("missing.txt")]).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reviewer_diff_contains_untracked_bytes_and_reports_git_failure() -> Result<()> {
+        let repo = tempdir()?;
+        git_fixture(repo.path(), &["init", "-q"])?;
+        git_fixture(
+            repo.path(),
+            &["config", "user.email", "orbit@example.invalid"],
+        )?;
+        git_fixture(repo.path(), &["config", "user.name", "Orbit fixture"])?;
+        std::fs::write(repo.path().join("tracked.txt"), b"base")?;
+        git_fixture(repo.path(), &["add", "tracked.txt"])?;
+        git_fixture(repo.path(), &["commit", "-qm", "base"])?;
+        let baseline = git_fixture(repo.path(), &["rev-parse", "HEAD"])?;
+        std::fs::write(repo.path().join("untracked.txt"), b"review these bytes")?;
+        let diff = review_candidate_diff(repo.path(), &baseline).await?;
+        assert!(diff.contains("untracked.txt"));
+        assert!(diff.contains("review these bytes"));
+        assert!(
+            review_candidate_diff(repo.path(), "missing-revision")
+                .await
+                .is_err()
+        );
+        Ok(())
+    }
 
     fn make_test_wire() -> (Wire, Wire) {
         let (client_r, server_w) = tokio::io::duplex(65536);
@@ -3075,6 +3692,8 @@ mod tests {
         let (mut server_wire, mut client_wire) = make_test_wire();
 
         let mut state = AcpTurnState::new(repo_path, WorkspaceAccess::ReadWrite);
+        state.role_id = Some("implementer".into());
+        state.workspace_identity = Some(repo_path.canonicalize()?.to_string_lossy().into_owned());
 
         let msg = serde_json::json!({
             "id": 1,
@@ -3185,5 +3804,105 @@ mod tests {
         assert!(!source.contains("tier-cargo-plan"));
         assert!(!source.contains("tier-docs-plan"));
         assert!(!source.contains("unwrap_or_else(|| vec![\"true\".into()])"));
+    }
+
+    #[test]
+    fn s7_handoff_needs_successful_supervisor_and_matching_cleanup() {
+        use std::os::unix::process::ExitStatusExt;
+        let handoff = format!("{ORBIT_HANDOFF_START}\n{{}}\n{ORBIT_HANDOFF_END}");
+        let nonzero =
+            classify_supervisor_evidence(std::process::ExitStatus::from_raw(7 << 8), Ok(7));
+        assert!(nonzero.cleanup_confirmed);
+        assert_eq!(nonzero.exit_code, Some(7));
+        assert!(
+            validate_role_turn_completion(&handoff, &nonzero)
+                .unwrap_err()
+                .to_string()
+                .contains("ROLE_SUPERVISOR_EXIT_FAILED")
+        );
+
+        let signal = classify_supervisor_evidence(
+            std::process::ExitStatus::from_raw(libc::SIGTERM),
+            Ok(128 + libc::SIGTERM),
+        );
+        assert_eq!(signal.exit_code, Some(128 + libc::SIGTERM));
+        assert!(validate_role_turn_completion(&handoff, &signal).is_err());
+
+        let missing = classify_supervisor_evidence(
+            std::process::ExitStatus::from_raw(0),
+            Err(anyhow::anyhow!("missing receipt")),
+        );
+        assert!(!missing.cleanup_confirmed);
+        assert!(
+            validate_role_turn_completion(&handoff, &missing)
+                .unwrap_err()
+                .to_string()
+                .contains("ROLE_CLEANUP_UNCONFIRMED")
+        );
+
+        let successful = classify_supervisor_evidence(std::process::ExitStatus::from_raw(0), Ok(0));
+        assert!(validate_role_turn_completion(&handoff, &successful).is_ok());
+    }
+
+    #[tokio::test]
+    async fn s7_supervisor_wait_is_bounded_and_kills_process_group() -> Result<()> {
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .args(["-c", "sleep 30"])
+            .process_group(0)
+            .kill_on_drop(true);
+        let mut child = command.spawn()?;
+        let started = tokio::time::Instant::now();
+        let status = wait_cli_supervisor(
+            &mut child,
+            Duration::from_millis(50),
+            Duration::from_secs(2),
+        )
+        .await?;
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(!status.success());
+        Ok(())
+    }
+
+    #[test]
+    fn s7_wrong_credential_generation_is_rejected() {
+        let target = ResolvedExecutionTarget {
+            provider: "codex".into(),
+            runtime_interface: "codex-acp".into(),
+            credential_id: Some("codex-main".into()),
+            credential_generation: Some(3),
+            requested_model: Some("requested".into()),
+            resolved_model: Some("configured".into()),
+            runtime_image_digest: None,
+            resolution_reason: "test".into(),
+        };
+        let credential = crate::credential_registry::Credential {
+            id: "fixture".into(),
+            provider: "codex".into(),
+            reference: "codex-main".into(),
+            generation: 4,
+            endpoint: None,
+            auth_type: "local-session".into(),
+            secret_backend: "local-private".into(),
+            secret_locator: None,
+            status: crate::credential_registry::CredentialStatus::Enrolled,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
+        let provenance = role_model_evidence(&target, None);
+        assert_eq!(provenance.requested, Some("requested"));
+        assert_eq!(provenance.configured, Some("configured"));
+        assert_eq!(provenance.observed, None);
+        assert!(
+            validate_role_credential_target(&target, &credential)
+                .unwrap_err()
+                .to_string()
+                .contains("CREDENTIAL_GENERATION_CHANGED")
+        );
+        let same = crate::credential_registry::Credential {
+            generation: 3,
+            ..credential
+        };
+        assert!(validate_role_credential_target(&target, &same).is_ok());
     }
 }

@@ -23,6 +23,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use crate::{
     model::id,
@@ -546,6 +547,14 @@ pub struct HandoffArtifact {
 pub struct WorkflowStore {
     pool: PgPool,
     verification_store: VerificationStore,
+    step_claim: Option<StepClaim>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StepClaim {
+    pub workflow_run_id: String,
+    pub owner_id: String,
+    pub generation: i64,
 }
 
 impl WorkflowStore {
@@ -554,7 +563,141 @@ impl WorkflowStore {
         Self {
             pool,
             verification_store,
+            step_claim: None,
         }
+    }
+
+    pub fn with_step_claim(&self, claim: StepClaim) -> Self {
+        let mut owned = self.clone();
+        owned.step_claim = Some(claim);
+        owned
+    }
+
+    /// A claim is one short PostgreSQL update. Provider I/O happens after it commits.
+    pub async fn claim_workflow_step(&self, wf_id: &str) -> Result<Option<StepClaim>> {
+        let owner_id = format!("step-{}", id());
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis() as i64;
+        let generation = sqlx::query_scalar::<_, i64>(
+            "UPDATE orbit_workflow_runs SET step_owner_id = $2, step_generation = step_generation + 1, step_owner_pid = $3, step_owner_started_at_ms = $4 WHERE id = $1 AND step_owner_id IS NULL AND status NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'EXHAUSTED') RETURNING step_generation",
+        )
+        .bind(wf_id)
+        .bind(&owner_id)
+        .bind(std::process::id() as i32)
+        .bind(now_ms)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(generation.map(|generation| StepClaim {
+            workflow_run_id: wf_id.to_owned(),
+            owner_id,
+            generation,
+        }))
+    }
+
+    /// Reclaim a dead coordinator only when no role or verification process can
+    /// still own external work. A live or uncertain owner remains fenced.
+    pub async fn recover_orphaned_workflow_step(&self, wf_id: &str) -> Result<bool> {
+        let row = sqlx::query(
+            "SELECT step_owner_id, step_owner_pid, step_generation FROM orbit_workflow_runs WHERE id = $1",
+        )
+        .bind(wf_id)
+        .fetch_one(&self.pool)
+        .await?;
+        let Some(owner_id) = row.get::<Option<String>, _>("step_owner_id") else {
+            return Ok(false);
+        };
+        let pid: Option<i32> = row.get("step_owner_pid");
+        let generation: i64 = row.get("step_generation");
+        if pid.is_some_and(|pid| pid > 0 && Path::new(&format!("/proc/{pid}")).exists()) {
+            return Ok(false);
+        }
+        let active_roles: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM orbit_role_executions WHERE workflow_run_id = $1 AND status IN ('RESOLVING', 'RUNNING')",
+        )
+        .bind(wf_id)
+        .fetch_one(&self.pool)
+        .await?;
+        ensure!(
+            active_roles == 0,
+            "WORKFLOW_RECOVERY_REQUIRES_EXTERNAL_RECONCILIATION: an unfinished role may still have effects"
+        );
+        let active_verifications: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM orbit_verification_runs vr JOIN orbit_workflow_runs wf ON vr.attempt_id = wf.attempt_id WHERE wf.id = $1 AND vr.status IN ('PENDING', 'RUNNING')",
+        )
+        .bind(wf_id)
+        .fetch_one(&self.pool)
+        .await?;
+        ensure!(
+            active_verifications == 0,
+            "WORKFLOW_RECOVERY_REQUIRES_EXTERNAL_RECONCILIATION: verification may still be running"
+        );
+        let mut tx = self.pool.begin().await?;
+        let released = sqlx::query(
+            "UPDATE orbit_workflow_runs SET step_owner_id = NULL, step_owner_pid = NULL, step_owner_started_at_ms = NULL, step_generation = step_generation + 1 WHERE id = $1 AND step_owner_id = $2 AND step_generation = $3",
+        )
+        .bind(wf_id)
+        .bind(&owner_id)
+        .bind(generation)
+        .execute(&mut *tx)
+        .await?;
+        if released.rows_affected() == 1 {
+            sqlx::query(
+                "UPDATE orbit_role_executions SET status = 'FAILED', termination_reason = 'STEP_OWNER_LOST_BEFORE_ROLE_START' WHERE workflow_run_id = $1 AND status = 'PENDING'",
+            )
+            .bind(wf_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "DELETE FROM orbit_attempt_workspace_locks locks USING orbit_role_executions re WHERE locks.holder_role_execution_id = re.id AND re.workflow_run_id = $1 AND re.status IN ('SUCCEEDED', 'FAILED', 'CANCELLED') AND NOT EXISTS (SELECT 1 FROM orbit_agent_executions ae WHERE ae.role_execution_id = re.id AND ae.status IN ('PENDING', 'RUNNING'))",
+            )
+            .bind(wf_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(released.rows_affected() == 1)
+    }
+
+    pub async fn release_workflow_step(&self, claim: &StepClaim) -> Result<()> {
+        let result = sqlx::query(
+            "UPDATE orbit_workflow_runs SET step_owner_id = NULL, step_owner_pid = NULL, step_owner_started_at_ms = NULL WHERE id = $1 AND step_owner_id = $2 AND step_generation = $3",
+        )
+        .bind(&claim.workflow_run_id)
+        .bind(&claim.owner_id)
+        .bind(claim.generation)
+        .execute(&self.pool)
+        .await?;
+        ensure!(result.rows_affected() == 1, "WORKFLOW_STEP_OWNER_LOST");
+        Ok(())
+    }
+
+    pub async fn advance_repair_iteration(
+        &self,
+        wf_id: &str,
+        previous: u32,
+        next: u32,
+    ) -> Result<()> {
+        let claim = self
+            .step_claim
+            .as_ref()
+            .context("WORKFLOW_STEP_OWNER_REQUIRED")?;
+        ensure!(
+            claim.workflow_run_id == wf_id,
+            "WORKFLOW_STEP_OWNER_MISMATCH"
+        );
+        let result = sqlx::query(
+            "UPDATE orbit_workflow_runs SET iteration = $1 WHERE id = $2 AND iteration = $3 AND status = 'REPAIRING' AND step_owner_id = $4 AND step_generation = $5",
+        )
+        .bind(next as i32)
+        .bind(wf_id)
+        .bind(previous as i32)
+        .bind(&claim.owner_id)
+        .bind(claim.generation)
+        .execute(&self.pool)
+        .await?;
+        ensure!(result.rows_affected() == 1, "WORKFLOW_STEP_OWNER_LOST");
+        Ok(())
     }
 
     pub fn verification_store(&self) -> &VerificationStore {
@@ -615,6 +758,15 @@ impl WorkflowStore {
         base_revision: Option<&str>,
     ) -> Result<WorkflowRun> {
         let wf_id = format!("wf-{}", id());
+        let canonical_repository = std::fs::canonicalize(repository_path.unwrap_or("."))
+            .context("canonicalize workflow repository at creation")?;
+        ensure!(
+            canonical_repository.is_dir(),
+            "workflow repository must be a directory"
+        );
+        let canonical_repository = canonical_repository
+            .to_str()
+            .context("workflow repository path is not UTF-8")?;
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_millis() as i64;
@@ -663,7 +815,7 @@ impl WorkflowStore {
         .bind(sel_ver)
         .bind(sel_dig.as_deref())
         .bind(task_prompt)
-        .bind(repository_path)
+        .bind(canonical_repository)
         .bind(base_revision)
         .bind(now_ms)
         .execute(&self.pool)
@@ -819,6 +971,12 @@ impl WorkflowStore {
             .get_workflow_run(wf_id)
             .await?
             .context("workflow run not found")?;
+        if let Some(claim) = &self.step_claim {
+            ensure!(
+                claim.workflow_run_id == wf_id,
+                "WORKFLOW_STEP_OWNER_MISMATCH"
+            );
+        }
 
         if current.status.is_terminal() {
             bail!(
@@ -867,7 +1025,7 @@ impl WorkflowStore {
             None
         };
 
-        sqlx::query(
+        let result = sqlx::query(
             r#"
             UPDATE orbit_workflow_runs
             SET status = $1,
@@ -877,7 +1035,9 @@ impl WorkflowStore {
                 finished_at_ms = COALESCE($5, finished_at_ms),
                 failure_reason = COALESCE($6, failure_reason),
                 cancellation_reason = COALESCE($7, cancellation_reason)
-            WHERE id = $8
+            WHERE id = $8 AND status = $9
+              AND (($10::text IS NULL AND step_owner_id IS NULL)
+                   OR (step_owner_id = $10 AND step_generation = $11))
             "#,
         )
         .bind(new_stage.as_str())
@@ -888,16 +1048,24 @@ impl WorkflowStore {
         .bind(failure_reason)
         .bind(cancellation_reason)
         .bind(wf_id)
+        .bind(current.status.as_str())
+        .bind(
+            self.step_claim
+                .as_ref()
+                .map(|claim| claim.owner_id.as_str()),
+        )
+        .bind(self.step_claim.as_ref().map(|claim| claim.generation))
         .execute(&self.pool)
         .await
         .context("update orbit_workflow_runs status")?;
+        ensure!(result.rows_affected() == 1, "WORKFLOW_STAGE_FENCE_REJECTED");
 
         self.get_workflow_run(wf_id)
             .await?
             .context("workflow run not found after update")
     }
 
-    /// Acquire the exclusive workspace mutation lock for an attempt.
+    /// Acquire exclusion for the persisted role and canonical repository candidate.
     pub async fn acquire_workspace_mutation_lock(
         &self,
         attempt_id: &str,
@@ -909,8 +1077,14 @@ impl WorkflowStore {
 
         let res = sqlx::query(
             r#"
-            INSERT INTO orbit_attempt_workspace_locks (attempt_id, holder_role_execution_id, acquired_at_ms)
-            VALUES ($1, $2, $3)
+            INSERT INTO orbit_attempt_workspace_locks
+                (attempt_id, holder_role_execution_id, acquired_at_ms, workspace_identity)
+            SELECT wf.attempt_id, re.id, $3, wf.repository_path
+            FROM orbit_role_executions re
+            JOIN orbit_workflow_runs wf ON wf.id = re.workflow_run_id
+            WHERE re.id = $2 AND wf.attempt_id = $1 AND wf.repository_path IS NOT NULL
+              AND wf.status NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'EXHAUSTED')
+            FOR UPDATE OF wf
             "#,
         )
         .bind(attempt_id)
@@ -920,9 +1094,12 @@ impl WorkflowStore {
         .await;
 
         match res {
-            Ok(_) => Ok(()),
+            Ok(result) if result.rows_affected() == 1 => Ok(()),
+            Ok(_) => bail!("workspace mutation lock requires a matching persisted role execution"),
             Err(e) => {
-                bail!("workspace mutation lock already held for attempt '{attempt_id}': {e}");
+                bail!(
+                    "workspace mutation lock already held for canonical workspace or attempt '{attempt_id}': {e}"
+                );
             }
         }
     }
@@ -959,7 +1136,7 @@ impl WorkflowStore {
         role_execution_id: &str,
     ) -> Result<bool> {
         let row = sqlx::query_scalar::<_, String>(
-            "SELECT holder_role_execution_id FROM orbit_attempt_workspace_locks WHERE attempt_id = $1",
+            "SELECT holder_role_execution_id FROM orbit_attempt_workspace_locks WHERE attempt_id = $1 AND revoked_at_ms IS NULL",
         )
         .bind(attempt_id)
         .fetch_optional(&self.pool)
@@ -983,13 +1160,18 @@ impl WorkflowStore {
             .duration_since(std::time::UNIX_EPOCH)?
             .as_millis() as i64;
 
-        sqlx::query(
+        let inserted = sqlx::query(
             r#"
             INSERT INTO orbit_role_executions (
                 id, workflow_run_id, role_id, role_version, role_digest,
                 stage, iteration, status, input_workspace_state_id,
                 handoff_input_id, started_at_ms
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            ) SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
+              FROM orbit_workflow_runs wf
+              WHERE wf.id = $2 AND wf.status NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'EXHAUSTED')
+                AND (($12::text IS NULL AND wf.step_owner_id IS NULL)
+                     OR (wf.step_owner_id = $12 AND wf.step_generation = $13))
+              FOR UPDATE OF wf
             "#,
         )
         .bind(&re_id)
@@ -1003,9 +1185,15 @@ impl WorkflowStore {
         .bind(input_workspace_state_id)
         .bind(handoff_input_id)
         .bind(now_ms)
+        .bind(self.step_claim.as_ref().map(|claim| claim.owner_id.as_str()))
+        .bind(self.step_claim.as_ref().map(|claim| claim.generation))
         .execute(&self.pool)
         .await
         .context("insert orbit_role_executions")?;
+        ensure!(
+            inserted.rows_affected() == 1,
+            "ROLE_EXECUTION_FENCE_REJECTED"
+        );
 
         self.get_role_execution(&re_id)
             .await?
@@ -1122,19 +1310,31 @@ impl WorkflowStore {
         target: &ResolvedExecutionTarget,
     ) -> Result<()> {
         let val = serde_json::to_value(target)?;
-        sqlx::query(
+        let result = sqlx::query(
             r#"
             UPDATE orbit_role_executions
             SET status = $1, resolved_target = $2
-            WHERE id = $3
+            WHERE id = $3 AND status IN ('PENDING', 'RUNNING')
+              AND EXISTS (SELECT 1 FROM orbit_workflow_runs wf
+                  WHERE wf.id = workflow_run_id
+                    AND wf.status NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'EXHAUSTED')
+                    AND (($4::text IS NULL AND wf.step_owner_id IS NULL)
+                         OR (wf.step_owner_id = $4 AND wf.step_generation = $5)))
             "#,
         )
         .bind(RoleExecutionStatus::Running.as_str())
         .bind(val)
         .bind(re_id)
+        .bind(
+            self.step_claim
+                .as_ref()
+                .map(|claim| claim.owner_id.as_str()),
+        )
+        .bind(self.step_claim.as_ref().map(|claim| claim.generation))
         .execute(&self.pool)
         .await
         .context("update orbit_role_executions resolved")?;
+        ensure!(result.rows_affected() == 1, "ROLE_EXECUTION_FENCE_REJECTED");
         Ok(())
     }
 
@@ -1230,7 +1430,7 @@ impl WorkflowStore {
             .duration_since(std::time::UNIX_EPOCH)?
             .as_millis() as i64;
 
-        sqlx::query(
+        let result = sqlx::query(
             r#"
             UPDATE orbit_role_executions
             SET status = $1,
@@ -1238,7 +1438,12 @@ impl WorkflowStore {
                 handoff_output_id = $3,
                 finished_at_ms = $4,
                 termination_reason = 'success'
-            WHERE id = $5
+            WHERE id = $5 AND status IN ('PENDING', 'RUNNING')
+              AND EXISTS (SELECT 1 FROM orbit_workflow_runs wf
+                  WHERE wf.id = workflow_run_id
+                    AND wf.status NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'EXHAUSTED')
+                    AND (($6::text IS NULL AND wf.step_owner_id IS NULL)
+                         OR (wf.step_owner_id = $6 AND wf.step_generation = $7)))
             "#,
         )
         .bind(RoleExecutionStatus::Succeeded.as_str())
@@ -1246,9 +1451,16 @@ impl WorkflowStore {
         .bind(handoff_output_id)
         .bind(now_ms)
         .bind(re_id)
+        .bind(
+            self.step_claim
+                .as_ref()
+                .map(|claim| claim.owner_id.as_str()),
+        )
+        .bind(self.step_claim.as_ref().map(|claim| claim.generation))
         .execute(&self.pool)
         .await
         .context("complete orbit_role_executions success")?;
+        ensure!(result.rows_affected() == 1, "ROLE_EXECUTION_FENCE_REJECTED");
 
         self.get_role_execution(re_id)
             .await?
@@ -1266,14 +1478,19 @@ impl WorkflowStore {
             .duration_since(std::time::UNIX_EPOCH)?
             .as_millis() as i64;
 
-        sqlx::query(
+        let result = sqlx::query(
             r#"
             UPDATE orbit_role_executions
             SET status = $1,
                 finished_at_ms = $2,
                 termination_reason = $3,
                 failure_message = $4
-            WHERE id = $5
+            WHERE id = $5 AND status IN ('PENDING', 'RESOLVING', 'RUNNING')
+              AND EXISTS (SELECT 1 FROM orbit_workflow_runs wf
+                  WHERE wf.id = workflow_run_id
+                    AND wf.status NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'EXHAUSTED')
+                    AND (($6::text IS NULL AND wf.step_owner_id IS NULL)
+                         OR (wf.step_owner_id = $6 AND wf.step_generation = $7)))
             "#,
         )
         .bind(RoleExecutionStatus::Failed.as_str())
@@ -1281,9 +1498,16 @@ impl WorkflowStore {
         .bind(reason)
         .bind(message)
         .bind(re_id)
+        .bind(
+            self.step_claim
+                .as_ref()
+                .map(|claim| claim.owner_id.as_str()),
+        )
+        .bind(self.step_claim.as_ref().map(|claim| claim.generation))
         .execute(&self.pool)
         .await
         .context("complete orbit_role_executions failed")?;
+        ensure!(result.rows_affected() == 1, "ROLE_EXECUTION_FENCE_REJECTED");
 
         self.get_role_execution(re_id)
             .await?
@@ -1300,12 +1524,17 @@ impl WorkflowStore {
         structured_payload: serde_json::Value,
     ) -> Result<HandoffArtifact> {
         let hid = format!("ha-{}", id());
-        sqlx::query(
+        let inserted = sqlx::query(
             r#"
             INSERT INTO orbit_handoff_artifacts (
                 id, workflow_run_id, role_execution_id, handoff_type,
                 version, workspace_state_id, structured_payload
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ) SELECT $1, $2, $3, $4, $5, $6, $7
+              FROM orbit_workflow_runs wf
+              WHERE wf.id = $2 AND wf.status NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'EXHAUSTED')
+                AND (($8::text IS NULL AND wf.step_owner_id IS NULL)
+                     OR (wf.step_owner_id = $8 AND wf.step_generation = $9))
+              FOR UPDATE OF wf
             "#,
         )
         .bind(&hid)
@@ -1315,9 +1544,12 @@ impl WorkflowStore {
         .bind(1)
         .bind(workspace_state_id)
         .bind(&structured_payload)
+        .bind(self.step_claim.as_ref().map(|claim| claim.owner_id.as_str()))
+        .bind(self.step_claim.as_ref().map(|claim| claim.generation))
         .execute(&self.pool)
         .await
         .context("insert orbit_handoff_artifacts")?;
+        ensure!(inserted.rows_affected() == 1, "HANDOFF_FENCE_REJECTED");
 
         Ok(HandoffArtifact {
             id: hid,

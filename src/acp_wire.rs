@@ -37,6 +37,8 @@ pub struct Wire {
     messages: u64,
     limit: u64,
     codex: bool,
+    response_limit: Option<usize>,
+    response_limit_hit: bool,
 }
 impl Wire {
     pub fn new(
@@ -52,11 +54,21 @@ impl Wire {
             messages: 0,
             limit,
             codex: false,
+            response_limit: None,
+            response_limit_hit: false,
         }
     }
     pub fn codex(mut self) -> Self {
         self.codex = true;
         self
+    }
+    /// Apply a per-tool result bound to server callback responses on this wire.
+    pub fn set_response_limit(&mut self, limit: usize) {
+        self.response_limit = Some(limit);
+        self.response_limit_hit = false;
+    }
+    pub fn take_response_limit_hit(&mut self) -> bool {
+        std::mem::take(&mut self.response_limit_hit)
     }
     pub async fn read(&mut self) -> Result<Value> {
         let mut frame = Vec::new();
@@ -120,10 +132,22 @@ impl Wire {
         Ok(id)
     }
     pub async fn response_ok(&mut self, id: Value, result: Value) -> Result<()> {
+        if self.response_limit.is_some_and(|limit| {
+            serde_json::to_vec(&result).map_or(true, |bytes| bytes.len() > limit)
+        }) {
+            self.response_limit_hit = true;
+            return self.response_error(id, -32603, "OUTPUT_LIMIT").await;
+        }
         self.send(json!({"jsonrpc":"2.0","id":id,"result":result}))
             .await
     }
     pub async fn response_error(&mut self, id: Value, code: i64, message: &str) -> Result<()> {
+        let max = self.response_limit.unwrap_or(65536).min(65536);
+        let mut end = max.min(message.len());
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        let message = &message[..end];
         self.send(json!({
             "jsonrpc": "2.0",
             "id": id,

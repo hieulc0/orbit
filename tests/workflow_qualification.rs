@@ -107,6 +107,12 @@ async fn sample_environment() -> Result<EnvironmentIdentity> {
 }
 
 async fn advance_to_verifying(store: &WorkflowStore, workflow_id: &str) -> Result<()> {
+    let workflow = store.get_workflow_run(workflow_id).await?.unwrap();
+    let state = orbit::workflow_coordinator::compute_workspace_state(
+        std::path::Path::new(workflow.repository_path.as_deref().unwrap()),
+        workflow.base_revision.as_deref().unwrap_or("HEAD"),
+    )
+    .await?;
     store
         .transition_workflow_stage(workflow_id, WorkflowStage::Planning, None, None, None)
         .await?;
@@ -117,7 +123,7 @@ async fn advance_to_verifying(store: &WorkflowStore, workflow_id: &str) -> Resul
         .transition_workflow_stage(
             workflow_id,
             WorkflowStage::Verifying,
-            Some("ws-policy-resolution"),
+            Some(&state.state_id),
             None,
             None,
         )
@@ -985,30 +991,55 @@ async fn test_b3_read_only_reviewer() -> Result<()> {
 async fn test_b3_single_mutator_lock() -> Result<()> {
     let ctx = setup_workflow_test().await?;
     let attempt_id = format!("att-{}", id());
+    let repo = tempfile::tempdir()?;
+    let repository = repo.path().to_string_lossy().into_owned();
+    let workflow = ctx
+        .store
+        .create_workflow_run_full(
+            "lock-test",
+            &attempt_id,
+            2,
+            None,
+            None,
+            None,
+            None,
+            Some(&repository),
+            None,
+        )
+        .await?;
+    let role = RoleDefinition::implementer_v1();
+    let first = ctx
+        .store
+        .create_role_execution(&workflow.id, &role, "IMPLEMENTING", 1, None, None)
+        .await?;
+    let second = ctx
+        .store
+        .create_role_execution(&workflow.id, &role, "IMPLEMENTING", 1, None, None)
+        .await?;
 
     // Role 1 acquires lock
     ctx.store
-        .acquire_workspace_mutation_lock(&attempt_id, "role-exec-1")
+        .acquire_workspace_mutation_lock(&attempt_id, &first.id)
         .await?;
 
     // Role 2 attempts to acquire lock concurrently -> FAILS
     let res = ctx
         .store
-        .acquire_workspace_mutation_lock(&attempt_id, "role-exec-2")
+        .acquire_workspace_mutation_lock(&attempt_id, &second.id)
         .await;
     assert!(res.is_err(), "concurrent workspace lock must fail");
 
     // Role 1 releases lock
     ctx.store
-        .release_workspace_mutation_lock(&attempt_id, "role-exec-1")
+        .release_workspace_mutation_lock(&attempt_id, &first.id)
         .await?;
 
     // Now Role 2 can acquire lock
     ctx.store
-        .acquire_workspace_mutation_lock(&attempt_id, "role-exec-2")
+        .acquire_workspace_mutation_lock(&attempt_id, &second.id)
         .await?;
     ctx.store
-        .release_workspace_mutation_lock(&attempt_id, "role-exec-2")
+        .release_workspace_mutation_lock(&attempt_id, &second.id)
         .await?;
 
     ctx.database.teardown().await?;

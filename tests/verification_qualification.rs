@@ -128,6 +128,37 @@ async fn b1_unpinned_host_verification_is_denied_before_spawn() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires pinned local Podman Alpine image"]
+async fn s7_cancellation_stops_isolated_verification_and_confirms_cleanup() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let image = pinned_podman_image_id(PODMAN_IMAGE_ALPINE).await?;
+    let step = VerificationStep::new_command(
+        "s7_cancel",
+        "Cancellation probe",
+        vec!["sh".into(), "-c".into(), "sleep 30".into()],
+    );
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let repo = workspace.path().to_path_buf();
+    let execution = tokio::spawn(async move {
+        execute_verification_command_isolated(
+            &step,
+            &repo,
+            Some(Duration::from_secs(20)),
+            Some(rx),
+            Some(&image),
+            None,
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    tx.send(true)?;
+    let result = tokio::time::timeout(Duration::from_secs(15), execution).await??;
+    let error = result.unwrap_err();
+    assert!(error.to_string().contains("cancelled"), "{error:#}");
+    Ok(())
+}
+
+#[tokio::test]
 #[ignore = "requires podman sandbox"]
 async fn test_b1_qualification_host_isolation_and_security_escape() -> Result<()> {
     let ws_dir = tempfile::tempdir()?;

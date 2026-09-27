@@ -70,6 +70,28 @@ validated integration/browser action; unresolved checks stop selection. CLI
 workflow verification also requires a pinned rootless Podman profile and has no
 host or generic Cargo/docs fallback.
 
+Workflow creation persists an absolute canonical repository path, including
+when the caller supplied a relative path. Disk candidates use the version 2
+workspace identity: tracked Git changes and eligible untracked files are
+included, and Git or file-read errors fail the operation. Legacy snapshot
+identities retain their original encoding. Verification, review, and final
+completion recheck the candidate identity; reviewer diff generation errors
+record `REVIEW_ERROR` instead of supplying an empty diff.
+
+The CLI ACP repository callback checks the role and canonical workspace identity
+for every tool call. Mutations require the persisted role execution's database
+lock, and callback calls, output, and runtime are bounded by tool metadata.
+Filesystem mutations use directory-relative handles to reject traversal and
+symlink replacement. CLI workflow terminal calls remain denied.
+
+Workflow steps now claim a persisted owner and generation before work. Stage,
+handoff, and role writes check that claim; cancellation fences the generation
+and revokes callback locks. Mutation locks use the canonical repository path
+across attempts. On restart, a dead owner is reclaimed only when no role or
+verification remains active; an uncertain external execution requires explicit
+reconciliation before retry. Existing attempt-only locks must be reconciled
+before migration 0024 can add workspace identity.
+
 ```sh
 ORBIT_TEST_DATABASE_URL=postgres://orbit:orbit-local-test@127.0.0.1:55439/orbit \
 cargo test --locked --test workflow_qualification -- --ignored --test-threads=1
