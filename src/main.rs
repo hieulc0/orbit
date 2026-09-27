@@ -1002,6 +1002,9 @@ fn reset_aware_selection_evidence(reason: &str) -> serde_json::Value {
         }
         _ => None,
     };
+    let quota_snapshot_freshness = fields
+        .get("quota_snapshot_freshness")
+        .filter(|value| matches!(**value, "FRESH" | "STALE" | "ABSENT"));
     let availability = fields.get("availability").filter(|value| {
         matches!(
             **value,
@@ -1052,6 +1055,7 @@ fn reset_aware_selection_evidence(reason: &str) -> serde_json::Value {
         "ranking": if reason.starts_with("reset-aware rank=") { "reset-aware" } else { "other_or_unknown" },
         "rank": rank,
         "weekly_reset_rank": weekly_reset_rank,
+        "quota_snapshot_freshness": quota_snapshot_freshness,
         "availability": availability,
         "five_hour_remaining": five_hour_remaining,
         "seven_day_remaining": seven_day_remaining,
@@ -1064,6 +1068,7 @@ fn reset_aware_selection_evidence(reason: &str) -> serde_json::Value {
             "ranking": if reason.starts_with("reset-aware rank=") { "reset-aware" } else { "other_or_unknown" },
             "rank": rank,
             "weekly_reset_rank": weekly_reset_rank,
+            "quota_snapshot_freshness": quota_snapshot_freshness,
             "availability": availability,
             "five_hour_remaining": five_hour_remaining,
             "seven_day_remaining": seven_day_remaining,
@@ -4786,11 +4791,16 @@ mod live_workflow_qualification_tests {
     #[test]
     fn quota_report_preserves_reset_aware_selection_facts() {
         let facts = reset_aware_selection_evidence(
-            "reset-aware rank=1; known_weekly_reset; availability=Ready; 5h_remaining=82.0%; 7d_remaining=61.0%; 7d_reset_at_ms=1780000000000; provider_preference_rank=0; tie_break=provider_preference_then_stable_account_id; rejected=[codex:private-account:quota_exhausted(5h=unknown,7d=unknown,7d_reset=unknown),antigravity:another-private-account:auth_failed(5h=unknown,7d=unknown,7d_reset=unknown)]",
+            "reset-aware rank=1; known_weekly_reset; quota_snapshot_freshness=FRESH; availability=Ready; 5h_remaining=82.0%; 7d_remaining=61.0%; 7d_reset_at_ms=1780000000000; provider_preference_rank=0; tie_break=provider_preference_then_stable_account_id; rejected=[codex:private-account:quota_exhausted(5h=unknown,7d=unknown,7d_reset=unknown),antigravity:another-private-account:auth_failed(5h=unknown,7d=unknown,7d_reset=unknown)]",
         );
         assert_eq!(facts["ranking"], "reset-aware");
         assert_eq!(facts["rank"], "1");
         assert_eq!(facts["weekly_reset_rank"], "known_weekly_reset");
+        assert_eq!(facts["quota_snapshot_freshness"], "FRESH");
+        assert_eq!(
+            facts["selection_reason"]["quota_snapshot_freshness"],
+            "FRESH"
+        );
         assert_eq!(facts["availability"], "Ready");
         assert_eq!(facts["five_hour_remaining"], "82.0%");
         assert_eq!(facts["seven_day_remaining"], "61.0%");
@@ -4800,6 +4810,46 @@ mod live_workflow_qualification_tests {
         let projected = serde_json::to_string(&facts).unwrap();
         assert!(!projected.contains("private-account"));
         assert!(!projected.contains("another-private-account"));
+    }
+
+    #[test]
+    fn quota_report_distinguishes_stale_and_absent_snapshots_without_quota_facts() {
+        for (freshness, availability) in [("STALE", "Unknown"), ("ABSENT", "Unknown")] {
+            let reason = format!(
+                "reset-aware rank=1; weekly_reset_unknown_or_not_applicable; quota_snapshot_freshness={freshness}; availability={availability}; 5h_remaining=unknown; 7d_remaining=unknown; 7d_reset_at_ms=unknown; provider_preference_rank=0; tie_break=provider_preference_then_stable_account_id; rejected=[]"
+            );
+            let evidence = reset_aware_selection_evidence(&reason);
+            assert_eq!(evidence["quota_snapshot_freshness"], freshness);
+            assert_eq!(evidence["availability"], "Unknown");
+            assert_eq!(
+                evidence["weekly_reset_rank"],
+                "weekly_reset_unknown_or_not_applicable"
+            );
+            assert_eq!(evidence["five_hour_remaining"], "unknown");
+            assert_eq!(evidence["seven_day_remaining"], "unknown");
+            assert_eq!(evidence["seven_day_reset_at_ms"], "unknown");
+        }
+
+        let fresh_without_known_weekly_facts = reset_aware_selection_evidence(
+            "reset-aware rank=1; weekly_reset_unknown_or_not_applicable; quota_snapshot_freshness=FRESH; availability=Unknown; 5h_remaining=unknown; 7d_remaining=unknown; 7d_reset_at_ms=unknown; provider_preference_rank=0; tie_break=provider_preference_then_stable_account_id; rejected=[]",
+        );
+        assert_eq!(
+            fresh_without_known_weekly_facts["quota_snapshot_freshness"],
+            "FRESH"
+        );
+        assert_eq!(fresh_without_known_weekly_facts["availability"], "Unknown");
+        assert_eq!(
+            fresh_without_known_weekly_facts["weekly_reset_rank"],
+            "weekly_reset_unknown_or_not_applicable"
+        );
+
+        let unsupported = reset_aware_selection_evidence(
+            "reset-aware rank=1; weekly_reset_unknown_or_not_applicable; quota_snapshot_freshness=provider-payload; availability=Unknown; 5h_remaining=unknown; 7d_remaining=unknown; 7d_reset_at_ms=unknown; provider_preference_rank=0; tie_break=provider_preference_then_stable_account_id; rejected=[]",
+        );
+        assert_eq!(
+            unsupported["quota_snapshot_freshness"],
+            serde_json::Value::Null
+        );
     }
 
     #[test]

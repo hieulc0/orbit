@@ -1761,6 +1761,38 @@ struct RuntimeQuotaFacts {
     explicitly_exhausted: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuotaSnapshotFreshness {
+    Fresh,
+    Stale,
+    Absent,
+}
+
+impl QuotaSnapshotFreshness {
+    fn as_evidence(self) -> &'static str {
+        match self {
+            Self::Fresh => "FRESH",
+            Self::Stale => "STALE",
+            Self::Absent => "ABSENT",
+        }
+    }
+}
+
+fn quota_snapshot_freshness(
+    snapshot: Option<&crate::availability::AvailabilitySnapshot>,
+    now_ms: i64,
+) -> QuotaSnapshotFreshness {
+    match snapshot {
+        None => QuotaSnapshotFreshness::Absent,
+        Some(snapshot) if snapshot.observed_at_ms <= now_ms && now_ms < snapshot.expires_at_ms => {
+            QuotaSnapshotFreshness::Fresh
+        }
+        // A present snapshot outside its validity interval is evidence that a
+        // snapshot exists, but its quota facts are not current and are unused.
+        Some(_) => QuotaSnapshotFreshness::Stale,
+    }
+}
+
 type NormalizedQuotaWindow = (Option<i64>, String, Option<f64>, Option<i64>, Option<bool>);
 
 #[derive(Clone, Debug)]
@@ -1770,6 +1802,7 @@ struct RuntimeCandidate {
     credential_reference: String,
     credential_id: String,
     quota: RuntimeQuotaFacts,
+    quota_snapshot_freshness: QuotaSnapshotFreshness,
     availability: crate::availability::AvailabilityState,
 }
 
@@ -2009,6 +2042,33 @@ fn sort_runtime_candidates(candidates: &mut [RuntimeCandidate]) {
     });
 }
 
+fn runtime_candidate_selection_reason(
+    candidate: &RuntimeCandidate,
+    rank: usize,
+    rejected: &str,
+) -> String {
+    let weekly_reset_rank = if candidate.quota.seven_day_remaining.is_some()
+        && candidate.quota.seven_day_reset_at_ms.is_some()
+    {
+        "known_weekly_reset"
+    } else {
+        "weekly_reset_unknown_or_not_applicable"
+    };
+    format!(
+        "reset-aware rank={rank}; {weekly_reset_rank}; quota_snapshot_freshness={}; availability={:?}; 5h_remaining={}; 7d_remaining={}; 7d_reset_at_ms={}; provider_preference_rank={}; tie_break=provider_preference_then_stable_account_id; rejected={rejected}",
+        candidate.quota_snapshot_freshness.as_evidence(),
+        candidate.availability,
+        format_quota_percent(candidate.quota.five_hour_remaining),
+        format_quota_percent(candidate.quota.seven_day_remaining),
+        candidate
+            .quota
+            .seven_day_reset_at_ms
+            .map(|reset| reset.to_string())
+            .unwrap_or_else(|| "unknown".into()),
+        candidate.provider_preference_rank
+    )
+}
+
 fn format_quota_percent(percent: Option<f64>) -> String {
     percent
         .map(|value| format!("{value:.1}%"))
@@ -2132,9 +2192,8 @@ impl RoleRuntimeResolver {
                 let snapshot = availability_store
                     .current_for_credential(&credential.identity())
                     .await?;
-                let snapshot_is_fresh = snapshot.as_ref().is_some_and(|snapshot| {
-                    snapshot.observed_at_ms <= now_ms && now_ms < snapshot.expires_at_ms
-                });
+                let snapshot_freshness = quota_snapshot_freshness(snapshot.as_ref(), now_ms);
+                let snapshot_is_fresh = snapshot_freshness == QuotaSnapshotFreshness::Fresh;
                 let availability = if snapshot_is_fresh {
                     snapshot.as_ref().unwrap().state
                 } else {
@@ -2177,6 +2236,7 @@ impl RoleRuntimeResolver {
                     credential_reference: credential.reference.clone(),
                     credential_id: credential.id.clone(),
                     quota,
+                    quota_snapshot_freshness: snapshot_freshness,
                     availability,
                 });
             }
@@ -2197,27 +2257,8 @@ impl RoleRuntimeResolver {
             .into_iter()
             .enumerate()
             .map(|(rank, mut candidate)| {
-                let weekly_reset_rank = if candidate.quota.seven_day_remaining.is_some()
-                    && candidate.quota.seven_day_reset_at_ms.is_some()
-                {
-                    "known_weekly_reset"
-                } else {
-                    "weekly_reset_unknown_or_not_applicable"
-                };
-                candidate.target.resolution_reason = format!(
-                    "reset-aware rank={}; {}; availability={:?}; 5h_remaining={}; 7d_remaining={}; 7d_reset_at_ms={}; provider_preference_rank={}; tie_break=provider_preference_then_stable_account_id; rejected={rejected}",
-                    rank + 1,
-                    weekly_reset_rank,
-                    candidate.availability,
-                    format_quota_percent(candidate.quota.five_hour_remaining),
-                    format_quota_percent(candidate.quota.seven_day_remaining),
-                    candidate
-                        .quota
-                        .seven_day_reset_at_ms
-                        .map(|reset| reset.to_string())
-                        .unwrap_or_else(|| "unknown".into()),
-                    candidate.provider_preference_rank
-                );
+                candidate.target.resolution_reason =
+                    runtime_candidate_selection_reason(&candidate, rank + 1, &rejected);
                 candidate.target
             })
             .collect())
@@ -2460,6 +2501,7 @@ mod tests {
             credential_reference: reference.into(),
             credential_id: account_id.into(),
             quota,
+            quota_snapshot_freshness: QuotaSnapshotFreshness::Fresh,
             availability: crate::availability::AvailabilityState::Ready,
         }
     }
@@ -2803,6 +2845,134 @@ mod tests {
             RuntimeQuotaFacts::default(),
             "past-reset or expired snapshot values are unknown, not current headroom"
         );
+    }
+
+    #[test]
+    fn reset_aware_snapshot_freshness_is_evidence_only() {
+        let now_ms = 10_000;
+        let fresh = quota_snapshot("codex", now_ms, Vec::new());
+        let stale = crate::availability::AvailabilitySnapshot {
+            expires_at_ms: now_ms,
+            ..fresh.clone()
+        };
+        let future_observation = crate::availability::AvailabilitySnapshot {
+            observed_at_ms: now_ms + 1,
+            ..fresh.clone()
+        };
+
+        assert_eq!(
+            quota_snapshot_freshness(None, now_ms).as_evidence(),
+            "ABSENT"
+        );
+        assert_eq!(
+            quota_snapshot_freshness(Some(&stale), now_ms).as_evidence(),
+            "STALE"
+        );
+        assert_eq!(
+            quota_snapshot_freshness(Some(&future_observation), now_ms).as_evidence(),
+            "STALE",
+            "a present snapshot outside its validity interval is not current evidence"
+        );
+        assert_eq!(
+            quota_snapshot_freshness(Some(&fresh), now_ms).as_evidence(),
+            "FRESH"
+        );
+
+        let known_fresh = candidate(
+            "antigravity",
+            "known-fresh",
+            "id-known",
+            1,
+            RuntimeQuotaFacts {
+                seven_day_remaining: Some(45.0),
+                seven_day_reset_at_ms: Some(20_000),
+                ..RuntimeQuotaFacts::default()
+            },
+        );
+        let mut unknown_stale = candidate(
+            "codex",
+            "unknown-stale",
+            "id-stale",
+            0,
+            quota_facts_for_candidate(Some(&stale), "codex", "gpt-6-luna", now_ms),
+        );
+        unknown_stale.quota_snapshot_freshness = quota_snapshot_freshness(Some(&stale), now_ms);
+        unknown_stale.availability = crate::availability::AvailabilityState::Unknown;
+        let mut unknown_absent = candidate(
+            "codex",
+            "unknown-absent",
+            "id-absent",
+            0,
+            quota_facts_for_candidate(None, "codex", "gpt-6-luna", now_ms),
+        );
+        unknown_absent.quota_snapshot_freshness = quota_snapshot_freshness(None, now_ms);
+        unknown_absent.availability = crate::availability::AvailabilityState::Unknown;
+        let stale_reason = runtime_candidate_selection_reason(&unknown_stale, 2, "[]");
+        let absent_reason = runtime_candidate_selection_reason(&unknown_absent, 3, "[]");
+        assert!(stale_reason.contains(
+            "weekly_reset_unknown_or_not_applicable; quota_snapshot_freshness=STALE; availability=Unknown; 5h_remaining=unknown; 7d_remaining=unknown; 7d_reset_at_ms=unknown"
+        ));
+        assert!(absent_reason.contains(
+            "weekly_reset_unknown_or_not_applicable; quota_snapshot_freshness=ABSENT; availability=Unknown; 5h_remaining=unknown; 7d_remaining=unknown; 7d_reset_at_ms=unknown"
+        ));
+
+        let mut ranked = vec![unknown_stale, known_fresh.clone(), unknown_absent];
+        sort_runtime_candidates(&mut ranked);
+        assert_eq!(
+            ranked[0].credential_reference, known_fresh.credential_reference,
+            "fresh known weekly reset keeps the V1 rank regardless of evidence label"
+        );
+        assert_eq!(
+            ranked[1].quota_snapshot_freshness,
+            QuotaSnapshotFreshness::Absent
+        );
+        assert_eq!(
+            ranked[2].quota_snapshot_freshness,
+            QuotaSnapshotFreshness::Stale
+        );
+        assert_eq!(
+            ranked[1].availability,
+            crate::availability::AvailabilityState::Unknown
+        );
+        assert_eq!(
+            ranked[2].availability,
+            crate::availability::AvailabilityState::Unknown
+        );
+        assert_eq!(ranked[1].quota, RuntimeQuotaFacts::default());
+        assert_eq!(ranked[2].quota, RuntimeQuotaFacts::default());
+
+        let same_facts = RuntimeQuotaFacts {
+            five_hour_remaining: Some(55.0),
+            seven_day_remaining: Some(65.0),
+            seven_day_reset_at_ms: Some(30_000),
+            explicitly_exhausted: false,
+        };
+        let mut first_fresh = candidate("codex", "first", "id-a", 0, same_facts);
+        let mut second_stale = candidate("codex", "second", "id-b", 0, same_facts);
+        second_stale.quota_snapshot_freshness = QuotaSnapshotFreshness::Stale;
+        let mut original_order = vec![first_fresh.clone(), second_stale.clone()];
+        sort_runtime_candidates(&mut original_order);
+        let serialize_rank = |candidates: &[RuntimeCandidate]| {
+            let ordered_accounts: Vec<_> = candidates
+                .iter()
+                .map(|candidate| {
+                    (
+                        candidate.target.provider.as_str(),
+                        candidate.credential_reference.as_str(),
+                        candidate.credential_id.as_str(),
+                    )
+                })
+                .collect();
+            serde_json::to_vec(&ordered_accounts).unwrap()
+        };
+        let original_rank = serialize_rank(&original_order);
+
+        first_fresh.quota_snapshot_freshness = QuotaSnapshotFreshness::Absent;
+        second_stale.quota_snapshot_freshness = QuotaSnapshotFreshness::Fresh;
+        let mut evidence_changed_order = vec![second_stale, first_fresh];
+        sort_runtime_candidates(&mut evidence_changed_order);
+        let evidence_changed_rank = serialize_rank(&evidence_changed_order);
+        assert_eq!(evidence_changed_rank, original_rank);
     }
 
     #[test]
