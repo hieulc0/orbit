@@ -2805,7 +2805,7 @@ fn path_arguments_for_tool(
         .iter()
         .filter_map(|(argument, required)| {
             let value = params.get(*argument);
-            if value.is_none() && !required {
+            if !required && value.is_none_or(serde_json::Value::is_null) {
                 return None;
             }
             if matches!(tool, Tool::GitStatus | Tool::GitDiff) {
@@ -5309,6 +5309,10 @@ mod tests {
             ),
             (3, Tool::GitStatus, serde_json::json!({"path": 987654321})),
             (4, Tool::GitDiff, serde_json::json!({})),
+            (5, Tool::GitDiff, serde_json::json!({"path": null})),
+            (6, Tool::FsListDirectory, serde_json::json!({"path": null})),
+            (7, Tool::FsFindPath, serde_json::json!({"path": null})),
+            (8, Tool::GitShow, serde_json::json!({"path": null})),
         ];
         for (sequence, tool, params) in cases {
             audit.begin_call(sequence, Some(tool), sequence - 1, 0);
@@ -5332,9 +5336,11 @@ mod tests {
             audit.entries[2].path_arguments[0].workspace_relative_path,
             None
         );
-        assert!(audit.entries[3].path_arguments.is_empty());
+        for entry in audit.entries.iter().skip(3) {
+            assert!(entry.path_arguments.is_empty());
+        }
         let metadata = serde_json::json!({
-            "tool_call_audit": audit.metadata(4, 4, 0)
+            "tool_call_audit": audit.metadata(8, 8, 0)
         });
         let encoded = metadata.to_string();
         let report = render_tool_call_audit(&metadata);
@@ -5353,6 +5359,12 @@ mod tests {
         assert!(!report.contains("WORKSPACE_RELATIVE("));
         let absent_filter_row = report.lines().find(|line| line.starts_with("4 |"));
         assert!(absent_filter_row.is_some_and(|line| line.contains("|  | Tool call completed.")));
+        for sequence in 5..=8 {
+            let row = report
+                .lines()
+                .find(|line| line.starts_with(&format!("{sequence} |")));
+            assert!(row.is_some_and(|line| line.contains("|  | Tool call completed.")));
+        }
         Ok(())
     }
 
