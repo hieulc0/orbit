@@ -1619,7 +1619,7 @@ async fn b34_13_coordinator_wire_dispatch_enforces_s1_gates() -> Result<()> {
 }
 
 // -----------------------------------------------------------------------------
-// CHECKPOINTS 36-37: Live Codex and Antigravity Fixtures
+// Live Codex and Antigravity role fixtures
 // -----------------------------------------------------------------------------
 
 #[tokio::test]
