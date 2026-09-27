@@ -77,8 +77,8 @@ fixture creates its repository under a temporary directory.
 Run only the explicitly authorized fixture you intend to execute:
 
 ```sh
-cargo test --locked --features fault-injection --test core_coding_agent_tool_surface_qualification -- --ignored --exact b34_real_codex_coding_fixture --nocapture
-cargo test --locked --features fault-injection --test core_coding_agent_tool_surface_qualification -- --ignored --exact b34_real_antigravity_review_fixture --nocapture
+cargo test --locked --features fault-injection --test core_coding_agent_tool_surface_qualification -- --ignored --exact real_codex_coding_fixture --nocapture
+cargo test --locked --features fault-injection --test core_coding_agent_tool_surface_qualification -- --ignored --exact real_antigravity_review_fixture --nocapture
 ```
 
 The Codex fixture resolves the `codex-main` account through the control-plane
@@ -147,7 +147,7 @@ cargo test --locked --lib codex_quota_selection_uses_default_and_ignores_gpt_res
 cargo test --locked --lib antigravity_quota_selection_uses_the_matching_provider_model_group
 ```
 
-The database-backed resolver ranking case is `b31_08_reset_aware_resolver_prefers_earlier_weekly_reset`
+The database-backed resolver ranking case is `reset_aware_resolver_prefers_earlier_weekly_reset`
 in `workflow_orchestration_qualification`; run it with the disposable
 `ORBIT_TEST_DATABASE_URL` described below.
 
@@ -165,10 +165,10 @@ cargo test --locked --test repository_filesystem_mutation_qualification
 cargo test --locked --test core_coding_agent_tool_surface_qualification
 
 ORBIT_TEST_DATABASE_URL=postgres://orbit:orbit-local-test@127.0.0.1:55439/orbit \
-cargo test --locked --test core_coding_agent_tool_surface_qualification b34_05 -- --ignored
+cargo test --locked --test core_coding_agent_tool_surface_qualification attempt_mutation_lock_enforcement -- --ignored
 
 ORBIT_TEST_DATABASE_URL=postgres://orbit:orbit-local-test@127.0.0.1:55439/orbit \
-cargo test --locked --test core_coding_agent_tool_surface_qualification b34_13 -- --ignored
+cargo test --locked --test core_coding_agent_tool_surface_qualification coordinator_wire_dispatch_enforces_cli_workflow_gates -- --ignored
 ```
 
 Qualification defaults to two concurrent cases (`RUST_TEST_THREADS=2`); each case

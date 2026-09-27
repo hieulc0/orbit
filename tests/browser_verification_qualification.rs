@@ -156,7 +156,7 @@ fn dummy_env_identity() -> EnvironmentIdentity {
 // 1. B5_BROWSER_HAPPY_PATH
 #[tokio::test]
 #[ignore = "requires PostgreSQL and podman"]
-async fn test_b5_01_browser_happy_path() -> Result<()> {
+async fn browser_happy_path() -> Result<()> {
     let ctx = setup_qualification_context().await?;
     let ws_dir = tempfile::tempdir()?;
 
@@ -242,7 +242,7 @@ module.exports = async function({ page }) {
 // 2. B5_ASSERTION_FAILURE
 #[tokio::test]
 #[ignore = "requires PostgreSQL and podman"]
-async fn test_b5_02_assertion_failure() -> Result<()> {
+async fn assertion_failure() -> Result<()> {
     let ctx = setup_qualification_context().await?;
     let ws_dir = tempfile::tempdir()?;
 
@@ -334,7 +334,7 @@ module.exports = async function({ page }) {
 // 3. B5_NAVIGATION_FAILURE
 #[tokio::test]
 #[ignore = "requires PostgreSQL and podman"]
-async fn test_b5_03_navigation_failure() -> Result<()> {
+async fn navigation_failure() -> Result<()> {
     let ctx = setup_qualification_context().await?;
     let ws_dir = tempfile::tempdir()?;
 
@@ -413,7 +413,7 @@ module.exports = async function({ page }) {
 // 4. B5_PAGE_ERROR_CAPTURE
 #[tokio::test]
 #[ignore = "requires PostgreSQL and podman"]
-async fn test_b5_04_page_error_capture() -> Result<()> {
+async fn page_error_capture() -> Result<()> {
     let ctx = setup_qualification_context().await?;
     let ws_dir = tempfile::tempdir()?;
 
@@ -509,7 +509,7 @@ module.exports = async function({ page }) {
 // 5. B5_CONSOLE_RECORD
 #[tokio::test]
 #[ignore = "requires PostgreSQL and podman"]
-async fn test_b5_05_console_record() -> Result<()> {
+async fn console_record() -> Result<()> {
     let ctx = setup_qualification_context().await?;
     let ws_dir = tempfile::tempdir()?;
 
@@ -604,7 +604,7 @@ module.exports = async function({ page }) {
 // 6. B5_CONSOLE_FAIL_POLICY
 #[tokio::test]
 #[ignore = "requires PostgreSQL and podman"]
-async fn test_b5_06_console_fail_policy() -> Result<()> {
+async fn console_fail_policy() -> Result<()> {
     let ctx = setup_qualification_context().await?;
     let ws_dir = tempfile::tempdir()?;
 
@@ -693,7 +693,7 @@ module.exports = async function({ page }) {
 // 7. B5_NETWORK_FAILURE_CAPTURE
 #[tokio::test]
 #[ignore = "requires PostgreSQL and podman"]
-async fn test_b5_07_network_failure_capture() -> Result<()> {
+async fn network_failure_capture() -> Result<()> {
     let ctx = setup_qualification_context().await?;
     let ws_dir = tempfile::tempdir()?;
 
@@ -783,7 +783,7 @@ module.exports = async function({ page }) {
 // 8. B5_SCREENSHOT_ARTIFACT
 #[tokio::test]
 #[ignore = "requires PostgreSQL and podman"]
-async fn test_b5_08_screenshot_artifact() -> Result<()> {
+async fn screenshot_artifact() -> Result<()> {
     let ctx = setup_qualification_context().await?;
     let ws_dir = tempfile::tempdir()?;
 
@@ -874,7 +874,7 @@ module.exports = async function({ page }) {
 // 9. B5_TRACE_ARTIFACT
 #[tokio::test]
 #[ignore = "requires PostgreSQL and podman"]
-async fn test_b5_09_trace_artifact() -> Result<()> {
+async fn trace_artifact() -> Result<()> {
     let ctx = setup_qualification_context().await?;
     let ws_dir = tempfile::tempdir()?;
 
@@ -964,7 +964,7 @@ module.exports = async function({ page }) {
 // 10. B5_BROWSER_RUNTIME_IDENTITY
 #[tokio::test]
 #[ignore = "requires PostgreSQL and podman"]
-async fn test_b5_10_browser_runtime_identity() -> Result<()> {
+async fn browser_runtime_identity() -> Result<()> {
     let ctx = setup_qualification_context().await?;
     let ws_dir = tempfile::tempdir()?;
 
@@ -1043,7 +1043,7 @@ async fn test_b5_10_browser_runtime_identity() -> Result<()> {
 // 11. B5_SPEC_MUTATION_INVALIDATION
 #[tokio::test]
 #[ignore = "requires PostgreSQL and podman"]
-async fn test_b5_11_spec_mutation_invalidation() -> Result<()> {
+async fn spec_mutation_invalidation() -> Result<()> {
     let ctx = setup_qualification_context().await?;
     let ws_dir = tempfile::tempdir()?;
 
@@ -1128,7 +1128,7 @@ async fn test_b5_11_spec_mutation_invalidation() -> Result<()> {
 // 12. B5_WORKSPACE_MUTATION_INVALIDATION
 #[tokio::test]
 #[ignore = "requires PostgreSQL and podman"]
-async fn test_b5_12_workspace_mutation_invalidation() -> Result<()> {
+async fn workspace_mutation_invalidation() -> Result<()> {
     let ctx = setup_qualification_context().await?;
     let ws_dir = tempfile::tempdir()?;
 
@@ -1210,7 +1210,7 @@ async fn test_b5_12_workspace_mutation_invalidation() -> Result<()> {
 // 13. B5_TIMEOUT_CLEANUP
 #[tokio::test]
 #[ignore = "requires PostgreSQL and podman"]
-async fn test_b5_13_timeout_cleanup() -> Result<()> {
+async fn timeout_cleanup() -> Result<()> {
     let ctx = setup_qualification_context().await?;
     let ws_dir = tempfile::tempdir()?;
 
@@ -1289,7 +1289,7 @@ module.exports = async function() {
 // 14. B5_CANCEL_CLEANUP
 #[tokio::test]
 #[ignore = "requires PostgreSQL and podman"]
-async fn test_b5_14_cancel_cleanup() -> Result<()> {
+async fn cancel_cleanup() -> Result<()> {
     let ctx = setup_qualification_context().await?;
     let ws_dir = tempfile::tempdir()?;
 
@@ -1369,7 +1369,7 @@ module.exports = async function() {
 // 15. B5_NO_HOST_PORT_REQUIRED
 #[tokio::test]
 #[ignore = "requires PostgreSQL and podman"]
-async fn test_b5_15_no_host_port_required() -> Result<()> {
+async fn no_host_port_required() -> Result<()> {
     let ctx = setup_qualification_context().await?;
     let ws_dir = tempfile::tempdir()?;
 
@@ -1478,7 +1478,7 @@ module.exports = async function({ page, baseURL }) {
 // 16. B5_BROWSER_SECURITY_ISOLATION
 #[tokio::test]
 #[ignore = "requires PostgreSQL and podman"]
-async fn test_b5_16_browser_security_isolation() -> Result<()> {
+async fn browser_security_isolation() -> Result<()> {
     let ctx = setup_qualification_context().await?;
     let ws_dir = tempfile::tempdir()?;
 
@@ -1570,7 +1570,7 @@ module.exports = async function() {{
 // 17. B5_RESTART_DURABILITY
 #[tokio::test]
 #[ignore = "requires PostgreSQL and podman"]
-async fn test_b5_17_restart_durability() -> Result<()> {
+async fn restart_durability() -> Result<()> {
     let ctx = setup_qualification_context().await?;
     let ws_dir = tempfile::tempdir()?;
 
@@ -1654,7 +1654,7 @@ async fn test_b5_17_restart_durability() -> Result<()> {
 // 18. B5_B3_REPAIR_INTEGRATION
 #[tokio::test]
 #[ignore = "requires PostgreSQL and podman"]
-async fn test_b5_18_b3_repair_integration() -> Result<()> {
+async fn repair_loop_integration() -> Result<()> {
     let ctx = setup_qualification_context().await?;
     let ws_dir = tempfile::tempdir()?;
 
@@ -1764,7 +1764,7 @@ module.exports = async function() {
 // 19. B5_FINAL_REGRESSION_INTEGRATION
 #[tokio::test]
 #[ignore = "requires PostgreSQL and podman"]
-async fn test_b5_19_final_regression_integration() -> Result<()> {
+async fn final_regression_integration() -> Result<()> {
     let ctx = setup_qualification_context().await?;
     let ws_dir = tempfile::tempdir()?;
 

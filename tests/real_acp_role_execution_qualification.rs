@@ -428,7 +428,7 @@ impl RoleAgentExecutor for OfflineAcpRoleExecutor {
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
-async fn b32_01_agent_executions_schema_persists_durable_metrics() -> Result<()> {
+async fn agent_executions_schema_persists_durable_metrics() -> Result<()> {
     let ctx = setup_test().await?;
 
     let wf = ctx
@@ -509,7 +509,7 @@ async fn b32_01_agent_executions_schema_persists_durable_metrics() -> Result<()>
 }
 
 #[test]
-fn b32_02_structured_envelope_extraction_enforces_strict_delimiters() {
+fn structured_envelope_extraction_enforces_strict_delimiters() {
     #[derive(serde::Deserialize, PartialEq, Debug)]
     struct TestPlan {
         summary: String,
@@ -561,7 +561,7 @@ fn b32_02_structured_envelope_extraction_enforces_strict_delimiters() {
 }
 
 #[tokio::test]
-async fn b32_03_role_permission_enforcement_read_only_vs_read_write() -> Result<()> {
+async fn role_permission_enforcement_read_only_vs_read_write() -> Result<()> {
     // Planner has ReadOnly access
     let planner = RoleDefinition::planner_v1();
     assert_eq!(planner.workspace_access, WorkspaceAccess::ReadOnly);
@@ -579,7 +579,7 @@ async fn b32_03_role_permission_enforcement_read_only_vs_read_write() -> Result<
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
-async fn b32_04_host_verification_is_blocked_without_pinned_profile() -> Result<()> {
+async fn host_verification_is_blocked_without_pinned_profile() -> Result<()> {
     let ctx = setup_test().await?;
     enroll_sample_credentials(&ctx.engine.pool).await?;
 
@@ -633,7 +633,7 @@ async fn b32_04_host_verification_is_blocked_without_pinned_profile() -> Result<
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
-async fn b32_05_simulation_is_explicitly_injected() -> Result<()> {
+async fn simulation_is_explicitly_injected() -> Result<()> {
     let ctx = setup_test().await?;
 
     let wf = ctx
@@ -690,7 +690,7 @@ async fn b32_05_simulation_is_explicitly_injected() -> Result<()> {
 }
 
 #[tokio::test]
-async fn b32_06_orbit_mock_acp_cannot_switch_the_real_executor() -> Result<()> {
+async fn orbit_mock_acp_cannot_switch_the_real_executor() -> Result<()> {
     use std::time::Duration;
 
     let previous = std::env::var_os("ORBIT_MOCK_ACP");
@@ -795,7 +795,7 @@ async fn b32_06_orbit_mock_acp_cannot_switch_the_real_executor() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
-async fn b32_07_full_coordinator_offline_acp_callbacks_handoffs_and_verification() -> Result<()> {
+async fn full_coordinator_offline_acp_callbacks_handoffs_and_verification() -> Result<()> {
     let ctx = setup_test().await?;
     enroll_sample_credentials(&ctx.engine.pool).await?;
 

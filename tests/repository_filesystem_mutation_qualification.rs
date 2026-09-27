@@ -17,7 +17,7 @@ use std::fs;
 use tempfile::tempdir;
 
 #[test]
-fn b33_create_directory() -> Result<()> {
+fn directory_creation_is_idempotent_and_checks_parent() -> Result<()> {
     let repo = tempdir()?;
     let repo_path = repo.path();
 
@@ -38,7 +38,7 @@ fn b33_create_directory() -> Result<()> {
 }
 
 #[test]
-fn b33_directory_traversal_prevention() -> Result<()> {
+fn directory_traversal_prevention() -> Result<()> {
     let repo = tempdir()?;
     let repo_path = repo.path();
 
@@ -77,7 +77,7 @@ fn b33_directory_traversal_prevention() -> Result<()> {
 }
 
 #[test]
-fn b33_safe_move_with_collision_detection() -> Result<()> {
+fn safe_move_with_collision_detection() -> Result<()> {
     let repo = tempdir()?;
     let repo_path = repo.path();
 
@@ -112,7 +112,7 @@ fn b33_safe_move_with_collision_detection() -> Result<()> {
 }
 
 #[test]
-fn b33_confined_delete_file() -> Result<()> {
+fn confined_delete_file() -> Result<()> {
     let repo = tempdir()?;
     let repo_path = repo.path();
 
@@ -138,7 +138,7 @@ fn b33_confined_delete_file() -> Result<()> {
 }
 
 #[test]
-fn b33_confined_delete_directory() -> Result<()> {
+fn confined_delete_directory() -> Result<()> {
     let repo = tempdir()?;
     let repo_path = repo.path();
 
@@ -167,7 +167,7 @@ fn b33_confined_delete_directory() -> Result<()> {
 }
 
 #[test]
-fn b33_read_only_role_denial() {
+fn read_only_role_denial() {
     // In coding_agent, verify permissions for mutation tools
     assert_eq!(
         coding_agent::tool_permissions("create_directory"),
@@ -192,7 +192,7 @@ fn b33_read_only_role_denial() {
 }
 
 #[test]
-fn b33_acp_discovery_exposure() -> Result<()> {
+fn acp_discovery_exposure() -> Result<()> {
     let tools = vec![
         "read_file".into(),
         "write_file".into(),
@@ -243,7 +243,7 @@ fn b33_acp_discovery_exposure() -> Result<()> {
 }
 
 #[tokio::test]
-async fn b33_real_repair_loop_filesystem_mutation() -> Result<()> {
+async fn real_repair_loop_filesystem_mutation() -> Result<()> {
     use orbit::acp_wire::Wire;
 
     let repo = tempdir()?;

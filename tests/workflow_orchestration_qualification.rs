@@ -113,7 +113,7 @@ async fn enroll_sample_credentials(pool: &PgPool) -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
-async fn b31_01_workflow_fails_closed_without_pinned_verification_profile() -> Result<()> {
+async fn workflow_fails_closed_without_pinned_verification_profile() -> Result<()> {
     let ctx = setup_test().await?;
     enroll_sample_credentials(&ctx.engine.pool).await?;
 
@@ -158,7 +158,7 @@ async fn b31_01_workflow_fails_closed_without_pinned_verification_profile() -> R
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
-async fn b31_02_real_planner_codex_acp() -> Result<()> {
+async fn real_planner_codex_acp() -> Result<()> {
     let ctx = setup_test().await?;
     enroll_sample_credentials(&ctx.engine.pool).await?;
 
@@ -173,7 +173,7 @@ async fn b31_02_real_planner_codex_acp() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
-async fn b31_03_real_antigravity_role_execution() -> Result<()> {
+async fn real_antigravity_role_execution() -> Result<()> {
     let ctx = setup_test().await?;
     enroll_sample_credentials(&ctx.engine.pool).await?;
 
@@ -188,7 +188,7 @@ async fn b31_03_real_antigravity_role_execution() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
-async fn b31_04_live_credential_resolution() -> Result<()> {
+async fn live_credential_resolution() -> Result<()> {
     let ctx = setup_test().await?;
     enroll_sample_credentials(&ctx.engine.pool).await?;
 
@@ -202,7 +202,7 @@ async fn b31_04_live_credential_resolution() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
-async fn b31_05_live_runtime_capability_resolution() -> Result<()> {
+async fn live_runtime_capability_resolution() -> Result<()> {
     let ctx = setup_test().await?;
     enroll_sample_credentials(&ctx.engine.pool).await?;
 
@@ -216,7 +216,7 @@ async fn b31_05_live_runtime_capability_resolution() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
-async fn b31_08_reset_aware_resolver_prefers_earlier_weekly_reset() -> Result<()> {
+async fn reset_aware_resolver_prefers_earlier_weekly_reset() -> Result<()> {
     let ctx = setup_test().await?;
     enroll_sample_credentials(&ctx.engine.pool).await?;
     let credentials = orbit::credential_registry::CredentialStore::new(&ctx.engine.pool)
@@ -345,7 +345,7 @@ async fn b31_08_reset_aware_resolver_prefers_earlier_weekly_reset() -> Result<()
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
-async fn b31_06_no_dummy_credentials() -> Result<()> {
+async fn no_dummy_credentials() -> Result<()> {
     let ctx = setup_test().await?;
     // No credentials enrolled: resolver MUST bail out, NOT return "cred-planner"
     let role = RoleDefinition::planner_v1();
@@ -359,7 +359,7 @@ async fn b31_06_no_dummy_credentials() -> Result<()> {
 }
 
 #[tokio::test]
-async fn b31_07_structured_plan_handoff() -> Result<()> {
+async fn structured_plan_handoff() -> Result<()> {
     let valid_plan = PlanHandoff {
         summary: "Plan summary".into(),
         affected_areas: vec!["src".into()],
@@ -395,7 +395,7 @@ async fn b31_07_structured_plan_handoff() -> Result<()> {
 }
 
 #[tokio::test]
-async fn b31_08_structured_implementation_handoff() -> Result<()> {
+async fn structured_implementation_handoff() -> Result<()> {
     let valid_impl = ImplementationHandoff {
         summary: "Applied patch".into(),
         changed_files: vec!["src/main.rs".into()],
@@ -420,7 +420,7 @@ async fn b31_08_structured_implementation_handoff() -> Result<()> {
 }
 
 #[tokio::test]
-async fn b31_09_structured_review_handoff() -> Result<()> {
+async fn structured_review_handoff() -> Result<()> {
     let valid_review = ReviewDecision {
         decision: ReviewDecisionStatus::Approve,
         summary: "LGTM".into(),
@@ -443,7 +443,7 @@ async fn b31_09_structured_review_handoff() -> Result<()> {
 }
 
 #[tokio::test]
-async fn b31_10_planner_read_only_live() -> Result<()> {
+async fn planner_read_only_live() -> Result<()> {
     let planner = RoleDefinition::planner_v1();
     assert_eq!(planner.workspace_access, WorkspaceAccess::ReadOnly);
     assert!(!planner.allowed_capabilities.repo_write);
@@ -453,7 +453,7 @@ async fn b31_10_planner_read_only_live() -> Result<()> {
 }
 
 #[tokio::test]
-async fn b31_11_reviewer_read_only_live() -> Result<()> {
+async fn reviewer_read_only_live() -> Result<()> {
     let reviewer = RoleDefinition::reviewer_v1();
     assert_eq!(reviewer.workspace_access, WorkspaceAccess::ReadOnly);
     assert!(!reviewer.allowed_capabilities.repo_write);
@@ -464,7 +464,7 @@ async fn b31_11_reviewer_read_only_live() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
-async fn b31_12_implementer_mutation_lock_live() -> Result<()> {
+async fn implementer_mutation_lock_live() -> Result<()> {
     let ctx = setup_test().await?;
     let repo = tempfile::tempdir()?;
     let repository = repo.path().to_string_lossy().into_owned();
@@ -520,7 +520,7 @@ async fn b31_12_implementer_mutation_lock_live() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
-async fn b31_13_fast_auto_execution() -> Result<()> {
+async fn fast_auto_execution() -> Result<()> {
     let ctx = setup_test().await?;
     enroll_sample_credentials(&ctx.engine.pool).await?;
 
@@ -563,7 +563,7 @@ async fn b31_13_fast_auto_execution() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
-async fn b31_14_standard_auto_execution() -> Result<()> {
+async fn standard_auto_execution() -> Result<()> {
     let ctx = setup_test().await?;
     enroll_sample_credentials(&ctx.engine.pool).await?;
 
@@ -599,7 +599,7 @@ async fn b31_14_standard_auto_execution() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
-async fn b31_15_review_auto_execution() -> Result<()> {
+async fn review_auto_execution() -> Result<()> {
     let ctx = setup_test().await?;
     enroll_sample_credentials(&ctx.engine.pool).await?;
 
@@ -635,7 +635,7 @@ async fn b31_15_review_auto_execution() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
-async fn b31_16_full_auto_execution() -> Result<()> {
+async fn full_auto_execution() -> Result<()> {
     let ctx = setup_test().await?;
     enroll_sample_credentials(&ctx.engine.pool).await?;
 
@@ -671,7 +671,7 @@ async fn b31_16_full_auto_execution() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
-async fn b31_17_repair_path_is_blocked_without_verification_profile() -> Result<()> {
+async fn repair_path_is_blocked_without_verification_profile() -> Result<()> {
     let ctx = setup_test().await?;
     enroll_sample_credentials(&ctx.engine.pool).await?;
 
@@ -707,7 +707,7 @@ async fn b31_17_repair_path_is_blocked_without_verification_profile() -> Result<
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
-async fn b31_18_provider_fallback_live_path() -> Result<()> {
+async fn provider_fallback_live_path() -> Result<()> {
     let ctx = setup_test().await?;
     enroll_sample_credentials(&ctx.engine.pool).await?;
 
@@ -724,7 +724,7 @@ async fn b31_18_provider_fallback_live_path() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
-async fn b31_19_session_independence_live_path() -> Result<()> {
+async fn session_independence_live_path() -> Result<()> {
     let ctx = setup_test().await?;
     enroll_sample_credentials(&ctx.engine.pool).await?;
 
@@ -769,7 +769,7 @@ async fn b31_19_session_independence_live_path() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
-async fn b31_20_restart_recovery() -> Result<()> {
+async fn restart_recovery() -> Result<()> {
     let ctx = setup_test().await?;
     enroll_sample_credentials(&ctx.engine.pool).await?;
 
@@ -810,7 +810,7 @@ async fn b31_20_restart_recovery() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
-async fn b31_21_cancellation_propagation() -> Result<()> {
+async fn cancellation_propagation() -> Result<()> {
     let ctx = setup_test().await?;
     enroll_sample_credentials(&ctx.engine.pool).await?;
 
@@ -847,7 +847,7 @@ async fn b31_21_cancellation_propagation() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
-async fn b31_22_cli_only_operator_path() -> Result<()> {
+async fn cli_only_operator_path() -> Result<()> {
     let ctx = setup_test().await?;
     enroll_sample_credentials(&ctx.engine.pool).await?;
 
@@ -876,7 +876,7 @@ async fn b31_22_cli_only_operator_path() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL and --test-threads=1"]
-async fn s4_relative_repository_is_stable_after_restart_from_another_cwd() -> Result<()> {
+async fn relative_repository_is_stable_after_restart_from_another_cwd() -> Result<()> {
     let ctx = setup_test().await?;
     let root = tempfile::tempdir()?;
     std::fs::create_dir(root.path().join("repo"))?;
@@ -924,7 +924,7 @@ async fn s4_relative_repository_is_stable_after_restart_from_another_cwd() -> Re
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
-async fn s4_candidate_mutation_is_rejected_before_review_and_full() -> Result<()> {
+async fn candidate_mutation_is_rejected_before_review_and_full() -> Result<()> {
     let ctx = setup_test().await?;
     let repo = tempfile::tempdir()?;
     let candidate = repo.path().join("candidate.txt");
@@ -1056,7 +1056,7 @@ async fn s4_candidate_mutation_is_rejected_before_review_and_full() -> Result<()
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
-async fn s4_empty_reviewer_diff_records_review_error() -> Result<()> {
+async fn empty_reviewer_diff_records_review_error() -> Result<()> {
     let ctx = setup_test().await?;
     let repo = tempfile::tempdir()?;
     for args in [
@@ -1134,7 +1134,7 @@ async fn s4_empty_reviewer_diff_records_review_error() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
-async fn s6_one_step_owner_and_cancel_fences_late_role_completion() -> Result<()> {
+async fn one_step_owner_and_cancel_fences_late_role_completion() -> Result<()> {
     let ctx = setup_test().await?;
     let wf = ctx
         .store
@@ -1192,7 +1192,7 @@ async fn s6_one_step_owner_and_cancel_fences_late_role_completion() -> Result<()
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
-async fn s6_different_attempts_same_repository_cannot_both_mutate() -> Result<()> {
+async fn different_attempts_same_repository_cannot_both_mutate() -> Result<()> {
     let ctx = setup_test().await?;
     let repo = tempfile::tempdir()?;
     let repository = repo.path().to_str().unwrap();
@@ -1256,7 +1256,7 @@ async fn s6_different_attempts_same_repository_cannot_both_mutate() -> Result<()
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
-async fn s6_restart_recovers_dead_owner_without_external_role() -> Result<()> {
+async fn restart_recovers_dead_owner_without_external_role() -> Result<()> {
     let ctx = setup_test().await?;
     let wf = ctx
         .store
@@ -1303,7 +1303,7 @@ async fn s6_restart_recovers_dead_owner_without_external_role() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
-async fn s6_restart_reuses_completed_provider_handoff_without_rerun() -> Result<()> {
+async fn restart_reuses_completed_provider_handoff_without_rerun() -> Result<()> {
     let ctx = setup_test().await?;
     let wf = ctx
         .store
@@ -1360,7 +1360,7 @@ async fn s6_restart_reuses_completed_provider_handoff_without_rerun() -> Result<
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
-async fn s6_restart_keeps_uncertain_external_role_fenced() -> Result<()> {
+async fn restart_keeps_uncertain_external_role_fenced() -> Result<()> {
     let ctx = setup_test().await?;
     let wf = ctx
         .store
@@ -1407,13 +1407,13 @@ async fn s6_restart_keeps_uncertain_external_role_fenced() -> Result<()> {
     teardown_test(ctx).await
 }
 
-struct S6HoldingExecutor {
+struct HoldingRoleExecutor {
     started: tokio::sync::Notify,
     release: tokio::sync::Notify,
 }
 
 #[async_trait::async_trait]
-impl RoleAgentExecutor for S6HoldingExecutor {
+impl RoleAgentExecutor for HoldingRoleExecutor {
     async fn execute_role(
         &self,
         _pool: &PgPool,
@@ -1442,14 +1442,14 @@ impl RoleAgentExecutor for S6HoldingExecutor {
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
-async fn s6_simultaneous_steps_and_cancel_have_one_owner() -> Result<()> {
+async fn simultaneous_steps_and_cancel_have_one_owner() -> Result<()> {
     let ctx = setup_test().await?;
     enroll_sample_credentials(&ctx.engine.pool).await?;
     let wf = ctx
         .store
         .create_workflow_run("s6-step-race", &format!("att-{}", id()), 1, None)
         .await?;
-    let executor = Arc::new(S6HoldingExecutor {
+    let executor = Arc::new(HoldingRoleExecutor {
         started: tokio::sync::Notify::new(),
         release: tokio::sync::Notify::new(),
     });
@@ -1481,14 +1481,14 @@ async fn s6_simultaneous_steps_and_cancel_have_one_owner() -> Result<()> {
     teardown_test(ctx).await
 }
 
-struct S7LocalProcessExecutor {
+struct LocalProcessRoleExecutor {
     started: tokio::sync::Notify,
     child_pid: std::sync::atomic::AtomicU32,
 }
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
-async fn s7_recovery_retains_lock_after_unconfirmed_role_cleanup() -> Result<()> {
+async fn recovery_retains_lock_after_unconfirmed_role_cleanup() -> Result<()> {
     let ctx = setup_test().await?;
     let wf = ctx
         .store
@@ -1533,7 +1533,7 @@ async fn s7_recovery_retains_lock_after_unconfirmed_role_cleanup() -> Result<()>
 }
 
 #[async_trait::async_trait]
-impl RoleAgentExecutor for S7LocalProcessExecutor {
+impl RoleAgentExecutor for LocalProcessRoleExecutor {
     async fn execute_role(
         &self,
         _pool: &PgPool,
@@ -1572,14 +1572,14 @@ impl RoleAgentExecutor for S7LocalProcessExecutor {
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
-async fn s7_cancel_from_another_coordinator_reaches_local_role_process() -> Result<()> {
+async fn cancel_from_another_coordinator_reaches_local_role_process() -> Result<()> {
     let ctx = setup_test().await?;
     enroll_sample_credentials(&ctx.engine.pool).await?;
     let wf = ctx
         .store
         .create_workflow_run("s7-cross-process-cancel", &format!("att-{}", id()), 1, None)
         .await?;
-    let executor = Arc::new(S7LocalProcessExecutor {
+    let executor = Arc::new(LocalProcessRoleExecutor {
         started: tokio::sync::Notify::new(),
         child_pid: std::sync::atomic::AtomicU32::new(0),
     });

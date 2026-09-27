@@ -1404,7 +1404,7 @@ fn test_recovery_action_deterministic_matrix() {
 }
 
 #[tokio::test]
-async fn test_phase5_real_restart_recovery_from_persistence() {
+async fn real_restart_recovery_from_persistence() {
     // Proves that when Orbit stops/crashes, constructing the state purely from disk
     // (with NO in-memory state retained) accurately derives the pending fallback,
     // continues the exact same workspace, executes Agent #2, and achieves SUCCESS.
@@ -1768,7 +1768,7 @@ fn test_generalized_agent_chain_progression_and_bounds() {
 }
 
 #[tokio::test]
-async fn test_phase6_three_agent_continuation_and_fingerprint_repetition() {
+async fn three_agent_continuation_and_fingerprint_repetition() {
     // Proves:
     // Agent #1 (Antigravity) -> TurnLimit
     // Agent #2 (Codex) -> Fails validation with Fingerprint ABC

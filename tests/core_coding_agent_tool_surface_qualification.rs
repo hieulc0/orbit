@@ -335,7 +335,7 @@ async fn load_agent_tool_audit(
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
-async fn b34_agent_tool_audit_reads_persisted_counter_columns() -> Result<()> {
+async fn agent_tool_audit_reads_persisted_counter_columns() -> Result<()> {
     let ctx = setup_test().await?;
     let fixture_result = async {
         let execution_id = format!("execution-{}", id());
@@ -381,7 +381,7 @@ fn init_git_repo(path: &Path) -> Result<()> {
 // -----------------------------------------------------------------------------
 
 #[test]
-fn b34_01_canonical_identity_resolution_all_18_tools() -> Result<()> {
+fn canonical_identity_resolution_all_18_tools() -> Result<()> {
     let canonical_tools = [
         (
             CanonicalToolName::FsReadTextFile,
@@ -489,7 +489,7 @@ fn b34_01_canonical_identity_resolution_all_18_tools() -> Result<()> {
 }
 
 #[test]
-fn b34_02_wire_alias_and_provider_routing() -> Result<()> {
+fn wire_alias_and_provider_routing() -> Result<()> {
     // ACP slash aliases
     assert_eq!(
         CanonicalToolName::from_wire("fs/read_text_file"),
@@ -664,7 +664,7 @@ fn b34_02_wire_alias_and_provider_routing() -> Result<()> {
 }
 
 #[tokio::test]
-async fn b34_03_unsupported_tool_rejection() -> Result<()> {
+async fn unsupported_tool_rejection() -> Result<()> {
     let repo = tempdir()?;
     let (server_in, client_out) = tokio::io::duplex(65536);
     let (client_in, server_out) = tokio::io::duplex(65536);
@@ -702,7 +702,7 @@ async fn b34_03_unsupported_tool_rejection() -> Result<()> {
 // -----------------------------------------------------------------------------
 
 #[tokio::test]
-async fn b34_04_role_matrix_planner_denial_and_implementer_allowance() -> Result<()> {
+async fn role_matrix_planner_denial_and_implementer_allowance() -> Result<()> {
     let repo = tempdir()?;
     let (server_in, client_out) = tokio::io::duplex(65536);
     let (client_in, server_out) = tokio::io::duplex(65536);
@@ -829,7 +829,7 @@ async fn b34_04_role_matrix_planner_denial_and_implementer_allowance() -> Result
 // -----------------------------------------------------------------------------
 
 #[tokio::test]
-async fn b34_04_missing_mutation_lock_context_is_denied() -> Result<()> {
+async fn missing_mutation_lock_context_is_denied() -> Result<()> {
     let repo = tempdir()?;
     let (server_in, client_out) = tokio::io::duplex(65536);
     let (client_in, server_out) = tokio::io::duplex(65536);
@@ -862,7 +862,7 @@ async fn b34_04_missing_mutation_lock_context_is_denied() -> Result<()> {
 }
 
 #[tokio::test]
-async fn s5_dispatch_enforces_reviewer_identity_call_and_output_limits() -> Result<()> {
+async fn dispatch_enforces_reviewer_identity_call_and_output_limits() -> Result<()> {
     let repo = tempdir()?;
     fs::write(repo.path().join("large.txt"), "x".repeat(70_000))?;
     let (server_in, client_out) = tokio::io::duplex(131_072);
@@ -948,7 +948,7 @@ async fn s5_dispatch_enforces_reviewer_identity_call_and_output_limits() -> Resu
 }
 
 #[tokio::test]
-async fn b34_04_cli_terminal_create_is_denied() -> Result<()> {
+async fn cli_terminal_create_is_denied() -> Result<()> {
     let repo = tempdir()?;
     let (server_in, client_out) = tokio::io::duplex(65536);
     let (client_in, server_out) = tokio::io::duplex(65536);
@@ -980,7 +980,7 @@ async fn b34_04_cli_terminal_create_is_denied() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
-async fn b34_05_attempt_mutation_lock_enforcement() -> Result<()> {
+async fn attempt_mutation_lock_enforcement() -> Result<()> {
     let ctx = setup_test().await?;
 
     let repo = tempdir()?;
@@ -1076,7 +1076,7 @@ async fn b34_05_attempt_mutation_lock_enforcement() -> Result<()> {
 // -----------------------------------------------------------------------------
 
 #[test]
-fn b34_06_path_confinement_security() -> Result<()> {
+fn path_confinement_security() -> Result<()> {
     let repo = tempdir()?;
     let repo_path = repo.path();
 
@@ -1114,7 +1114,7 @@ fn b34_06_path_confinement_security() -> Result<()> {
 // -----------------------------------------------------------------------------
 
 #[test]
-fn b34_07_fs_list_directory_and_find_path() -> Result<()> {
+fn fs_list_directory_and_find_path() -> Result<()> {
     let repo = tempdir()?;
     let p = repo.path();
 
@@ -1169,7 +1169,7 @@ fn b34_07_fs_list_directory_and_find_path() -> Result<()> {
 }
 
 #[test]
-fn b34_08_search_grep_functionality() -> Result<()> {
+fn search_grep_functionality() -> Result<()> {
     let repo = tempdir()?;
     let p = repo.path();
 
@@ -1207,7 +1207,7 @@ fn b34_08_search_grep_functionality() -> Result<()> {
 }
 
 #[test]
-fn b34_09_fs_edit_file_exact_matching_and_replacements() -> Result<()> {
+fn fs_edit_file_exact_matching_and_replacements() -> Result<()> {
     let repo = tempdir()?;
     let p = repo.path();
     let file = p.join("config.txt");
@@ -1243,7 +1243,7 @@ fn b34_09_fs_edit_file_exact_matching_and_replacements() -> Result<()> {
 }
 
 #[test]
-fn b34_10_fs_copy_file_and_directory() -> Result<()> {
+fn fs_copy_file_and_directory() -> Result<()> {
     let repo = tempdir()?;
     let p = repo.path();
 
@@ -1277,7 +1277,7 @@ fn b34_10_fs_copy_file_and_directory() -> Result<()> {
 // -----------------------------------------------------------------------------
 
 #[tokio::test]
-async fn b34_11_git_status_diff_and_show() -> Result<()> {
+async fn git_status_diff_and_show() -> Result<()> {
     let repo = tempdir()?;
     let p = repo.path();
     init_git_repo(p)?;
@@ -1325,7 +1325,7 @@ async fn b34_11_git_status_diff_and_show() -> Result<()> {
 // -----------------------------------------------------------------------------
 
 #[tokio::test]
-async fn b34_12_terminal_lifecycle_and_bounded_preview() -> Result<()> {
+async fn terminal_lifecycle_and_bounded_preview() -> Result<()> {
     let temp = tempdir()?;
     let cwd = temp.path();
 
@@ -1385,7 +1385,7 @@ async fn b34_12_terminal_lifecycle_and_bounded_preview() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
-async fn b34_13_coordinator_wire_dispatch_enforces_s1_gates() -> Result<()> {
+async fn coordinator_wire_dispatch_enforces_cli_workflow_gates() -> Result<()> {
     let ctx = setup_test().await?;
     let repo = tempdir()?;
     let p = repo.path();
@@ -1624,7 +1624,7 @@ async fn b34_13_coordinator_wire_dispatch_enforces_s1_gates() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires explicit live-provider opt-in and a private control-plane URL file"]
-async fn b34_real_codex_coding_fixture() -> Result<()> {
+async fn real_codex_coding_fixture() -> Result<()> {
     let credential_catalog_pool = explicitly_authorized_live_credential_catalog().await?;
     let ctx = match setup_test().await {
         Ok(ctx) => ctx,
@@ -1785,7 +1785,7 @@ async fn b34_real_codex_coding_fixture() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires explicit live-provider opt-in and a private control-plane URL file"]
-async fn b34_real_antigravity_review_fixture() -> Result<()> {
+async fn real_antigravity_review_fixture() -> Result<()> {
     let credential_catalog_pool = explicitly_authorized_live_credential_catalog().await?;
     let ctx = match setup_test().await {
         Ok(ctx) => ctx,

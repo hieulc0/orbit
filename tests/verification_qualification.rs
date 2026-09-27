@@ -52,7 +52,7 @@ async fn pinned_podman_image_id(image: &str) -> Result<String> {
 }
 
 #[tokio::test]
-async fn b1_unpinned_host_verification_is_denied_before_spawn() -> Result<()> {
+async fn unpinned_host_verification_is_denied_before_spawn() -> Result<()> {
     let workspace = tempfile::tempdir()?;
     let marker = workspace.path().join("host-verification-ran");
     let store = VerificationStore::new(PgPool::connect_lazy(
@@ -129,7 +129,7 @@ async fn b1_unpinned_host_verification_is_denied_before_spawn() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires pinned local Podman Alpine image"]
-async fn s7_cancellation_stops_isolated_verification_and_confirms_cleanup() -> Result<()> {
+async fn cancellation_stops_isolated_verification_and_confirms_cleanup() -> Result<()> {
     let workspace = tempfile::tempdir()?;
     let image = pinned_podman_image_id(PODMAN_IMAGE_ALPINE).await?;
     let step = VerificationStep::new_command(
@@ -160,7 +160,7 @@ async fn s7_cancellation_stops_isolated_verification_and_confirms_cleanup() -> R
 
 #[tokio::test]
 #[ignore = "requires podman sandbox"]
-async fn test_b1_qualification_host_isolation_and_security_escape() -> Result<()> {
+async fn host_isolation_and_security_escape() -> Result<()> {
     let ws_dir = tempfile::tempdir()?;
     let canary = ws_dir.path().join("canary.txt");
     tokio::fs::write(&canary, "canary-secret-12345").await?;
@@ -218,7 +218,7 @@ async fn test_b1_qualification_host_isolation_and_security_escape() -> Result<()
 
 #[tokio::test]
 #[ignore = "requires PostgreSQL and podman"]
-async fn test_b1_qualification_large_output_accounting_and_truncation() -> Result<()> {
+async fn large_output_accounting_and_truncation() -> Result<()> {
     let (engine, store, _home) = setup_db_store().await?;
     let ws_dir = tempfile::tempdir()?;
 
@@ -306,7 +306,7 @@ async fn test_b1_qualification_large_output_accounting_and_truncation() -> Resul
 
 #[tokio::test]
 #[ignore = "requires PostgreSQL and podman"]
-async fn test_b1_qualification_real_rust_fixture() -> Result<()> {
+async fn real_rust_fixture() -> Result<()> {
     let (engine, store, _home) = setup_db_store().await?;
     let ws_dir = tempfile::tempdir()?;
 
@@ -413,7 +413,7 @@ fn test_addition() {
 
 #[tokio::test]
 #[ignore = "requires PostgreSQL and podman"]
-async fn test_b1_qualification_real_python_fixture() -> Result<()> {
+async fn real_python_fixture() -> Result<()> {
     let (engine, store, _home) = setup_db_store().await?;
     let ws_dir = tempfile::tempdir()?;
 
@@ -513,7 +513,7 @@ def test_calc_fail():
 
 #[tokio::test]
 #[ignore = "requires PostgreSQL"]
-async fn test_b1_qualification_restart_durability() -> Result<()> {
+async fn restart_durability() -> Result<()> {
     let base = std::env::var("ORBIT_TEST_DATABASE_URL")
         .context("set ORBIT_TEST_DATABASE_URL to a disposable PostgreSQL database")?;
     let admin = PgPool::connect(&base).await?;
@@ -605,7 +605,7 @@ async fn test_b1_qualification_restart_durability() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_b1_qualification_empty_or_no_test_rejection() -> Result<()> {
+async fn empty_or_no_test_rejection() -> Result<()> {
     // 1. Empty plan rejected
     let empty_plan = VerificationPlan {
         id: "empty".into(),
@@ -640,7 +640,7 @@ async fn test_b1_qualification_empty_or_no_test_rejection() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires podman sandbox"]
-async fn test_b2_qualification_host_env_leak_and_clean_home() -> Result<()> {
+async fn host_env_leak_and_clean_home() -> Result<()> {
     let ws_dir = tempfile::tempdir()?;
     unsafe {
         std::env::set_var("ORBIT_SECRET_CANARY", "should-not-be-visible");
@@ -719,7 +719,7 @@ async fn test_b2_qualification_host_env_leak_and_clean_home() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires podman sandbox"]
-async fn test_b2_qualification_explicit_env_injection_and_allowlist() -> Result<()> {
+async fn explicit_env_injection_and_allowlist() -> Result<()> {
     let ws_dir = tempfile::tempdir()?;
 
     unsafe {
@@ -769,7 +769,7 @@ async fn test_b2_qualification_explicit_env_injection_and_allowlist() -> Result<
 
 #[tokio::test]
 #[ignore = "requires podman sandbox"]
-async fn test_b2_qualification_network_remains_unavailable() -> Result<()> {
+async fn network_remains_unavailable() -> Result<()> {
     let ws_dir = tempfile::tempdir()?;
 
     let step = VerificationStep::new_command(
@@ -808,7 +808,7 @@ async fn test_b2_qualification_network_remains_unavailable() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires PostgreSQL and podman"]
-async fn test_b2_qualification_policy_mutation_invalidates_qualification() -> Result<()> {
+async fn policy_mutation_invalidates_qualification() -> Result<()> {
     let (engine, store, _home) = setup_db_store().await?;
     let ws_dir = tempfile::tempdir()?;
 
@@ -895,7 +895,7 @@ async fn test_b2_qualification_policy_mutation_invalidates_qualification() -> Re
 
 #[tokio::test]
 #[ignore = "requires PostgreSQL"]
-async fn test_b2_policy_id_version_is_immutable_and_digest_checked() -> Result<()> {
+async fn policy_id_version_is_immutable_and_digest_checked() -> Result<()> {
     let (engine, store, _home) = setup_db_store().await?;
     let mut policy = VerificationPolicy::new("pol-immutable", "Immutable Policy");
     policy.required_steps = vec!["declared-check".into()];
@@ -965,8 +965,7 @@ async fn test_b2_policy_id_version_is_immutable_and_digest_checked() -> Result<(
 
 #[tokio::test]
 #[ignore = "requires PostgreSQL and podman"]
-async fn test_b2_qualification_environment_identity_mutation_invalidates_qualification()
--> Result<()> {
+async fn environment_identity_mutation_invalidates_qualification() -> Result<()> {
     let (engine, store, _home) = setup_db_store().await?;
     let ws_dir = tempfile::tempdir()?;
 
@@ -1044,7 +1043,7 @@ async fn test_b2_qualification_environment_identity_mutation_invalidates_qualifi
 
 #[tokio::test]
 #[ignore = "requires PostgreSQL and podman"]
-async fn test_b2_qualification_required_step_policy_enforcement() -> Result<()> {
+async fn required_step_policy_enforcement() -> Result<()> {
     let (engine, store, _home) = setup_db_store().await?;
     let ws_dir = tempfile::tempdir()?;
 
@@ -1113,7 +1112,7 @@ async fn test_b2_qualification_required_step_policy_enforcement() -> Result<()> 
 
 #[tokio::test]
 #[ignore = "requires PostgreSQL and podman"]
-async fn test_b2_qualification_restart_durability_with_policy() -> Result<()> {
+async fn restart_durability_with_policy() -> Result<()> {
     let base = std::env::var("ORBIT_TEST_DATABASE_URL")
         .context("set ORBIT_TEST_DATABASE_URL to a disposable PostgreSQL database")?;
     let admin = PgPool::connect(&base).await?;

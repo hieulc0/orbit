@@ -108,7 +108,7 @@ async fn setup_qualification_context() -> Result<TestContext> {
 /// Scenario 1: Managed Container Service (PostgreSQL) + Readiness Probe + Test Execution
 #[tokio::test]
 #[ignore = "requires PostgreSQL and podman"]
-async fn test_b4_01_managed_container_service_postgres() -> Result<()> {
+async fn managed_container_service_postgres() -> Result<()> {
     let ctx = setup_qualification_context().await?;
     let ws_dir = tempfile::tempdir()?;
 
@@ -235,7 +235,7 @@ async fn test_b4_01_managed_container_service_postgres() -> Result<()> {
 /// Scenario 2: Multi-Service Environment (Postgres + Redis) with DNS discovery
 #[tokio::test]
 #[ignore = "requires PostgreSQL and podman"]
-async fn test_b4_02_multi_service_postgres_and_redis() -> Result<()> {
+async fn multi_service_postgres_and_redis() -> Result<()> {
     let ctx = setup_qualification_context().await?;
     let ws_dir = tempfile::tempdir()?;
 
@@ -361,7 +361,7 @@ async fn test_b4_02_multi_service_postgres_and_redis() -> Result<()> {
 /// an isolated container runtime and NOT directly on the Orbit worker host.
 #[tokio::test]
 #[ignore = "requires PostgreSQL and podman"]
-async fn test_b4_03_managed_process_service() -> Result<()> {
+async fn managed_process_service() -> Result<()> {
     let ctx = setup_qualification_context().await?;
     let ws_dir = tempfile::tempdir()?;
 
@@ -577,7 +577,7 @@ async fn test_b4_03_managed_process_service() -> Result<()> {
 /// Scenario 4: External Network Isolation (`--internal` Podman Network blocks Internet)
 #[tokio::test]
 #[ignore = "requires PostgreSQL and podman"]
-async fn test_b4_04_isolated_network_blocks_external_internet() -> Result<()> {
+async fn isolated_network_blocks_external_internet() -> Result<()> {
     let ctx = setup_qualification_context().await?;
     let ws_dir = tempfile::tempdir()?;
 
@@ -653,7 +653,7 @@ async fn test_b4_04_isolated_network_blocks_external_internet() -> Result<()> {
 /// Scenario 5: Distinguishing READINESS_TIMEOUT vs SERVICE_START_FAILED vs VERIFICATION_FAILED
 #[tokio::test]
 #[ignore = "requires PostgreSQL and podman"]
-async fn test_b4_05_failure_differentiation_readiness_timeout() -> Result<()> {
+async fn failure_differentiation_readiness_timeout() -> Result<()> {
     let ctx = setup_qualification_context().await?;
     let ws_dir = tempfile::tempdir()?;
 
@@ -747,7 +747,7 @@ async fn test_b4_05_failure_differentiation_readiness_timeout() -> Result<()> {
 /// Scenario 6: Premature Service Crash Detected as SERVICE_START_FAILED
 #[tokio::test]
 #[ignore = "requires PostgreSQL and podman"]
-async fn test_b4_06_failure_differentiation_premature_crash() -> Result<()> {
+async fn failure_differentiation_premature_crash() -> Result<()> {
     let ctx = setup_qualification_context().await?;
     let ws_dir = tempfile::tempdir()?;
 
@@ -843,7 +843,7 @@ async fn test_b4_06_failure_differentiation_premature_crash() -> Result<()> {
 /// Scenario 7: Dependency Graph Ordering + Setup Migration Step
 #[tokio::test]
 #[ignore = "requires PostgreSQL and podman"]
-async fn test_b4_07_dependency_order_and_setup_step() -> Result<()> {
+async fn dependency_order_and_setup_step() -> Result<()> {
     let ctx = setup_qualification_context().await?;
     let ws_dir = tempfile::tempdir()?;
 
@@ -1000,7 +1000,7 @@ async fn test_b4_07_dependency_order_and_setup_step() -> Result<()> {
 /// Scenario 8: Immutable Environment Identity and Image Digest Verification
 #[tokio::test]
 #[ignore = "requires PostgreSQL and podman"]
-async fn test_b4_08_immutable_environment_digest_and_qualification() -> Result<()> {
+async fn immutable_environment_digest_and_qualification() -> Result<()> {
     let ctx = setup_qualification_context().await?;
     let ws_dir = tempfile::tempdir()?;
 
@@ -1114,7 +1114,7 @@ async fn test_b4_08_immutable_environment_digest_and_qualification() -> Result<(
 /// Scenario 9: Workflow Orchestration with Integration Environment Policy (B3 Workflow Integration)
 #[tokio::test]
 #[ignore = "requires PostgreSQL and podman"]
-async fn test_b4_09_workflow_integration_with_environment_policy() -> Result<()> {
+async fn workflow_integration_with_environment_policy() -> Result<()> {
     let ctx = setup_qualification_context().await?;
     let ws_dir = tempfile::tempdir()?;
 
@@ -1210,7 +1210,7 @@ async fn test_b4_09_workflow_integration_with_environment_policy() -> Result<()>
 /// Scenario 10: Teardown Cleanup and Durability after Reopen
 #[tokio::test]
 #[ignore = "requires PostgreSQL and podman"]
-async fn test_b4_10_cleanup_and_restart_durability() -> Result<()> {
+async fn cleanup_and_restart_durability() -> Result<()> {
     let ctx = setup_qualification_context().await?;
     let ws_dir = tempfile::tempdir()?;
 
@@ -1323,7 +1323,7 @@ async fn test_b4_10_cleanup_and_restart_durability() -> Result<()> {
 /// Scenario 11: Process Service Cleanup on Test Failure (Terminal State: FAIL)
 #[tokio::test]
 #[ignore = "requires PostgreSQL and podman"]
-async fn test_b4_11_process_service_cleanup_on_test_failure() -> Result<()> {
+async fn process_service_cleanup_on_test_failure() -> Result<()> {
     let ctx = setup_qualification_context().await?;
     let ws_dir = tempfile::tempdir()?;
 
@@ -1448,7 +1448,7 @@ async fn test_b4_11_process_service_cleanup_on_test_failure() -> Result<()> {
 /// Scenario 12: Process Service Cleanup on Readiness Timeout (Terminal State: TIMEOUT)
 #[tokio::test]
 #[ignore = "requires PostgreSQL and podman"]
-async fn test_b4_12_process_service_cleanup_on_readiness_timeout() -> Result<()> {
+async fn process_service_cleanup_on_readiness_timeout() -> Result<()> {
     let ctx = setup_qualification_context().await?;
     let ws_dir = tempfile::tempdir()?;
 
@@ -1569,7 +1569,7 @@ async fn test_b4_12_process_service_cleanup_on_readiness_timeout() -> Result<()>
 /// Scenario 13: Process Service Cleanup on Cancellation (Terminal State: CANCEL)
 #[tokio::test]
 #[ignore = "requires PostgreSQL and podman"]
-async fn test_b4_13_process_service_cleanup_on_cancellation() -> Result<()> {
+async fn process_service_cleanup_on_cancellation() -> Result<()> {
     let ctx = setup_qualification_context().await?;
     let ws_dir = tempfile::tempdir()?;
 

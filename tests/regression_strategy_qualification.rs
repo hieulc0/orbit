@@ -343,7 +343,7 @@ fn sample_regression_policy(sel_pol: &SelectionPolicy) -> RegressionPolicy {
 
 #[tokio::test]
 #[ignore = "requires database URL"]
-async fn test_b6_policy_versions_are_immutable_and_digest_checked() -> Result<()> {
+async fn policy_versions_are_immutable_and_digest_checked() -> Result<()> {
     let ctx = setup_regression_test().await?;
     let selection = sample_selection_policy();
     ctx.reg_store.insert_selection_policy(&selection).await?;
@@ -394,7 +394,7 @@ async fn test_b6_policy_versions_are_immutable_and_digest_checked() -> Result<()
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL and pinned rootless Podman Alpine image"]
-async fn test_b6_selected_integration_action_records_named_required_evidence() -> Result<()> {
+async fn selected_integration_action_records_named_required_evidence() -> Result<()> {
     let ctx = setup_regression_test().await?;
     let workspace = tempfile::tempdir()?;
     let mut integration =
@@ -475,7 +475,7 @@ async fn test_b6_selected_integration_action_records_named_required_evidence() -
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL and pinned rootless Podman images"]
-async fn test_b6_selected_browser_action_records_named_required_evidence() -> Result<()> {
+async fn selected_browser_action_records_named_required_evidence() -> Result<()> {
     let ctx = setup_regression_test().await?;
     let workspace = tempfile::tempdir()?;
     let artifacts = tempfile::tempdir()?;
@@ -564,7 +564,7 @@ module.exports = async function({ page }) {
 }
 
 #[tokio::test]
-async fn test_b6_01_auth_change_selection() -> Result<()> {
+async fn auth_change_selection() -> Result<()> {
     let sel_pol = sample_selection_policy();
     let reg_pol = sample_regression_policy(&sel_pol);
 
@@ -602,7 +602,7 @@ async fn test_b6_01_auth_change_selection() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_b6_02_frontend_change_selection() -> Result<()> {
+async fn frontend_change_selection() -> Result<()> {
     let sel_pol = sample_selection_policy();
     let reg_pol = sample_regression_policy(&sel_pol);
 
@@ -631,7 +631,7 @@ async fn test_b6_02_frontend_change_selection() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_b6_03_migration_change_escalation() -> Result<()> {
+async fn migration_change_escalation() -> Result<()> {
     let sel_pol = sample_selection_policy();
     let reg_pol = sample_regression_policy(&sel_pol);
 
@@ -667,7 +667,7 @@ async fn test_b6_03_migration_change_escalation() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_b6_04_build_change_escalation() -> Result<()> {
+async fn build_change_escalation() -> Result<()> {
     let sel_pol = sample_selection_policy();
     let reg_pol = sample_regression_policy(&sel_pol);
 
@@ -695,7 +695,7 @@ async fn test_b6_04_build_change_escalation() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_b6_05_unknown_change_fallback() -> Result<()> {
+async fn unknown_change_fallback() -> Result<()> {
     let sel_pol = sample_selection_policy();
     let reg_pol = sample_regression_policy(&sel_pol);
 
@@ -721,7 +721,7 @@ async fn test_b6_05_unknown_change_fallback() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_b6_06_previous_failure_rerun() -> Result<()> {
+async fn previous_failure_rerun() -> Result<()> {
     let sel_pol = sample_selection_policy();
     let reg_pol = sample_regression_policy(&sel_pol);
 
@@ -748,7 +748,7 @@ async fn test_b6_06_previous_failure_rerun() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_b6_07_reviewer_escalation() -> Result<()> {
+async fn reviewer_escalation() -> Result<()> {
     let sel_pol = sample_selection_policy();
     let reg_pol = sample_regression_policy(&sel_pol);
 
@@ -775,7 +775,7 @@ async fn test_b6_07_reviewer_escalation() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_b6_08_arbitrary_reviewer_command_rejected() -> Result<()> {
+async fn arbitrary_reviewer_command_rejected() -> Result<()> {
     let sel_pol = sample_selection_policy();
     let reg_pol = sample_regression_policy(&sel_pol);
 
@@ -799,7 +799,7 @@ async fn test_b6_08_arbitrary_reviewer_command_rejected() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires database URL"]
-async fn test_b6_09_fast_not_full() -> Result<()> {
+async fn fast_not_full() -> Result<()> {
     let ctx = setup_regression_test().await?;
     let sel_pol = sample_selection_policy();
     let reg_pol = sample_regression_policy(&sel_pol);
@@ -912,7 +912,7 @@ async fn test_b6_09_fast_not_full() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires database URL"]
-async fn test_b6_10_standard_not_full() -> Result<()> {
+async fn standard_not_full() -> Result<()> {
     let ctx = setup_regression_test().await?;
     let sel_pol = sample_selection_policy();
     let reg_pol = sample_regression_policy(&sel_pol);
@@ -1014,7 +1014,7 @@ async fn test_b6_10_standard_not_full() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires database URL"]
-async fn test_b6_11_full_completion_gate() -> Result<()> {
+async fn full_completion_gate() -> Result<()> {
     let ctx = setup_regression_test().await?;
     let sel_pol = sample_selection_policy();
     let reg_pol = sample_regression_policy(&sel_pol);
@@ -1122,7 +1122,7 @@ async fn test_b6_11_full_completion_gate() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires database URL"]
-async fn test_b6_12_full_failure_blocks_completion() -> Result<()> {
+async fn full_failure_blocks_completion() -> Result<()> {
     let ctx = setup_regression_test().await?;
     let sel_pol = sample_selection_policy();
     let reg_pol = sample_regression_policy(&sel_pol);
@@ -1234,7 +1234,7 @@ async fn test_b6_12_full_failure_blocks_completion() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires database URL"]
-async fn test_b6_13_selection_policy_mutation_invalidation() -> Result<()> {
+async fn selection_policy_mutation_invalidation() -> Result<()> {
     let ctx = setup_regression_test().await?;
     let sel_pol = sample_selection_policy();
     let reg_pol = sample_regression_policy(&sel_pol);
@@ -1339,7 +1339,7 @@ async fn test_b6_13_selection_policy_mutation_invalidation() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires database URL"]
-async fn test_b6_14_regression_policy_mutation_invalidation() -> Result<()> {
+async fn regression_policy_mutation_invalidation() -> Result<()> {
     let ctx = setup_regression_test().await?;
     let sel_pol = sample_selection_policy();
     let reg_pol = sample_regression_policy(&sel_pol);
@@ -1444,7 +1444,7 @@ async fn test_b6_14_regression_policy_mutation_invalidation() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires database URL"]
-async fn test_b6_15_workspace_mutation_invalidation() -> Result<()> {
+async fn workspace_mutation_invalidation() -> Result<()> {
     let ctx = setup_regression_test().await?;
     let sel_pol = sample_selection_policy();
     let reg_pol = sample_regression_policy(&sel_pol);
@@ -1544,7 +1544,7 @@ async fn test_b6_15_workspace_mutation_invalidation() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_b6_16_check_dependency_expansion() -> Result<()> {
+async fn check_dependency_expansion() -> Result<()> {
     let sel_pol = sample_selection_policy();
     let reg_pol = sample_regression_policy(&sel_pol);
 
@@ -1588,7 +1588,7 @@ async fn test_b6_16_check_dependency_expansion() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_b6_17_skip_reason_evidence() -> Result<()> {
+async fn skip_reason_evidence() -> Result<()> {
     let sel_pol = sample_selection_policy();
     let reg_pol = sample_regression_policy(&sel_pol);
 
@@ -1618,7 +1618,7 @@ async fn test_b6_17_skip_reason_evidence() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires database URL"]
-async fn test_b6_18_restart_durability() -> Result<()> {
+async fn restart_durability() -> Result<()> {
     let ctx = setup_regression_test().await?;
     let sel_pol = sample_selection_policy();
     let reg_pol = sample_regression_policy(&sel_pol);
@@ -1673,7 +1673,7 @@ async fn test_b6_18_restart_durability() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires database URL"]
-async fn test_b6_19_b3_workflow_integration() -> Result<()> {
+async fn workflow_integration() -> Result<()> {
     let ctx = setup_regression_test().await?;
     let sel_pol = sample_selection_policy();
     let reg_pol = sample_regression_policy(&sel_pol);
@@ -1818,7 +1818,7 @@ async fn test_b6_19_b3_workflow_integration() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires database URL"]
-async fn test_b6_20_b4_integration() -> Result<()> {
+async fn integration_environment_action() -> Result<()> {
     let ctx = setup_regression_test().await?;
     let mut sel_pol = sample_selection_policy();
 
@@ -1889,7 +1889,7 @@ async fn test_b6_20_b4_integration() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires database URL"]
-async fn test_b6_21_b5_integration() -> Result<()> {
+async fn browser_action_integration() -> Result<()> {
     let _ctx = setup_regression_test().await?;
     let mut sel_pol = sample_selection_policy();
 
