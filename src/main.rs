@@ -1386,6 +1386,117 @@ async fn pinned_qualification_verification_environment()
     qualification_environment_from_image_id(&image_id)
 }
 
+fn durable_tool_call_audit_is_strict(
+    audit: &serde_json::Value,
+    tool_call_count: i64,
+    tool_success_count: i64,
+    tool_failure_count: i64,
+) -> bool {
+    let (Ok(expected_total), Ok(expected_success), Ok(expected_failure)) = (
+        u64::try_from(tool_call_count),
+        u64::try_from(tool_success_count),
+        u64::try_from(tool_failure_count),
+    ) else {
+        return false;
+    };
+    if expected_failure != 0 || expected_success != expected_total {
+        return false;
+    }
+    let Some(summary) = audit.get("summary") else {
+        return false;
+    };
+    let Some(entries) = audit.get("entries").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    audit
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        == Some(1)
+        && summary.get("total").and_then(serde_json::Value::as_u64) == Some(expected_total)
+        && summary
+            .get("successful")
+            .and_then(serde_json::Value::as_u64)
+            == Some(expected_success)
+        && summary
+            .get("unsuccessful")
+            .and_then(serde_json::Value::as_u64)
+            == Some(expected_failure)
+        && summary
+            .get("unmatched_provider_calls")
+            .and_then(serde_json::Value::as_u64)
+            == Some(0)
+        && summary.get("denied").and_then(serde_json::Value::as_u64) == Some(0)
+        && summary
+            .get("mutating_unknown")
+            .and_then(serde_json::Value::as_u64)
+            == Some(0)
+        && audit
+            .get("omitted_count")
+            .and_then(serde_json::Value::as_u64)
+            == Some(0)
+        && audit
+            .get("provider_tool_names_omitted")
+            .and_then(serde_json::Value::as_u64)
+            == Some(0)
+        && usize::try_from(expected_total).ok() == Some(entries.len())
+        && successful_tool_audit_rows_are_correlated(entries)
+}
+
+fn successful_tool_audit_rows_are_correlated(entries: &[serde_json::Value]) -> bool {
+    entries.iter().all(|entry| {
+        let provider_name = entry
+            .get("provider_tool_name")
+            .and_then(serde_json::Value::as_str);
+        let canonical_name = entry
+            .get("canonical_tool_name")
+            .and_then(serde_json::Value::as_str);
+        let provider_tool_matches = provider_name
+            .and_then(orbit::tool_surface::CanonicalToolName::from_wire)
+            .is_some_and(|tool| canonical_name == Some(tool.as_str()));
+        entry.get("outcome").and_then(serde_json::Value::as_str) == Some("SUCCESS")
+            && entry
+                .get("error_code")
+                .is_none_or(serde_json::Value::is_null)
+            && entry
+                .get("provider_update_title_class")
+                .and_then(serde_json::Value::as_str)
+                == Some("known_tool_name")
+            && entry
+                .get("provider_name_mapping")
+                .and_then(serde_json::Value::as_str)
+                == Some("MATCH")
+            && entry
+                .get("provider_update_status")
+                .and_then(serde_json::Value::as_str)
+                == Some("in_progress")
+            && entry
+                .get("provider_update_tool_kind")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(provider_tool_kind_is_allowlisted)
+            && entry
+                .get("provider_tool_call_id_shape")
+                .and_then(serde_json::Value::as_str)
+                == Some("string")
+            && provider_tool_matches
+    })
+}
+
+fn provider_tool_kind_is_allowlisted(kind: &str) -> bool {
+    matches!(
+        kind,
+        "read"
+            | "edit"
+            | "delete"
+            | "move"
+            | "search"
+            | "execute"
+            | "think"
+            | "fetch"
+            | "switch_mode"
+            | "other"
+    )
+}
+
 async fn run_live_cli_qualification(
     repository_path: &Path,
     database_url_file: Option<&Path>,
@@ -1528,6 +1639,7 @@ async fn run_live_cli_qualification(
     let mut all_successful_agent_target_correlations = true;
     let mut all_role_agent_rows_linked = true;
     let mut all_successful_targets_have_credential_generation = true;
+    let mut all_agent_tool_audits_reconciled = true;
     let mut implementer_mutation_tool_calls = 0u64;
     let mut implementer_tool_success_count = 0u64;
     let mut implementer_tool_failure_count = 0u64;
@@ -1544,7 +1656,8 @@ async fn run_live_cli_qualification(
                    COALESCE(tool_success_count, 0) AS tool_success_count,
                    COALESCE(tool_failure_count, 0) AS tool_failure_count,
                    COALESCE(tool_counts, '{}'::jsonb) AS tool_counts,
-                   metadata->>'cleanup_confirmed' AS cleanup_confirmed
+                   metadata->>'cleanup_confirmed' AS cleanup_confirmed,
+                   COALESCE(metadata->'tool_call_audit', 'null'::jsonb) AS tool_call_audit
             FROM orbit_agent_executions
             WHERE role_execution_id = $1
             ORDER BY started_at_ms, id
@@ -1571,6 +1684,17 @@ async fn run_live_cli_qualification(
             let tool_counts = bounded_tool_counts(&raw_tool_counts);
             let cleanup_confirmed: Option<String> = agent.get("cleanup_confirmed");
             let cleanup_confirmed = cleanup_confirmed.as_deref() == Some("true");
+            let tool_call_audit: serde_json::Value = agent.get("tool_call_audit");
+            let tool_call_audit_reconciled = durable_tool_call_audit_is_strict(
+                &tool_call_audit,
+                tool_call_count,
+                tool_success_count,
+                tool_failure_count,
+            );
+            all_agent_tool_audits_reconciled &= tool_call_audit_reconciled;
+            let tool_call_audit_diagnostic = orbit::workflow_coordinator::render_tool_call_audit(
+                &serde_json::json!({"tool_call_audit": tool_call_audit}),
+            );
             let role_agent_id_linked = role.agent_execution_ids.contains(&id);
             let selected_target_correlation = role.resolved_target.as_ref().is_some_and(|target| {
                 role_agent_id_linked
@@ -1655,6 +1779,10 @@ async fn run_live_cli_qualification(
                 "tool_success_count": tool_success_count,
                 "tool_failure_count": tool_failure_count,
                 "tool_counts": tool_counts,
+                "tool_call_audit": {
+                    "strictly_reconciled": tool_call_audit_reconciled,
+                    "sanitized_diagnostic": tool_call_audit_diagnostic
+                },
                 "role_execution_id_linked": linked_role_execution_id.as_deref() == Some(role.id.as_str()) && role_agent_id_linked,
                 "selected_target_correlation": selected_target_correlation
             }));
@@ -1837,6 +1965,7 @@ async fn run_live_cli_qualification(
         && all_successful_agent_target_correlations
         && all_successful_targets_have_credential_generation
         && all_role_agent_rows_linked
+        && all_agent_tool_audits_reconciled
         && implementer_mutation_owner_observed
         && read_only_roles_had_no_mutation_calls
         && cleanup_confirmed
@@ -1890,6 +2019,8 @@ async fn run_live_cli_qualification(
             "all_role_agent_rows_linked_to_durable_role_execution_ids": all_role_agent_rows_linked,
             "credential_identity_and_generation_source": "persisted RoleExecution.resolved_target linked to each AgentExecution by role_execution_id and agent_execution_ids"
         },
+        "all_agent_tool_audits_reconciled": all_agent_tool_audits_reconciled,
+        "tool_call_audit_acceptance": "durable totals and outcomes must match persisted agent counters; every row must be successful; unmatched updates and omitted audit evidence must be zero",
         "mutation_authority": {
             "observed_active_lock_owner_role_execution_ids": observed_lock_owners,
             "implementer_mutation_owner_role_execution_ids": observed_implementer_owner_role_execution_ids,
@@ -4401,6 +4532,143 @@ mod live_workflow_qualification_tests {
             "weaker check",
         ]);
         assert!(caller_override.is_err());
+    }
+
+    #[test]
+    fn live_qualification_rejects_unmatched_or_inconsistent_durable_tool_audits() {
+        let audit = |total, successful, unsuccessful, unmatched| {
+            serde_json::json!({
+                "schema_version": 1,
+                "summary": {
+                    "total": total,
+                    "successful": successful,
+                    "unsuccessful": unsuccessful,
+                    "unmatched_provider_calls": unmatched,
+                    "denied": 0,
+                    "mutating_unknown": 0
+                },
+                "entries": (0..total).map(|index| serde_json::json!({
+                    "sequence": index + 1,
+                    "provider_tool_name": "orbit_read_file",
+                    "provider_name_mapping": "MATCH",
+                    "provider_update_title_class": "known_tool_name",
+                    "provider_update_tool_kind": "read",
+                    "provider_update_status": "in_progress",
+                    "provider_tool_call_id_shape": "string",
+                    "canonical_tool_name": "fs.read_text_file",
+                    "outcome": "SUCCESS",
+                    "error_code": null
+                })).collect::<Vec<_>>(),
+                "omitted_count": 0,
+                "provider_tool_names_omitted": 0
+            })
+        };
+
+        let clean = audit(2, 2, 0, 0);
+        assert!(durable_tool_call_audit_is_strict(&clean, 2, 2, 0));
+
+        let mut missing_update = clean.clone();
+        missing_update["entries"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("provider_update_title_class");
+        assert!(!durable_tool_call_audit_is_strict(&missing_update, 2, 2, 0));
+
+        let mut missing_kind = clean.clone();
+        missing_kind["entries"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("provider_update_tool_kind");
+        assert!(!durable_tool_call_audit_is_strict(&missing_kind, 2, 2, 0));
+
+        let mut unknown_kind = clean.clone();
+        unknown_kind["entries"][0]["provider_update_tool_kind"] = serde_json::json!("unrecognized");
+        assert!(!durable_tool_call_audit_is_strict(&unknown_kind, 2, 2, 0));
+
+        let mut missing_call_id_shape = clean.clone();
+        missing_call_id_shape["entries"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("provider_tool_call_id_shape");
+        assert!(!durable_tool_call_audit_is_strict(
+            &missing_call_id_shape,
+            2,
+            2,
+            0
+        ));
+
+        let mut non_string_call_id_shape = clean.clone();
+        non_string_call_id_shape["entries"][0]["provider_tool_call_id_shape"] =
+            serde_json::json!("non_string");
+        assert!(!durable_tool_call_audit_is_strict(
+            &non_string_call_id_shape,
+            2,
+            2,
+            0
+        ));
+
+        assert!(provider_tool_kind_is_allowlisted("switch_mode"));
+        assert!(!provider_tool_kind_is_allowlisted("unknown_provider_kind"));
+
+        let mut unknown_title = clean.clone();
+        unknown_title["entries"][0]["provider_update_title_class"] =
+            serde_json::json!("unrecognized_string");
+        unknown_title["entries"][0]["provider_name_mapping"] = serde_json::json!("UNKNOWN");
+        unknown_title["entries"][0]["provider_tool_name"] = serde_json::json!("unknown");
+        assert!(!durable_tool_call_audit_is_strict(&unknown_title, 2, 2, 0));
+
+        let mut mismatched_update = clean.clone();
+        mismatched_update["entries"][0]["provider_tool_name"] =
+            serde_json::json!("orbit_write_file");
+        mismatched_update["entries"][0]["provider_name_mapping"] = serde_json::json!("MISMATCH");
+        assert!(!durable_tool_call_audit_is_strict(
+            &mismatched_update,
+            2,
+            2,
+            0
+        ));
+
+        for failure_status in ["failed", "cancelled"] {
+            let mut failed_update = clean.clone();
+            failed_update["entries"][0]["provider_update_status"] =
+                serde_json::json!(failure_status);
+            assert!(!durable_tool_call_audit_is_strict(&failed_update, 2, 2, 0));
+        }
+
+        let unmatched = audit(4, 2, 2, 2);
+        assert!(!durable_tool_call_audit_is_strict(&unmatched, 2, 2, 0));
+
+        let mismatched_counter = audit(2, 1, 1, 0);
+        assert!(!durable_tool_call_audit_is_strict(
+            &mismatched_counter,
+            2,
+            2,
+            0
+        ));
+
+        let contradictory = audit(2, 2, 0, 0);
+        assert!(!durable_tool_call_audit_is_strict(&contradictory, 2, 2, 1));
+
+        let mut omitted = clean.clone();
+        omitted["omitted_count"] = serde_json::json!(1);
+        assert!(!durable_tool_call_audit_is_strict(&omitted, 2, 2, 0));
+
+        let mut denied = clean.clone();
+        denied["summary"]["denied"] = serde_json::json!(1);
+        assert!(!durable_tool_call_audit_is_strict(&denied, 2, 2, 0));
+
+        let mut unknown_mutation = clean.clone();
+        unknown_mutation["summary"]["mutating_unknown"] = serde_json::json!(1);
+        assert!(!durable_tool_call_audit_is_strict(
+            &unknown_mutation,
+            2,
+            2,
+            0
+        ));
+
+        let mut failed_entry = clean;
+        failed_entry["entries"][0]["outcome"] = serde_json::json!("EXECUTION_FAILURE");
+        assert!(!durable_tool_call_audit_is_strict(&failed_entry, 2, 2, 0));
     }
 
     #[test]

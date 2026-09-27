@@ -2290,6 +2290,10 @@ struct ToolCallAuditEntry {
     sequence: u64,
     provider_tool_name: &'static str,
     provider_name_mapping: &'static str,
+    provider_update_title_class: Option<&'static str>,
+    provider_update_tool_kind: Option<&'static str>,
+    provider_update_status: Option<&'static str>,
+    provider_tool_call_id_shape: Option<&'static str>,
     canonical_tool_name: &'static str,
     advertised_to_provider: Option<bool>,
     role_allowed: Option<bool>,
@@ -2307,6 +2311,15 @@ struct ProviderToolNameObservation {
     provider_tool_name: &'static str,
     request_tool_name: &'static str,
     canonical_tool_name: crate::tool_surface::CanonicalToolName,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ProviderToolUpdateObservation {
+    tool_name: Option<ProviderToolNameObservation>,
+    title_class: &'static str,
+    tool_kind: &'static str,
+    status: &'static str,
+    tool_call_id_shape: &'static str,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -2327,7 +2340,7 @@ struct ToolCallAudit {
     denied_count: u64,
     role_id: Option<String>,
     advertised_tools: Option<BTreeSet<String>>,
-    provider_tool_names: VecDeque<Option<ProviderToolNameObservation>>,
+    provider_tool_names: VecDeque<ProviderToolUpdateObservation>,
     provider_tool_names_omitted: u64,
     pending_overflow_names: u64,
     active_call: Option<ActiveToolCall>,
@@ -2366,11 +2379,55 @@ impl ToolCallAudit {
             return;
         }
 
-        let observation = update
-            .get("title")
+        let title = update.get("title");
+        let tool_name = title
             .and_then(serde_json::Value::as_str)
-            .and_then(codex_provider_tool_name);
-        self.provider_tool_names.push_back(observation);
+            .and_then(provider_tool_name_observation);
+        let title_class = match title {
+            Some(serde_json::Value::String(_)) if tool_name.is_some() => "known_tool_name",
+            Some(serde_json::Value::String(_)) => "unrecognized_string",
+            Some(_) => "non_string",
+            None => "missing",
+        };
+        let tool_kind = classify_provider_update_value(
+            update.get("kind"),
+            &[
+                "read",
+                "edit",
+                "delete",
+                "move",
+                "search",
+                "execute",
+                "think",
+                "fetch",
+                "switch_mode",
+                "other",
+            ],
+        );
+        let status = classify_provider_update_value(
+            update.get("status"),
+            &[
+                "pending",
+                "in_progress",
+                "completed",
+                "failed",
+                "cancelled",
+                "canceled",
+            ],
+        );
+        let tool_call_id_shape = match update.get("toolCallId") {
+            Some(serde_json::Value::String(_)) => "string",
+            Some(_) => "non_string",
+            None => "missing",
+        };
+        self.provider_tool_names
+            .push_back(ProviderToolUpdateObservation {
+                tool_name,
+                title_class,
+                tool_kind,
+                status,
+                tool_call_id_shape,
+            });
     }
 
     fn begin_call(
@@ -2388,7 +2445,7 @@ impl ToolCallAudit {
         if observed_event.is_none() && self.pending_overflow_names > 0 {
             self.pending_overflow_names -= 1;
         }
-        let observation = observed_event.flatten();
+        let observation = observed_event.and_then(|update| update.tool_name);
         let canonical_name = canonical_tool
             .map(|tool| tool.as_str())
             .unwrap_or("unknown");
@@ -2433,6 +2490,18 @@ impl ToolCallAudit {
             sequence,
             provider_tool_name: provider_name,
             provider_name_mapping,
+            provider_update_title_class: Some(
+                observed_event.map_or("update_not_observed", |update| update.title_class),
+            ),
+            provider_update_tool_kind: Some(
+                observed_event.map_or("update_not_observed", |update| update.tool_kind),
+            ),
+            provider_update_status: Some(
+                observed_event.map_or("update_not_observed", |update| update.status),
+            ),
+            provider_tool_call_id_shape: Some(
+                observed_event.map_or("update_not_observed", |update| update.tool_call_id_shape),
+            ),
             canonical_tool_name: canonical_name,
             advertised_to_provider,
             role_allowed,
@@ -2579,7 +2648,7 @@ impl ToolCallAudit {
         let mut next_sequence = callback_count.saturating_add(1);
         let queued = self.provider_tool_names.drain(..).collect::<Vec<_>>();
         for observation in &queued {
-            self.record_mutating(observation.map(|name| {
+            self.record_mutating(observation.tool_name.map(|name| {
                 crate::tool_surface::ToolMetadata::for_tool(name.canonical_tool_name).mutating
             }));
         }
@@ -2587,7 +2656,7 @@ impl ToolCallAudit {
             .mutating_unknown_count
             .saturating_add(self.pending_overflow_names);
         for observation in queued.iter().copied().take(capacity) {
-            self.push_unmatched_provider_call(next_sequence, observation, completed);
+            self.push_unmatched_provider_call(next_sequence, Some(observation), completed);
             next_sequence = next_sequence.saturating_add(1);
         }
         let recorded_queued = queued.len().min(capacity);
@@ -2608,13 +2677,14 @@ impl ToolCallAudit {
     fn push_unmatched_provider_call(
         &mut self,
         sequence: u64,
-        observation: Option<ProviderToolNameObservation>,
+        observation: Option<ProviderToolUpdateObservation>,
         completed: bool,
     ) {
-        let tool = observation.map(|name| name.canonical_tool_name);
+        let tool_name = observation.and_then(|update| update.tool_name);
+        let tool = tool_name.map(|name| name.canonical_tool_name);
         let metadata = tool.map(crate::tool_surface::ToolMetadata::for_tool);
         let mutating = metadata.as_ref().map(|metadata| metadata.mutating);
-        let advertised_to_provider = observation.and_then(|name| {
+        let advertised_to_provider = tool_name.and_then(|name| {
             self.advertised_tools
                 .as_ref()
                 .map(|tools| tools.contains(name.request_tool_name))
@@ -2626,8 +2696,22 @@ impl ToolCallAudit {
         });
         self.entries.push(ToolCallAuditEntry {
             sequence,
-            provider_tool_name: observation.map_or("unknown", |name| name.provider_tool_name),
+            provider_tool_name: tool_name.map_or("unknown", |name| name.provider_tool_name),
             provider_name_mapping: "UNMATCHED",
+            provider_update_title_class: Some(
+                observation.map_or("details_omitted_by_limit", |update| update.title_class),
+            ),
+            provider_update_tool_kind: Some(
+                observation.map_or("details_omitted_by_limit", |update| update.tool_kind),
+            ),
+            provider_update_status: Some(
+                observation.map_or("details_omitted_by_limit", |update| update.status),
+            ),
+            provider_tool_call_id_shape: Some(
+                observation.map_or("details_omitted_by_limit", |update| {
+                    update.tool_call_id_shape
+                }),
+            ),
             canonical_tool_name: tool.map_or("unknown", |tool| tool.as_str()),
             advertised_to_provider,
             role_allowed,
@@ -2665,9 +2749,24 @@ impl ToolCallAudit {
     }
 }
 
-fn codex_provider_tool_name(name: &str) -> Option<ProviderToolNameObservation> {
+fn classify_provider_update_value(
+    value: Option<&serde_json::Value>,
+    allowed: &[&'static str],
+) -> &'static str {
+    match value {
+        Some(serde_json::Value::String(value)) => allowed
+            .iter()
+            .copied()
+            .find(|candidate| *candidate == value.as_str())
+            .unwrap_or("unrecognized"),
+        Some(_) => "non_string",
+        None => "missing",
+    }
+}
+
+fn provider_tool_name_observation(name: &str) -> Option<ProviderToolNameObservation> {
     let tool = crate::tool_surface::CanonicalToolName::from_wire(name)?;
-    let provider_tool_name = match tool {
+    let orbit_provider_name = match tool {
         crate::tool_surface::CanonicalToolName::FsReadTextFile => "orbit_read_file",
         crate::tool_surface::CanonicalToolName::FsWriteTextFile => "orbit_write_file",
         crate::tool_surface::CanonicalToolName::FsEditFile => "orbit_edit_file",
@@ -2688,9 +2787,14 @@ fn codex_provider_tool_name(name: &str) -> Option<ProviderToolNameObservation> {
         crate::tool_surface::CanonicalToolName::GitDiff => "orbit_git_diff",
         crate::tool_surface::CanonicalToolName::GitShow => "orbit_git_show",
     };
-    if name != provider_tool_name {
+    let slash_name = tool.as_str().replace('.', "/");
+    let provider_tool_name = if name == orbit_provider_name {
+        orbit_provider_name
+    } else if name == tool.as_str() || name == tool.legacy_name() || name == slash_name {
+        tool.as_str()
+    } else {
         return None;
-    }
+    };
     Some(ProviderToolNameObservation {
         provider_tool_name,
         request_tool_name: tool.legacy_name(),
@@ -3042,7 +3146,7 @@ pub fn render_tool_call_audit(metadata: &serde_json::Value) -> String {
         count("denied"),
         count("unmatched_provider_calls")
     );
-    report.push_str("seq | provider title from session/update | mapping | canonical | advertised | role allowed | outcome | error code | mutation applied | later callback observed | turn complete | paths | detail\n");
+    report.push_str("seq | provider title from session/update | title class | provider kind | provider status | toolCallId shape | mapping | canonical | advertised | role allowed | outcome | error code | mutation applied | later callback observed | turn complete | paths | detail\n");
 
     for entry in entries.iter().take(TOOL_CALL_AUDIT_LIMIT) {
         let string = |name| {
@@ -3051,7 +3155,7 @@ pub fn render_tool_call_audit(metadata: &serde_json::Value) -> String {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("")
         };
-        let provider = codex_provider_tool_name(string("provider_tool_name"))
+        let provider = provider_tool_name_observation(string("provider_tool_name"))
             .map_or("unknown", |name| name.provider_tool_name);
         let canonical =
             crate::tool_surface::CanonicalToolName::from_canonical(string("canonical_tool_name"))
@@ -3061,6 +3165,55 @@ pub fn render_tool_call_audit(metadata: &serde_json::Value) -> String {
             "MISMATCH" => "MISMATCH",
             "UNMATCHED" => "UNMATCHED",
             _ => "UNKNOWN",
+        };
+        let title_class = match string("provider_update_title_class") {
+            "known_tool_name" => "known_tool_name",
+            "unrecognized_string" => "unrecognized_string",
+            "non_string" => "non_string",
+            "missing" => "missing",
+            "update_not_observed" => "update_not_observed",
+            "details_omitted_by_limit" => "details_omitted_by_limit",
+            _ => "unknown",
+        };
+        let provider_kind = match string("provider_update_tool_kind") {
+            "read"
+            | "edit"
+            | "delete"
+            | "move"
+            | "search"
+            | "execute"
+            | "think"
+            | "fetch"
+            | "switch_mode"
+            | "other"
+            | "unrecognized"
+            | "non_string"
+            | "missing"
+            | "update_not_observed"
+            | "details_omitted_by_limit" => string("provider_update_tool_kind"),
+            _ => "unknown",
+        };
+        let provider_status = match string("provider_update_status") {
+            "pending"
+            | "in_progress"
+            | "completed"
+            | "failed"
+            | "cancelled"
+            | "canceled"
+            | "unrecognized"
+            | "non_string"
+            | "missing"
+            | "update_not_observed"
+            | "details_omitted_by_limit" => string("provider_update_status"),
+            _ => "unknown",
+        };
+        let tool_call_id_shape = match string("provider_tool_call_id_shape") {
+            "string"
+            | "non_string"
+            | "missing"
+            | "update_not_observed"
+            | "details_omitted_by_limit" => string("provider_tool_call_id_shape"),
+            _ => "unknown",
         };
         let (outcome, detail) =
             audit_outcome(entry.get("outcome").unwrap_or(&serde_json::Value::Null));
@@ -3087,7 +3240,7 @@ pub fn render_tool_call_audit(metadata: &serde_json::Value) -> String {
                 .unwrap_or(&serde_json::Value::Null),
         );
         report.push_str(&format!(
-            "{} | {provider} | {mapping} | {canonical} | {} | {} | {outcome} | {error_code} | {mutating}/{applied} | {later} | {complete} | {paths} | {}\n",
+            "{} | {provider} | {title_class} | {provider_kind} | {provider_status} | {tool_call_id_shape} | {mapping} | {canonical} | {} | {} | {outcome} | {error_code} | {mutating}/{applied} | {later} | {complete} | {paths} | {}\n",
             entry.get("sequence").and_then(serde_json::Value::as_u64).unwrap_or(0),
             audit_bool(entry.get("advertised_to_provider").and_then(serde_json::Value::as_bool)),
             audit_bool(entry.get("role_allowed").and_then(serde_json::Value::as_bool)),
@@ -5574,6 +5727,113 @@ mod tests {
             "tool_call_audit": overflow.metadata(0, 0, 0)
         }));
         assert!(overflow_report.contains("provider titles omitted=1"));
+    }
+
+    #[test]
+    fn unknown_provider_updates_keep_safe_classification_and_remain_unmatched() {
+        use crate::tool_surface::CanonicalToolName as Tool;
+
+        let mut audit = ToolCallAudit::with_context(Some("planner"), None);
+        for status in ["in_progress", "completed", "in_progress", "completed"] {
+            audit.observe_provider_tool_name(&serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "secret-call-id-123",
+                "title": "private-token-shaped-provider-title",
+                "kind": "read",
+                "status": status,
+                "rawInput": {"path": "/private/provider/payload"}
+            }));
+        }
+
+        for sequence in 1..=2 {
+            let call = audit.begin_call(sequence, Some(Tool::FsReadTextFile), sequence - 1, 0);
+            audit.finish_call(call, ToolCallOutcome::Success, None);
+        }
+        audit.set_turn_completion(true, 2);
+        let metadata = serde_json::json!({
+            "tool_call_audit": audit.metadata(2, 2, 0)
+        });
+
+        assert_eq!(metadata["tool_call_audit"]["summary"]["total"], 4);
+        assert_eq!(metadata["tool_call_audit"]["summary"]["successful"], 2);
+        assert_eq!(metadata["tool_call_audit"]["summary"]["unsuccessful"], 2);
+        assert_eq!(
+            metadata["tool_call_audit"]["summary"]["unmatched_provider_calls"],
+            2
+        );
+        assert_eq!(
+            metadata["tool_call_audit"]["entries"][0]["provider_update_title_class"],
+            "unrecognized_string"
+        );
+        assert_eq!(
+            metadata["tool_call_audit"]["entries"][0]["provider_update_tool_kind"],
+            "read"
+        );
+        assert_eq!(
+            metadata["tool_call_audit"]["entries"][0]["provider_update_status"],
+            "in_progress"
+        );
+        assert_eq!(
+            metadata["tool_call_audit"]["entries"][0]["provider_tool_call_id_shape"],
+            "string"
+        );
+        assert_eq!(
+            metadata["tool_call_audit"]["entries"][2]["error_code"],
+            "PROVIDER_CALLBACK_UNRESOLVED"
+        );
+
+        let encoded = metadata.to_string();
+        let report = render_tool_call_audit(&metadata);
+        assert!(!encoded.contains("private-token-shaped-provider-title"));
+        assert!(!encoded.contains("secret-call-id-123"));
+        assert!(!encoded.contains("/private/provider/payload"));
+        assert!(!report.contains("private-token-shaped-provider-title"));
+        assert!(!report.contains("secret-call-id-123"));
+        assert!(!report.contains("/private/provider/payload"));
+        assert!(report.contains("unrecognized_string"));
+        assert!(report.contains("in_progress"));
+        assert!(report.contains("completed"));
+    }
+
+    #[test]
+    fn exact_tool_wire_titles_are_mapped_and_human_titles_stay_unknown() {
+        use crate::tool_surface::CanonicalToolName as Tool;
+
+        let mut wire_name_audit = ToolCallAudit::default();
+        wire_name_audit.observe_provider_tool_name(&serde_json::json!({
+            "sessionUpdate": "tool_call",
+            "title": "fs/read_text_file",
+            "kind": "read",
+            "status": "in_progress"
+        }));
+        let call = wire_name_audit.begin_call(1, Some(Tool::FsReadTextFile), 0, 0);
+        wire_name_audit.finish_call(call, ToolCallOutcome::Success, None);
+        wire_name_audit.set_turn_completion(true, 1);
+        assert_eq!(
+            wire_name_audit.entries[0].provider_tool_name,
+            "fs.read_text_file"
+        );
+        assert_eq!(wire_name_audit.entries[0].provider_name_mapping, "MATCH");
+
+        let mut human_title_audit = ToolCallAudit::default();
+        human_title_audit.observe_provider_tool_name(&serde_json::json!({
+            "sessionUpdate": "tool_call",
+            "title": "Reading the project README",
+            "kind": "read",
+            "status": "in_progress"
+        }));
+        let call = human_title_audit.begin_call(1, Some(Tool::FsReadTextFile), 0, 0);
+        human_title_audit.finish_call(call, ToolCallOutcome::Success, None);
+        human_title_audit.set_turn_completion(true, 1);
+        assert_eq!(human_title_audit.entries[0].provider_tool_name, "unknown");
+        assert_eq!(
+            human_title_audit.entries[0].provider_name_mapping,
+            "UNKNOWN"
+        );
+        assert_eq!(
+            human_title_audit.entries[0].provider_update_title_class,
+            Some("unrecognized_string")
+        );
     }
 
     #[test]
