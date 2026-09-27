@@ -258,7 +258,7 @@ struct WorkflowArgs {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum WorkflowAction {
-    /// Run Orbit's fixed S8 live qualification against a disposable temporary Git repository.
+    /// Run Orbit's fixed live CLI qualification against a disposable temporary Git repository.
     QualifyLive {
         /// Clean disposable Git repository under temp with committed README.md and fixed test.sh.
         #[arg(long, value_name = "PATH", required = true)]
@@ -659,24 +659,24 @@ fn ensure_cli_workflow_execution_enabled(action: &WorkflowAction) -> Result<()> 
         WorkflowAction::Start { .. } | WorkflowAction::Run { .. }
     ) {
         anyhow::bail!(
-            "CLI_WORKFLOW_EXECUTION_GATED: workflow start and resume are disabled pending R4 qualification"
+            "CLI_WORKFLOW_EXECUTION_GATED: workflow start and resume remain gated pending qualification"
         );
     }
     Ok(())
 }
 
-const S8_LIVE_VERIFICATION_IMAGE: &str = "docker.io/library/alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b";
-const S8_LIVE_README_CONTENT: &str = "ORBIT_R4_S8_QUALIFICATION_OK";
-const S8_LIVE_TEST_MARKER: &str = "ORBIT_R4_S8_QUALIFICATION_CHECK_PASSED";
-const S8_LIVE_TEST_SCRIPT: &str = "#!/bin/sh\nset -eu\nif ! printf '%s\\n' 'ORBIT_R4_S8_QUALIFICATION_OK' | cmp -s - README.md; then\n    printf '%s\\n' 'S8 candidate README contract failed' >&2\n    exit 1\nfi\nprintf '%s\\n' 'ORBIT_R4_S8_QUALIFICATION_CHECK_PASSED'\n";
+const LIVE_QUALIFICATION_VERIFICATION_IMAGE: &str = "docker.io/library/alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b";
+const LIVE_QUALIFICATION_README_CONTENT: &str = "ORBIT_R4_S8_QUALIFICATION_OK";
+const LIVE_QUALIFICATION_TEST_MARKER: &str = "ORBIT_R4_S8_QUALIFICATION_CHECK_PASSED";
+const LIVE_QUALIFICATION_TEST_SCRIPT: &str = "#!/bin/sh\nset -eu\nif ! printf '%s\\n' 'ORBIT_R4_S8_QUALIFICATION_OK' | cmp -s - README.md; then\n    printf '%s\\n' 'Live qualification candidate contract failed' >&2\n    exit 1\nfi\nprintf '%s\\n' 'ORBIT_R4_S8_QUALIFICATION_CHECK_PASSED'\n";
 
-struct S8LiveQualificationPolicies {
+struct LiveCliQualificationPolicies {
     verification: orbit::verification::VerificationPolicy,
     regression: orbit::regression_strategy::RegressionPolicy,
     selection: orbit::regression_strategy::SelectionPolicy,
 }
 
-fn s8_live_qualification_policies() -> S8LiveQualificationPolicies {
+fn live_cli_qualification_policies() -> LiveCliQualificationPolicies {
     use orbit::{
         regression_strategy::{
             RegressionFallbackBehavior, RegressionPolicy, SelectionPolicy, VerificationCheck,
@@ -686,21 +686,21 @@ fn s8_live_qualification_policies() -> S8LiveQualificationPolicies {
     };
 
     let mut verification = VerificationPolicy::new(
-        "orbit-r4-s8-live-verification-v1",
-        "Fixed Orbit R4 S8 live qualification check",
+        "orbit-live-cli-verification-v1",
+        "Fixed Orbit live CLI qualification check",
     );
-    verification.required_steps = vec!["s8-candidate-contract".into()];
+    verification.required_steps = vec!["candidate-contract".into()];
     verification.allowed_commands = vec![AllowedCommand::with_prefix("sh", vec!["test.sh".into()])];
     verification.network_policy = orbit::verification::VerificationNetworkPolicy::None;
     verification.cache_policy = orbit::verification::VerificationCachePolicy::Clean;
 
     let mut selection = SelectionPolicy::new(
-        "orbit-r4-s8-live-selection-v1",
-        "Fixed Orbit R4 S8 live qualification selection",
+        "orbit-live-cli-selection-v1",
+        "Fixed Orbit live CLI qualification selection",
     );
     let mut check = VerificationCheck::new_command(
-        "s8-candidate-contract",
-        "Check the S8 qualification candidate",
+        "candidate-contract",
+        "Check the live qualification candidate",
         vec![
             VerificationTier::Fast,
             VerificationTier::Standard,
@@ -712,27 +712,27 @@ fn s8_live_qualification_policies() -> S8LiveQualificationPolicies {
     selection.checks.push(check);
 
     let mut regression = RegressionPolicy::new(
-        "orbit-r4-s8-live-regression-v1",
-        "Fixed Orbit R4 S8 live qualification regression",
+        "orbit-live-cli-regression-v1",
+        "Fixed Orbit live CLI qualification regression",
     );
     regression.fallback_behavior = RegressionFallbackBehavior::FailClosed;
     regression.selection_policy_id = Some(selection.id.clone());
     regression.selection_policy_version = Some(selection.version);
     regression.selection_policy_digest = Some(selection.digest());
 
-    S8LiveQualificationPolicies {
+    LiveCliQualificationPolicies {
         verification,
         regression,
         selection,
     }
 }
 
-struct S8LiveRepository {
+struct LiveQualificationRepository {
     path: PathBuf,
     base_revision: String,
 }
 
-const S8_ALLOWED_LOCAL_GIT_CONFIG_KEYS: &[&str] = &[
+const LIVE_QUALIFICATION_LOCAL_GIT_CONFIG_ALLOWLIST: &[&str] = &[
     "core.repositoryformatversion",
     "core.filemode",
     "core.bare",
@@ -741,7 +741,7 @@ const S8_ALLOWED_LOCAL_GIT_CONFIG_KEYS: &[&str] = &[
     "user.email",
 ];
 
-fn s8_local_git_config_keys(repository: &Path) -> Result<Vec<String>> {
+fn local_git_config_keys_for_qualification(repository: &Path) -> Result<Vec<String>> {
     let keys = git_readonly_output(
         repository,
         &[
@@ -760,11 +760,11 @@ fn s8_local_git_config_keys(repository: &Path) -> Result<Vec<String>> {
         .collect())
 }
 
-fn s8_validate_local_git_config(repository: &Path) -> Result<()> {
-    let keys = s8_local_git_config_keys(repository)?;
+fn validate_local_git_config_for_qualification(repository: &Path) -> Result<()> {
+    let keys = local_git_config_keys_for_qualification(repository)?;
     for key in &keys {
         anyhow::ensure!(
-            S8_ALLOWED_LOCAL_GIT_CONFIG_KEYS.contains(&key.as_str()),
+            LIVE_QUALIFICATION_LOCAL_GIT_CONFIG_ALLOWLIST.contains(&key.as_str()),
             "qualification repository Git configuration contains an unsupported setting"
         );
     }
@@ -776,7 +776,7 @@ fn s8_validate_local_git_config(repository: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_s8_live_repository(path: &Path) -> Result<S8LiveRepository> {
+fn validate_live_qualification_repository(path: &Path) -> Result<LiveQualificationRepository> {
     let canonical = path
         .canonicalize()
         .context("qualification repository path must exist")?;
@@ -825,7 +825,7 @@ fn validate_s8_live_repository(path: &Path) -> Result<S8LiveRepository> {
                 let readme = fs::read_to_string(entry.path())
                     .context("qualification repository README.md must be UTF-8 text")?;
                 anyhow::ensure!(
-                    readme.trim() != S8_LIVE_README_CONTENT,
+                    readme.trim() != LIVE_QUALIFICATION_README_CONTENT,
                     "qualification repository README.md must require a candidate mutation"
                 );
                 has_readme = true;
@@ -833,8 +833,8 @@ fn validate_s8_live_repository(path: &Path) -> Result<S8LiveRepository> {
             Some("test.sh") => {
                 anyhow::ensure!(
                     file_type.is_file()
-                        && fs::read(entry.path())? == S8_LIVE_TEST_SCRIPT.as_bytes(),
-                    "qualification repository must contain the fixed S8 contract test.sh"
+                        && fs::read(entry.path())? == LIVE_QUALIFICATION_TEST_SCRIPT.as_bytes(),
+                    "qualification repository must contain the fixed contract test.sh"
                 );
                 has_test_script = true;
             }
@@ -866,7 +866,7 @@ fn validate_s8_live_repository(path: &Path) -> Result<S8LiveRepository> {
             "qualification repository must not contain active or custom Git hooks"
         );
     }
-    s8_validate_local_git_config(&canonical)?;
+    validate_local_git_config_for_qualification(&canonical)?;
 
     let top_level = git_readonly_output(&canonical, &["rev-parse", "--show-toplevel"])?;
     anyhow::ensure!(
@@ -897,14 +897,14 @@ fn validate_s8_live_repository(path: &Path) -> Result<S8LiveRepository> {
         "qualification repository must have a committed Git baseline"
     );
 
-    Ok(S8LiveRepository {
+    Ok(LiveQualificationRepository {
         path: canonical,
         base_revision,
     })
 }
 
 fn git_readonly_output(repository: &Path, args: &[&str]) -> Result<String> {
-    let output = s8_git_readonly_command(repository, args)
+    let output = read_only_qualification_git_command(repository, args)
         .output()
         .context("could not start Git while validating the qualification repository")?;
     anyhow::ensure!(
@@ -916,7 +916,7 @@ fn git_readonly_output(repository: &Path, args: &[&str]) -> Result<String> {
         .map(|value| value.trim().to_owned())
 }
 
-fn s8_git_readonly_command(repository: &Path, args: &[&str]) -> std::process::Command {
+fn read_only_qualification_git_command(repository: &Path, args: &[&str]) -> std::process::Command {
     let path = std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into());
     let mut command = std::process::Command::new("git");
     command
@@ -950,7 +950,7 @@ fn s8_git_readonly_command(repository: &Path, args: &[&str]) -> std::process::Co
     command
 }
 
-fn s8_live_environment_from_image_id(
+fn qualification_environment_from_image_id(
     image_id: &str,
 ) -> Result<orbit::verification::EnvironmentIdentity> {
     let image_id = image_id
@@ -963,12 +963,12 @@ fn s8_live_environment_from_image_id(
     );
     anyhow::ensure!(
         std::env::consts::OS == "linux",
-        "S8 live qualification requires Linux rootless Podman"
+        "live CLI qualification requires Linux rootless Podman"
     );
     Ok(orbit::verification::EnvironmentIdentity {
         execution_profile: "sandboxed-container".into(),
         isolation: "rootless-podman".into(),
-        runtime_image: Some(S8_LIVE_VERIFICATION_IMAGE.into()),
+        runtime_image: Some(LIVE_QUALIFICATION_VERIFICATION_IMAGE.into()),
         runtime_image_digest: Some(format!("sha256:{image_id}")),
         oci_runtime: Some("podman".into()),
         network_policy: orbit::verification::VerificationNetworkPolicy::None,
@@ -985,7 +985,7 @@ fn s8_live_environment_from_image_id(
     })
 }
 
-fn s8_reset_aware_evidence(reason: &str) -> serde_json::Value {
+fn reset_aware_selection_evidence(reason: &str) -> serde_json::Value {
     let fields: std::collections::BTreeMap<&str, &str> = reason
         .split("; ")
         .filter_map(|field| field.split_once('='))
@@ -1019,11 +1019,11 @@ fn s8_reset_aware_evidence(reason: &str) -> serde_json::Value {
     let five_hour_remaining = fields
         .get("5h_remaining")
         .copied()
-        .filter(|value| s8_is_safe_quota_percent(value));
+        .filter(|value| is_safe_quota_percent(value));
     let seven_day_remaining = fields
         .get("7d_remaining")
         .copied()
-        .filter(|value| s8_is_safe_quota_percent(value));
+        .filter(|value| is_safe_quota_percent(value));
     let seven_day_reset_at_ms = fields
         .get("7d_reset_at_ms")
         .filter(|value| **value == "unknown" || value.bytes().all(|byte| byte.is_ascii_digit()));
@@ -1074,7 +1074,7 @@ fn s8_reset_aware_evidence(reason: &str) -> serde_json::Value {
     })
 }
 
-fn s8_is_safe_quota_percent(value: &str) -> bool {
+fn is_safe_quota_percent(value: &str) -> bool {
     value == "unknown"
         || (!value.is_empty()
             && value
@@ -1082,11 +1082,11 @@ fn s8_is_safe_quota_percent(value: &str) -> bool {
                 .all(|byte| byte.is_ascii_digit() || matches!(byte, b'.' | b'%')))
 }
 
-fn s8_safe_quota_percent(value: Option<f64>) -> Option<f64> {
+fn safe_quota_percent(value: Option<f64>) -> Option<f64> {
     value.filter(|value| value.is_finite() && (0.0..=100.0).contains(value))
 }
 
-fn s8_bounded_tool_counts(value: &serde_json::Value) -> serde_json::Value {
+fn bounded_tool_counts(value: &serde_json::Value) -> serde_json::Value {
     const SAFE_TOOL_NAMES: &[&str] = &[
         "read_file",
         "write_file",
@@ -1143,14 +1143,14 @@ fn s8_bounded_tool_counts(value: &serde_json::Value) -> serde_json::Value {
     serde_json::Value::Object(bounded)
 }
 
-fn s8_tool_count(counts: &serde_json::Value, names: &[&str]) -> u64 {
+fn tool_count(counts: &serde_json::Value, names: &[&str]) -> u64 {
     names
         .iter()
         .filter_map(|name| counts.get(*name).and_then(serde_json::Value::as_u64))
         .fold(0, u64::saturating_add)
 }
 
-async fn s8_selected_credential_quota_evidence(
+async fn selected_credential_quota_evidence(
     pool: &sqlx::PgPool,
     target: &orbit::workflow::ResolvedExecutionTarget,
 ) -> Result<serde_json::Value> {
@@ -1199,7 +1199,7 @@ async fn s8_selected_credential_quota_evidence(
         windows.push(serde_json::json!({
             "window_kind": window_kind,
             "duration_minutes": duration_minutes,
-            "remaining_percent": s8_safe_quota_percent(remaining_percent),
+            "remaining_percent": safe_quota_percent(remaining_percent),
             "resets_at_ms": resets_at_ms.filter(|reset| *reset >= 0),
             "exhausted": exhausted
         }));
@@ -1238,7 +1238,7 @@ async fn s8_selected_credential_quota_evidence(
     }))
 }
 
-fn s8_selection_contains_required_check(
+fn selection_contains_required_check(
     selection: Option<&orbit::regression_strategy::VerificationSelection>,
     workspace_state_id: &str,
     tier: orbit::regression_strategy::VerificationTier,
@@ -1249,11 +1249,11 @@ fn s8_selection_contains_required_check(
             && selection
                 .selected_checks
                 .iter()
-                .any(|check| check.check_id == "s8-candidate-contract")
+                .any(|check| check.check_id == "candidate-contract")
     })
 }
 
-fn s8_run_executed_fixed_check(
+fn executed_fixed_check_passed(
     run: Option<&orbit::verification::VerificationRun>,
     expected_environment: &orbit::verification::EnvironmentIdentity,
 ) -> bool {
@@ -1261,9 +1261,9 @@ fn s8_run_executed_fixed_check(
     let check = run
         .step_runs
         .iter()
-        .find(|step| step.step_id == "s8-candidate-contract");
+        .find(|step| step.step_id == "candidate-contract");
     let planned_command = run.plan_snapshot.steps.iter().any(|step| {
-        step.id == "s8-candidate-contract"
+        step.id == "candidate-contract"
             && step.argv == ["sh".to_owned(), "test.sh".to_owned()]
             && step.required
     });
@@ -1274,7 +1274,7 @@ fn s8_run_executed_fixed_check(
                 && step
                     .stdout_preview
                     .as_deref()
-                    .is_some_and(|stdout| stdout.contains(S8_LIVE_TEST_MARKER))
+                    .is_some_and(|stdout| stdout.contains(LIVE_QUALIFICATION_TEST_MARKER))
         })
         && planned_command
         && run.environment_identity.execution_profile == expected_environment.execution_profile
@@ -1287,12 +1287,12 @@ fn s8_run_executed_fixed_check(
         && run.environment_identity.cache_policy == expected_environment.cache_policy
 }
 
-fn s8_candidate_contract_evidence(repository: &S8LiveRepository) -> serde_json::Value {
-    let expected_readme = format!("{S8_LIVE_README_CONTENT}\n");
+fn candidate_contract_evidence(repository: &LiveQualificationRepository) -> serde_json::Value {
+    let expected_readme = format!("{LIVE_QUALIFICATION_README_CONTENT}\n");
     let readme_is_exact = fs::read_to_string(repository.path.join("README.md"))
         .is_ok_and(|readme| readme == expected_readme);
     let fixed_harness_unchanged = fs::read(repository.path.join("test.sh"))
-        .is_ok_and(|script| script == S8_LIVE_TEST_SCRIPT.as_bytes());
+        .is_ok_and(|script| script == LIVE_QUALIFICATION_TEST_SCRIPT.as_bytes());
     let changed_tracked_files = git_readonly_output(
         &repository.path,
         &[
@@ -1345,11 +1345,11 @@ fn s8_candidate_contract_evidence(repository: &S8LiveRepository) -> serde_json::
     })
 }
 
-async fn pinned_s8_live_verification_environment()
+async fn pinned_qualification_verification_environment()
 -> Result<orbit::verification::EnvironmentIdentity> {
     anyhow::ensure!(
         unsafe { libc::geteuid() } != 0,
-        "S8 live qualification requires rootless Podman"
+        "live CLI qualification requires rootless Podman"
     );
     let rootless = tokio::process::Command::new("podman")
         .args([
@@ -1363,42 +1363,42 @@ async fn pinned_s8_live_verification_environment()
         .context("could not inspect the local rootless Podman runtime")?;
     anyhow::ensure!(
         rootless.status.success() && String::from_utf8_lossy(&rootless.stdout).trim() == "true",
-        "S8 live qualification requires a working rootless Podman runtime"
+        "live CLI qualification requires a working rootless Podman runtime"
     );
     let image = tokio::process::Command::new("podman")
         .args([
             "--remote=false",
             "image",
             "inspect",
-            S8_LIVE_VERIFICATION_IMAGE,
+            LIVE_QUALIFICATION_VERIFICATION_IMAGE,
             "--format",
             "{{.Id}}",
         ])
         .output()
         .await
-        .context("could not inspect the locally pinned S8 verification image")?;
+        .context("could not inspect the locally pinned live qualification image")?;
     anyhow::ensure!(
         image.status.success(),
-        "locally pinned S8 verification image is unavailable in rootless Podman"
+        "locally pinned live qualification image is unavailable in rootless Podman"
     );
     let image_id = String::from_utf8(image.stdout)
         .context("Podman returned a non-UTF-8 verification image identity")?;
-    s8_live_environment_from_image_id(&image_id)
+    qualification_environment_from_image_id(&image_id)
 }
 
-async fn run_s8_live_qualification(
+async fn run_live_cli_qualification(
     repository_path: &Path,
     database_url_file: Option<&Path>,
     output_format: Output,
 ) -> Result<()> {
-    let repository = validate_s8_live_repository(repository_path)?;
-    let verification_environment = pinned_s8_live_verification_environment().await?;
+    let repository = validate_live_qualification_repository(repository_path)?;
+    let verification_environment = pinned_qualification_verification_environment().await?;
     let database_url = read_private_database_url(database_url_file).await?;
     let (engine, scratch) = connect_durable_catalog_engine(database_url.as_str()).await?;
     let workflow_store = orbit::workflow::WorkflowStore::new(engine.pool.clone());
     let verification_store = orbit::verification::VerificationStore::new(engine.pool.clone());
     let regression_store = orbit::regression_strategy::RegressionStore::new(engine.pool.clone());
-    let policies = s8_live_qualification_policies();
+    let policies = live_cli_qualification_policies();
 
     verification_store
         .save_policy(&policies.verification)
@@ -1410,10 +1410,10 @@ async fn run_s8_live_qualification(
         .insert_regression_policy(&policies.regression)
         .await?;
 
-    let task_id = format!("task-s8-live-qualification-{}", orbit::model::id());
-    let attempt_id = format!("attempt-s8-live-qualification-{}", orbit::model::id());
+    let task_id = format!("task-live-cli-qualification-{}", orbit::model::id());
+    let attempt_id = format!("attempt-live-cli-qualification-{}", orbit::model::id());
     let task = format!(
-        "This is the fixed Orbit R4 S8 live qualification task. In this disposable repository, replace README.md with exactly one line containing `{S8_LIVE_README_CONTENT}`. The committed `test.sh` is a fixed qualification harness: do not modify it or any other file. Return a structured implementation handoff."
+        "This is the fixed live CLI qualification task. In this disposable repository, replace README.md with exactly one line containing `{LIVE_QUALIFICATION_README_CONTENT}`. The committed `test.sh` is a fixed qualification harness: do not modify it or any other file. Return a structured implementation handoff."
     );
     let workflow = workflow_store
         .create_workflow_run_full(
@@ -1433,7 +1433,7 @@ async fn run_s8_live_qualification(
             Some(&repository.base_revision),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("S8 qualification workflow could not be created"))?;
+        .map_err(|_| anyhow::anyhow!("live CLI qualification workflow could not be created"))?;
 
     let coordinator = orbit::workflow_coordinator::WorkflowCoordinator::new(
         engine.pool.clone(),
@@ -1469,7 +1469,7 @@ async fn run_s8_live_qualification(
     let final_workflow = workflow_store
         .get_workflow_run(&workflow.id)
         .await?
-        .context("S8 qualification workflow record disappeared")?;
+        .context("live CLI qualification workflow record disappeared")?;
     let role_executions = workflow_store.list_role_executions(&workflow.id).await?;
     let latest_review = workflow_store
         .get_latest_handoff_of_type(&workflow.id, orbit::workflow::HandoffType::Review)
@@ -1515,7 +1515,7 @@ async fn run_s8_live_qualification(
     )
     .await
     .ok();
-    let candidate_contract = s8_candidate_contract_evidence(&repository);
+    let candidate_contract = candidate_contract_evidence(&repository);
     let candidate_contract_passed =
         candidate_contract["only_expected_readme_change"] == serde_json::Value::Bool(true);
 
@@ -1568,7 +1568,7 @@ async fn run_s8_live_qualification(
             let tool_success_count: i64 = agent.get("tool_success_count");
             let tool_failure_count: i64 = agent.get("tool_failure_count");
             let raw_tool_counts: serde_json::Value = agent.get("tool_counts");
-            let tool_counts = s8_bounded_tool_counts(&raw_tool_counts);
+            let tool_counts = bounded_tool_counts(&raw_tool_counts);
             let cleanup_confirmed: Option<String> = agent.get("cleanup_confirmed");
             let cleanup_confirmed = cleanup_confirmed.as_deref() == Some("true");
             let role_agent_id_linked = role.agent_execution_ids.contains(&id);
@@ -1604,7 +1604,7 @@ async fn run_s8_live_qualification(
             }
             if role.role_id == "implementer" {
                 implementer_mutation_tool_calls = implementer_mutation_tool_calls.saturating_add(
-                    s8_tool_count(&tool_counts, &["fs.write_text_file", "fs.edit_file"]),
+                    tool_count(&tool_counts, &["fs.write_text_file", "fs.edit_file"]),
                 );
                 implementer_tool_success_count = implementer_tool_success_count
                     .saturating_add(u64::try_from(tool_success_count.max(0)).unwrap_or(0));
@@ -1613,13 +1613,13 @@ async fn run_s8_live_qualification(
                 if role_agent_id_linked
                     && selected_target_correlation
                     && observed_lock_owners.contains(&role.id)
-                    && s8_tool_count(&tool_counts, &["fs.write_text_file", "fs.edit_file"]) > 0
+                    && tool_count(&tool_counts, &["fs.write_text_file", "fs.edit_file"]) > 0
                 {
                     observed_implementer_owner_ids.push(role.id.clone());
                 }
             } else if matches!(role.role_id.as_str(), "planner" | "reviewer") {
                 planner_reviewer_mutation_tool_calls = planner_reviewer_mutation_tool_calls
-                    .saturating_add(s8_tool_count(
+                    .saturating_add(tool_count(
                         &tool_counts,
                         &["fs.write_text_file", "fs.edit_file"],
                     ));
@@ -1676,9 +1676,9 @@ async fn run_s8_live_qualification(
                         "requested": "not_configured",
                         "actual": "unknown_not_observed"
                     },
-                    "quota_and_availability_selection": s8_reset_aware_evidence(&target.resolution_reason)
+                    "quota_and_availability_selection": reset_aware_selection_evidence(&target.resolution_reason)
                 })),
-                s8_selected_credential_quota_evidence(&engine.pool, target).await?,
+                selected_credential_quota_evidence(&engine.pool, target).await?,
             )
         } else {
             (
@@ -1730,26 +1730,26 @@ async fn run_s8_live_qualification(
     let disk_workspace_state_id = disk_workspace_state
         .as_ref()
         .map(|state| state.state_id.as_str());
-    let fast_passed = s8_run_executed_fixed_check(fast_run, &verification_environment)
+    let fast_passed = executed_fixed_check_passed(fast_run, &verification_environment)
         && fast_run.is_some_and(|run| {
-            s8_selection_contains_required_check(
+            selection_contains_required_check(
                 fast_selection.as_ref(),
                 &run.workspace_state_id,
                 orbit::regression_strategy::VerificationTier::Fast,
             )
         });
-    let standard_passed = s8_run_executed_fixed_check(standard_run, &verification_environment)
+    let standard_passed = executed_fixed_check_passed(standard_run, &verification_environment)
         && standard_run.is_some_and(|run| {
-            s8_selection_contains_required_check(
+            selection_contains_required_check(
                 standard_selection.as_ref(),
                 &run.workspace_state_id,
                 orbit::regression_strategy::VerificationTier::Standard,
             )
         });
-    let full_passed = s8_run_executed_fixed_check(full_run, &verification_environment)
+    let full_passed = executed_fixed_check_passed(full_run, &verification_environment)
         && full_run.is_some_and(|run| {
             run.tier == Some(orbit::regression_strategy::VerificationTier::Full)
-                && s8_selection_contains_required_check(
+                && selection_contains_required_check(
                     full_selection.as_ref(),
                     &run.workspace_state_id,
                     orbit::regression_strategy::VerificationTier::Full,
@@ -1866,7 +1866,7 @@ async fn run_s8_live_qualification(
                     "step_id": step.step_id,
                     "status": step.status,
                     "exit_code": step.exit_code,
-                    "stdout_marker_observed": step.stdout_preview.as_deref().is_some_and(|stdout| stdout.contains(S8_LIVE_TEST_MARKER))
+                    "stdout_marker_observed": step.stdout_preview.as_deref().is_some_and(|stdout| stdout.contains(LIVE_QUALIFICATION_TEST_MARKER))
                 })).collect::<Vec<_>>()
             })
         })
@@ -1950,7 +1950,7 @@ async fn run_s8_live_qualification(
     }
     anyhow::ensure!(
         accepted,
-        "S8 live qualification did not satisfy acceptance; inspect sanitized evidence"
+        "live CLI qualification did not satisfy acceptance; inspect sanitized evidence"
     );
     Ok(())
 }
@@ -2591,7 +2591,7 @@ async fn main() -> Result<()> {
                 repo,
                 database_url_file,
             } => {
-                run_s8_live_qualification(repo, database_url_file.as_deref(), output_format)
+                run_live_cli_qualification(repo, database_url_file.as_deref(), output_format)
                     .await?;
                 return Ok(());
             }
@@ -4312,7 +4312,7 @@ mod workflow_execution_gate_tests {
             database_url_file: None,
         };
         let qualify_live = WorkflowAction::QualifyLive {
-            repo: PathBuf::from("/tmp/orbit-s8-candidate"),
+            repo: PathBuf::from("/tmp/orbit-live-cli-candidate"),
             database_url_file: None,
         };
 
@@ -4356,16 +4356,19 @@ mod s8_live_qualification_tests {
         assert!(init.status.success());
         git(
             &repository,
-            &["config", "user.name", "S8 Qualification Test"],
+            &["config", "user.name", "Live Qualification Test"],
         );
         git(
             &repository,
-            &["config", "user.email", "s8-qualification@example.invalid"],
+            &["config", "user.email", "live-qualification@example.invalid"],
         );
-        fs::write(repository.join("README.md"), "Disposable S8 candidate\n")
-            .expect("write qualification README");
-        fs::write(repository.join("test.sh"), S8_LIVE_TEST_SCRIPT)
-            .expect("write fixed S8 contract script");
+        fs::write(
+            repository.join("README.md"),
+            "Disposable live CLI candidate\n",
+        )
+        .expect("write qualification README");
+        fs::write(repository.join("test.sh"), LIVE_QUALIFICATION_TEST_SCRIPT)
+            .expect("write fixed live qualification contract script");
         git(&repository, &["add", "README.md", "test.sh"]);
         git(
             &repository,
@@ -4381,7 +4384,7 @@ mod s8_live_qualification_tests {
             "workflow",
             "qualify-live",
             "--repo",
-            "/tmp/orbit-r4-s8-candidate",
+            "/tmp/orbit-live-cli-candidate",
         ]);
         assert!(parsed.is_ok());
 
@@ -4393,7 +4396,7 @@ mod s8_live_qualification_tests {
             "workflow",
             "qualify-live",
             "--repo",
-            "/tmp/orbit-r4-s8-candidate",
+            "/tmp/orbit-live-cli-candidate",
             "--task",
             "weaker check",
         ]);
@@ -4402,10 +4405,10 @@ mod s8_live_qualification_tests {
 
     #[test]
     fn fixed_live_policies_require_the_same_real_check_at_every_tier() {
-        let policies = s8_live_qualification_policies();
+        let policies = live_cli_qualification_policies();
         assert_eq!(
             policies.verification.required_steps,
-            vec!["s8-candidate-contract".to_owned()]
+            vec!["candidate-contract".to_owned()]
         );
         assert_eq!(policies.verification.allowed_commands[0].executable, "sh");
         assert_eq!(
@@ -4419,7 +4422,7 @@ mod s8_live_qualification_tests {
         );
         let check = &policies.selection.checks[0];
         assert!(check.required && check.always_run);
-        assert_eq!(check.check_id, "s8-candidate-contract");
+        assert_eq!(check.check_id, "candidate-contract");
         assert_eq!(
             check.command.as_ref().unwrap(),
             &vec!["sh".to_owned(), "test.sh".to_owned()]
@@ -4445,11 +4448,11 @@ mod s8_live_qualification_tests {
     #[test]
     fn local_image_identity_requires_sha256_and_is_pinned_to_rootless_profile() {
         let digest = "a".repeat(64);
-        let environment = s8_live_environment_from_image_id(&format!("sha256:{digest}"))
+        let environment = qualification_environment_from_image_id(&format!("sha256:{digest}"))
             .expect("valid local Podman image ID");
         assert_eq!(
             environment.runtime_image.as_deref(),
-            Some(S8_LIVE_VERIFICATION_IMAGE)
+            Some(LIVE_QUALIFICATION_VERIFICATION_IMAGE)
         );
         assert_eq!(
             environment.runtime_image_digest.as_deref(),
@@ -4458,12 +4461,12 @@ mod s8_live_qualification_tests {
         assert_eq!(environment.execution_profile, "sandboxed-container");
         assert_eq!(environment.isolation, "rootless-podman");
         assert_eq!(environment.oci_runtime.as_deref(), Some("podman"));
-        assert!(s8_live_environment_from_image_id("not-a-digest").is_err());
+        assert!(qualification_environment_from_image_id("not-a-digest").is_err());
     }
 
     #[test]
     fn quota_report_preserves_reset_aware_selection_facts() {
-        let facts = s8_reset_aware_evidence(
+        let facts = reset_aware_selection_evidence(
             "reset-aware rank=1; known_weekly_reset; availability=Ready; 5h_remaining=82.0%; 7d_remaining=61.0%; 7d_reset_at_ms=1780000000000; provider_preference_rank=0; tie_break=provider_preference_then_stable_account_id; rejected=[codex:private-account:quota_exhausted(5h=unknown,7d=unknown,7d_reset=unknown),antigravity:another-private-account:auth_failed(5h=unknown,7d=unknown,7d_reset=unknown)]",
         );
         assert_eq!(facts["ranking"], "reset-aware");
@@ -4482,7 +4485,7 @@ mod s8_live_qualification_tests {
 
     #[test]
     fn tool_telemetry_is_bounded_to_known_names_and_canonical_mutations() {
-        let counts = s8_bounded_tool_counts(&serde_json::json!({
+        let counts = bounded_tool_counts(&serde_json::json!({
             "write_file": 2,
             "fs.write_text_file": 2,
             "fs.read_text_file": 3,
@@ -4490,7 +4493,7 @@ mod s8_live_qualification_tests {
         }));
         assert_eq!(counts.as_object().unwrap().len(), 3);
         assert_eq!(
-            s8_tool_count(&counts, &["fs.write_text_file", "fs.edit_file"]),
+            tool_count(&counts, &["fs.write_text_file", "fs.edit_file"]),
             2
         );
         assert!(counts.get("untrusted-secret-shaped-tool-name").is_none());
@@ -4498,44 +4501,46 @@ mod s8_live_qualification_tests {
 
     #[test]
     fn quota_percentages_are_bounded_before_reporting() {
-        assert_eq!(s8_safe_quota_percent(Some(42.5)), Some(42.5));
-        assert_eq!(s8_safe_quota_percent(Some(f64::NAN)), None);
-        assert_eq!(s8_safe_quota_percent(Some(101.0)), None);
+        assert_eq!(safe_quota_percent(Some(42.5)), Some(42.5));
+        assert_eq!(safe_quota_percent(Some(f64::NAN)), None);
+        assert_eq!(safe_quota_percent(Some(101.0)), None);
     }
 
     #[test]
     fn qualification_repository_must_be_clean_and_narrowly_shaped_under_temp() {
         let temp = tempfile::tempdir().expect("temporary root");
         let repository = clean_temp_git_repository(temp.path());
-        let validated = validate_s8_live_repository(&repository).expect("valid fixture repo");
+        let validated =
+            validate_live_qualification_repository(&repository).expect("valid fixture repo");
         assert_eq!(validated.path, repository.canonicalize().unwrap());
         assert_eq!(validated.base_revision.len(), 40);
 
         fs::write(repository.join("test.sh"), "echo unsafe\n").unwrap();
-        assert!(validate_s8_live_repository(&repository).is_err());
+        assert!(validate_live_qualification_repository(&repository).is_err());
     }
 
     #[test]
     fn candidate_contract_accepts_only_readme_mutation_with_fixed_harness() {
         let temp = tempfile::tempdir().expect("temporary root");
         let repository_path = clean_temp_git_repository(temp.path());
-        let repository = validate_s8_live_repository(&repository_path).expect("fixture repo");
+        let repository =
+            validate_live_qualification_repository(&repository_path).expect("fixture repo");
         fs::write(
             repository.path.join("README.md"),
-            format!("{S8_LIVE_README_CONTENT}\n"),
+            format!("{LIVE_QUALIFICATION_README_CONTENT}\n"),
         )
         .unwrap();
-        let valid = s8_candidate_contract_evidence(&repository);
+        let valid = candidate_contract_evidence(&repository);
         assert_eq!(valid["only_expected_readme_change"], true);
         assert_eq!(valid["fixed_harness_unchanged"], true);
 
         fs::write(repository.path.join(".env"), "not part of the candidate\n").unwrap();
-        let extra_file = s8_candidate_contract_evidence(&repository);
+        let extra_file = candidate_contract_evidence(&repository);
         assert_eq!(extra_file["only_expected_readme_change"], false);
         fs::remove_file(repository.path.join(".env")).unwrap();
 
         fs::write(repository.path.join("test.sh"), "echo forged pass\n").unwrap();
-        let forged = s8_candidate_contract_evidence(&repository);
+        let forged = candidate_contract_evidence(&repository);
         assert_eq!(forged["only_expected_readme_change"], false);
         assert_eq!(forged["fixed_harness_unchanged"], false);
     }
@@ -4545,15 +4550,17 @@ mod s8_live_qualification_tests {
         let temp = tempfile::tempdir().expect("temporary root");
         let repository = clean_temp_git_repository(temp.path());
         fs::write(repository.join("README.md"), "modified after commit\n").unwrap();
-        assert!(validate_s8_live_repository(&repository).is_err());
+        assert!(validate_live_qualification_repository(&repository).is_err());
 
         let non_git = temp.path().join("plain");
         fs::create_dir(&non_git).unwrap();
         fs::write(non_git.join("README.md"), "plain\n").unwrap();
-        assert!(validate_s8_live_repository(&non_git).is_err());
+        assert!(validate_live_qualification_repository(&non_git).is_err());
 
-        assert!(validate_s8_live_repository(Path::new(env!("CARGO_MANIFEST_DIR"))).is_err());
-        assert!(validate_s8_live_repository(temp.path()).is_err());
+        assert!(
+            validate_live_qualification_repository(Path::new(env!("CARGO_MANIFEST_DIR"))).is_err()
+        );
+        assert!(validate_live_qualification_repository(temp.path()).is_err());
     }
 
     #[test]
@@ -4565,7 +4572,7 @@ mod s8_live_qualification_tests {
             "#!/bin/sh\nexit 0\n",
         )
         .unwrap();
-        assert!(validate_s8_live_repository(&repository).is_err());
+        assert!(validate_live_qualification_repository(&repository).is_err());
     }
 
     #[test]
@@ -4608,17 +4615,20 @@ mod s8_live_qualification_tests {
         set_config("core.fsmonitor", &fsmonitor_script);
         set_config("diff.external", &diff_script);
 
-        let keys = s8_local_git_config_keys(&repository).unwrap();
+        let keys = local_git_config_keys_for_qualification(&repository).unwrap();
         assert!(keys.iter().any(|key| key == "core.fsmonitor"));
         assert!(keys.iter().any(|key| key == "diff.external"));
-        assert!(s8_validate_local_git_config(&repository).is_err());
-        let status = s8_git_readonly_command(&repository, &["status", "--short"])
+        assert!(validate_local_git_config_for_qualification(&repository).is_err());
+        let status = read_only_qualification_git_command(&repository, &["status", "--short"])
             .output()
             .expect("run hardened status inspection");
         assert!(status.status.success());
-        let diff = s8_git_readonly_command(&repository, &["diff", "--name-only", "HEAD", "--"])
-            .output()
-            .expect("run hardened diff inspection");
+        let diff = read_only_qualification_git_command(
+            &repository,
+            &["diff", "--name-only", "HEAD", "--"],
+        )
+        .output()
+        .expect("run hardened diff inspection");
         assert!(diff.status.success());
         assert!(!fsmonitor_marker.exists());
         assert!(!diff_marker.exists());
@@ -4653,10 +4663,10 @@ mod s8_live_qualification_tests {
         ));
         fs::write(repository.join(".git/config"), local_config).unwrap();
 
-        let keys = s8_local_git_config_keys(&repository).unwrap();
+        let keys = local_git_config_keys_for_qualification(&repository).unwrap();
         assert!(keys.iter().any(|key| key == "include.path"));
         assert!(!keys.iter().any(|key| key == "diff.external.textconv"));
-        assert!(s8_validate_local_git_config(&repository).is_err());
+        assert!(validate_local_git_config_for_qualification(&repository).is_err());
         assert!(!marker.exists());
     }
 }

@@ -33,7 +33,6 @@ use orbit::{
     coding_agent,
     fs_tools::*,
     model::id,
-    secret_backend::{LocalPrivateSecretBackend, SecretBackend, SecretLocator},
     tool_surface::{
         AgentTerminal, CanonicalToolName, ERR_MULTIPLE_MATCHES, ERR_MUTATION_LOCK_REQUIRED,
         ERR_NO_MATCH, ERR_READ_ONLY_ROLE, ERR_UNSUPPORTED_TOOL, ToolMetadata, copy_path, edit_file,
@@ -43,11 +42,18 @@ use orbit::{
     workflow_coordinator::*,
 };
 use serde_json::json;
-use std::fs;
-use std::path::Path;
+use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::time::Duration;
 use std::{collections::BTreeMap, ops::Deref};
+use std::{
+    fs,
+    io::Read,
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 use tempfile::tempdir;
+use zeroize::Zeroizing;
 
 struct TestContext {
     database: common::DisposablePgTestContext,
@@ -72,76 +78,241 @@ async fn setup_test() -> Result<TestContext> {
     Ok(TestContext { database, store })
 }
 
-async fn stage_live_test_credential(
-    pool: &sqlx::PgPool,
-    provider: &str,
-    reference: &str,
+const LIVE_PROVIDER_OPT_IN: &str = "I_AUTHORIZE_LIVE_PROVIDER_CALLS";
+const LIVE_PROVIDER_OPT_IN_ENV: &str = "ORBIT_B34_LIVE_PROVIDER_OPT_IN";
+const LIVE_CREDENTIAL_URL_FILE_ENV: &str = "ORBIT_B34_LIVE_CREDENTIAL_DATABASE_URL_FILE";
+
+async fn explicitly_authorized_live_credential_catalog() -> Result<PgPool> {
+    ensure!(
+        std::env::var(LIVE_PROVIDER_OPT_IN_ENV).as_deref() == Ok(LIVE_PROVIDER_OPT_IN),
+        "live provider fixture requires explicit opt-in"
+    );
+    let path = PathBuf::from(
+        std::env::var_os(LIVE_CREDENTIAL_URL_FILE_ENV)
+            .context("live provider fixture requires an explicit credential URL file path")?,
+    );
+    ensure!(
+        path.is_absolute() && path.canonicalize().ok().as_deref() == Some(path.as_path()),
+        "credential URL file path must be absolute and canonical"
+    );
+
+    let operator_home = orbit::secret_backend::operator_home()?;
+    let private_root = operator_home.join(".orbit/private");
+    ensure!(
+        private_root.canonicalize().ok().as_deref() == Some(private_root.as_path())
+            && path.starts_with(&private_root),
+        "credential URL file must be inside Orbit's private root"
+    );
+
+    let mut directory = path
+        .parent()
+        .context("credential URL file parent directory is unavailable")?;
+    loop {
+        let metadata = fs::symlink_metadata(directory)
+            .map_err(|_| anyhow::anyhow!("credential URL directory is unavailable"))?;
+        ensure!(
+            metadata.is_dir()
+                && !metadata.file_type().is_symlink()
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.mode() & 0o7777 == 0o700,
+            "credential URL directory must be private and owned by the current user"
+        );
+        if directory == private_root {
+            break;
+        }
+        directory = directory
+            .parent()
+            .filter(|parent| parent.starts_with(&private_root))
+            .context("credential URL file is outside Orbit's private root")?;
+    }
+
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(&path)
+        .map_err(|_| anyhow::anyhow!("credential URL file is unavailable"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| anyhow::anyhow!("credential URL file metadata is unavailable"))?;
+    ensure!(
+        metadata.is_file()
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.mode() & 0o077 == 0
+            && metadata.mode() & 0o400 != 0
+            && metadata.len() <= 8192,
+        "credential URL file must be a private regular file of at most 8 KiB"
+    );
+    let mut url = Zeroizing::new(String::new());
+    file.take(8193)
+        .read_to_string(&mut url)
+        .map_err(|_| anyhow::anyhow!("credential URL file contents are invalid"))?;
+    let url = url.trim();
+    ensure!(!url.is_empty(), "credential URL file is empty");
+
+    let options = sqlx::postgres::PgConnectOptions::from_str(url)
+        .map_err(|_| anyhow::anyhow!("credential catalog URL is invalid"))?;
+    ensure!(
+        matches!(options.get_host(), "127.0.0.1" | "::1" | "localhost")
+            && options.get_port() == 55442
+            && options.get_database() == Some("orbit_control_plane")
+            && options.get_socket().is_none(),
+        "credential catalog must target loopback:55442/orbit_control_plane"
+    );
+
+    PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(options.options([("default_transaction_read_only", "on")]))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("unable to connect to explicitly authorized credential catalog")
+        })
+}
+
+async fn ensure_live_catalog_is_separate(
+    catalog_pool: &PgPool,
+    workflow_pool: &PgPool,
+    workflow_schema: &str,
 ) -> Result<()> {
-    let mut tx = pool.begin().await?;
-    sqlx::query("SET CONSTRAINTS ALL DEFERRED")
-        .execute(&mut *tx)
+    let catalog_identity: (String, String) =
+        sqlx::query_as("SELECT current_database(), current_schema()")
+            .fetch_one(catalog_pool)
+            .await
+            .map_err(|_| anyhow::anyhow!("unable to verify credential catalog identity"))?;
+    let workflow_identity: (String, String) =
+        sqlx::query_as("SELECT current_database(), current_schema()")
+            .fetch_one(workflow_pool)
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("unable to verify disposable workflow database identity")
+            })?;
+    ensure!(
+        catalog_identity.0 == "orbit_control_plane"
+            && catalog_identity.1 == "public"
+            && (catalog_identity.0 != workflow_identity.0
+                || catalog_identity.1 != workflow_identity.1)
+            && workflow_identity.1 == workflow_schema,
+        "live credentials must remain in the separate control-plane catalog"
+    );
+    Ok(())
+}
+
+async fn resolve_live_target(
+    catalog_pool: &PgPool,
+    role: &RoleDefinition,
+    provider: &str,
+    reference: Option<&str>,
+) -> Result<ResolvedExecutionTarget> {
+    let candidates = RoleRuntimeResolver::resolve_ranked_targets_live(
+        catalog_pool,
+        role,
+        None,
+        RuntimeQuotaSelectionPolicy::default(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("no eligible account in the authorized credential catalog"))?;
+    candidates
+        .into_iter()
+        .find(|candidate| {
+            candidate.provider == provider
+                && reference
+                    .is_none_or(|reference| candidate.credential_id.as_deref() == Some(reference))
+        })
+        .context("no eligible account matched the requested provider fixture")
+}
+
+fn sanitized_live_selection_summary(target: &ResolvedExecutionTarget) -> serde_json::Value {
+    let fields: BTreeMap<&str, &str> = target
+        .resolution_reason
+        .split("; ")
+        .filter_map(|field| field.split_once('='))
+        .collect();
+    let rank = target
+        .resolution_reason
+        .strip_prefix("reset-aware rank=")
+        .and_then(|tail| tail.split_once(';'))
+        .and_then(|(rank, _)| rank.parse::<u32>().ok());
+    let availability = fields.get("availability").filter(|value| {
+        matches!(
+            **value,
+            "Ready"
+                | "Limited"
+                | "Cooldown"
+                | "RateLimited"
+                | "QuotaExhausted"
+                | "AuthFailed"
+                | "RuntimeUnavailable"
+                | "CapabilityMismatch"
+                | "Unknown"
+        )
+    });
+    let quota_percent = |key: &str| {
+        fields
+            .get(key)
+            .and_then(|value| value.strip_suffix('%'))
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite() && (0.0..=100.0).contains(value))
+    };
+    let reset_at_ms = fields
+        .get("7d_reset_at_ms")
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value >= 0);
+    let provider_preference_rank = fields
+        .get("provider_preference_rank")
+        .and_then(|value| value.parse::<u32>().ok());
+    let reason_category = match target.resolution_reason.split("; ").nth(1) {
+        Some("known_weekly_reset") => "known_weekly_reset",
+        Some("weekly_reset_unknown_or_not_applicable") => "weekly_reset_unknown_or_not_applicable",
+        _ => "unknown",
+    };
+
+    serde_json::json!({
+        "provider": target.provider,
+        "account_reference": target.credential_id,
+        "requested_model": target.requested_model,
+        "resolved_model": target.resolved_model,
+        "credential_generation": target.credential_generation,
+        "availability": availability,
+        "five_hour_remaining_percent": quota_percent("5h_remaining"),
+        "seven_day_remaining_percent": quota_percent("7d_remaining"),
+        "seven_day_reset_at_ms": reset_at_ms,
+        "rank": rank,
+        "provider_preference_rank": provider_preference_rank,
+        "selection_reason_category": reason_category
+    })
+}
+
+async fn ensure_disposable_schema_has_no_credentials(pool: &PgPool) -> Result<()> {
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM orbit_credentials")
+        .fetch_one(pool)
         .await?;
-    let source: Option<(String, i64)> = sqlx::query_as(
-        "SELECT id, current_generation FROM public.orbit_credentials \
-         WHERE scope_key='operator' AND provider=$1 AND reference=$2 AND status='enrolled'",
-    )
-    .bind(provider)
-    .bind(reference)
-    .fetch_optional(&mut *tx)
-    .await
-    .context("failed reading the explicitly selected live test credential")?;
-    let (credential_id, generation) = source.context(format!(
-        "required live test credential {provider}/{reference} is not enrolled in public"
-    ))?;
-
-    let inserted = sqlx::query(
-        "INSERT INTO orbit_credentials SELECT * FROM public.orbit_credentials WHERE id=$1",
-    )
-    .bind(&credential_id)
-    .execute(&mut *tx)
-    .await
-    .context("failed staging the selected live test credential metadata")?;
     ensure!(
-        inserted.rows_affected() == 1,
-        "selected credential row was not staged"
+        count == 0,
+        "live provider credentials must not be present in the disposable workflow schema"
     );
-
-    let inserted = sqlx::query(
-        "INSERT INTO orbit_credential_generations \
-         SELECT * FROM public.orbit_credential_generations \
-         WHERE credential_id=$1 AND generation=$2",
-    )
-    .bind(&credential_id)
-    .bind(generation)
-    .execute(&mut *tx)
-    .await
-    .context("failed staging the selected live test credential generation")?;
-    ensure!(
-        inserted.rows_affected() == 1,
-        "selected credential generation was not staged"
-    );
-
-    let inserted = sqlx::query(
-        "INSERT INTO orbit_credential_representations \
-         SELECT * FROM public.orbit_credential_representations \
-         WHERE credential_id=$1 AND generation=$2",
-    )
-    .bind(&credential_id)
-    .bind(generation)
-    .execute(&mut *tx)
-    .await
-    .context("failed staging selected live test credential representations")?;
-    ensure!(
-        inserted.rows_affected() > 0,
-        "selected credential has no staged runtime representation"
-    );
-
-    tx.commit().await?;
     Ok(())
 }
 
 async fn teardown_test(ctx: TestContext) -> Result<()> {
     ctx.database.teardown().await
+}
+
+async fn finish_live_fixture(
+    credential_catalog_pool: PgPool,
+    ctx: TestContext,
+    fixture_result: Result<()>,
+) -> Result<()> {
+    credential_catalog_pool.close().await;
+    let teardown_result = teardown_test(ctx).await;
+    match (fixture_result, teardown_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(fixture_error), Ok(())) => Err(fixture_error),
+        (Ok(()), Err(teardown_error)) => {
+            Err(teardown_error.context("failed to tear down disposable workflow schema"))
+        }
+        (Err(fixture_error), Err(teardown_error)) => Err(fixture_error.context(format!(
+            "disposable workflow schema teardown also failed: {teardown_error:#}"
+        ))),
+    }
 }
 
 fn init_git_repo(path: &Path) -> Result<()> {
@@ -1395,256 +1566,284 @@ async fn b34_13_coordinator_wire_dispatch_enforces_s1_gates() -> Result<()> {
 // -----------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "requires explicitly staged provider credentials and a live ACP runtime"]
+#[ignore = "requires explicit live-provider opt-in and a private control-plane URL file"]
 async fn b34_real_codex_coding_fixture() -> Result<()> {
-    let ctx = setup_test().await?;
-    stage_live_test_credential(&ctx.engine.pool, "codex", "codex-main").await?;
-    let backend = LocalPrivateSecretBackend::default_for_operator()
-        .context("required local credential backend is unavailable")?;
-
-    // Verify enrolled codex credential is registered
-    let cred_opt: Option<(String, String)> = sqlx::query_as(
-        "SELECT id, reference FROM orbit_credentials WHERE provider = 'codex' AND reference = 'codex-main'",
-    )
-    .fetch_optional(&ctx.engine.pool)
-    .await?;
-
-    let (_cred_id, cred_ref) =
-        cred_opt.context("required codex-main credential is not enrolled in the test schema")?;
-
-    orbit::codex_credential_enrollment::registered_auth_diagnostic(
-        &ctx.engine.pool,
-        &backend,
-        &cred_ref,
-    )
-    .await
-    .context("required codex-main auth token is not staged")?;
-
-    let repo = tempdir()?;
-    let p = repo.path();
-    init_git_repo(p)?;
-
-    // Populate initial project files
-    fs::create_dir_all(p.join("src"))?;
-    fs::write(
-        p.join("src/lib.rs"),
-        "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
-    )?;
-    fs::write(
-        p.join("README.md"),
-        "# Sample Project\nAn Orbit coding fixture test.\n",
-    )?;
-    std::process::Command::new("git")
-        .args(["add", "."])
-        .current_dir(p)
-        .output()?;
-    std::process::Command::new("git")
-        .args(["commit", "-m", "initial commit"])
-        .current_dir(p)
-        .output()?;
-
-    // Create workflow attempt
-    let att_id = format!("att-{}", id());
-    let wf = ctx
-        .store
-        .create_workflow_run_full(
-            "software_change_v1",
-            &att_id,
-            3,
-            None,
-            None,
-            None,
-            Some("Add a multiply function to src/lib.rs and update README.md"),
-            None,
-            None,
-        )
-        .await?;
-
-    let role = RoleDefinition::implementer_v1();
-    let role_exec = ctx
-        .store
-        .create_role_execution(&wf.id, &role, "IMPLEMENTING", 0, None, None)
-        .await?;
-
-    // Acquire workspace mutation lock
-    ctx.store
-        .acquire_workspace_mutation_lock(&att_id, &role_exec.id)
-        .await?;
-
-    // Exercise real implementer execution
-    let target = ResolvedExecutionTarget {
-        provider: "codex".into(),
-        runtime_interface: "codex-acp".into(),
-        credential_id: Some("codex-main".into()),
-        credential_generation: Some(1),
-        requested_model: Some("gpt-6-luna".into()),
-        resolved_model: Some("gpt-6-luna".into()),
-        runtime_image_digest: None,
-        resolution_reason: "fixture qualification".into(),
+    let credential_catalog_pool = explicitly_authorized_live_credential_catalog().await?;
+    let ctx = match setup_test().await {
+        Ok(ctx) => ctx,
+        Err(error) => {
+            credential_catalog_pool.close().await;
+            return Err(error);
+        }
     };
-
-    // Run coordinator real turn
-    let outcome = RealAcpRoleExecutor
-        .execute_role(
+    let fixture_result = async {
+        ensure_live_catalog_is_separate(
+            &credential_catalog_pool,
             &ctx.engine.pool,
-            &wf,
-            &role_exec,
-            &role,
-            &target,
-            "Add a multiply function to src/lib.rs and document it in README.md",
-            p,
-            None,
-            tokio::sync::watch::channel(false).1,
+            &ctx.database.schema,
         )
         .await?;
+        ensure_disposable_schema_has_no_credentials(&ctx.engine.pool).await?;
 
-    assert!(
-        outcome.raw_output.contains("ORBIT_HANDOFF_START"),
-        "expected structured handoff in implementer output"
-    );
-    assert_eq!(outcome.termination_reason.as_deref(), Some("completed"));
+        let repo = tempdir()?;
+        let p = repo.path();
+        init_git_repo(p)?;
 
-    // Verify that the workspace now contains modifications or committed git changes
-    let status = git_status(p, None).await?;
-    let diff = git_diff(p, None, None, None, false, 65536).await?;
-    println!(
-        "Codex raw output:
-{}",
-        outcome.raw_output
-    );
-    println!(
-        "Git status clean: {}, diff len: {}",
-        status.clean,
-        diff.diff.len()
-    );
-    assert!(
-        !status.clean || !diff.diff.is_empty() || outcome.raw_output.contains("multiply"),
-        "expected git modifications or code in outcome from coding agent"
-    );
+        fs::create_dir_all(p.join("src"))?;
+        fs::write(
+            p.join("src/lib.rs"),
+            "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
+        )?;
+        fs::write(
+            p.join("README.md"),
+            "# Sample Project\nAn Orbit coding fixture test.\n",
+        )?;
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(p)
+            .output()?;
+        std::process::Command::new("git")
+            .args(["commit", "-m", "initial commit"])
+            .current_dir(p)
+            .output()?;
 
-    teardown_test(ctx).await?;
-    Ok(())
+        let candidate_repository_path = p.canonicalize()?.to_string_lossy().into_owned();
+        let attempt_id = format!("att-{}", id());
+        let created_workflow = ctx
+            .store
+            .create_workflow_run_full(
+                "software_change_v1",
+                &attempt_id,
+                3,
+                None,
+                None,
+                None,
+                Some("Add a multiply function to src/lib.rs and update README.md"),
+                Some(&candidate_repository_path),
+                None,
+            )
+            .await?;
+        let wf = ctx
+            .store
+            .get_workflow_run(&created_workflow.id)
+            .await?
+            .context("Codex fixture workflow was not persisted")?;
+        ensure!(
+            wf.repository_path.as_deref() == Some(candidate_repository_path.as_str()),
+            "Codex fixture workflow is not bound to its temporary repository"
+        );
+
+        let role = RoleDefinition::implementer_v1();
+        let target =
+            resolve_live_target(&credential_catalog_pool, &role, "codex", Some("codex-main"))
+                .await?;
+        println!(
+            "B3.4 live role selection: {}",
+            serde_json::to_string(&sanitized_live_selection_summary(&target))?
+        );
+        let role_exec = ctx
+            .store
+            .create_role_execution(&wf.id, &role, "IMPLEMENTING", 0, None, None)
+            .await?;
+
+        ctx.store
+            .acquire_workspace_mutation_lock(&attempt_id, &role_exec.id)
+            .await?;
+
+        let outcome = RealAcpRoleExecutor
+            .execute_role_with_credential_catalog(
+                &ctx.engine.pool,
+                &credential_catalog_pool,
+                &wf,
+                &role_exec,
+                &role,
+                &target,
+                "Add a multiply function to src/lib.rs and document it in README.md",
+                p,
+                None,
+                tokio::sync::watch::channel(false).1,
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("live provider fixture execution failed"))?;
+
+        ensure!(
+            outcome.raw_output.contains("ORBIT_HANDOFF_START"),
+            "implementer did not return a structured handoff"
+        );
+        ensure!(
+            outcome.termination_reason.as_deref() == Some("completed"),
+            "implementer fixture did not complete"
+        );
+
+        let source = fs::read_to_string(p.join("src/lib.rs"))?;
+        ensure!(
+            source.contains("pub fn multiply(") && source.contains("a * b"),
+            "implementer did not modify src/lib.rs through repository tools"
+        );
+        let readme = fs::read_to_string(p.join("README.md"))?;
+        ensure!(
+            readme.to_ascii_lowercase().contains("multiply"),
+            "implementer did not update README.md through repository tools"
+        );
+
+        let execution_id = outcome
+            .agent_execution_ids
+            .first()
+            .context("implementer execution evidence is missing")?;
+        let (execution_status, tool_call_count, tool_successes, tool_failure_count, tool_counts): (
+            String,
+            i64,
+            i64,
+            i64,
+            serde_json::Value,
+        ) = sqlx::query_as(
+            "SELECT status, tool_calls, tool_successes, tool_failures, tool_counts \
+             FROM orbit_agent_executions WHERE id = $1",
+        )
+        .bind(execution_id)
+        .fetch_one(&ctx.engine.pool)
+        .await?;
+        ensure!(
+            execution_status == "SUCCEEDED"
+                && tool_failure_count == 0
+                && tool_successes == tool_call_count,
+            "implementer execution evidence includes an unsuccessful tool call"
+        );
+        let file_mutation_calls = ["fs.write_text_file", "fs.edit_file"]
+            .iter()
+            .filter_map(|tool| tool_counts.get(tool).and_then(serde_json::Value::as_i64))
+            .sum::<i64>();
+        ensure!(
+            file_mutation_calls >= 2,
+            "implementer did not record successful repository file mutations"
+        );
+
+        let status = git_status(p, None).await?;
+        let diff = git_diff(p, None, None, None, false, 65536).await?;
+        ensure!(
+            !status.clean && !diff.diff.is_empty(),
+            "Codex fixture candidate has no repository diff"
+        );
+        ensure_disposable_schema_has_no_credentials(&ctx.engine.pool).await?;
+        Ok(())
+    }
+    .await;
+
+    finish_live_fixture(credential_catalog_pool, ctx, fixture_result).await
 }
 
 #[tokio::test]
-#[ignore = "requires explicitly staged provider credentials and a live ACP runtime"]
+#[ignore = "requires explicit live-provider opt-in and a private control-plane URL file"]
 async fn b34_real_antigravity_review_fixture() -> Result<()> {
-    let ctx = setup_test().await?;
-    stage_live_test_credential(&ctx.engine.pool, "antigravity", "antigravity-ch9b2013").await?;
-    let backend = LocalPrivateSecretBackend::default_for_operator()
-        .context("required local credential backend is unavailable")?;
-
-    // Verify enrolled antigravity credential is registered
-    let cred_opt: Option<(String, String)> = sqlx::query_as(
-        "SELECT id, reference FROM orbit_credentials WHERE provider = 'antigravity' AND reference = 'antigravity-ch9b2013'",
-    )
-    .fetch_optional(&ctx.engine.pool)
-    .await?;
-
-    let (cred_id, _cred_ref) = cred_opt
-        .context("required antigravity-ch9b2013 credential is not enrolled in the test schema")?;
-
-    // Verify auth secret is readable
-    let locator_opt: Option<String> = sqlx::query_scalar(
-        "SELECT secret_locator FROM orbit_credential_generations WHERE credential_id = $1",
-    )
-    .bind(&cred_id)
-    .fetch_optional(&ctx.engine.pool)
-    .await?;
-
-    let locator = locator_opt
-        .context("required antigravity credential generation is missing from the test schema")?;
-    let locator =
-        SecretLocator::parse(&locator).context("invalid test credential secret locator")?;
-    backend
-        .read(locator)
-        .await
-        .context("required antigravity auth token is not readable")?;
-
-    let repo = tempdir()?;
-    let p = repo.path();
-    init_git_repo(p)?;
-
-    // Seed git history with an initial commit and a diff
-    fs::write(p.join("src.rs"), "fn original() {}\n")?;
-    std::process::Command::new("git")
-        .args(["add", "."])
-        .current_dir(p)
-        .output()?;
-    std::process::Command::new("git")
-        .args(["commit", "-m", "initial commit"])
-        .current_dir(p)
-        .output()?;
-
-    // Modify file to review
-    fs::write(
-        p.join("src.rs"),
-        "fn original() {}\npub fn multiply(a: i32, b: i32) -> i32 {\n    a * b\n}\n",
-    )?;
-
-    let att_id = format!("att-{}", id());
-    let wf = ctx
-        .store
-        .create_workflow_run_full(
-            "software_change_v1",
-            &att_id,
-            3,
-            None,
-            None,
-            None,
-            Some("Review addition of multiply function"),
-            None,
-            None,
-        )
-        .await?;
-
-    let role = RoleDefinition::reviewer_v1();
-    let role_exec = ctx
-        .store
-        .create_role_execution(&wf.id, &role, "REVIEWING", 0, None, None)
-        .await?;
-
-    let target = ResolvedExecutionTarget {
-        provider: "antigravity".into(),
-        runtime_interface: "antigravity-acp".into(),
-        credential_id: Some("antigravity-ch9b2013".into()),
-        credential_generation: Some(1),
-        requested_model: Some("gemini-2.5-flash".into()),
-        resolved_model: Some("gemini-2.5-flash".into()),
-        runtime_image_digest: None,
-        resolution_reason: "fixture review qualification".into(),
+    let credential_catalog_pool = explicitly_authorized_live_credential_catalog().await?;
+    let ctx = match setup_test().await {
+        Ok(ctx) => ctx,
+        Err(error) => {
+            credential_catalog_pool.close().await;
+            return Err(error);
+        }
     };
-
-    let outcome = RealAcpRoleExecutor
-        .execute_role(
+    let fixture_result = async {
+        ensure_live_catalog_is_separate(
+            &credential_catalog_pool,
             &ctx.engine.pool,
-            &wf,
-            &role_exec,
-            &role,
-            &target,
-            "Review the newly added multiply function in src.rs",
-            p,
-            None,
-            tokio::sync::watch::channel(false).1,
+            &ctx.database.schema,
         )
         .await?;
+        ensure_disposable_schema_has_no_credentials(&ctx.engine.pool).await?;
 
-    assert!(
-        outcome.raw_output.contains("ORBIT_HANDOFF_START"),
-        "expected structured handoff in reviewer output"
-    );
-    assert_eq!(outcome.termination_reason.as_deref(), Some("completed"));
+        let repo = tempdir()?;
+        let p = repo.path();
+        init_git_repo(p)?;
 
-    // Verify reviewer never acquired mutation lock
-    let lock_held = ctx
-        .store
-        .check_workspace_mutation_lock(&att_id, &role_exec.id)
-        .await?;
-    assert!(
-        !lock_held,
-        "reviewer must never hold workspace mutation lock"
-    );
+        fs::write(p.join("src.rs"), "fn original() {}\n")?;
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(p)
+            .output()?;
+        std::process::Command::new("git")
+            .args(["commit", "-m", "initial commit"])
+            .current_dir(p)
+            .output()?;
 
-    teardown_test(ctx).await?;
-    Ok(())
+        fs::write(
+            p.join("src.rs"),
+            "fn original() {}\npub fn multiply(a: i32, b: i32) -> i32 {\n    a * b\n}\n",
+        )?;
+
+        let candidate_repository_path = p.canonicalize()?.to_string_lossy().into_owned();
+        let attempt_id = format!("att-{}", id());
+        let created_workflow = ctx
+            .store
+            .create_workflow_run_full(
+                "software_change_v1",
+                &attempt_id,
+                3,
+                None,
+                None,
+                None,
+                Some("Review addition of multiply function"),
+                Some(&candidate_repository_path),
+                None,
+            )
+            .await?;
+        let wf = ctx
+            .store
+            .get_workflow_run(&created_workflow.id)
+            .await?
+            .context("Antigravity fixture workflow was not persisted")?;
+        ensure!(
+            wf.repository_path.as_deref() == Some(candidate_repository_path.as_str()),
+            "Antigravity fixture workflow is not bound to its temporary repository"
+        );
+
+        let role = RoleDefinition::reviewer_v1();
+        let target =
+            resolve_live_target(&credential_catalog_pool, &role, "antigravity", None).await?;
+        println!(
+            "B3.4 live role selection: {}",
+            serde_json::to_string(&sanitized_live_selection_summary(&target))?
+        );
+        let role_exec = ctx
+            .store
+            .create_role_execution(&wf.id, &role, "REVIEWING", 0, None, None)
+            .await?;
+
+        let outcome = RealAcpRoleExecutor
+            .execute_role_with_credential_catalog(
+                &ctx.engine.pool,
+                &credential_catalog_pool,
+                &wf,
+                &role_exec,
+                &role,
+                &target,
+                "Review the newly added multiply function in src.rs",
+                p,
+                None,
+                tokio::sync::watch::channel(false).1,
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("live provider fixture execution failed"))?;
+
+        ensure!(
+            outcome.raw_output.contains("ORBIT_HANDOFF_START"),
+            "reviewer did not return a structured handoff"
+        );
+        ensure!(
+            outcome.termination_reason.as_deref() == Some("completed"),
+            "reviewer fixture did not complete"
+        );
+
+        let lock_held = ctx
+            .store
+            .check_workspace_mutation_lock(&attempt_id, &role_exec.id)
+            .await?;
+        ensure!(!lock_held, "reviewer unexpectedly held a mutation lock");
+
+        ensure_disposable_schema_has_no_credentials(&ctx.engine.pool).await?;
+        Ok(())
+    }
+    .await;
+
+    finish_live_fixture(credential_catalog_pool, ctx, fixture_result).await
 }

@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-// Normalized error codes (Requirement 27)
+// Stable normalized error codes for repository tool calls.
 pub const ERR_PATH_NOT_FOUND: &str = "PATH_NOT_FOUND";
 pub const ERR_PATH_OUTSIDE_WORKSPACE: &str = "PATH_OUTSIDE_WORKSPACE";
 pub const ERR_DESTINATION_EXISTS: &str = "DESTINATION_EXISTS";
@@ -29,7 +29,7 @@ pub const ERR_OUTPUT_LIMIT: &str = "OUTPUT_LIMIT";
 pub const ERR_NO_MATCH: &str = "NO_MATCH";
 pub const ERR_MULTIPLE_MATCHES: &str = "MULTIPLE_MATCHES";
 
-/// Canonical tool identities (Requirement 10)
+/// Canonical tool identities used by provider and workflow adapters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CanonicalToolName {
@@ -148,7 +148,7 @@ impl CanonicalToolName {
     }
 }
 
-/// Tool metadata (Requirement 22)
+/// Tool metadata used to enforce role permissions and call bounds.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolMetadata {
     pub tool_id: String,
@@ -323,7 +323,7 @@ pub fn authorize_repository_tool(
     Ok(metadata)
 }
 
-/// Returns the complete inventory of all canonical Orbit tools (Requirement 1 & 42)
+/// Returns the complete inventory of canonical repository tools.
 pub fn full_tool_inventory() -> Vec<ToolMetadata> {
     vec![
         ToolMetadata::for_tool(CanonicalToolName::FsReadTextFile),

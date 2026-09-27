@@ -1,4 +1,4 @@
-//! Phase B1: Isolated Command Execution and Verification Evidence.
+//! Isolated command execution and durable verification evidence.
 //!
 //! Provides the verification substrate for Orbit:
 //! - Orbit independently executes verification commands inside the Attempt's isolated workspace.

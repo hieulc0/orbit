@@ -1,4 +1,4 @@
-//! Phase B4: Managed Integration Test Environments
+//! Managed integration-test environment lifecycle and provisioning.
 //!
 //! Extends Orbit's verification subsystem so it can test multi-process and multi-service applications:
 //! - Orbit owns integration environment lifecycle (not agents).

@@ -63,6 +63,30 @@ ACP transport and makes no provider calls. Do not use `--ignored` for the whole
 B3.4 target: its real Codex and Antigravity fixtures require separate live
 account authorization.
 
+The two live fixtures are opt-in individually. Set `ORBIT_TEST_DATABASE_URL` to
+the disposable qualification database, set
+`ORBIT_B34_LIVE_PROVIDER_OPT_IN=I_AUTHORIZE_LIVE_PROVIDER_CALLS`, and set
+`ORBIT_B34_LIVE_CREDENTIAL_DATABASE_URL_FILE` to an explicit absolute path for
+the private control-plane URL file under Orbit's private root. The file must
+target the loopback control-plane catalog on port 55442. Its connection is
+read-only: the tests read credentials directly from that catalog and never copy
+credential, generation, or representation rows into the disposable database.
+Workflow and role-execution state stays in the disposable schema, and each
+fixture creates its repository under a temporary directory.
+
+Run only the explicitly authorized fixture you intend to execute:
+
+```sh
+cargo test --locked --features fault-injection --test core_coding_agent_tool_surface_qualification -- --ignored --exact b34_real_codex_coding_fixture --nocapture
+cargo test --locked --features fault-injection --test core_coding_agent_tool_surface_qualification -- --ignored --exact b34_real_antigravity_review_fixture --nocapture
+```
+
+The Codex fixture resolves the `codex-main` account through the control-plane
+catalog. The Antigravity fixture uses the ranked resolver to select an eligible
+Antigravity account. Both commands can make real provider calls and consume
+quota; `--nocapture` prints only the sanitized selection summary, not provider
+output or credential data.
+
 Verification policy ID/version pairs are immutable. Workflow runs pin the
 definition digest at creation and fail if that exact version is missing or its
 content changes. Every selected required check needs a declared command or a

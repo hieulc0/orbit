@@ -72,13 +72,13 @@ async fn enroll_sample_credentials(pool: &PgPool) -> Result<()> {
         .bind(&cred_id1)
         .bind(&locator1)
         .execute(&mut *tx).await?;
-    let acp_representation_id1 = id();
-    let acp_representation_locator1 =
-        format!("credential://{cred_id1}/generation/1/{acp_representation_id1}");
-    sqlx::query("INSERT INTO orbit_credential_representations(id, credential_id, generation, interface, auth_type, state, secret_locator, last_validated_at) VALUES($1, $2, 1, 'acp', 'local-session', 'stored', $3, TIMESTAMPTZ '2000-01-01 00:00:00+00')")
-        .bind(&acp_representation_id1)
+    let codex_representation_id = id();
+    let codex_representation_locator =
+        format!("credential://{cred_id1}/generation/1/{codex_representation_id}");
+    sqlx::query("INSERT INTO orbit_credential_representations(id, credential_id, generation, interface, auth_type, state, secret_locator, last_validated_at) VALUES($1, $2, 1, 'codex', 'local-session', 'stored', $3, TIMESTAMPTZ '2000-01-01 00:00:00+00')")
+        .bind(&codex_representation_id)
         .bind(&cred_id1)
-        .bind(&acp_representation_locator1)
+        .bind(&codex_representation_locator)
         .execute(&mut *tx)
         .await?;
 

@@ -1,5 +1,5 @@
 // src/regression_strategy.rs
-// Phase B6 — Regression Strategy & Test Selection
+// Regression tier selection and policy evaluation.
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};

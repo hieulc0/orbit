@@ -81,7 +81,7 @@ async fn enroll_sample_credentials(pool: &PgPool) -> Result<()> {
     let representation_id1 = id();
     let representation_locator1 =
         format!("credential://{cred_id1}/generation/1/{representation_id1}");
-    sqlx::query("INSERT INTO orbit_credential_representations(id, credential_id, generation, interface, auth_type, state, secret_locator, last_validated_at) VALUES($1, $2, 1, 'acp', 'local-session', 'stored', $3, clock_timestamp())")
+    sqlx::query("INSERT INTO orbit_credential_representations(id, credential_id, generation, interface, auth_type, state, secret_locator, last_validated_at) VALUES($1, $2, 1, 'codex', 'local-session', 'stored', $3, clock_timestamp())")
         .bind(&representation_id1)
         .bind(&cred_id1)
         .bind(&representation_locator1)

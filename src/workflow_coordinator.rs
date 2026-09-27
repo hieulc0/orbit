@@ -1,4 +1,4 @@
-//! Production Workflow Coordinator (Phase B3.1).
+//! Production workflow stage progression, role execution, and evidence coordination.
 //! Orchestrates autonomous multi-stage software change workflows
 //! using durable state, credential resolution, ACP agent execution,
 //! and multi-tier verification.
@@ -1221,7 +1221,7 @@ impl WorkflowCoordinator {
                     });
                 }
 
-                // Workspace Mutation Invariant check (Requirement 27)
+                // Repository mutations require a matching persisted execution lock owner.
                 // Immediately before final completion, inspect workspace on disk.
                 // Must strictly match the reviewed & qualified ws_state_id!
                 let disk_ws_state = compute_workspace_state(repo_path, baseline).await?;
@@ -3072,7 +3072,8 @@ async fn wait_cli_supervisor(
 
 #[allow(clippy::too_many_arguments)]
 async fn execute_real_acp_turn(
-    pool: &PgPool,
+    workflow_state_pool: &PgPool,
+    credential_catalog_pool: &PgPool,
     wf_run: &WorkflowRun,
     role_exec: &RoleExecution,
     role: &RoleDefinition,
@@ -3081,11 +3082,12 @@ async fn execute_real_acp_turn(
     repo_path: &Path,
     input_handoff: Option<&HandoffArtifact>,
     mut cancellation: tokio::sync::watch::Receiver<bool>,
+    suppress_diagnostics: bool,
 ) -> Result<RoleExecutionOutcome> {
     let agent_exec_id = format!("acp-exec-{}", id());
     let started_at_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
 
-    let cred_store = CredentialStore::new(pool);
+    let cred_store = CredentialStore::new(credential_catalog_pool);
     let credential_ref = target
         .credential_id
         .as_deref()
@@ -3108,15 +3110,16 @@ async fn execute_real_acp_turn(
     let auth_store_dir = auth_store_dir.canonicalize()?;
 
     let runtime = if target.provider == "codex" {
-        let secret_bytes = registered_auth_diagnostic(pool, &backend, &credential.reference)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "failed to stage Codex credentials for {}: {:?}",
-                    credential.reference,
-                    e
-                )
-            })?;
+        let secret_bytes =
+            registered_auth_diagnostic(credential_catalog_pool, &backend, &credential.reference)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "failed to stage Codex credentials for {}: {:?}",
+                        credential.reference,
+                        e
+                    )
+                })?;
         let auth_file = auth_store_dir.join("auth.json");
         tokio::fs::write(&auth_file, secret_bytes.expose()).await?;
         std::fs::set_permissions(&auth_file, std::fs::Permissions::from_mode(0o600))?;
@@ -3357,7 +3360,11 @@ async fn execute_real_acp_turn(
         )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(if suppress_diagnostics {
+            Stdio::null()
+        } else {
+            Stdio::inherit()
+        })
         .kill_on_drop(true);
     command.process_group(0);
 
@@ -3391,7 +3398,7 @@ async fn execute_real_acp_turn(
         terminals: BTreeMap::new(),
         wf_attempt_id: Some(wf_run.attempt_id.clone()),
         role_exec_id: Some(role_exec.id.clone()),
-        pool: Some(pool),
+        pool: Some(workflow_state_pool),
     };
 
     let turn = tokio::select! {
@@ -3536,7 +3543,7 @@ async fn execute_real_acp_turn(
 
     let finished_at_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
 
-    let store = WorkflowStore::new(pool.clone());
+    let store = WorkflowStore::new(workflow_state_pool.clone());
 
     let mut failure = turn.err();
     if let Err(error) = validate_role_turn_completion(&state.agent_output, &evidence) {
@@ -3552,9 +3559,13 @@ async fn execute_real_acp_turn(
     } else {
         "completed"
     };
-    let failure_message = failure
-        .as_ref()
-        .map(|error| error.to_string().chars().take(512).collect::<String>());
+    let failure_message = failure.as_ref().map(|error| {
+        if suppress_diagnostics {
+            "live provider fixture execution failed".to_owned()
+        } else {
+            error.to_string().chars().take(512).collect::<String>()
+        }
+    });
     let model_evidence = role_model_evidence(target, None);
     store
         .insert_agent_execution(
@@ -3605,6 +3616,42 @@ async fn execute_real_acp_turn(
 /// Production ACP role agent executor that executes real ACP agent turns.
 pub struct RealAcpRoleExecutor;
 
+impl RealAcpRoleExecutor {
+    /// Execute a real ACP role turn with separate workflow and credential stores.
+    /// Production callers normally use the same pool for both stores.
+    #[cfg(feature = "fault-injection")]
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn execute_role_with_credential_catalog(
+        &self,
+        workflow_state_pool: &PgPool,
+        credential_catalog_pool: &PgPool,
+        wf_run: &WorkflowRun,
+        role_exec: &RoleExecution,
+        role: &RoleDefinition,
+        target: &ResolvedExecutionTarget,
+        task_text: &str,
+        repo_path: &Path,
+        input_handoff: Option<&HandoffArtifact>,
+        cancellation: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<RoleExecutionOutcome> {
+        execute_real_acp_turn(
+            workflow_state_pool,
+            credential_catalog_pool,
+            wf_run,
+            role_exec,
+            role,
+            target,
+            task_text,
+            repo_path,
+            input_handoff,
+            cancellation,
+            true,
+        )
+        .await
+    }
+}
+
 #[async_trait::async_trait]
 impl RoleAgentExecutor for RealAcpRoleExecutor {
     async fn execute_role(
@@ -3637,6 +3684,7 @@ impl RoleAgentExecutor for RealAcpRoleExecutor {
 
         execute_real_acp_turn(
             pool,
+            pool,
             wf_run,
             role_exec,
             role,
@@ -3645,6 +3693,7 @@ impl RoleAgentExecutor for RealAcpRoleExecutor {
             repo_path,
             input_handoff,
             cancellation,
+            false,
         )
         .await
     }

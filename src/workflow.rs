@@ -1,4 +1,4 @@
-//! Phase B3: Role Agents + Verified Sequential Workflow.
+//! Durable role-agent workflows, transitions, handoffs, and candidate evidence.
 //!
 //! Orbit owns durable task/workflow state.
 //! Agents reason and modify. Orbit controls state transitions.
@@ -1676,7 +1676,7 @@ impl WorkflowStore {
             ws_id
         );
 
-        // 3. Phase B6 Invariant: Completion requires FULL regression tier
+        // Completion requires a successful FULL regression tier.
         let required_tier = if let Some(ref reg_id) = wf.regression_policy_id {
             let reg_store = crate::regression_strategy::RegressionStore::new(self.pool.clone());
             let reg_pol = reg_store
@@ -1970,14 +1970,20 @@ fn candidate_rejection(
     None
 }
 
-fn credential_has_valid_acp_representation(
+fn credential_has_valid_runtime_representation(
     inspection: &crate::credential_registry::CredentialInspection,
 ) -> bool {
+    let expected_interface = match inspection.credential.provider.as_str() {
+        "codex" => crate::codex_credential_enrollment::CODEX_INTERFACE,
+        "antigravity" => "acp",
+        _ => return false,
+    };
     inspection.credential.has_secret
         && inspection.representations.iter().any(|representation| {
             representation.current_generation
                 && representation.generation == inspection.credential.generation
-                && representation.interface == "acp"
+                && representation.interface == expected_interface
+                && representation.state == crate::credential_registry::RepresentationState::Stored
                 && representation.validation == "valid"
                 && representation.has_secret
         })
@@ -2115,9 +2121,9 @@ impl RoleRuntimeResolver {
                     ));
                     continue;
                 }
-                if !credential_has_valid_acp_representation(&inspection) {
+                if !credential_has_valid_runtime_representation(&inspection) {
                     rejected.push(format!(
-                        "{provider}:{}:missing_or_invalid_current_acp_representation",
+                        "{provider}:{}:missing_or_invalid_current_runtime_representation",
                         credential.reference
                     ));
                     continue;
@@ -2322,6 +2328,115 @@ pub fn format_workflow_show(wf: &WorkflowRun, roles: &[RoleExecution]) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn runtime_credential_inspection(
+        provider: &str,
+        interface: &str,
+    ) -> crate::credential_registry::CredentialInspection {
+        use crate::credential_registry::{
+            CredentialInspection, CredentialStatus, CredentialView, RepresentationState,
+            RepresentationView,
+        };
+
+        CredentialInspection {
+            credential: CredentialView {
+                id: "credential-id".into(),
+                provider: provider.into(),
+                reference: "fixture-account".into(),
+                generation: 3,
+                endpoint: None,
+                auth_type: "fixture-auth".into(),
+                secret_backend: "fixture-backend".into(),
+                status: CredentialStatus::Enrolled,
+                has_secret: true,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            },
+            generations: Vec::new(),
+            representations: vec![RepresentationView {
+                id: "representation-id".into(),
+                generation: 3,
+                current_generation: true,
+                interface: interface.into(),
+                auth_type: "fixture-auth".into(),
+                state: RepresentationState::Stored,
+                validation: "valid".into(),
+                capabilities: Vec::new(),
+                runtime_provenance: None,
+                enrollment_stage: None,
+                has_secret: true,
+                last_validated_at_ms: Some(1),
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            }],
+            identity_bindings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn runtime_credentials_require_their_provider_interface() {
+        let codex = runtime_credential_inspection(
+            "codex",
+            crate::codex_credential_enrollment::CODEX_INTERFACE,
+        );
+        let antigravity = runtime_credential_inspection("antigravity", "acp");
+
+        assert!(credential_has_valid_runtime_representation(&codex));
+        assert!(credential_has_valid_runtime_representation(&antigravity));
+        assert!(!credential_has_valid_runtime_representation(
+            &runtime_credential_inspection("codex", "acp")
+        ));
+        assert!(!credential_has_valid_runtime_representation(
+            &runtime_credential_inspection("antigravity", "codex")
+        ));
+    }
+
+    #[test]
+    fn runtime_credentials_reject_stale_invalid_and_secretless_representations() {
+        use crate::credential_registry::RepresentationState;
+
+        let mut stale_generation = runtime_credential_inspection(
+            "codex",
+            crate::codex_credential_enrollment::CODEX_INTERFACE,
+        );
+        stale_generation.representations[0].generation = 2;
+        assert!(!credential_has_valid_runtime_representation(
+            &stale_generation
+        ));
+
+        let mut non_current = runtime_credential_inspection(
+            "codex",
+            crate::codex_credential_enrollment::CODEX_INTERFACE,
+        );
+        non_current.representations[0].current_generation = false;
+        assert!(!credential_has_valid_runtime_representation(&non_current));
+
+        let mut invalid_state = runtime_credential_inspection(
+            "codex",
+            crate::codex_credential_enrollment::CODEX_INTERFACE,
+        );
+        invalid_state.representations[0].state = RepresentationState::Invalid;
+        assert!(!credential_has_valid_runtime_representation(&invalid_state));
+
+        let mut invalid_validation = runtime_credential_inspection(
+            "codex",
+            crate::codex_credential_enrollment::CODEX_INTERFACE,
+        );
+        invalid_validation.representations[0].validation = "invalid".into();
+        assert!(!credential_has_valid_runtime_representation(
+            &invalid_validation
+        ));
+
+        let mut secretless = runtime_credential_inspection(
+            "codex",
+            crate::codex_credential_enrollment::CODEX_INTERFACE,
+        );
+        secretless.representations[0].has_secret = false;
+        assert!(!credential_has_valid_runtime_representation(&secretless));
+        secretless.representations[0].has_secret = true;
+        secretless.credential.has_secret = false;
+        assert!(!credential_has_valid_runtime_representation(&secretless));
+    }
 
     fn candidate(
         provider: &str,
