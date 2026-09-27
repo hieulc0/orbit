@@ -92,6 +92,13 @@ verification remains active; an uncertain external execution requires explicit
 reconciliation before retry. Existing attempt-only locks must be reconciled
 before migration 0024 can add workspace identity.
 
+Role execution now waits for the local ACP supervisor and matching cleanup
+receipt before recording success. Cancellation reaches active role and isolated
+verification processes, including when another coordinator cancels the workflow.
+The coordinator checks the selected credential generation again before launch;
+`actual_model` remains unset unless the runtime reports an observed model. A
+missing cleanup receipt leaves the mutation lock fenced for reconciliation.
+
 ```sh
 ORBIT_TEST_DATABASE_URL=postgres://orbit:orbit-local-test@127.0.0.1:55439/orbit \
 cargo test --locked --test workflow_qualification -- --ignored --test-threads=1

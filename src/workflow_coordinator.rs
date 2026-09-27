@@ -204,8 +204,31 @@ impl WorkflowCoordinator {
         self.active_cancellations
             .lock()
             .unwrap()
-            .insert(wf_id.to_owned(), cancel_tx);
+            .insert(wf_id.to_owned(), cancel_tx.clone());
+        let watch_pool = self.pool.clone();
+        let watch_claim = claim.clone();
+        let watchdog = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(200));
+            loop {
+                interval.tick().await;
+                let authority: std::result::Result<Option<(String, Option<String>, i64)>, sqlx::Error> =
+                    sqlx::query_as(
+                        "SELECT status, step_owner_id, step_generation FROM orbit_workflow_runs WHERE id = $1",
+                    )
+                    .bind(&watch_claim.workflow_run_id)
+                    .fetch_optional(&watch_pool)
+                    .await;
+                let still_owned = matches!(authority,
+                    Ok(Some((status, Some(owner), generation)))
+                        if status != "CANCELLED" && owner == watch_claim.owner_id && generation == watch_claim.generation);
+                if !still_owned {
+                    let _ = cancel_tx.send(true);
+                    break;
+                }
+            }
+        });
         let result = owned.step_claimed(wf_id).await;
+        watchdog.abort();
         self.active_cancellations.lock().unwrap().remove(wf_id);
         let release = self.store.release_workflow_step(&claim).await;
         match (result, release) {
@@ -3303,8 +3326,14 @@ async fn execute_real_acp_turn(
 
     let mut child = command.spawn().context("failed to spawn acp-supervisor")?;
 
-    let child_out = child.stdout.take().context("child stdout missing")?;
-    let child_in = child.stdin.take().context("child stdin missing")?;
+    let child_out = child
+        .stdout
+        .take()
+        .ok_or_else(|| UnconfirmedRoleCleanup("supervisor stdout missing".into()))?;
+    let child_in = child
+        .stdin
+        .take()
+        .ok_or_else(|| UnconfirmedRoleCleanup("supervisor stdin missing".into()))?;
     let mut wire = Wire::new(child_out, child_in, 16 * 1024 * 1024);
 
     let mut state = AcpTurnState {

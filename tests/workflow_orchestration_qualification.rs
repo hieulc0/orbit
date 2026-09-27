@@ -1333,3 +1333,129 @@ async fn s6_simultaneous_steps_and_cancel_have_one_owner() -> Result<()> {
     assert_eq!(roles[0].status, RoleExecutionStatus::Cancelled);
     teardown_test(ctx).await
 }
+
+struct S7LocalProcessExecutor {
+    started: tokio::sync::Notify,
+    child_pid: std::sync::atomic::AtomicU32,
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
+async fn s7_recovery_retains_lock_after_unconfirmed_role_cleanup() -> Result<()> {
+    let ctx = setup_test().await?;
+    let wf = ctx
+        .store
+        .create_workflow_run("s7-unconfirmed-cleanup", &format!("att-{}", id()), 1, None)
+        .await?;
+    let claim = ctx.store.claim_workflow_step(&wf.id).await?.unwrap();
+    let role = ctx
+        .store
+        .with_step_claim(claim)
+        .create_role_execution(
+            &wf.id,
+            &RoleDefinition::implementer_v1(),
+            "IMPLEMENTING",
+            1,
+            None,
+            None,
+        )
+        .await?;
+    ctx.store
+        .acquire_workspace_mutation_lock(&wf.attempt_id, &role.id)
+        .await?;
+    sqlx::query("UPDATE orbit_role_executions SET status = 'FAILED' WHERE id = $1")
+        .bind(&role.id)
+        .execute(&ctx.engine.pool)
+        .await?;
+    sqlx::query("INSERT INTO orbit_agent_executions (id, role_execution_id, agent_type, started_at_ms, status, metadata) VALUES ($1, $2, 'local-acp', 1, 'FAILED', '{\"cleanup_confirmed\":false}'::jsonb)")
+        .bind(id())
+        .bind(&role.id)
+        .execute(&ctx.engine.pool)
+        .await?;
+    sqlx::query("UPDATE orbit_workflow_runs SET step_owner_pid = 99999999 WHERE id = $1")
+        .bind(&wf.id)
+        .execute(&ctx.engine.pool)
+        .await?;
+    assert!(ctx.store.recover_orphaned_workflow_step(&wf.id).await?);
+    assert!(
+        ctx.store
+            .check_workspace_mutation_lock(&wf.attempt_id, &role.id)
+            .await?
+    );
+    teardown_test(ctx).await
+}
+
+#[async_trait::async_trait]
+impl RoleAgentExecutor for S7LocalProcessExecutor {
+    async fn execute_role(
+        &self,
+        _pool: &PgPool,
+        _wf_run: &WorkflowRun,
+        _role_exec: &RoleExecution,
+        _role: &RoleDefinition,
+        _target: &ResolvedExecutionTarget,
+        _task_text: &str,
+        _repo_path: &std::path::Path,
+        _input_handoff: Option<&HandoffArtifact>,
+        mut cancellation: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<RoleExecutionOutcome> {
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .args(["-c", "sleep 30"])
+            .process_group(0)
+            .kill_on_drop(true);
+        let mut child = command.spawn()?;
+        let pid = child.id().unwrap();
+        self.child_pid
+            .store(pid, std::sync::atomic::Ordering::SeqCst);
+        self.started.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while cancellation.changed().await.is_ok() {
+                if *cancellation.borrow() {
+                    break;
+                }
+            }
+        })
+        .await?;
+        unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+        child.wait().await?;
+        anyhow::bail!("ROLE_EXECUTION_CANCELLED")
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
+async fn s7_cancel_from_another_coordinator_reaches_local_role_process() -> Result<()> {
+    let ctx = setup_test().await?;
+    enroll_sample_credentials(&ctx.engine.pool).await?;
+    let wf = ctx
+        .store
+        .create_workflow_run("s7-cross-process-cancel", &format!("att-{}", id()), 1, None)
+        .await?;
+    let executor = Arc::new(S7LocalProcessExecutor {
+        started: tokio::sync::Notify::new(),
+        child_pid: std::sync::atomic::AtomicU32::new(0),
+    });
+    let worker = Arc::new(WorkflowCoordinator::new(
+        ctx.engine.pool.clone(),
+        executor.clone(),
+    ));
+    let canceller = WorkflowCoordinator::new(ctx.engine.pool.clone(), executor.clone());
+    worker.step(&wf.id).await?;
+    let id = wf.id.clone();
+    let worker_copy = Arc::clone(&worker);
+    let active = tokio::spawn(async move { worker_copy.step(&id).await });
+    executor.started.notified().await;
+    canceller
+        .cancel_workflow(&wf.id, "cancel from another coordinator")
+        .await?;
+    let completed = tokio::time::timeout(std::time::Duration::from_secs(5), active).await???;
+    assert_eq!(
+        completed,
+        WorkflowStepResult::Terminal(WorkflowStage::Cancelled)
+    );
+    let pid = executor.child_pid.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(pid > 0);
+    assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+    teardown_test(ctx).await
+}

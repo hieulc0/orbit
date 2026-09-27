@@ -649,7 +649,7 @@ impl WorkflowStore {
             .execute(&mut *tx)
             .await?;
             sqlx::query(
-                "DELETE FROM orbit_attempt_workspace_locks locks USING orbit_role_executions re WHERE locks.holder_role_execution_id = re.id AND re.workflow_run_id = $1 AND re.status IN ('SUCCEEDED', 'FAILED', 'CANCELLED') AND NOT EXISTS (SELECT 1 FROM orbit_agent_executions ae WHERE ae.role_execution_id = re.id AND ae.status IN ('PENDING', 'RUNNING'))",
+                "DELETE FROM orbit_attempt_workspace_locks locks USING orbit_role_executions re WHERE locks.holder_role_execution_id = re.id AND re.workflow_run_id = $1 AND re.status IN ('SUCCEEDED', 'FAILED', 'CANCELLED') AND NOT EXISTS (SELECT 1 FROM orbit_agent_executions ae WHERE ae.role_execution_id = re.id AND (ae.status IN ('PENDING', 'RUNNING') OR COALESCE(ae.metadata->>'cleanup_confirmed', 'false') <> 'true'))",
             )
             .bind(wf_id)
             .execute(&mut *tx)
