@@ -45,6 +45,9 @@ async fn teardown_test(ctx: TestContext) -> Result<()> {
 }
 
 async fn enroll_sample_credentials(pool: &PgPool) -> Result<()> {
+    // These catalog-only representations let the production resolver run in
+    // coordinator tests; the explicitly injected offline executor never reads
+    // their synthetic locators or contacts a provider.
     let mut tx = pool.begin().await?;
     let cred_id1 = id();
     let secret_id1 = id();
@@ -56,6 +59,15 @@ async fn enroll_sample_credentials(pool: &PgPool) -> Result<()> {
         .bind(&cred_id1)
         .bind(&locator1)
         .execute(&mut *tx).await?;
+    let acp_representation_id1 = id();
+    let acp_representation_locator1 =
+        format!("credential://{cred_id1}/generation/1/{acp_representation_id1}");
+    sqlx::query("INSERT INTO orbit_credential_representations(id, credential_id, generation, interface, auth_type, state, secret_locator, last_validated_at) VALUES($1, $2, 1, 'acp', 'local-session', 'stored', $3, TIMESTAMPTZ '2000-01-01 00:00:00+00')")
+        .bind(&acp_representation_id1)
+        .bind(&cred_id1)
+        .bind(&acp_representation_locator1)
+        .execute(&mut *tx)
+        .await?;
 
     let cred_id2 = id();
     let secret_id2 = id();
@@ -67,6 +79,15 @@ async fn enroll_sample_credentials(pool: &PgPool) -> Result<()> {
         .bind(&cred_id2)
         .bind(&locator2)
         .execute(&mut *tx).await?;
+    let acp_representation_id2 = id();
+    let acp_representation_locator2 =
+        format!("credential://{cred_id2}/generation/1/{acp_representation_id2}");
+    sqlx::query("INSERT INTO orbit_credential_representations(id, credential_id, generation, interface, auth_type, state, secret_locator, last_validated_at) VALUES($1, $2, 1, 'acp', 'oauth', 'stored', $3, TIMESTAMPTZ '2000-01-01 00:00:00+00')")
+        .bind(&acp_representation_id2)
+        .bind(&cred_id2)
+        .bind(&acp_representation_locator2)
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
     Ok(())
 }
