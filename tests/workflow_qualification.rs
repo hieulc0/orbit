@@ -46,6 +46,7 @@ fn sample_policy() -> VerificationPolicy {
         version: 1,
         name: "Test Policy".into(),
         required_steps: vec!["test".into()],
+        specialized_required_steps: vec![],
         allowed_commands: vec![],
         environment_policy: orbit::verification::VerificationEnvironmentPolicy {
             inherit: vec![],
@@ -103,6 +104,80 @@ async fn sample_environment() -> Result<EnvironmentIdentity> {
         regression_policy_digest: None,
         selection_digest: None,
     })
+}
+
+async fn advance_to_verifying(store: &WorkflowStore, workflow_id: &str) -> Result<()> {
+    store
+        .transition_workflow_stage(workflow_id, WorkflowStage::Planning, None, None, None)
+        .await?;
+    store
+        .transition_workflow_stage(workflow_id, WorkflowStage::Implementing, None, None, None)
+        .await?;
+    store
+        .transition_workflow_stage(
+            workflow_id,
+            WorkflowStage::Verifying,
+            Some("ws-policy-resolution"),
+            None,
+            None,
+        )
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL; see docs/development/testing.md"]
+async fn test_b3_workflow_rejects_missing_or_changed_pinned_policy() -> Result<()> {
+    let ctx = setup_workflow_test().await?;
+    let missing_policy = sample_policy();
+    let missing_wf = ctx
+        .store
+        .create_workflow_run(
+            &format!("task-{}", id()),
+            &format!("att-{}", id()),
+            1,
+            Some(&missing_policy),
+        )
+        .await?;
+    advance_to_verifying(&ctx.store, &missing_wf.id).await?;
+    let coordinator = orbit::workflow_coordinator::WorkflowCoordinator::new(
+        ctx.engine.pool.clone(),
+        std::sync::Arc::new(orbit::workflow_coordinator::RealAcpRoleExecutor),
+    );
+    let missing = coordinator.step(&missing_wf.id).await.unwrap_err();
+    assert!(missing.to_string().contains("pinned verification policy"));
+    assert!(missing.to_string().contains("is missing"));
+
+    let policy = sample_policy();
+    ctx.store.verification_store().save_policy(&policy).await?;
+    let changed_wf = ctx
+        .store
+        .create_workflow_run(
+            &format!("task-{}", id()),
+            &format!("att-{}", id()),
+            1,
+            Some(&policy),
+        )
+        .await?;
+    advance_to_verifying(&ctx.store, &changed_wf.id).await?;
+
+    let mut changed = policy.clone();
+    changed.name = "Changed stored policy".into();
+    sqlx::query(
+        "UPDATE orbit_verification_policies SET name = $3, digest = $4, definition = $5 WHERE id = $1 AND version = $2",
+    )
+    .bind(&changed.id)
+    .bind(changed.version as i32)
+    .bind(&changed.name)
+    .bind(changed.digest())
+    .bind(serde_json::to_value(&changed)?)
+    .execute(&ctx.engine.pool)
+    .await?;
+
+    let mismatch = coordinator.step(&changed_wf.id).await.unwrap_err();
+    assert!(mismatch.to_string().contains("POLICY_DIGEST_MISMATCH"));
+    ctx.database.teardown().await?;
+    Ok(())
 }
 
 #[tokio::test]

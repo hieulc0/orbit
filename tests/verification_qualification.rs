@@ -863,6 +863,76 @@ async fn test_b2_qualification_policy_mutation_invalidates_qualification() -> Re
 }
 
 #[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn test_b2_policy_id_version_is_immutable_and_digest_checked() -> Result<()> {
+    let (engine, store, _home) = setup_db_store().await?;
+    let mut policy = VerificationPolicy::new("pol-immutable", "Immutable Policy");
+    policy.required_steps = vec!["declared-check".into()];
+    store.save_policy(&policy).await?;
+
+    let mut replacement = policy.clone();
+    replacement.name = "Replacement Content".into();
+    let conflict = store.save_policy(&replacement).await.unwrap_err();
+    assert!(conflict.to_string().contains("POLICY_VERSION_IMMUTABLE"));
+
+    let loaded = store
+        .get_policy(&policy.id, policy.version)
+        .await?
+        .expect("original policy version remains stored");
+    assert_eq!(loaded.digest(), policy.digest());
+    assert!(
+        store
+            .get_policy(&policy.id, policy.version + 1)
+            .await?
+            .is_none(),
+        "missing pinned policy version is not substituted"
+    );
+
+    let mut mismatched_row_version = policy.clone();
+    mismatched_row_version.version += 1;
+    sqlx::query(
+        "UPDATE orbit_verification_policies SET digest = $3, definition = $4 WHERE id = $1 AND version = $2",
+    )
+    .bind(&policy.id)
+    .bind(policy.version as i32)
+    .bind(mismatched_row_version.digest())
+    .bind(serde_json::to_value(&mismatched_row_version)?)
+    .execute(&engine.pool)
+    .await?;
+    let latest_mismatch = store.get_latest_policy(&policy.id).await.unwrap_err();
+    assert!(
+        latest_mismatch
+            .to_string()
+            .contains("POLICY_DIGEST_MISMATCH")
+    );
+
+    sqlx::query(
+        "UPDATE orbit_verification_policies SET digest = $3, definition = $4 WHERE id = $1 AND version = $2",
+    )
+    .bind(&policy.id)
+    .bind(policy.version as i32)
+    .bind(policy.digest())
+    .bind(serde_json::to_value(&policy)?)
+    .execute(&engine.pool)
+    .await?;
+    sqlx::query(
+        "UPDATE orbit_verification_policies SET digest = 'sha256:corrupt' WHERE id = $1 AND version = $2",
+    )
+    .bind(&policy.id)
+    .bind(policy.version as i32)
+    .execute(&engine.pool)
+    .await?;
+    let mismatch = store
+        .get_policy(&policy.id, policy.version)
+        .await
+        .unwrap_err();
+    assert!(mismatch.to_string().contains("POLICY_DIGEST_MISMATCH"));
+
+    engine.pool.close().await;
+    Ok(())
+}
+
+#[tokio::test]
 #[ignore = "requires PostgreSQL and podman"]
 async fn test_b2_qualification_environment_identity_mutation_invalidates_qualification()
 -> Result<()> {
@@ -1000,7 +1070,11 @@ async fn test_b2_qualification_required_step_policy_enforcement() -> Result<()> 
     .await;
 
     assert!(res.is_err());
-    assert!(res.unwrap_err().to_string().contains("mandated by policy"));
+    assert!(
+        res.unwrap_err()
+            .to_string()
+            .contains("required action 'test' is unresolved")
+    );
 
     engine.pool.close().await;
     Ok(())

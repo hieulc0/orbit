@@ -63,6 +63,13 @@ ACP transport and makes no provider calls. Do not use `--ignored` for the whole
 B3.4 target: its real Codex and Antigravity fixtures require separate live
 account authorization.
 
+Verification policy ID/version pairs are immutable. Workflow runs pin the
+definition digest at creation and fail if that exact version is missing or its
+content changes. Every selected required check needs a declared command or a
+validated integration/browser action; unresolved checks stop selection. CLI
+workflow verification also requires a pinned rootless Podman profile and has no
+host or generic Cargo/docs fallback.
+
 ```sh
 ORBIT_TEST_DATABASE_URL=postgres://orbit:orbit-local-test@127.0.0.1:55439/orbit \
 cargo test --locked --test workflow_qualification -- --ignored --test-threads=1

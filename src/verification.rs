@@ -9,7 +9,7 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, PgPool};
+use sqlx::{FromRow, PgPool, Row};
 use std::{collections::BTreeMap, path::Path, time::Duration};
 use tokio::time::Instant;
 
@@ -149,8 +149,7 @@ impl VerificationPlan {
     }
 
     pub fn validate(&self) -> Result<()> {
-        ensure!(!self.id.trim().is_empty(), "plan id required");
-        ensure!(!self.name.trim().is_empty(), "plan name required");
+        self.validate_structure()?;
         ensure!(
             !self.steps.is_empty(),
             "plan must contain at least one step"
@@ -159,6 +158,12 @@ impl VerificationPlan {
             self.steps.iter().any(|s| s.required),
             "plan must contain at least one required verification step; absence of tests is not verification"
         );
+        Ok(())
+    }
+
+    fn validate_structure(&self) -> Result<()> {
+        ensure!(!self.id.trim().is_empty(), "plan id required");
+        ensure!(!self.name.trim().is_empty(), "plan name required");
         let mut ids = std::collections::HashSet::new();
         for step in &self.steps {
             step.validate()?;
@@ -297,6 +302,8 @@ pub struct VerificationPolicy {
     pub name: String,
     #[serde(default)]
     pub required_steps: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub specialized_required_steps: Vec<SpecializedVerificationRequirement>,
     #[serde(default)]
     pub allowed_commands: Vec<AllowedCommand>,
     #[serde(default)]
@@ -312,6 +319,21 @@ pub struct VerificationPolicy {
     pub browser_verification_spec: Option<crate::browser_verification::BrowserVerificationSpec>,
 }
 
+/// A required policy action whose durable evidence is produced by an Orbit
+/// integration or browser runner rather than a command step.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpecializedVerificationRequirement {
+    pub step_id: String,
+    pub action: SpecializedVerificationAction,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
+pub enum SpecializedVerificationAction {
+    IntegrationEnvironment,
+    BrowserTest(String),
+}
+
 impl VerificationPolicy {
     pub fn new(id: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
@@ -319,6 +341,7 @@ impl VerificationPolicy {
             version: 1,
             name: name.into(),
             required_steps: Vec::new(),
+            specialized_required_steps: Vec::new(),
             allowed_commands: Vec::new(),
             environment_policy: VerificationEnvironmentPolicy::clean(),
             network_policy: VerificationNetworkPolicy::None,
@@ -345,18 +368,95 @@ impl VerificationPolicy {
 
     /// Check if a plan satisfies this policy before execution.
     pub fn check_plan(&self, plan: &VerificationPlan) -> Result<()> {
-        plan.validate()?;
+        self.validate()?;
+        plan.validate_structure()?;
 
-        // 1. If policy specifies required steps by ID, they must exist in the plan
+        let mut action_ids = std::collections::HashSet::new();
+        for step in &plan.steps {
+            action_ids.insert(step.id.as_str());
+        }
+        for requirement in &self.specialized_required_steps {
+            ensure!(
+                !requirement.step_id.trim().is_empty(),
+                "specialized verification step id required"
+            );
+            ensure!(
+                action_ids.insert(requirement.step_id.as_str()),
+                "duplicate verification action id '{}'",
+                requirement.step_id
+            );
+            ensure!(
+                self.required_steps
+                    .iter()
+                    .any(|required| required == &requirement.step_id),
+                "specialized verification action '{}' is not listed as required",
+                requirement.step_id
+            );
+            match &requirement.action {
+                SpecializedVerificationAction::IntegrationEnvironment => {
+                    let spec = self
+                        .integration_environment_spec
+                        .as_ref()
+                        .context("required integration verification action has no specification")?;
+                    spec.validate()?;
+                    ensure!(
+                        !spec.setup_steps.is_empty()
+                            || spec
+                                .services
+                                .iter()
+                                .any(|service| service.readiness.is_some()),
+                        "required integration verification action '{}' has no setup or readiness check",
+                        spec.id
+                    );
+                }
+                SpecializedVerificationAction::BrowserTest(test_id) => {
+                    let spec = self
+                        .browser_verification_spec
+                        .as_ref()
+                        .context("required browser verification action has no specification")?;
+                    spec.validate()?;
+                    ensure!(
+                        spec.tests
+                            .iter()
+                            .any(|test| test.id == *test_id && test.required),
+                        "required browser verification action '{}' is missing or not required",
+                        test_id
+                    );
+                }
+            }
+        }
+
+        // Required IDs can be backed by a command step or an explicitly declared
+        // specialized action. The executor records the latter under the same ID.
         for req_id in &self.required_steps {
-            let found = plan.steps.iter().any(|s| &s.id == req_id && s.required);
+            let found = plan.steps.iter().any(|s| &s.id == req_id && s.required)
+                || self
+                    .specialized_required_steps
+                    .iter()
+                    .any(|requirement| &requirement.step_id == req_id);
             ensure!(
                 found,
-                "plan does not contain required step '{}' mandated by policy '{}'",
+                "required action '{}' is unresolved by verification policy '{}'",
                 req_id,
                 self.id
             );
         }
+
+        ensure!(
+            (plan.steps.iter().any(|step| step.required)
+                || !self.specialized_required_steps.is_empty())
+                && self.required_steps.iter().all(|id| {
+                    plan.steps
+                        .iter()
+                        .any(|step| step.required && &step.id == id)
+                        || self
+                            .specialized_required_steps
+                            .iter()
+                            .any(|requirement| requirement.step_id == *id)
+                }),
+            "verification policy '{}' has no resolved required action",
+            self.id
+        );
 
         // 2. Check allowed commands if policy defines an allowlist
         if !self.allowed_commands.is_empty() {
@@ -964,7 +1064,7 @@ impl VerificationStore {
         }
     }
 
-    /// Save or update a verification policy.
+    /// Save a verification policy under its immutable ID/version.
     pub async fn save_policy(&self, policy: &VerificationPolicy) -> Result<()> {
         policy.validate()?;
         let digest = policy.digest();
@@ -972,10 +1072,7 @@ impl VerificationStore {
             r#"
             INSERT INTO orbit_verification_policies (id, version, digest, name, definition)
             VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (id, version) DO UPDATE SET
-                digest = EXCLUDED.digest,
-                name = EXCLUDED.name,
-                definition = EXCLUDED.definition
+            ON CONFLICT (id, version) DO NOTHING
             "#,
         )
         .bind(&policy.id)
@@ -985,6 +1082,26 @@ impl VerificationStore {
         .bind(serde_json::to_value(policy)?)
         .execute(&self.pool)
         .await?;
+
+        let stored = sqlx::query(
+            "SELECT digest, definition FROM orbit_verification_policies WHERE id = $1 AND version = $2",
+        )
+        .bind(&policy.id)
+        .bind(policy.version as i32)
+        .fetch_one(&self.pool)
+        .await?;
+        let stored_digest: String = stored.get("digest");
+        let stored_definition: serde_json::Value = stored.get("definition");
+        let stored_policy: VerificationPolicy = serde_json::from_value(stored_definition)?;
+        ensure!(
+            stored_digest == digest
+                && stored_policy.id == policy.id
+                && stored_policy.version == policy.version
+                && stored_policy.digest() == stored_digest,
+            "POLICY_VERSION_IMMUTABLE: verification policy '{}' version {} already has different content",
+            policy.id,
+            policy.version
+        );
         Ok(())
     }
 
@@ -994,33 +1111,47 @@ impl VerificationStore {
         policy_id: &str,
         version: u32,
     ) -> Result<Option<VerificationPolicy>> {
-        let row = sqlx::query_scalar::<_, serde_json::Value>(
-            "SELECT definition FROM orbit_verification_policies WHERE id = $1 AND version = $2",
+        let row = sqlx::query(
+            "SELECT digest, definition FROM orbit_verification_policies WHERE id = $1 AND version = $2",
         )
         .bind(policy_id)
         .bind(version as i32)
         .fetch_optional(&self.pool)
         .await?;
 
-        match row {
-            Some(val) => Ok(Some(serde_json::from_value(val)?)),
-            None => Ok(None),
-        }
+        let Some(row) = row else { return Ok(None) };
+        let digest: String = row.get("digest");
+        let definition: serde_json::Value = row.get("definition");
+        let policy: VerificationPolicy = serde_json::from_value(definition)?;
+        ensure!(
+            policy.id == policy_id && policy.version == version && policy.digest() == digest,
+            "POLICY_DIGEST_MISMATCH: stored verification policy '{}' version {} does not match its pinned digest/content",
+            policy_id,
+            version
+        );
+        Ok(Some(policy))
     }
 
     /// Get the latest version of a policy by ID.
     pub async fn get_latest_policy(&self, policy_id: &str) -> Result<Option<VerificationPolicy>> {
-        let row = sqlx::query_scalar::<_, serde_json::Value>(
-            "SELECT definition FROM orbit_verification_policies WHERE id = $1 ORDER BY version DESC LIMIT 1",
+        let row = sqlx::query(
+            "SELECT version, digest, definition FROM orbit_verification_policies WHERE id = $1 ORDER BY version DESC LIMIT 1",
         )
         .bind(policy_id)
         .fetch_optional(&self.pool)
         .await?;
 
-        match row {
-            Some(val) => Ok(Some(serde_json::from_value(val)?)),
-            None => Ok(None),
-        }
+        let Some(row) = row else { return Ok(None) };
+        let version: i32 = row.get("version");
+        let digest: String = row.get("digest");
+        let definition: serde_json::Value = row.get("definition");
+        let policy: VerificationPolicy = serde_json::from_value(definition)?;
+        ensure!(
+            policy.id == policy_id && policy.version == version as u32 && policy.digest() == digest,
+            "POLICY_DIGEST_MISMATCH: latest stored verification policy '{}' does not match its digest/content",
+            policy_id
+        );
+        Ok(Some(policy))
     }
 
     /// Create a new VerificationRun record in PENDING status.
@@ -1070,9 +1201,10 @@ impl VerificationStore {
         selection: Option<&crate::regression_strategy::VerificationSelection>,
         regression_policy: Option<&crate::regression_strategy::RegressionPolicy>,
     ) -> Result<VerificationRun> {
-        plan.validate()?;
         if let Some(pol) = policy {
             pol.check_plan(plan)?;
+        } else {
+            plan.validate()?;
         }
         let run_id = format!("vrun-{}", crate::model::id());
         let started_at_ms = now_millis();
@@ -1781,9 +1913,10 @@ pub async fn execute_verification_plan_with_policy(
     policy: Option<&VerificationPolicy>,
     cancellation_token: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<VerificationRun> {
-    plan.validate()?;
     if let Some(pol) = policy {
         pol.check_plan(plan)?;
+    } else {
+        plan.validate()?;
     }
     validate_pinned_verification_profile(&environment)?;
 
@@ -1814,6 +1947,12 @@ pub async fn execute_run_contents(
     policy: Option<&VerificationPolicy>,
     cancellation_token: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<VerificationRun> {
+    validate_pinned_verification_profile(&run.environment_identity)?;
+    if let Some(policy) = policy {
+        policy.check_plan(plan)?;
+    } else {
+        plan.validate()?;
+    }
     let mut overall_result;
     let mut step_runs = Vec::new();
 
@@ -2142,6 +2281,154 @@ pub async fn execute_run_contents(
                 Err(_) => {
                     overall_result = VerificationRunResult::Error;
                 }
+            }
+        }
+    }
+
+    if let Some(policy) = policy {
+        for requirement in &policy.specialized_required_steps {
+            let (status, error_message) = match &requirement.action {
+                SpecializedVerificationAction::IntegrationEnvironment => {
+                    let env_store =
+                        crate::integration_environment::EnvironmentStore::new(store.pool().clone());
+                    match env_store
+                        .get_environment_run_for_verification(&run.id)
+                        .await?
+                    {
+                        Some(env_run)
+                            if env_run.workspace_state_id == workspace_state.state_id
+                                && policy.integration_environment_spec.as_ref().is_some_and(
+                                    |spec| env_run.environment_spec_digest == spec.digest(),
+                                ) =>
+                        {
+                            let status = match env_run.status {
+                                crate::integration_environment::EnvironmentRunStatus::Passed => {
+                                    VerificationStepStatus::Passed
+                                }
+                                crate::integration_environment::EnvironmentRunStatus::Failed => {
+                                    VerificationStepStatus::Failed
+                                }
+                                crate::integration_environment::EnvironmentRunStatus::TimedOut => {
+                                    VerificationStepStatus::TimedOut
+                                }
+                                crate::integration_environment::EnvironmentRunStatus::Cancelled => {
+                                    VerificationStepStatus::Cancelled
+                                }
+                                _ => VerificationStepStatus::Error,
+                            };
+                            (status, env_run.error_message)
+                        }
+                        Some(_) => (
+                            VerificationStepStatus::Error,
+                            Some(
+                                "integration evidence does not match the selected spec/workspace"
+                                    .into(),
+                            ),
+                        ),
+                        None => (
+                            VerificationStepStatus::Error,
+                            Some("required integration verification evidence is missing".into()),
+                        ),
+                    }
+                }
+                SpecializedVerificationAction::BrowserTest(test_id) => {
+                    let browser_store =
+                        crate::browser_verification::BrowserStore::new(store.pool().clone());
+                    match browser_store
+                        .get_browser_run_for_verification(&run.id)
+                        .await?
+                    {
+                        Some(browser_run)
+                            if browser_run.workspace_state_id == workspace_state.state_id
+                                && policy.browser_verification_spec.as_ref().is_some_and(
+                                    |spec| browser_run.spec_digest == spec.digest(),
+                                ) =>
+                        {
+                            match browser_run
+                                .test_runs
+                                .iter()
+                                .find(|test| &test.test_id == test_id && test.required)
+                            {
+                                Some(test) => {
+                                    let status = match test.status {
+                                        crate::browser_verification::BrowserTestStatus::Passed => {
+                                            VerificationStepStatus::Passed
+                                        }
+                                        crate::browser_verification::BrowserTestStatus::Failed => {
+                                            VerificationStepStatus::Failed
+                                        }
+                                        crate::browser_verification::BrowserTestStatus::TimedOut => {
+                                            VerificationStepStatus::TimedOut
+                                        }
+                                        crate::browser_verification::BrowserTestStatus::Cancelled => {
+                                            VerificationStepStatus::Cancelled
+                                        }
+                                        crate::browser_verification::BrowserTestStatus::Error => {
+                                            VerificationStepStatus::Error
+                                        }
+                                    };
+                                    (status, test.failure_message.clone())
+                                }
+                                None => (
+                                    VerificationStepStatus::Error,
+                                    Some(format!(
+                                        "required browser test '{test_id}' has no durable test result"
+                                    )),
+                                ),
+                            }
+                        }
+                        Some(_) => (
+                            VerificationStepStatus::Error,
+                            Some(
+                                "browser evidence does not match the selected spec/workspace"
+                                    .into(),
+                            ),
+                        ),
+                        None => (
+                            VerificationStepStatus::Error,
+                            Some("required browser verification evidence is missing".into()),
+                        ),
+                    }
+                }
+            };
+
+            let now = now_millis();
+            let step_run = VerificationStepRun {
+                id: format!("vstep-specialized-{}", crate::model::id()),
+                verification_run_id: run.id.clone(),
+                step_id: requirement.step_id.clone(),
+                step_name: format!("specialized verification action: {:?}", requirement.action),
+                status,
+                required: true,
+                exit_code: (status == VerificationStepStatus::Passed).then_some(0),
+                started_at_ms: now,
+                finished_at_ms: Some(now),
+                duration_ms: Some(0),
+                stdout_preview: None,
+                stdout_truncated: false,
+                stdout_bytes: 0,
+                stdout_artifact_id: None,
+                stderr_preview: error_message.clone(),
+                stderr_truncated: false,
+                stderr_bytes: error_message
+                    .as_ref()
+                    .map_or(0, |message| message.len() as u64),
+                stderr_artifact_id: None,
+                artifacts: Vec::new(),
+                error_message,
+            };
+            store.record_step_run(&step_run).await?;
+            step_runs.push(step_run);
+
+            if overall_result == VerificationRunResult::Passed
+                && status != VerificationStepStatus::Passed
+            {
+                overall_result = match status {
+                    VerificationStepStatus::TimedOut => VerificationRunResult::TimedOut,
+                    VerificationStepStatus::Cancelled => VerificationRunResult::Cancelled,
+                    VerificationStepStatus::Error => VerificationRunResult::Error,
+                    _ => VerificationRunResult::Failed,
+                };
             }
         }
     }

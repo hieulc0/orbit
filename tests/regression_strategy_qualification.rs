@@ -89,6 +89,45 @@ fn sample_environment() -> EnvironmentIdentity {
     }
 }
 
+async fn pinned_alpine_environment() -> Result<EnvironmentIdentity> {
+    const IMAGE: &str = "docker.io/library/alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b";
+    let output = tokio::process::Command::new("podman")
+        .args([
+            "--remote=false",
+            "image",
+            "inspect",
+            IMAGE,
+            "--format",
+            "{{.Id}}",
+        ])
+        .output()
+        .await?;
+    anyhow::ensure!(output.status.success(), "pinned Alpine image is required");
+    let image_id = String::from_utf8(output.stdout)?.trim().to_owned();
+    anyhow::ensure!(
+        image_id.len() == 64 && image_id.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "Podman did not return a full immutable Alpine image ID"
+    );
+    Ok(EnvironmentIdentity {
+        execution_profile: "sandboxed-container".into(),
+        isolation: "rootless-podman".into(),
+        runtime_image: Some(IMAGE.into()),
+        runtime_image_digest: Some(format!("sha256:{image_id}")),
+        oci_runtime: Some("podman".into()),
+        network_policy: VerificationNetworkPolicy::None,
+        cache_policy: VerificationCachePolicy::Clean,
+        environment_policy_digest: None,
+        integration_environment_digest: None,
+        architecture: std::env::consts::ARCH.into(),
+        os: std::env::consts::OS.into(),
+        orbit_version: env!("CARGO_PKG_VERSION").into(),
+        browser_verification_digest: None,
+        browser_runtime_image_digest: None,
+        regression_policy_digest: None,
+        selection_digest: None,
+    })
+}
+
 fn sample_selection_policy() -> SelectionPolicy {
     let mut pol = SelectionPolicy::new("sel-policy-1", "Test Selection Policy");
     pol.checks = vec![
@@ -259,6 +298,14 @@ fn sample_selection_policy() -> SelectionPolicy {
     ];
     pol.broad_impact_paths = vec!["Cargo.toml".into(), "package.json".into()];
     pol.conservative_unknown_tier = VerificationTier::Standard;
+    // These commands keep the test policy structurally complete; the B6
+    // selection cases inspect selection records and never treat echo as proof.
+    for check in &mut pol.checks {
+        check.command = Some(vec![
+            "echo".into(),
+            format!("selection-fixture:{}", check.check_id),
+        ]);
+    }
     pol
 }
 
@@ -292,6 +339,228 @@ fn sample_regression_policy(sel_pol: &SelectionPolicy) -> RegressionPolicy {
     reg.selection_policy_version = Some(sel_pol.version);
     reg.selection_policy_digest = Some(sel_pol.digest());
     reg
+}
+
+#[tokio::test]
+#[ignore = "requires database URL"]
+async fn test_b6_policy_versions_are_immutable_and_digest_checked() -> Result<()> {
+    let ctx = setup_regression_test().await?;
+    let selection = sample_selection_policy();
+    ctx.reg_store.insert_selection_policy(&selection).await?;
+
+    let mut changed_selection = selection.clone();
+    changed_selection.name.push_str(" replacement");
+    let conflict = ctx
+        .reg_store
+        .insert_selection_policy(&changed_selection)
+        .await
+        .unwrap_err();
+    assert!(conflict.to_string().contains("POLICY_VERSION_IMMUTABLE"));
+    assert!(
+        ctx.reg_store
+            .get_selection_policy(&selection.id, selection.version + 1)
+            .await?
+            .is_none()
+    );
+
+    sqlx::query(
+        "UPDATE orbit_selection_policies SET digest = 'sha256:corrupt' WHERE id = $1 AND version = $2",
+    )
+    .bind(&selection.id)
+    .bind(selection.version as i32)
+    .execute(&ctx._engine.pool)
+    .await?;
+    let mismatch = ctx
+        .reg_store
+        .get_selection_policy(&selection.id, selection.version)
+        .await
+        .unwrap_err();
+    assert!(mismatch.to_string().contains("POLICY_DIGEST_MISMATCH"));
+
+    let regression = sample_regression_policy(&selection);
+    ctx.reg_store.insert_regression_policy(&regression).await?;
+    let mut changed_regression = regression.clone();
+    changed_regression.name.push_str(" replacement");
+    let conflict = ctx
+        .reg_store
+        .insert_regression_policy(&changed_regression)
+        .await
+        .unwrap_err();
+    assert!(conflict.to_string().contains("POLICY_VERSION_IMMUTABLE"));
+
+    ctx._engine.pool.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL and pinned rootless Podman Alpine image"]
+async fn test_b6_selected_integration_action_records_named_required_evidence() -> Result<()> {
+    let ctx = setup_regression_test().await?;
+    let workspace = tempfile::tempdir()?;
+    let mut integration =
+        orbit::integration_environment::IntegrationEnvironmentSpec::new("setup-action");
+    integration.network_policy = VerificationNetworkPolicy::None;
+    integration.setup_steps = vec![orbit::verification::VerificationStep::new_command(
+        "integration-setup",
+        "Run the declared integration setup check",
+        vec!["sh".into(), "-c".into(), "test -d /tmp".into()],
+    )];
+
+    let mut selection_policy = SelectionPolicy::new("selected-integration", "Integration");
+    selection_policy.checks.push(VerificationCheck {
+        check_id: "integration-check".into(),
+        name: "Integration readiness".into(),
+        tiers: vec![VerificationTier::Standard],
+        paths: Vec::new(),
+        affected_components: Vec::new(),
+        dependencies: Vec::new(),
+        required: true,
+        always_run: true,
+        estimated_duration_ms: None,
+        cost_class: CostClass::Medium,
+        command: None,
+        integration_environment_spec: Some(integration),
+        browser_test_spec: None,
+    });
+    let workspace_state = WorkspaceState::compute_from_parts("base", "head", None);
+    let selected = select_verification(
+        &selection_policy,
+        None,
+        &workspace_state.state_id,
+        VerificationTier::Standard,
+        &[],
+        &[],
+        &[],
+    )?;
+
+    assert!(selected.plan.steps.is_empty());
+    let run = orbit::regression_strategy::execute_selected_verification_plan(
+        &ctx.store,
+        &format!("att-{}", id()),
+        &workspace_state,
+        &selected,
+        workspace.path(),
+        pinned_alpine_environment().await?,
+        None,
+        None,
+    )
+    .await?;
+
+    assert_eq!(run.overall_result, Some(VerificationRunResult::Passed));
+    let action = run
+        .step_runs
+        .iter()
+        .find(|step| step.step_id == "integration-check")
+        .expect("specialized action result must use the selected check ID");
+    assert_eq!(
+        action.status,
+        orbit::verification::VerificationStepStatus::Passed
+    );
+    let qualification = ctx
+        .store
+        .check_workspace_qualification_with_tier(
+            &workspace_state.state_id,
+            &selected.policy,
+            VerificationTier::Standard,
+            None,
+            Some(&selection_policy),
+            Some(&run.environment_identity),
+        )
+        .await?;
+    assert!(qualification.is_some());
+
+    ctx._engine.pool.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL and pinned rootless Podman images"]
+async fn test_b6_selected_browser_action_records_named_required_evidence() -> Result<()> {
+    let ctx = setup_regression_test().await?;
+    let workspace = tempfile::tempdir()?;
+    let artifacts = tempfile::tempdir()?;
+    tokio::fs::write(
+        workspace.path().join("test_ui.js"),
+        r#"
+module.exports = async function({ page }) {
+  await page.setContent("<h1>Orbit selected browser action</h1>");
+  if (await page.innerText("h1") !== "Orbit selected browser action") {
+    throw new Error("browser assertion failed");
+  }
+};
+"#,
+    )
+    .await?;
+
+    let mut selection_policy = SelectionPolicy::new("selected-browser", "Browser");
+    selection_policy.checks.push(VerificationCheck {
+        check_id: "browser-check".into(),
+        name: "Browser assertion".into(),
+        tiers: vec![VerificationTier::Standard],
+        paths: Vec::new(),
+        affected_components: Vec::new(),
+        dependencies: Vec::new(),
+        required: true,
+        always_run: true,
+        estimated_duration_ms: None,
+        cost_class: CostClass::Expensive,
+        command: None,
+        integration_environment_spec: None,
+        browser_test_spec: Some(orbit::browser_verification::BrowserTestSpec {
+            id: "selected-browser-test".into(),
+            name: "Selected Browser Test".into(),
+            entrypoint: "test_ui.js".into(),
+            command: None,
+            timeout_seconds: 15,
+            required: true,
+        }),
+    });
+    let workspace_state = WorkspaceState::compute_from_parts("base", "head", None);
+    let selected = select_verification(
+        &selection_policy,
+        None,
+        &workspace_state.state_id,
+        VerificationTier::Standard,
+        &["ui/test_ui.js".into()],
+        &[],
+        &[],
+    )?;
+
+    let environment = pinned_alpine_environment().await?;
+    let original_artifacts_dir = std::env::var_os("ORBIT_ARTIFACTS_DIR");
+    unsafe { std::env::set_var("ORBIT_ARTIFACTS_DIR", artifacts.path()) };
+    let run = orbit::regression_strategy::execute_selected_verification_plan(
+        &ctx.store,
+        &format!("att-{}", id()),
+        &workspace_state,
+        &selected,
+        workspace.path(),
+        environment,
+        None,
+        None,
+    )
+    .await;
+    if let Some(value) = original_artifacts_dir {
+        unsafe { std::env::set_var("ORBIT_ARTIFACTS_DIR", value) };
+    } else {
+        unsafe { std::env::remove_var("ORBIT_ARTIFACTS_DIR") };
+    }
+    let run = run?;
+
+    assert_eq!(run.overall_result, Some(VerificationRunResult::Passed));
+    let action = run
+        .step_runs
+        .iter()
+        .find(|step| step.step_id == "browser-check")
+        .expect("specialized browser result must use the selected check ID");
+    assert_eq!(
+        action.status,
+        orbit::verification::VerificationStepStatus::Passed
+    );
+    assert!(run.browser_verification_run.is_some());
+
+    ctx._engine.pool.close().await;
+    Ok(())
 }
 
 #[tokio::test]
@@ -1566,7 +1835,10 @@ async fn test_b6_20_b4_integration() -> Result<()> {
             env: BTreeMap::new(),
             mounts: vec![],
             internal_port: None,
-            readiness: None,
+            readiness: Some(orbit::integration_environment::ReadinessProbe::Process {
+                timeout_seconds: 5,
+                interval_ms: 50,
+            }),
             timeout_seconds: 60,
             dependencies: vec![],
         }],
@@ -1604,7 +1876,13 @@ async fn test_b6_20_b4_integration() -> Result<()> {
         &[],
     )?;
 
-    assert!(plan.plan.steps.iter().any(|s| s.id == "svc-check"));
+    assert!(!plan.plan.steps.iter().any(|s| s.id == "svc-check"));
+    assert!(
+        plan.policy
+            .specialized_required_steps
+            .iter()
+            .any(|step| step.step_id == "svc-check")
+    );
     assert!(plan.policy.integration_environment_spec.is_some());
     Ok(())
 }
@@ -1652,6 +1930,13 @@ async fn test_b6_21_b5_integration() -> Result<()> {
     )?;
 
     assert!(plan.policy.browser_verification_spec.is_some());
+    assert!(!plan.plan.steps.iter().any(|s| s.id == "browser-ui-check"));
+    assert!(
+        plan.policy
+            .specialized_required_steps
+            .iter()
+            .any(|step| step.step_id == "browser-ui-check")
+    );
     let b_spec = plan.policy.browser_verification_spec.unwrap();
     assert_eq!(b_spec.tests.len(), 1);
     assert_eq!(b_spec.tests[0].id, "login-browser-test");

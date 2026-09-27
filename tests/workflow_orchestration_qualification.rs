@@ -40,6 +40,7 @@ fn sample_policy() -> VerificationPolicy {
         version: 1,
         name: "Test Policy".into(),
         required_steps: vec!["fast".into(), "standard".into(), "full".into()],
+        specialized_required_steps: vec![],
         allowed_commands: vec![],
         environment_policy: VerificationEnvironmentPolicy {
             inherit: vec![],
@@ -99,6 +100,7 @@ async fn b31_01_workflow_fails_closed_without_pinned_verification_profile() -> R
     enroll_sample_credentials(&ctx.engine.pool).await?;
 
     let policy = sample_policy();
+    ctx.store.verification_store().save_policy(&policy).await?;
     let repo = tempfile::tempdir()?;
     let repo_path = repo.path().to_string_lossy().into_owned();
     let wf = ctx
@@ -352,6 +354,7 @@ async fn b31_13_fast_auto_execution() -> Result<()> {
     enroll_sample_credentials(&ctx.engine.pool).await?;
 
     let policy = sample_policy();
+    ctx.store.verification_store().save_policy(&policy).await?;
     let repo = tempfile::tempdir()?;
     let repo_path = repo.path().to_string_lossy().into_owned();
     let wf = ctx
@@ -394,6 +397,7 @@ async fn b31_14_standard_auto_execution() -> Result<()> {
     enroll_sample_credentials(&ctx.engine.pool).await?;
 
     let policy = sample_policy();
+    ctx.store.verification_store().save_policy(&policy).await?;
     let repo = tempfile::tempdir()?;
     let repo_path = repo.path().to_string_lossy().into_owned();
     let wf = ctx
@@ -429,6 +433,7 @@ async fn b31_15_review_auto_execution() -> Result<()> {
     enroll_sample_credentials(&ctx.engine.pool).await?;
 
     let policy = sample_policy();
+    ctx.store.verification_store().save_policy(&policy).await?;
     let repo = tempfile::tempdir()?;
     let repo_path = repo.path().to_string_lossy().into_owned();
     let wf = ctx
@@ -464,6 +469,7 @@ async fn b31_16_full_auto_execution() -> Result<()> {
     enroll_sample_credentials(&ctx.engine.pool).await?;
 
     let policy = sample_policy();
+    ctx.store.verification_store().save_policy(&policy).await?;
     let repo = tempfile::tempdir()?;
     let repo_path = repo.path().to_string_lossy().into_owned();
     let wf = ctx
@@ -499,6 +505,7 @@ async fn b31_17_repair_path_is_blocked_without_verification_profile() -> Result<
     enroll_sample_credentials(&ctx.engine.pool).await?;
 
     let policy = sample_policy();
+    ctx.store.verification_store().save_policy(&policy).await?;
     let repo = tempfile::tempdir()?;
     let repo_path = repo.path().to_string_lossy().into_owned();
     let wf = ctx
@@ -551,6 +558,7 @@ async fn b31_19_session_independence_live_path() -> Result<()> {
     enroll_sample_credentials(&ctx.engine.pool).await?;
 
     let policy = sample_policy();
+    ctx.store.verification_store().save_policy(&policy).await?;
     let repo = tempfile::tempdir()?;
     let repo_path = repo.path().to_string_lossy().into_owned();
     let wf = ctx
@@ -595,6 +603,7 @@ async fn b31_20_restart_recovery() -> Result<()> {
     enroll_sample_credentials(&ctx.engine.pool).await?;
 
     let policy = sample_policy();
+    ctx.store.verification_store().save_policy(&policy).await?;
     let repo = tempfile::tempdir()?;
     let repo_path = repo.path().to_string_lossy().into_owned();
     let wf = ctx

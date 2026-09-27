@@ -33,6 +33,30 @@ const PODMAN_IMAGE_ALPINE: &str = "docker.io/library/alpine:latest";
 const PODMAN_IMAGE_POSTGRES: &str = "docker.io/library/postgres:17-alpine";
 const PODMAN_IMAGE_REDIS: &str = "docker.io/library/redis:alpine";
 
+async fn pinned_podman_image_id(image: &str) -> Result<String> {
+    let output = tokio::process::Command::new("podman")
+        .args([
+            "--remote=false",
+            "image",
+            "inspect",
+            image,
+            "--format",
+            "{{.Id}}",
+        ])
+        .output()
+        .await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "preloaded Podman image is required: {image}"
+    );
+    let image_id = String::from_utf8(output.stdout)?.trim().to_owned();
+    anyhow::ensure!(
+        image_id.len() == 64 && image_id.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "Podman did not return a full immutable image ID"
+    );
+    Ok(format!("sha256:{image_id}"))
+}
+
 struct TestContext {
     engine: Engine,
     verification_store: VerificationStore,
@@ -137,7 +161,7 @@ async fn test_b4_01_managed_container_service_postgres() -> Result<()> {
         execution_profile: "sandboxed-container".into(),
         isolation: "rootless-podman".into(),
         runtime_image: Some(PODMAN_IMAGE_ALPINE.into()),
-        runtime_image_digest: None,
+        runtime_image_digest: Some(pinned_podman_image_id(PODMAN_IMAGE_ALPINE).await?),
         oci_runtime: Some("podman".into()),
         network_policy: VerificationNetworkPolicy::Isolated,
         cache_policy: VerificationCachePolicy::Clean,
@@ -284,7 +308,7 @@ async fn test_b4_02_multi_service_postgres_and_redis() -> Result<()> {
         execution_profile: "sandboxed-container".into(),
         isolation: "rootless-podman".into(),
         runtime_image: Some(PODMAN_IMAGE_ALPINE.into()),
-        runtime_image_digest: None,
+        runtime_image_digest: Some(pinned_podman_image_id(PODMAN_IMAGE_ALPINE).await?),
         oci_runtime: Some("podman".into()),
         network_policy: VerificationNetworkPolicy::Isolated,
         cache_policy: VerificationCachePolicy::Clean,
@@ -450,7 +474,7 @@ async fn test_b4_03_managed_process_service() -> Result<()> {
         execution_profile: "sandboxed-container".into(),
         isolation: "rootless-podman".into(),
         runtime_image: Some(PODMAN_IMAGE_ALPINE.into()),
-        runtime_image_digest: None,
+        runtime_image_digest: Some(pinned_podman_image_id(PODMAN_IMAGE_ALPINE).await?),
         oci_runtime: Some("podman".into()),
         network_policy: VerificationNetworkPolicy::Isolated,
         cache_policy: VerificationCachePolicy::Clean,
@@ -585,7 +609,7 @@ async fn test_b4_04_isolated_network_blocks_external_internet() -> Result<()> {
         execution_profile: "sandboxed-container".into(),
         isolation: "rootless-podman".into(),
         runtime_image: Some(PODMAN_IMAGE_ALPINE.into()),
-        runtime_image_digest: None,
+        runtime_image_digest: Some(pinned_podman_image_id(PODMAN_IMAGE_ALPINE).await?),
         oci_runtime: Some("podman".into()),
         network_policy: VerificationNetworkPolicy::Isolated,
         cache_policy: VerificationCachePolicy::Clean,
@@ -674,7 +698,7 @@ async fn test_b4_05_failure_differentiation_readiness_timeout() -> Result<()> {
         execution_profile: "sandboxed-container".into(),
         isolation: "rootless-podman".into(),
         runtime_image: Some(PODMAN_IMAGE_ALPINE.into()),
-        runtime_image_digest: None,
+        runtime_image_digest: Some(pinned_podman_image_id(PODMAN_IMAGE_ALPINE).await?),
         oci_runtime: Some("podman".into()),
         network_policy: VerificationNetworkPolicy::Isolated,
         cache_policy: VerificationCachePolicy::Clean,
@@ -772,7 +796,7 @@ async fn test_b4_06_failure_differentiation_premature_crash() -> Result<()> {
         execution_profile: "sandboxed-container".into(),
         isolation: "rootless-podman".into(),
         runtime_image: Some(PODMAN_IMAGE_ALPINE.into()),
-        runtime_image_digest: None,
+        runtime_image_digest: Some(pinned_podman_image_id(PODMAN_IMAGE_ALPINE).await?),
         oci_runtime: Some("podman".into()),
         network_policy: VerificationNetworkPolicy::Isolated,
         cache_policy: VerificationCachePolicy::Clean,
@@ -909,7 +933,7 @@ async fn test_b4_07_dependency_order_and_setup_step() -> Result<()> {
         execution_profile: "sandboxed-container".into(),
         isolation: "rootless-podman".into(),
         runtime_image: Some(PODMAN_IMAGE_ALPINE.into()),
-        runtime_image_digest: None,
+        runtime_image_digest: Some(pinned_podman_image_id(PODMAN_IMAGE_ALPINE).await?),
         oci_runtime: Some("podman".into()),
         network_policy: VerificationNetworkPolicy::Isolated,
         cache_policy: VerificationCachePolicy::Clean,
@@ -1031,7 +1055,7 @@ async fn test_b4_08_immutable_environment_digest_and_qualification() -> Result<(
         execution_profile: "sandboxed-container".into(),
         isolation: "rootless-podman".into(),
         runtime_image: Some(PODMAN_IMAGE_ALPINE.into()),
-        runtime_image_digest: None,
+        runtime_image_digest: Some(pinned_podman_image_id(PODMAN_IMAGE_ALPINE).await?),
         oci_runtime: Some("podman".into()),
         network_policy: VerificationNetworkPolicy::Isolated,
         cache_policy: VerificationCachePolicy::Clean,
@@ -1142,7 +1166,7 @@ async fn test_b4_09_workflow_integration_with_environment_policy() -> Result<()>
         execution_profile: "sandboxed-container".into(),
         isolation: "rootless-podman".into(),
         runtime_image: Some(PODMAN_IMAGE_ALPINE.into()),
-        runtime_image_digest: None,
+        runtime_image_digest: Some(pinned_podman_image_id(PODMAN_IMAGE_ALPINE).await?),
         oci_runtime: Some("podman".into()),
         network_policy: VerificationNetworkPolicy::Isolated,
         cache_policy: VerificationCachePolicy::Clean,
@@ -1238,7 +1262,7 @@ async fn test_b4_10_cleanup_and_restart_durability() -> Result<()> {
         execution_profile: "sandboxed-container".into(),
         isolation: "rootless-podman".into(),
         runtime_image: Some(PODMAN_IMAGE_ALPINE.into()),
-        runtime_image_digest: None,
+        runtime_image_digest: Some(pinned_podman_image_id(PODMAN_IMAGE_ALPINE).await?),
         oci_runtime: Some("podman".into()),
         network_policy: VerificationNetworkPolicy::Isolated,
         cache_policy: VerificationCachePolicy::Clean,
@@ -1352,7 +1376,7 @@ async fn test_b4_11_process_service_cleanup_on_test_failure() -> Result<()> {
         execution_profile: "sandboxed-container".into(),
         isolation: "rootless-podman".into(),
         runtime_image: Some(PODMAN_IMAGE_ALPINE.into()),
-        runtime_image_digest: None,
+        runtime_image_digest: Some(pinned_podman_image_id(PODMAN_IMAGE_ALPINE).await?),
         oci_runtime: Some("podman".into()),
         network_policy: VerificationNetworkPolicy::Isolated,
         cache_policy: VerificationCachePolicy::Clean,
@@ -1473,7 +1497,7 @@ async fn test_b4_12_process_service_cleanup_on_readiness_timeout() -> Result<()>
         execution_profile: "sandboxed-container".into(),
         isolation: "rootless-podman".into(),
         runtime_image: Some(PODMAN_IMAGE_ALPINE.into()),
-        runtime_image_digest: None,
+        runtime_image_digest: Some(pinned_podman_image_id(PODMAN_IMAGE_ALPINE).await?),
         oci_runtime: Some("podman".into()),
         network_policy: VerificationNetworkPolicy::Isolated,
         cache_policy: VerificationCachePolicy::Clean,
@@ -1594,7 +1618,7 @@ async fn test_b4_13_process_service_cleanup_on_cancellation() -> Result<()> {
         execution_profile: "sandboxed-container".into(),
         isolation: "rootless-podman".into(),
         runtime_image: Some(PODMAN_IMAGE_ALPINE.into()),
-        runtime_image_digest: None,
+        runtime_image_digest: Some(pinned_podman_image_id(PODMAN_IMAGE_ALPINE).await?),
         oci_runtime: Some("podman".into()),
         network_policy: VerificationNetworkPolicy::Isolated,
         cache_policy: VerificationCachePolicy::Clean,

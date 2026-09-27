@@ -11,8 +11,8 @@ use std::fmt;
 use crate::browser_verification::BrowserTestSpec;
 use crate::integration_environment::IntegrationEnvironmentSpec;
 use crate::verification::{
-    EnvironmentIdentity, VerificationPlan, VerificationPolicy, VerificationRun, VerificationStep,
-    VerificationStore,
+    EnvironmentIdentity, SpecializedVerificationAction, SpecializedVerificationRequirement,
+    VerificationPlan, VerificationPolicy, VerificationRun, VerificationStep, VerificationStore,
 };
 
 /// Verification Tiers distinguishing feedback speed from authoritative completion.
@@ -767,6 +767,7 @@ pub fn select_verification(
     let plan_id = format!("plan-{}", requested_tier.as_str().to_lowercase());
     let mut steps = Vec::new();
     let mut required_steps = Vec::new();
+    let mut specialized_required_steps = Vec::new();
     let mut env_spec: Option<IntegrationEnvironmentSpec> = None;
     let mut browser_spec: Option<crate::browser_verification::BrowserVerificationSpec> = None;
 
@@ -776,31 +777,84 @@ pub fn select_verification(
             .iter()
             .find(|c| c.check_id == sel.check_id)
         {
-            let cmd = chk.command.clone().unwrap_or_else(|| vec!["true".into()]);
-            steps.push(VerificationStep::new_command(&chk.check_id, &chk.name, cmd));
-
-            if chk.required {
-                required_steps.push(chk.check_id.clone());
+            let command = chk.command.as_ref().filter(|argv| !argv.is_empty());
+            if let Some(command) = command {
+                let mut step =
+                    VerificationStep::new_command(&chk.check_id, &chk.name, command.clone());
+                step.required = chk.required;
+                steps.push(step);
             }
 
-            if let Some(ref es) = chk.integration_environment_spec
-                && env_spec.is_none()
-            {
-                env_spec = Some(es.clone());
+            if let Some(ref es) = chk.integration_environment_spec {
+                es.validate()?;
+                if let Some(existing) = &env_spec {
+                    ensure!(
+                        existing.digest() == es.digest(),
+                        "selected checks declare conflicting integration environment specs"
+                    );
+                } else {
+                    env_spec = Some(es.clone());
+                }
             }
 
             if let Some(ref bts) = chk.browser_test_spec {
+                bts.validate()?;
                 if browser_spec.is_none() {
                     let mut bspec = crate::browser_verification::BrowserVerificationSpec::new(
                         "browser-selected",
                     );
                     bspec.tests = vec![bts.clone()];
                     browser_spec = Some(bspec);
-                } else if let Some(ref mut bspec) = browser_spec
-                    && !bspec.tests.iter().any(|t| t.id == bts.id)
-                {
-                    bspec.tests.push(bts.clone());
+                } else if let Some(ref mut bspec) = browser_spec {
+                    if let Some(existing) = bspec.tests.iter().find(|test| test.id == bts.id) {
+                        ensure!(
+                            existing == bts,
+                            "selected checks declare conflicting browser test specs for '{}'",
+                            bts.id
+                        );
+                    } else {
+                        bspec.tests.push(bts.clone());
+                    }
                 }
+            }
+
+            if command.is_none() {
+                let action = if let Some(browser_test) = &chk.browser_test_spec {
+                    ensure!(
+                        !chk.required || browser_test.required,
+                        "required verification check '{}' maps to an optional browser test",
+                        chk.check_id
+                    );
+                    SpecializedVerificationAction::BrowserTest(browser_test.id.clone())
+                } else if let Some(integration_spec) = &chk.integration_environment_spec {
+                    ensure!(
+                        !chk.required
+                            || !integration_spec.setup_steps.is_empty()
+                            || integration_spec
+                                .services
+                                .iter()
+                                .any(|service| service.readiness.is_some()),
+                        "required verification check '{}' has no executable command or integration setup/readiness action",
+                        chk.check_id
+                    );
+                    SpecializedVerificationAction::IntegrationEnvironment
+                } else {
+                    bail!(
+                        "VERIFICATION_ACTION_UNRESOLVED: selected check '{}' has no executable command or validated specialized action",
+                        chk.check_id
+                    );
+                };
+
+                if chk.required {
+                    specialized_required_steps.push(SpecializedVerificationRequirement {
+                        step_id: chk.check_id.clone(),
+                        action,
+                    });
+                }
+            }
+
+            if chk.required {
+                required_steps.push(chk.check_id.clone());
             }
         }
     }
@@ -812,8 +866,10 @@ pub fn select_verification(
         format!("Selection Policy for {}", requested_tier),
     );
     policy.required_steps = required_steps;
+    policy.specialized_required_steps = specialized_required_steps;
     policy.integration_environment_spec = env_spec;
     policy.browser_verification_spec = browser_spec;
+    policy.check_plan(&plan)?;
 
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -879,10 +935,7 @@ impl RegressionStore {
             r#"
             INSERT INTO orbit_selection_policies (id, version, digest, name, policy_json)
             VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (id, version) DO UPDATE
-            SET digest = EXCLUDED.digest,
-                name = EXCLUDED.name,
-                policy_json = EXCLUDED.policy_json
+            ON CONFLICT (id, version) DO NOTHING
             "#,
         )
         .bind(&policy.id)
@@ -894,6 +947,26 @@ impl RegressionStore {
         .await
         .context("insert_selection_policy")?;
 
+        let stored = sqlx::query(
+            "SELECT digest, policy_json FROM orbit_selection_policies WHERE id = $1 AND version = $2",
+        )
+        .bind(&policy.id)
+        .bind(policy.version as i32)
+        .fetch_one(&self.pool)
+        .await?;
+        let stored_digest: String = stored.get("digest");
+        let stored_json: serde_json::Value = stored.get("policy_json");
+        let stored_policy: SelectionPolicy = serde_json::from_value(stored_json)?;
+        ensure!(
+            stored_digest == digest
+                && stored_policy.id == policy.id
+                && stored_policy.version == policy.version
+                && stored_policy.digest() == stored_digest,
+            "POLICY_VERSION_IMMUTABLE: selection policy '{}' version {} already has different content",
+            policy.id,
+            policy.version
+        );
+
         Ok(())
     }
 
@@ -904,7 +977,7 @@ impl RegressionStore {
     ) -> Result<Option<SelectionPolicy>> {
         let row = sqlx::query(
             r#"
-            SELECT policy_json FROM orbit_selection_policies
+            SELECT digest, policy_json FROM orbit_selection_policies
             WHERE id = $1 AND version = $2
             "#,
         )
@@ -916,8 +989,15 @@ impl RegressionStore {
 
         match row {
             Some(r) => {
+                let stored_digest: String = r.get("digest");
                 let val: serde_json::Value = r.get("policy_json");
                 let pol: SelectionPolicy = serde_json::from_value(val)?;
+                ensure!(
+                    pol.id == id && pol.version == version && pol.digest() == stored_digest,
+                    "POLICY_DIGEST_MISMATCH: stored selection policy '{}' version {} does not match its pinned digest/content",
+                    id,
+                    version
+                );
                 Ok(Some(pol))
             }
             None => Ok(None),
@@ -936,17 +1016,7 @@ impl RegressionStore {
                 selection_policy_version, selection_policy_digest, policy_json
             )
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-            ON CONFLICT (id, version) DO UPDATE
-            SET digest = EXCLUDED.digest,
-                name = EXCLUDED.name,
-                feedback_tier = EXCLUDED.feedback_tier,
-                repair_tier = EXCLUDED.repair_tier,
-                review_gate_tier = EXCLUDED.review_gate_tier,
-                completion_tier = EXCLUDED.completion_tier,
-                selection_policy_id = EXCLUDED.selection_policy_id,
-                selection_policy_version = EXCLUDED.selection_policy_version,
-                selection_policy_digest = EXCLUDED.selection_policy_digest,
-                policy_json = EXCLUDED.policy_json
+            ON CONFLICT (id, version) DO NOTHING
             "#,
         )
         .bind(&policy.id)
@@ -965,6 +1035,26 @@ impl RegressionStore {
         .await
         .context("insert_regression_policy")?;
 
+        let stored = sqlx::query(
+            "SELECT digest, policy_json FROM orbit_regression_policies WHERE id = $1 AND version = $2",
+        )
+        .bind(&policy.id)
+        .bind(policy.version as i32)
+        .fetch_one(&self.pool)
+        .await?;
+        let stored_digest: String = stored.get("digest");
+        let stored_json: serde_json::Value = stored.get("policy_json");
+        let stored_policy: RegressionPolicy = serde_json::from_value(stored_json)?;
+        ensure!(
+            stored_digest == digest
+                && stored_policy.id == policy.id
+                && stored_policy.version == policy.version
+                && stored_policy.digest() == stored_digest,
+            "POLICY_VERSION_IMMUTABLE: regression policy '{}' version {} already has different content",
+            policy.id,
+            policy.version
+        );
+
         Ok(())
     }
 
@@ -975,7 +1065,7 @@ impl RegressionStore {
     ) -> Result<Option<RegressionPolicy>> {
         let row = sqlx::query(
             r#"
-            SELECT policy_json FROM orbit_regression_policies
+            SELECT digest, policy_json FROM orbit_regression_policies
             WHERE id = $1 AND version = $2
             "#,
         )
@@ -987,8 +1077,15 @@ impl RegressionStore {
 
         match row {
             Some(r) => {
+                let stored_digest: String = r.get("digest");
                 let val: serde_json::Value = r.get("policy_json");
                 let pol: RegressionPolicy = serde_json::from_value(val)?;
+                ensure!(
+                    pol.id == id && pol.version == version && pol.digest() == stored_digest,
+                    "POLICY_DIGEST_MISMATCH: stored regression policy '{}' version {} does not match its pinned digest/content",
+                    id,
+                    version
+                );
                 Ok(Some(pol))
             }
             None => Ok(None),
@@ -1189,10 +1286,56 @@ pub async fn execute_selected_verification_plan(
     regression_policy: Option<&RegressionPolicy>,
     cancellation_token: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<VerificationRun> {
-    selected_plan.plan.validate()?;
     selected_plan.policy.check_plan(&selected_plan.plan)?;
+    crate::verification::validate_pinned_verification_profile(&environment)?;
+    ensure!(
+        selected_plan.selection.workspace_state_id == workspace_state.state_id,
+        "SELECTION_STATE_MISMATCH: selected verification belongs to a different workspace state"
+    );
+    ensure!(
+        selected_plan.selection.digest == selected_plan.selection.compute_digest(),
+        "SELECTION_DIGEST_MISMATCH: selected verification record was modified after selection"
+    );
+    let mut plan_hasher = Sha256::new();
+    plan_hasher.update(selected_plan.selection.digest.as_bytes());
+    plan_hasher.update(selected_plan.plan.digest().as_bytes());
+    plan_hasher.update(selected_plan.policy.digest().as_bytes());
+    let expected_plan_digest = format!("sha256:{:x}", plan_hasher.finalize());
+    ensure!(
+        selected_plan.digest == expected_plan_digest,
+        "SELECTION_PLAN_DIGEST_MISMATCH: selected commands/actions changed after policy resolution"
+    );
+
+    match (
+        selected_plan.selection.regression_policy_id.as_deref(),
+        selected_plan.selection.regression_policy_version,
+        selected_plan.selection.regression_policy_digest.as_deref(),
+        regression_policy,
+    ) {
+        (None, None, None, None) => {}
+        (Some(id), Some(version), Some(digest), Some(policy)) => ensure!(
+            id == policy.id && version == policy.version && digest == policy.digest(),
+            "POLICY_DIGEST_MISMATCH: selected plan does not match the supplied regression policy"
+        ),
+        (Some(id), Some(version), Some(_), None) => {
+            bail!("pinned regression policy '{id}' version {version} is missing for selected plan")
+        }
+        _ => bail!(
+            "INCOMPLETE_POLICY_PIN: selected plan regression policy reference does not match execution input"
+        ),
+    }
 
     environment.selection_digest = Some(selected_plan.selection.digest.clone());
+    environment.integration_environment_digest = selected_plan
+        .policy
+        .integration_environment_spec
+        .as_ref()
+        .map(IntegrationEnvironmentSpec::digest);
+    environment.browser_verification_digest = selected_plan
+        .policy
+        .browser_verification_spec
+        .as_ref()
+        .map(crate::browser_verification::BrowserVerificationSpec::digest);
     if let Some(rp) = regression_policy {
         environment.regression_policy_digest = Some(rp.digest());
     }
@@ -1223,4 +1366,117 @@ pub async fn execute_selected_verification_plan(
         cancellation_token,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn selected_check() -> VerificationCheck {
+        VerificationCheck {
+            check_id: "unit-check".into(),
+            name: "Unit Check".into(),
+            tiers: vec![VerificationTier::Standard],
+            paths: vec!["src/engine/**".into()],
+            affected_components: vec!["engine".into()],
+            dependencies: Vec::new(),
+            required: true,
+            always_run: true,
+            estimated_duration_ms: None,
+            cost_class: CostClass::Cheap,
+            command: Some(vec!["cargo".into(), "test".into(), "engine".into()]),
+            integration_environment_spec: None,
+            browser_test_spec: None,
+        }
+    }
+
+    #[test]
+    fn selection_uses_changed_files_and_preserves_declared_command() -> Result<()> {
+        let mut policy = SelectionPolicy::new("selection", "Selection");
+        policy.component_mappings.push(ComponentMapping {
+            pattern: "src/engine/**".into(),
+            component: "engine".into(),
+        });
+        policy.checks.push(selected_check());
+        let selected = select_verification(
+            &policy,
+            None,
+            "ws-selection",
+            VerificationTier::Standard,
+            &["src/engine/scheduler.rs".into()],
+            &[],
+            &[],
+        )?;
+
+        assert_eq!(
+            selected.selection.changed_files,
+            vec!["src/engine/scheduler.rs"]
+        );
+        assert!(
+            selected
+                .selection
+                .affected_components
+                .contains(&"engine".to_string())
+        );
+        assert_eq!(selected.plan.steps[0].argv, ["cargo", "test", "engine"]);
+        Ok(())
+    }
+
+    #[test]
+    fn required_selected_check_without_command_or_specialized_action_fails() {
+        let mut policy = SelectionPolicy::new("selection", "Selection");
+        let mut check = selected_check();
+        check.command = None;
+        policy.checks.push(check);
+        let error = select_verification(
+            &policy,
+            None,
+            "ws-unresolved",
+            VerificationTier::Standard,
+            &["src/engine/scheduler.rs".into()],
+            &[],
+            &[],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("VERIFICATION_ACTION_UNRESOLVED"));
+    }
+
+    #[test]
+    fn required_browser_action_is_explicit_and_has_no_placeholder_command() -> Result<()> {
+        let mut policy = SelectionPolicy::new("selection", "Selection");
+        let mut check = selected_check();
+        check.command = None;
+        check.browser_test_spec = Some(BrowserTestSpec {
+            id: "login-flow".into(),
+            name: "Login Flow".into(),
+            entrypoint: "tests/browser/login.spec.ts".into(),
+            command: None,
+            timeout_seconds: 30,
+            required: true,
+        });
+        policy.checks.push(check);
+        let selected = select_verification(
+            &policy,
+            None,
+            "ws-browser",
+            VerificationTier::Standard,
+            &["src/engine/scheduler.rs".into()],
+            &[],
+            &[],
+        )?;
+
+        assert!(selected.plan.steps.is_empty());
+        assert_eq!(selected.policy.required_steps, ["unit-check"]);
+        assert_eq!(
+            selected.policy.specialized_required_steps,
+            [SpecializedVerificationRequirement {
+                step_id: "unit-check".into(),
+                action: SpecializedVerificationAction::BrowserTest("login-flow".into()),
+            }]
+        );
+        assert!(selected.policy.check_plan(&selected.plan).is_ok());
+        assert!(!serde_json::to_string(&selected.plan)?.contains("true"));
+        Ok(())
+    }
 }

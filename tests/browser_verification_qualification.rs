@@ -104,11 +104,40 @@ async fn setup_qualification_context() -> Result<TestContext> {
 }
 
 fn dummy_env_identity() -> EnvironmentIdentity {
+    static BROWSER_IMAGE_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let runtime_image_digest = BROWSER_IMAGE_ID
+        .get_or_init(|| {
+            let output = std::process::Command::new("podman")
+                .args([
+                    "--remote=false",
+                    "image",
+                    "inspect",
+                    DEFAULT_BROWSER_IMAGE,
+                    "--format",
+                    "{{.Id}}",
+                ])
+                .output()
+                .expect("Podman must be available for B5 qualification");
+            assert!(
+                output.status.success(),
+                "pinned browser image must be locally provisioned for B5 qualification"
+            );
+            let image_id = String::from_utf8(output.stdout)
+                .expect("Podman image ID must be UTF-8")
+                .trim()
+                .to_owned();
+            assert!(
+                image_id.len() == 64 && image_id.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "Podman must return a full immutable browser image ID"
+            );
+            format!("sha256:{image_id}")
+        })
+        .clone();
     EnvironmentIdentity {
-        execution_profile: "qualification".into(),
-        isolation: "container".into(),
+        execution_profile: "sandboxed-container".into(),
+        isolation: "rootless-podman".into(),
         runtime_image: Some(DEFAULT_BROWSER_IMAGE.into()),
-        runtime_image_digest: None,
+        runtime_image_digest: Some(runtime_image_digest),
         oci_runtime: Some("podman".into()),
         network_policy: VerificationNetworkPolicy::None,
         cache_policy: VerificationCachePolicy::Clean,

@@ -20,9 +20,8 @@ use crate::{
     },
     secret_backend::{LocalPrivateSecretBackend, SecretBackend},
     verification::{
-        EnvironmentIdentity, VerificationPlan, VerificationPolicy, VerificationRun,
-        VerificationRunResult, VerificationStep, VerificationStore, WorkspaceState,
-        execute_run_contents,
+        EnvironmentIdentity, VerificationPolicy, VerificationRun, VerificationRunResult,
+        VerificationStore, WorkspaceState,
     },
     workflow::*,
 };
@@ -50,6 +49,12 @@ pub enum WorkflowStepResult {
     },
     Terminal(WorkflowStage),
     Waiting,
+}
+
+struct ResolvedWorkflowPolicies {
+    verification: Option<VerificationPolicy>,
+    regression: Option<RegressionPolicy>,
+    selection: Option<SelectionPolicy>,
 }
 
 /// Outcome of a role agent execution.
@@ -470,29 +475,7 @@ impl WorkflowCoordinator {
                 let baseline = wf.base_revision.as_deref().unwrap_or("HEAD");
                 let ws_state = compute_workspace_state(repo_path, baseline).await?;
 
-                let policy = if let (Some(id), Some(ver)) =
-                    (&wf.verification_policy_id, wf.verification_policy_version)
-                {
-                    self.verification_store.get_policy(id, ver).await?
-                } else {
-                    None
-                };
-
-                let reg_policy = if let (Some(id), Some(ver)) =
-                    (&wf.regression_policy_id, wf.regression_policy_version)
-                {
-                    self.regression_store.get_regression_policy(id, ver).await?
-                } else {
-                    None
-                };
-
-                let sel_policy = if let (Some(id), Some(ver)) =
-                    (&wf.selection_policy_id, wf.selection_policy_version)
-                {
-                    self.regression_store.get_selection_policy(id, ver).await?
-                } else {
-                    None
-                };
+                let policies = self.resolve_workflow_policies(&wf).await?;
 
                 // Run FAST tier verification first
                 let fast_run = self
@@ -500,9 +483,9 @@ impl WorkflowCoordinator {
                         &wf,
                         &ws_state,
                         VerificationTier::Fast,
-                        policy.as_ref(),
-                        reg_policy.as_ref(),
-                        sel_policy.as_ref(),
+                        policies.verification.as_ref(),
+                        policies.regression.as_ref(),
+                        policies.selection.as_ref(),
                     )
                     .await?;
 
@@ -536,9 +519,9 @@ impl WorkflowCoordinator {
                         &wf,
                         &ws_state,
                         VerificationTier::Standard,
-                        policy.as_ref(),
-                        reg_policy.as_ref(),
-                        sel_policy.as_ref(),
+                        policies.verification.as_ref(),
+                        policies.regression.as_ref(),
+                        policies.selection.as_ref(),
                     )
                     .await?;
 
@@ -977,29 +960,7 @@ impl WorkflowCoordinator {
                 let baseline = wf.base_revision.as_deref().unwrap_or("HEAD");
                 let ws_state = compute_workspace_state(repo_path, baseline).await?;
 
-                let policy = if let (Some(id), Some(ver)) =
-                    (&wf.verification_policy_id, wf.verification_policy_version)
-                {
-                    self.verification_store.get_policy(id, ver).await?
-                } else {
-                    None
-                };
-
-                let reg_policy = if let (Some(id), Some(ver)) =
-                    (&wf.regression_policy_id, wf.regression_policy_version)
-                {
-                    self.regression_store.get_regression_policy(id, ver).await?
-                } else {
-                    None
-                };
-
-                let sel_policy = if let (Some(id), Some(ver)) =
-                    (&wf.selection_policy_id, wf.selection_policy_version)
-                {
-                    self.regression_store.get_selection_policy(id, ver).await?
-                } else {
-                    None
-                };
+                let policies = self.resolve_workflow_policies(&wf).await?;
 
                 // Run FULL tier regression verification
                 let full_run = self
@@ -1007,9 +968,9 @@ impl WorkflowCoordinator {
                         &wf,
                         &ws_state,
                         VerificationTier::Full,
-                        policy.as_ref(),
-                        reg_policy.as_ref(),
-                        sel_policy.as_ref(),
+                        policies.verification.as_ref(),
+                        policies.regression.as_ref(),
+                        policies.selection.as_ref(),
                     )
                     .await?;
 
@@ -1145,13 +1106,31 @@ impl WorkflowCoordinator {
         verif_run_id: Option<&str>,
         error_msg: &str,
     ) -> Result<()> {
+        let mut failed_steps = Vec::new();
+        let mut stdout_previews = BTreeMap::new();
+        let mut stderr_previews = BTreeMap::new();
+        if let Some(run_id) = verif_run_id
+            && let Some(run) = self.verification_store.get_run(run_id).await?
+        {
+            for step in run.step_runs.iter().filter(|step| {
+                step.required && step.status != crate::verification::VerificationStepStatus::Passed
+            }) {
+                failed_steps.push(step.step_id.clone());
+                if let Some(stdout) = &step.stdout_preview {
+                    stdout_previews.insert(step.step_id.clone(), stdout.clone());
+                }
+                if let Some(stderr) = &step.stderr_preview {
+                    stderr_previews.insert(step.step_id.clone(), stderr.clone());
+                }
+            }
+        }
         let evidence = FailureEvidenceHandoff {
             failed_stage: stage.to_string(),
             verification_run_id: verif_run_id.map(|s| s.to_string()),
-            failed_steps: vec![stage.to_string()],
+            failed_steps,
             error_summary: error_msg.to_string(),
-            stdout_previews: BTreeMap::new(),
-            stderr_previews: BTreeMap::new(),
+            stdout_previews,
+            stderr_previews,
         };
 
         self.store
@@ -1165,6 +1144,111 @@ impl WorkflowCoordinator {
             .await?;
 
         Ok(())
+    }
+
+    async fn resolve_workflow_policies(
+        &self,
+        wf: &WorkflowRun,
+    ) -> Result<ResolvedWorkflowPolicies> {
+        let verification = match (
+            wf.verification_policy_id.as_deref(),
+            wf.verification_policy_version,
+            wf.verification_policy_digest.as_deref(),
+        ) {
+            (None, None, None) => None,
+            (Some(id), Some(version), Some(expected_digest)) => {
+                let policy = self
+                    .verification_store
+                    .get_policy(id, version)
+                    .await?
+                    .with_context(|| {
+                        format!("pinned verification policy '{id}' version {version} is missing")
+                    })?;
+                ensure!(
+                    policy.digest() == expected_digest,
+                    "POLICY_DIGEST_MISMATCH: workflow verification policy '{id}' version {version} no longer matches its pinned content"
+                );
+                Some(policy)
+            }
+            _ => {
+                bail!("INCOMPLETE_POLICY_PIN: workflow verification policy reference is incomplete")
+            }
+        };
+
+        let regression = match (
+            wf.regression_policy_id.as_deref(),
+            wf.regression_policy_version,
+            wf.regression_policy_digest.as_deref(),
+        ) {
+            (None, None, None) => None,
+            (Some(id), Some(version), Some(expected_digest)) => {
+                let policy = self
+                    .regression_store
+                    .get_regression_policy(id, version)
+                    .await?
+                    .with_context(|| {
+                        format!("pinned regression policy '{id}' version {version} is missing")
+                    })?;
+                ensure!(
+                    policy.digest() == expected_digest,
+                    "POLICY_DIGEST_MISMATCH: workflow regression policy '{id}' version {version} no longer matches its pinned content"
+                );
+                Some(policy)
+            }
+            _ => bail!("INCOMPLETE_POLICY_PIN: workflow regression policy reference is incomplete"),
+        };
+
+        let selection = match (
+            wf.selection_policy_id.as_deref(),
+            wf.selection_policy_version,
+            wf.selection_policy_digest.as_deref(),
+        ) {
+            (None, None, None) => None,
+            (Some(id), Some(version), Some(expected_digest)) => {
+                let policy = self
+                    .regression_store
+                    .get_selection_policy(id, version)
+                    .await?
+                    .with_context(|| {
+                        format!("pinned selection policy '{id}' version {version} is missing")
+                    })?;
+                ensure!(
+                    policy.digest() == expected_digest,
+                    "POLICY_DIGEST_MISMATCH: workflow selection policy '{id}' version {version} no longer matches its pinned content"
+                );
+                Some(policy)
+            }
+            _ => bail!("INCOMPLETE_POLICY_PIN: workflow selection policy reference is incomplete"),
+        };
+
+        if let Some(regression_policy) = &regression {
+            match (
+                regression_policy.selection_policy_id.as_deref(),
+                regression_policy.selection_policy_version,
+                regression_policy.selection_policy_digest.as_deref(),
+                selection.as_ref(),
+            ) {
+                (None, None, None, None) | (None, None, None, Some(_)) => {}
+                (Some(id), Some(version), Some(digest), Some(selection_policy)) => ensure!(
+                    id == selection_policy.id
+                        && version == selection_policy.version
+                        && digest == selection_policy.digest(),
+                    "POLICY_DIGEST_MISMATCH: regression policy selection reference does not match the workflow selection policy"
+                ),
+                (Some(id), Some(version), Some(_), None) => bail!(
+                    "pinned regression policy references missing selection policy '{id}' version {version}"
+                ),
+                _ => bail!(
+                    "INCOMPLETE_POLICY_PIN: regression policy selection reference is incomplete"
+                ),
+            }
+        }
+
+        Ok(ResolvedWorkflowPolicies {
+            verification,
+            regression,
+            selection,
+        })
     }
 
     /// Execute tier verification with selection or default plan.
@@ -1182,8 +1266,22 @@ impl WorkflowCoordinator {
         crate::verification::validate_pinned_verification_profile(&env)?;
 
         if let Some(sp) = sel_policy {
-            let selected_plan =
-                select_verification(sp, reg_policy, &ws_state.state_id, tier, &[], &[], &[])?;
+            let changed_files = changed_files_for_selection(
+                repo_path,
+                wf.base_revision.as_deref().unwrap_or("HEAD"),
+            )
+            .await?;
+            let previous_failed_checks = self.previous_failed_checks(&wf.id).await?;
+            let reviewer_escalations = self.reviewer_escalations(&wf.id).await?;
+            let selected_plan = select_verification(
+                sp,
+                reg_policy,
+                &ws_state.state_id,
+                tier,
+                &changed_files,
+                &previous_failed_checks,
+                &reviewer_escalations,
+            )?;
             crate::regression_strategy::execute_selected_verification_plan(
                 &self.verification_store,
                 &wf.attempt_id,
@@ -1195,136 +1293,73 @@ impl WorkflowCoordinator {
                 None,
             )
             .await
-        } else if let Some(p) = policy {
-            let steps = if !p.required_steps.is_empty() {
-                p.required_steps
-                    .iter()
-                    .map(|s| {
-                        VerificationStep::new_command(
-                            s,
-                            s,
-                            vec!["git".into(), "diff".into(), "--check".into()],
-                        )
-                    })
-                    .collect()
-            } else {
-                vec![VerificationStep::new_command(
-                    "git-diff-check",
-                    "verify workspace diff formatting and cleanliness",
-                    vec!["git".into(), "diff".into(), "--check".into()],
-                )]
-            };
-            let plan = VerificationPlan::new(
-                "tier-policy-plan",
-                format!("{:?} Tier Verification", tier),
-                steps,
-            );
-            let run = self
-                .verification_store
-                .create_run_with_policy_and_tier(
-                    &wf.attempt_id,
-                    ws_state,
-                    &plan,
-                    env,
-                    Some(p),
-                    Some(tier),
-                    None,
-                    reg_policy,
-                )
-                .await?;
-            execute_run_contents(
-                &self.verification_store,
-                run,
-                ws_state,
-                &plan,
-                repo_path,
-                Some(p),
-                None,
-            )
-            .await
-        } else if repo_path
-            .join(".orbit/definitions/docs-workflow.yaml")
-            .exists()
-        {
-            let plan = VerificationPlan::new(
-                "tier-docs-plan",
-                format!("{:?} Tier Documentation Verification", tier),
-                vec![VerificationStep::new_command(
-                    "docs-presence-check",
-                    "verify documentation directories exist",
-                    vec!["sh".into(), "-c".into(), "test -d docs".into()],
-                )],
-            );
-            let authoritative_policy = VerificationPolicy::new(
-                "docs-workflow-authoritative",
-                "Authoritative Documentation Verification Policy",
-            );
-            let run = self
-                .verification_store
-                .create_run_with_policy_and_tier(
-                    &wf.attempt_id,
-                    ws_state,
-                    &plan,
-                    env,
-                    Some(&authoritative_policy),
-                    Some(tier),
-                    None,
-                    reg_policy,
-                )
-                .await?;
-            execute_run_contents(
-                &self.verification_store,
-                run,
-                ws_state,
-                &plan,
-                repo_path,
-                Some(&authoritative_policy),
-                None,
-            )
-            .await
-        } else if repo_path.join("Cargo.toml").exists() {
-            let plan = VerificationPlan::new(
-                "tier-cargo-plan",
-                format!("{:?} Tier Cargo Verification", tier),
-                vec![VerificationStep::new_command(
-                    "git-diff-check",
-                    "verify workspace git diff formatting",
-                    vec!["git".into(), "diff".into(), "--check".into()],
-                )],
-            );
-            let authoritative_policy = VerificationPolicy::new(
-                "cargo-workspace-authoritative",
-                "Authoritative Cargo Workspace Verification Policy",
-            );
-            let run = self
-                .verification_store
-                .create_run_with_policy_and_tier(
-                    &wf.attempt_id,
-                    ws_state,
-                    &plan,
-                    env,
-                    Some(&authoritative_policy),
-                    Some(tier),
-                    None,
-                    reg_policy,
-                )
-                .await?;
-            execute_run_contents(
-                &self.verification_store,
-                run,
-                ws_state,
-                &plan,
-                repo_path,
-                Some(&authoritative_policy),
-                None,
-            )
-            .await
         } else {
             bail!(
-                "VERIFICATION_POLICY_REQUIRED: no authoritative verification policy provided or resolved for workflow run"
+                "VERIFICATION_ACTIONS_UNRESOLVED: workflow tier has no pinned selection policy with declared verification actions (verification policy present: {})",
+                policy.is_some()
             );
         }
     }
+
+    async fn previous_failed_checks(&self, wf_id: &str) -> Result<Vec<String>> {
+        let payloads: Vec<serde_json::Value> = sqlx::query_scalar(
+            "SELECT structured_payload FROM orbit_handoff_artifacts WHERE workflow_run_id = $1 AND handoff_type = 'FAILURE_EVIDENCE' ORDER BY created_at",
+        )
+        .bind(wf_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut checks = std::collections::BTreeSet::new();
+        for payload in payloads {
+            let evidence: FailureEvidenceHandoff = serde_json::from_value(payload)
+                .context("decode persisted verification failure evidence")?;
+            checks.extend(evidence.failed_steps);
+        }
+        Ok(checks.into_iter().collect())
+    }
+
+    async fn reviewer_escalations(&self, wf_id: &str) -> Result<Vec<String>> {
+        let Some(handoff) = self
+            .store
+            .get_latest_handoff_of_type(wf_id, HandoffType::Review)
+            .await?
+        else {
+            return Ok(Vec::new());
+        };
+        let review: ReviewDecision = serde_json::from_value(handoff.structured_payload)
+            .context("decode persisted reviewer decision")?;
+        Ok(review.suggested_additional_checks)
+    }
+}
+
+async fn changed_files_for_selection(repo_path: &Path, baseline: &str) -> Result<Vec<String>> {
+    let mut changed = std::collections::BTreeSet::new();
+    for args in [
+        vec!["diff", "--name-only", "-z", "--no-renames", baseline, "--"],
+        vec!["ls-files", "--others", "--exclude-standard", "-z"],
+    ] {
+        let output = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(repo_path)
+            .args(args)
+            .output()
+            .await
+            .context("start git while collecting verification selection inputs")?;
+        ensure!(
+            output.status.success(),
+            "GIT_SELECTION_INPUT_FAILED: git returned {} while collecting changed paths: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        let stdout = String::from_utf8(output.stdout)
+            .context("GIT_SELECTION_INPUT_FAILED: changed path output is not UTF-8")?;
+        changed.extend(
+            stdout
+                .split('\0')
+                .filter(|path| !path.is_empty())
+                .map(str::to_owned),
+        );
+    }
+    Ok(changed.into_iter().collect())
 }
 
 /// Computes or captures current WorkspaceState for a given repository.
@@ -3139,5 +3174,16 @@ mod tests {
         assert_eq!(state.tool_successes, 0);
 
         Ok(())
+    }
+
+    #[test]
+    fn workflow_verification_has_no_weak_authoritative_fallbacks() {
+        let source = include_str!("workflow_coordinator.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(!source.contains("tier-cargo-plan"));
+        assert!(!source.contains("tier-docs-plan"));
+        assert!(!source.contains("unwrap_or_else(|| vec![\"true\".into()])"));
     }
 }
