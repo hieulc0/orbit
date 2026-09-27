@@ -3926,7 +3926,7 @@ mod tests {
     }
 
     #[test]
-    fn s7_handoff_needs_successful_supervisor_and_matching_cleanup() {
+    fn handoff_requires_successful_supervisor_and_matching_cleanup() {
         use std::os::unix::process::ExitStatusExt;
         let handoff = format!("{ORBIT_HANDOFF_START}\n{{}}\n{ORBIT_HANDOFF_END}");
         let nonzero =
@@ -3964,7 +3964,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn s7_supervisor_wait_is_bounded_and_kills_process_group() -> Result<()> {
+    async fn supervisor_wait_is_bounded_and_kills_process_group() -> Result<()> {
         let mut command = tokio::process::Command::new("sh");
         command
             .args(["-c", "sleep 30"])
@@ -3984,7 +3984,7 @@ mod tests {
     }
 
     #[test]
-    fn s7_wrong_credential_generation_is_rejected() {
+    fn wrong_credential_generation_is_rejected() {
         let target = ResolvedExecutionTarget {
             provider: "codex".into(),
             runtime_interface: "codex-acp".into(),

@@ -302,6 +302,10 @@ async fn finish_live_fixture(
     fixture_result: Result<()>,
 ) -> Result<()> {
     credential_catalog_pool.close().await;
+    finish_test_context(ctx, fixture_result).await
+}
+
+async fn finish_test_context(ctx: TestContext, fixture_result: Result<()>) -> Result<()> {
     let teardown_result = teardown_test(ctx).await;
     match (fixture_result, teardown_result) {
         (Ok(()), Ok(())) => Ok(()),
@@ -313,6 +317,59 @@ async fn finish_live_fixture(
             "disposable workflow schema teardown also failed: {teardown_error:#}"
         ))),
     }
+}
+
+async fn load_agent_tool_audit(
+    pool: &PgPool,
+    execution_id: &str,
+) -> Result<(String, i64, i64, i64, serde_json::Value)> {
+    sqlx::query_as(
+        "SELECT status, tool_call_count, tool_success_count, tool_failure_count, tool_counts \
+         FROM orbit_agent_executions WHERE id = $1",
+    )
+    .bind(execution_id)
+    .fetch_one(pool)
+    .await
+    .context("failed to read persisted agent tool audit")
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
+async fn b34_agent_tool_audit_reads_persisted_counter_columns() -> Result<()> {
+    let ctx = setup_test().await?;
+    let fixture_result = async {
+        let execution_id = format!("execution-{}", id());
+        let tool_counts = json!({
+            "fs.write_text_file": 1,
+            "fs.edit_file": 1,
+            "fs.read_text_file": 1
+        });
+        sqlx::query(
+            "INSERT INTO orbit_agent_executions \
+             (id, agent_type, started_at_ms, status, tool_call_count, tool_success_count, \
+              tool_failure_count, tool_counts) \
+             VALUES ($1, 'fixture', 1, 'SUCCEEDED', 3, 3, 0, $2)",
+        )
+        .bind(&execution_id)
+        .bind(&tool_counts)
+        .execute(&ctx.engine.pool)
+        .await?;
+
+        let (status, calls, successes, failures, persisted_tool_counts) =
+            load_agent_tool_audit(&ctx.engine.pool, &execution_id).await?;
+        ensure!(
+            status == "SUCCEEDED" && calls == 3 && successes == 3 && failures == 0,
+            "agent tool audit returned incorrect synthetic counters"
+        );
+        ensure!(
+            persisted_tool_counts == tool_counts,
+            "agent tool audit returned incorrect synthetic tool counts"
+        );
+        Ok(())
+    }
+    .await;
+
+    finish_test_context(ctx, fixture_result).await
 }
 
 fn init_git_repo(path: &Path) -> Result<()> {
@@ -1690,23 +1747,17 @@ async fn b34_real_codex_coding_fixture() -> Result<()> {
             .agent_execution_ids
             .first()
             .context("implementer execution evidence is missing")?;
-        let (execution_status, tool_call_count, tool_successes, tool_failure_count, tool_counts): (
-            String,
-            i64,
-            i64,
-            i64,
-            serde_json::Value,
-        ) = sqlx::query_as(
-            "SELECT status, tool_calls, tool_successes, tool_failures, tool_counts \
-             FROM orbit_agent_executions WHERE id = $1",
-        )
-        .bind(execution_id)
-        .fetch_one(&ctx.engine.pool)
-        .await?;
+        let (
+            execution_status,
+            tool_call_count,
+            tool_success_count,
+            tool_failure_count,
+            tool_counts,
+        ) = load_agent_tool_audit(&ctx.engine.pool, execution_id).await?;
         ensure!(
             execution_status == "SUCCEEDED"
                 && tool_failure_count == 0
-                && tool_successes == tool_call_count,
+                && tool_success_count == tool_call_count,
             "implementer execution evidence includes an unsuccessful tool call"
         );
         let file_mutation_calls = ["fs.write_text_file", "fs.edit_file"]

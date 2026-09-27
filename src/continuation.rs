@@ -905,7 +905,7 @@ impl Default for FallbackPolicy {
 /// Evaluates whether an agent execution and its subsequent external validation trigger a fallback.
 ///
 /// Cancellation, CredentialError, InfrastructureError, and ProcessCrash do NOT trigger fallback
-/// in this phase to prevent uncontrolled retries of fundamental environment failures.
+/// during fallback evaluation, to prevent uncontrolled retries of fundamental environment failures.
 pub fn fallback_trigger(
     execution: &AgentExecution,
     validation: Option<&ValidationSummary>,

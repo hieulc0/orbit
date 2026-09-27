@@ -877,7 +877,7 @@ impl<'a> CredentialStore<'a> {
 
     /// Record only the last completed agy enrollment stage. Values contain no
     /// auth material, locator, or host path and make interrupted enrollment
-    /// recoverable without guessing which phase completed.
+    /// recoverable without guessing which enrollment stage completed.
     pub async fn set_agy_enrollment_stage(
         &self,
         representation_id: &str,

@@ -666,9 +666,9 @@ fn ensure_cli_workflow_execution_enabled(action: &WorkflowAction) -> Result<()> 
 }
 
 const LIVE_QUALIFICATION_VERIFICATION_IMAGE: &str = "docker.io/library/alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b";
-const LIVE_QUALIFICATION_README_CONTENT: &str = "ORBIT_R4_S8_QUALIFICATION_OK";
-const LIVE_QUALIFICATION_TEST_MARKER: &str = "ORBIT_R4_S8_QUALIFICATION_CHECK_PASSED";
-const LIVE_QUALIFICATION_TEST_SCRIPT: &str = "#!/bin/sh\nset -eu\nif ! printf '%s\\n' 'ORBIT_R4_S8_QUALIFICATION_OK' | cmp -s - README.md; then\n    printf '%s\\n' 'Live qualification candidate contract failed' >&2\n    exit 1\nfi\nprintf '%s\\n' 'ORBIT_R4_S8_QUALIFICATION_CHECK_PASSED'\n";
+const LIVE_QUALIFICATION_README_CONTENT: &str = "ORBIT_CLI_WORKFLOW_FIXTURE_READY";
+const LIVE_QUALIFICATION_TEST_MARKER: &str = "ORBIT_CLI_WORKFLOW_CHECK_PASSED";
+const LIVE_QUALIFICATION_TEST_SCRIPT: &str = "#!/bin/sh\nset -eu\nif ! printf '%s\\n' 'ORBIT_CLI_WORKFLOW_FIXTURE_READY' | cmp -s - README.md; then\n    printf '%s\\n' 'Live qualification candidate contract failed' >&2\n    exit 1\nfi\nprintf '%s\\n' 'ORBIT_CLI_WORKFLOW_CHECK_PASSED'\n";
 
 struct LiveCliQualificationPolicies {
     verification: orbit::verification::VerificationPolicy,
@@ -1872,7 +1872,7 @@ async fn run_live_cli_qualification(
         })
         .collect();
     let report = serde_json::json!({
-        "qualification": "ORBIT_R4_S8_LIVE",
+        "qualification": "ORBIT_LIVE_WORKFLOW_QUALIFICATION",
         "task_id": task_id,
         "attempt_id": attempt_id,
         "workflow_id": workflow.id,
@@ -4326,7 +4326,7 @@ mod workflow_execution_gate_tests {
 }
 
 #[cfg(test)]
-mod s8_live_qualification_tests {
+mod live_workflow_qualification_tests {
     use super::*;
 
     fn git(repository: &Path, args: &[&str]) {
