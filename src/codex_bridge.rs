@@ -44,13 +44,23 @@ pub fn thread_start(
         json!({"type":"function", "name":format!("orbit_{}", tool["name"].as_str().unwrap()),
             "description":tool["description"], "inputSchema":tool["parameters"], "deferLoading":false})
     ).collect::<Vec<_>>();
+    let dynamic_tool_names = tools
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let available_tools = if dynamic_tool_names.is_empty() {
+        "No Orbit tools are available.".to_owned()
+    } else {
+        format!("Use only {dynamic_tool_names} when provided.")
+    };
     let mut request = json!({
         "model":model, "allowProviderModelFallback":false,
         "cwd":control_directory, "environments":[], "runtimeWorkspaceRoots":[],
         "selectedCapabilityRoots":[], "dynamicTools":tools,
         "approvalPolicy":"never", "approvalsReviewer":"user", "sandbox":"read-only",
         "ephemeral":true, "experimentalRawEvents":false,
-        "baseInstructions":format!("{} Use only orbit_read_file, orbit_write_file and orbit_shell when provided. File paths may be workspace-relative or absolute beneath {}; other absolute paths and traversal are rejected.",
+        "baseInstructions":format!("{} {available_tools} File paths may be workspace-relative or absolute beneath {}; other absolute paths and traversal are rejected.",
             crate::coding_agent::completion_instructions(crate::acp_runtime::WORKSPACE, names),
             crate::acp_runtime::WORKSPACE),
         "config":{

@@ -1,5 +1,5 @@
 use agent_client_protocol as acp;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use orbit::codex_bridge::{CODEX_VERSION, OrbitAcpClient, ToolCall, ToolRouter, thread_start};
 use serde_json::{Value, json};
 use std::{cell::RefCell, path::Path};
@@ -187,6 +187,12 @@ fn codex_bridge_pins_closed_no_environment_dynamic_tool_contract() -> Result<()>
     assert_eq!(request["config"]["features.goals"], false);
     assert_eq!(request["dynamicTools"][0]["name"], "orbit_read_file");
     assert_eq!(request["dynamicTools"][1]["name"], "orbit_shell");
+    assert!(
+        request["baseInstructions"]
+            .as_str()
+            .unwrap()
+            .contains("Use only orbit_read_file, orbit_shell when provided.")
+    );
     for (name, value) in request["config"].as_object().unwrap() {
         if name.starts_with("features.") {
             assert_eq!(*value, false);
@@ -215,6 +221,66 @@ fn codex_bridge_pins_closed_no_environment_dynamic_tool_contract() -> Result<()>
         )
         .is_err()
     );
+    Ok(())
+}
+
+#[test]
+fn codex_bridge_tool_instruction_matches_exact_dynamic_tool_aliases() -> Result<()> {
+    let names = [
+        "read_file",
+        "list_directory",
+        "find_path",
+        "grep",
+        "git_status",
+        "git_diff",
+        "git_show",
+        "write_file",
+        "edit_file",
+        "create_directory",
+        "move",
+        "copy",
+        "delete_file",
+        "delete_directory",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    let request = thread_start(
+        CODEX_VERSION,
+        "fixture-model",
+        None,
+        Path::new("/private/control"),
+        &names,
+    )?;
+    let expected_names = names
+        .iter()
+        .map(|name| format!("orbit_{name}"))
+        .collect::<Vec<_>>();
+    let dynamic_names = request["dynamicTools"]
+        .as_array()
+        .context("Codex dynamic tool list missing")?
+        .iter()
+        .map(|tool| {
+            tool["name"]
+                .as_str()
+                .context("Codex dynamic tool name missing")
+                .map(str::to_owned)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(dynamic_names, expected_names);
+
+    let instructions = request["baseInstructions"].as_str().unwrap();
+    assert!(instructions.contains(&format!(
+        "Use only {} when provided.",
+        expected_names.join(", ")
+    )));
+    assert!(!instructions.contains("orbit_shell"));
+    assert!(!instructions.contains("orbit_terminal"));
+    assert!(instructions.contains(&format!(
+        "File paths may be workspace-relative or absolute beneath {};",
+        orbit::acp_runtime::WORKSPACE
+    )));
+    assert!(instructions.contains("other absolute paths and traversal are rejected."));
+    assert!(instructions.contains("Terminal execution is unavailable"));
     Ok(())
 }
 

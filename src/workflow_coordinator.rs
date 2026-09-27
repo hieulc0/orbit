@@ -2099,6 +2099,37 @@ fn list_files_recursively(base: &Path, dir: &Path, acc: &mut Vec<String>) {
     }
 }
 
+fn repository_tools_for_role(role: &RoleDefinition) -> Vec<String> {
+    use crate::tool_surface::{CanonicalToolName as Tool, ToolMetadata};
+
+    const REPOSITORY_TOOLS: [Tool; 14] = [
+        Tool::FsReadTextFile,
+        Tool::FsListDirectory,
+        Tool::FsFindPath,
+        Tool::SearchGrep,
+        Tool::GitStatus,
+        Tool::GitDiff,
+        Tool::GitShow,
+        Tool::FsWriteTextFile,
+        Tool::FsEditFile,
+        Tool::FsCreateDirectory,
+        Tool::FsMove,
+        Tool::FsCopy,
+        Tool::FsDeleteFile,
+        Tool::FsDeleteDirectory,
+    ];
+
+    REPOSITORY_TOOLS
+        .into_iter()
+        .filter_map(|tool| {
+            let metadata = ToolMetadata::for_tool(tool);
+            (metadata.is_role_allowed(&role.role_id)
+                && (!metadata.mutating || role.workspace_access == WorkspaceAccess::ReadWrite))
+                .then(|| tool.legacy_name().to_owned())
+        })
+        .collect()
+}
+
 fn build_role_prompt(
     role: &RoleDefinition,
     task_text: &str,
@@ -2107,6 +2138,7 @@ fn build_role_prompt(
     input_handoff: Option<&HandoffArtifact>,
     git_diff: Option<&str>,
 ) -> String {
+    let orbit_acp_tool_names = repository_tools_for_role(role).join(", ");
     let mut doc_files = Vec::new();
     let docs_dir = repo_path.join("docs");
     if docs_dir.is_dir() {
@@ -2160,6 +2192,18 @@ fn build_role_prompt(
             task_text = task_text,
         ),
     };
+    let prompt = format!("{prompt}\n\nORBIT/ACP TOOL NAMES: {orbit_acp_tool_names}");
+    let prompt = if role.role_id == "implementer" {
+        format!(
+            "{prompt}\n\nDiscover paths with list_directory, find_path, or grep before guessing names for files the task does not identify. If a lookup returns PATH_NOT_FOUND, inspect the workspace with those tools and retry using a discovered path."
+        )
+    } else {
+        prompt
+    };
+    let prompt = prompt.replace(
+        "You can inspect files using fs/read_text_file.",
+        "You can inspect files using the listed read-only repository tools.",
+    );
     prompt.replace(
         "- terminal/create, terminal/output, terminal/wait_for_exit, terminal/kill, terminal/release: run tests or commands",
         "- CLI workflow terminal execution is unavailable until a confined terminal owner is qualified",
@@ -4320,18 +4364,7 @@ async fn execute_real_acp_turn(
         bail!("unsupported role provider: {}", target.provider);
     };
 
-    let allowed_tools = if role.workspace_access == WorkspaceAccess::ReadOnly {
-        vec!["read_file".to_string()]
-    } else {
-        vec![
-            "read_file".to_string(),
-            "write_file".to_string(),
-            "create_directory".to_string(),
-            "move".to_string(),
-            "delete_file".to_string(),
-            "delete_directory".to_string(),
-        ]
-    };
+    let allowed_tools = repository_tools_for_role(role);
 
     let request_path = scratch_dir.path().join("request.json");
     let current_credential = cred_store
@@ -4689,22 +4722,6 @@ impl RoleAgentExecutor for RealAcpRoleExecutor {
         input_handoff: Option<&HandoffArtifact>,
         cancellation: tokio::sync::watch::Receiver<bool>,
     ) -> Result<RoleExecutionOutcome> {
-        // Enforce role permissions and capabilities:
-        // Planner & Reviewer: read-only, only read_file tool.
-        // Implementer: read-write, full filesystem tools.
-        let _allowed_tools = if role.workspace_access == WorkspaceAccess::ReadOnly {
-            vec!["read_file".to_string()]
-        } else {
-            vec![
-                "read_file".to_string(),
-                "write_file".to_string(),
-                "create_directory".to_string(),
-                "move".to_string(),
-                "delete_file".to_string(),
-                "delete_directory".to_string(),
-            ]
-        };
-
         execute_real_acp_turn(
             pool,
             pool,
@@ -4726,6 +4743,89 @@ impl RoleAgentExecutor for RealAcpRoleExecutor {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn provider_tool_lists_match_role_prompt_and_permissions() -> Result<()> {
+        use crate::tool_surface::{CanonicalToolName as Tool, ToolMetadata};
+
+        let read_tools = [
+            "read_file",
+            "list_directory",
+            "find_path",
+            "grep",
+            "git_status",
+            "git_diff",
+            "git_show",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let planner = RoleDefinition::planner_v1();
+        let implementer = RoleDefinition::implementer_v1();
+        let reviewer = RoleDefinition::reviewer_v1();
+        let implementer_tools = [
+            "read_file",
+            "list_directory",
+            "find_path",
+            "grep",
+            "git_status",
+            "git_diff",
+            "git_show",
+            "write_file",
+            "edit_file",
+            "create_directory",
+            "move",
+            "copy",
+            "delete_file",
+            "delete_directory",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+
+        for (role, expected_tools) in [
+            (&planner, &read_tools),
+            (&implementer, &implementer_tools),
+            (&reviewer, &read_tools),
+        ] {
+            let tools = repository_tools_for_role(role);
+            assert_eq!(&tools, expected_tools);
+            assert!(
+                !tools
+                    .iter()
+                    .any(|tool| tool == "shell" || tool.starts_with("terminal"))
+            );
+            assert_eq!(
+                crate::coding_agent::tool_definitions(&tools)?.len(),
+                tools.len()
+            );
+
+            for tool_name in &tools {
+                let tool =
+                    Tool::from_wire(tool_name).context("provider tool has no canonical mapping")?;
+                let metadata = ToolMetadata::for_tool(tool);
+                assert!(metadata.is_role_allowed(&role.role_id));
+                if metadata.mutating {
+                    assert_eq!(role.workspace_access, WorkspaceAccess::ReadWrite);
+                    assert!(metadata.requires_mutation_lock);
+                }
+            }
+
+            let prompt = build_role_prompt(
+                role,
+                "Inspect and update the repository",
+                Path::new("/workspace"),
+                "HEAD",
+                None,
+                None,
+            );
+            assert!(prompt.contains(&format!("ORBIT/ACP TOOL NAMES: {}", tools.join(", "))));
+            if role.role_id == "implementer" {
+                assert!(prompt.contains("Discover paths with list_directory, find_path, or grep"));
+                assert!(prompt.contains("PATH_NOT_FOUND"));
+            }
+        }
+
+        Ok(())
+    }
 
     fn git_fixture(repo: &Path, args: &[&str]) -> Result<String> {
         let output = std::process::Command::new("git")
