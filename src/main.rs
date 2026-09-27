@@ -1451,50 +1451,48 @@ fn successful_tool_audit_rows_are_correlated(entries: &[serde_json::Value]) -> b
             .get("canonical_tool_name")
             .and_then(serde_json::Value::as_str);
         let provider_tool_matches = provider_name
+            .filter(|name| !name.is_empty() && name.trim() == *name)
             .and_then(orbit::tool_surface::CanonicalToolName::from_wire)
             .is_some_and(|tool| canonical_name == Some(tool.as_str()));
+        let provider_update_is_unassociated = entry
+            .get("provider_update_correlation")
+            .and_then(serde_json::Value::as_str)
+            == Some("NOT_OBSERVED")
+            && entry
+                .get("provider_update_title_class")
+                .and_then(serde_json::Value::as_str)
+                == Some("update_not_observed")
+            && entry
+                .get("provider_update_tool_kind")
+                .and_then(serde_json::Value::as_str)
+                == Some("update_not_observed")
+            && entry
+                .get("provider_update_status")
+                .and_then(serde_json::Value::as_str)
+                == Some("update_not_observed")
+            && entry
+                .get("provider_tool_call_id_shape")
+                .and_then(serde_json::Value::as_str)
+                == Some("update_not_observed");
         entry.get("outcome").and_then(serde_json::Value::as_str) == Some("SUCCESS")
             && entry
                 .get("error_code")
                 .is_none_or(serde_json::Value::is_null)
-            && entry
-                .get("provider_update_title_class")
-                .and_then(serde_json::Value::as_str)
-                == Some("known_tool_name")
+            && provider_update_is_unassociated
             && entry
                 .get("provider_name_mapping")
                 .and_then(serde_json::Value::as_str)
                 == Some("MATCH")
             && entry
-                .get("provider_update_status")
-                .and_then(serde_json::Value::as_str)
-                == Some("in_progress")
+                .get("advertised_to_provider")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
             && entry
-                .get("provider_update_tool_kind")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(provider_tool_kind_is_allowlisted)
-            && entry
-                .get("provider_tool_call_id_shape")
-                .and_then(serde_json::Value::as_str)
-                == Some("string")
+                .get("role_allowed")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
             && provider_tool_matches
     })
-}
-
-fn provider_tool_kind_is_allowlisted(kind: &str) -> bool {
-    matches!(
-        kind,
-        "read"
-            | "edit"
-            | "delete"
-            | "move"
-            | "search"
-            | "execute"
-            | "think"
-            | "fetch"
-            | "switch_mode"
-            | "other"
-    )
 }
 
 async fn run_live_cli_qualification(
@@ -4549,13 +4547,16 @@ mod live_workflow_qualification_tests {
                 },
                 "entries": (0..total).map(|index| serde_json::json!({
                     "sequence": index + 1,
-                    "provider_tool_name": "orbit_read_file",
+                    "provider_tool_name": "fs/read_text_file",
                     "provider_name_mapping": "MATCH",
-                    "provider_update_title_class": "known_tool_name",
-                    "provider_update_tool_kind": "read",
-                    "provider_update_status": "in_progress",
-                    "provider_tool_call_id_shape": "string",
+                    "provider_update_correlation": "NOT_OBSERVED",
+                    "provider_update_title_class": "update_not_observed",
+                    "provider_update_tool_kind": "update_not_observed",
+                    "provider_update_status": "update_not_observed",
+                    "provider_tool_call_id_shape": "update_not_observed",
                     "canonical_tool_name": "fs.read_text_file",
+                    "advertised_to_provider": true,
+                    "role_allowed": true,
                     "outcome": "SUCCESS",
                     "error_code": null
                 })).collect::<Vec<_>>(),
@@ -4567,59 +4568,44 @@ mod live_workflow_qualification_tests {
         let clean = audit(2, 2, 0, 0);
         assert!(durable_tool_call_audit_is_strict(&clean, 2, 2, 0));
 
-        let mut missing_update = clean.clone();
-        missing_update["entries"][0]
-            .as_object_mut()
-            .unwrap()
-            .remove("provider_update_title_class");
-        assert!(!durable_tool_call_audit_is_strict(&missing_update, 2, 2, 0));
-
-        let mut missing_kind = clean.clone();
-        missing_kind["entries"][0]
-            .as_object_mut()
-            .unwrap()
-            .remove("provider_update_tool_kind");
-        assert!(!durable_tool_call_audit_is_strict(&missing_kind, 2, 2, 0));
-
-        let mut unknown_kind = clean.clone();
-        unknown_kind["entries"][0]["provider_update_tool_kind"] = serde_json::json!("unrecognized");
-        assert!(!durable_tool_call_audit_is_strict(&unknown_kind, 2, 2, 0));
-
-        let mut missing_call_id_shape = clean.clone();
-        missing_call_id_shape["entries"][0]
-            .as_object_mut()
-            .unwrap()
-            .remove("provider_tool_call_id_shape");
+        let mut ambiguous_update = clean.clone();
+        ambiguous_update["entries"][0]["provider_update_correlation"] =
+            serde_json::json!("AMBIGUOUS");
+        ambiguous_update["entries"][0]["provider_update_title_class"] =
+            serde_json::json!("update_not_observed");
         assert!(!durable_tool_call_audit_is_strict(
-            &missing_call_id_shape,
+            &ambiguous_update,
             2,
             2,
             0
         ));
 
-        let mut non_string_call_id_shape = clean.clone();
-        non_string_call_id_shape["entries"][0]["provider_tool_call_id_shape"] =
-            serde_json::json!("non_string");
-        assert!(!durable_tool_call_audit_is_strict(
-            &non_string_call_id_shape,
-            2,
-            2,
-            0
-        ));
+        for field in ["advertised_to_provider", "role_allowed"] {
+            let mut missing_required_authority = clean.clone();
+            missing_required_authority["entries"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(!durable_tool_call_audit_is_strict(
+                &missing_required_authority,
+                2,
+                2,
+                0
+            ));
 
-        assert!(provider_tool_kind_is_allowlisted("switch_mode"));
-        assert!(!provider_tool_kind_is_allowlisted("unknown_provider_kind"));
-
-        let mut unknown_title = clean.clone();
-        unknown_title["entries"][0]["provider_update_title_class"] =
-            serde_json::json!("unrecognized_string");
-        unknown_title["entries"][0]["provider_name_mapping"] = serde_json::json!("UNKNOWN");
-        unknown_title["entries"][0]["provider_tool_name"] = serde_json::json!("unknown");
-        assert!(!durable_tool_call_audit_is_strict(&unknown_title, 2, 2, 0));
+            let mut false_required_authority = clean.clone();
+            false_required_authority["entries"][0][field] = serde_json::json!(false);
+            assert!(!durable_tool_call_audit_is_strict(
+                &false_required_authority,
+                2,
+                2,
+                0
+            ));
+        }
 
         let mut mismatched_update = clean.clone();
         mismatched_update["entries"][0]["provider_tool_name"] =
-            serde_json::json!("orbit_write_file");
+            serde_json::json!("fs/write_text_file");
         mismatched_update["entries"][0]["provider_name_mapping"] = serde_json::json!("MISMATCH");
         assert!(!durable_tool_call_audit_is_strict(
             &mismatched_update,
@@ -4628,15 +4614,80 @@ mod live_workflow_qualification_tests {
             0
         ));
 
-        for failure_status in ["failed", "cancelled"] {
-            let mut failed_update = clean.clone();
-            failed_update["entries"][0]["provider_update_status"] =
-                serde_json::json!(failure_status);
-            assert!(!durable_tool_call_audit_is_strict(&failed_update, 2, 2, 0));
-        }
+        let mut malformed_method = clean.clone();
+        malformed_method["entries"][0]["provider_tool_name"] =
+            serde_json::json!(" fs/read_text_file ");
+        assert!(!durable_tool_call_audit_is_strict(
+            &malformed_method,
+            2,
+            2,
+            0
+        ));
 
         let unmatched = audit(4, 2, 2, 2);
         assert!(!durable_tool_call_audit_is_strict(&unmatched, 2, 2, 0));
+
+        let mut equal_cardinality = audit(2, 2, 0, 0);
+        equal_cardinality["entries"][0]["provider_tool_name"] =
+            serde_json::json!("fs/read_text_file");
+        equal_cardinality["entries"][0]["canonical_tool_name"] =
+            serde_json::json!("fs.read_text_file");
+        equal_cardinality["entries"][0]["provider_update_correlation"] =
+            serde_json::json!("AMBIGUOUS");
+        equal_cardinality["entries"][1]["provider_tool_name"] =
+            serde_json::json!("fs/write_text_file");
+        equal_cardinality["entries"][1]["canonical_tool_name"] =
+            serde_json::json!("fs.write_text_file");
+        equal_cardinality["entries"][1]["provider_update_correlation"] =
+            serde_json::json!("AMBIGUOUS");
+        assert!(!successful_tool_audit_rows_are_correlated(
+            equal_cardinality["entries"].as_array().unwrap()
+        ));
+        equal_cardinality["entries"]
+            .as_array_mut()
+            .unwrap()
+            .extend([
+                serde_json::json!({
+                    "sequence": 3,
+                    "provider_tool_name": "unknown",
+                    "provider_name_mapping": "UNMATCHED",
+                    "provider_update_correlation": "UNMATCHED",
+                    "provider_update_title_class": "non_empty_string",
+                    "provider_update_tool_kind": "edit",
+                    "provider_update_status": "in_progress",
+                    "provider_tool_call_id_shape": "string",
+                    "canonical_tool_name": "unknown",
+                    "advertised_to_provider": null,
+                    "role_allowed": null,
+                    "outcome": "EXECUTION_FAILURE",
+                    "error_code": "PROVIDER_CALLBACK_UNRESOLVED"
+                }),
+                serde_json::json!({
+                    "sequence": 4,
+                    "provider_tool_name": "unknown",
+                    "provider_name_mapping": "UNMATCHED",
+                    "provider_update_correlation": "UNMATCHED",
+                    "provider_update_title_class": "non_empty_string",
+                    "provider_update_tool_kind": "read",
+                    "provider_update_status": "in_progress",
+                    "provider_tool_call_id_shape": "string",
+                    "canonical_tool_name": "unknown",
+                    "advertised_to_provider": null,
+                    "role_allowed": null,
+                    "outcome": "EXECUTION_FAILURE",
+                    "error_code": "PROVIDER_CALLBACK_UNRESOLVED"
+                }),
+            ]);
+        equal_cardinality["summary"]["total"] = serde_json::json!(4);
+        equal_cardinality["summary"]["successful"] = serde_json::json!(2);
+        equal_cardinality["summary"]["unsuccessful"] = serde_json::json!(2);
+        equal_cardinality["summary"]["unmatched_provider_calls"] = serde_json::json!(2);
+        assert!(!durable_tool_call_audit_is_strict(
+            &equal_cardinality,
+            4,
+            2,
+            2
+        ));
 
         let mismatched_counter = audit(2, 1, 1, 0);
         assert!(!durable_tool_call_audit_is_strict(
