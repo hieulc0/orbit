@@ -3,7 +3,10 @@
 //! mutation locking, multi-tier verification triggering, repair loops, fallback, and CLI invocation.
 
 use anyhow::{Context, Result};
-use orbit::{model::id, verification::*, workflow::*, workflow_coordinator::*};
+use orbit::{
+    model::id, regression_strategy::VerificationTier, verification::*, workflow::*,
+    workflow_coordinator::*,
+};
 use sqlx::PgPool;
 use std::{collections::BTreeMap, ops::Deref, sync::Arc};
 
@@ -109,6 +112,489 @@ async fn enroll_sample_credentials(pool: &PgPool) -> Result<()> {
         .await?;
     tx.commit().await?;
     Ok(())
+}
+
+async fn seed_completed_repair(
+    ctx: &TestContext,
+    task_id: &str,
+    attempt_id: &str,
+    repo_path: &std::path::Path,
+    max_iterations: u32,
+) -> Result<(WorkflowRun, WorkspaceState, RoleExecution, HandoffArtifact)> {
+    let workflow = ctx
+        .store
+        .create_workflow_run_full(
+            task_id,
+            attempt_id,
+            max_iterations,
+            None,
+            None,
+            None,
+            Some("repair coordinator state"),
+            repo_path.to_str(),
+            Some("base"),
+        )
+        .await?;
+    let state = orbit::workflow_coordinator::compute_workspace_state(repo_path, "base").await?;
+    ctx.store
+        .transition_workflow_stage(&workflow.id, WorkflowStage::Planning, None, None, None)
+        .await?;
+    ctx.store
+        .transition_workflow_stage(&workflow.id, WorkflowStage::Implementing, None, None, None)
+        .await?;
+    ctx.store
+        .transition_workflow_stage(
+            &workflow.id,
+            WorkflowStage::Verifying,
+            Some(&state.state_id),
+            None,
+            None,
+        )
+        .await?;
+    let initial_failure = ctx
+        .store
+        .save_handoff_artifact(
+            &workflow.id,
+            None,
+            HandoffType::FailureEvidence,
+            None,
+            serde_json::to_value(FailureEvidenceHandoff {
+                failed_stage: "VERIFYING_FAST".into(),
+                verification_run_id: None,
+                failed_steps: vec!["fixture-check".into()],
+                error_summary: "initial fixture failure".into(),
+                stdout_previews: BTreeMap::new(),
+                stderr_previews: BTreeMap::new(),
+            })?,
+        )
+        .await?;
+    ctx.store
+        .transition_workflow_stage(
+            &workflow.id,
+            WorkflowStage::Repairing,
+            Some(&state.state_id),
+            Some(1),
+            None,
+        )
+        .await?;
+
+    let repair = ctx
+        .store
+        .create_role_execution(
+            &workflow.id,
+            &RoleDefinition::implementer_v1(),
+            "REPAIRING",
+            1,
+            Some(&state.state_id),
+            Some(&initial_failure.id),
+        )
+        .await?;
+    ctx.store
+        .set_role_execution_resolved(&repair.id, &fixture_target())
+        .await?;
+    let implementation = ctx
+        .store
+        .save_handoff_artifact(
+            &workflow.id,
+            Some(&repair.id),
+            HandoffType::Implementation,
+            Some(&state.state_id),
+            serde_json::to_value(ImplementationHandoff {
+                summary: "repair completed before its stage transition".into(),
+                changed_files: vec![],
+                tests_added_or_modified: vec![],
+                exploratory_commands: vec![],
+                known_limitations: vec![],
+                verification_notes: vec![],
+            })?,
+        )
+        .await?;
+    ctx.store
+        .complete_role_execution_success(
+            &repair.id,
+            Some(&state.state_id),
+            Some(&implementation.id),
+        )
+        .await?;
+
+    Ok((workflow, state, repair, initial_failure))
+}
+
+fn fixture_target() -> ResolvedExecutionTarget {
+    ResolvedExecutionTarget {
+        provider: "codex".into(),
+        runtime_interface: "codex-acp".into(),
+        credential_id: Some("fixture-codex".into()),
+        credential_generation: Some(1),
+        requested_model: Some("gpt-6-luna".into()),
+        resolved_model: Some("gpt-6-luna".into()),
+        runtime_image_digest: None,
+        resolution_reason: "deterministic coordinator fixture".into(),
+    }
+}
+
+async fn record_later_failure(
+    ctx: &TestContext,
+    workflow_id: &str,
+    failed_stage: &str,
+    verification_run_id: Option<&str>,
+    state_id: &str,
+) -> Result<HandoffArtifact> {
+    let failure = ctx
+        .store
+        .save_handoff_artifact(
+            workflow_id,
+            None,
+            HandoffType::FailureEvidence,
+            None,
+            serde_json::to_value(FailureEvidenceHandoff {
+                failed_stage: failed_stage.into(),
+                verification_run_id: verification_run_id.map(str::to_owned),
+                failed_steps: vec!["fixture-check".into()],
+                error_summary: "later failure after repair completed".into(),
+                stdout_previews: BTreeMap::new(),
+                stderr_previews: BTreeMap::new(),
+            })?,
+        )
+        .await?;
+    ctx.store
+        .transition_workflow_stage(
+            workflow_id,
+            WorkflowStage::Repairing,
+            Some(state_id),
+            None,
+            Some("later failure after repair completed"),
+        )
+        .await?;
+    Ok(failure)
+}
+
+async fn simulate_changes_requested_after_repair(
+    ctx: &TestContext,
+    workflow_id: &str,
+    state: &WorkspaceState,
+) -> Result<HandoffArtifact> {
+    ctx.store
+        .transition_workflow_stage(
+            workflow_id,
+            WorkflowStage::Verifying,
+            Some(&state.state_id),
+            None,
+            None,
+        )
+        .await?;
+    ctx.store
+        .transition_workflow_stage(
+            workflow_id,
+            WorkflowStage::Reviewing,
+            Some(&state.state_id),
+            None,
+            None,
+        )
+        .await?;
+    let reviewer = ctx
+        .store
+        .create_role_execution(
+            workflow_id,
+            &RoleDefinition::reviewer_v1(),
+            "REVIEWING",
+            1,
+            Some(&state.state_id),
+            None,
+        )
+        .await?;
+    ctx.store
+        .set_role_execution_resolved(&reviewer.id, &fixture_target())
+        .await?;
+    let review = ctx
+        .store
+        .save_handoff_artifact(
+            workflow_id,
+            Some(&reviewer.id),
+            HandoffType::Review,
+            Some(&state.state_id),
+            serde_json::to_value(ReviewDecision {
+                decision: ReviewDecisionStatus::ChangesRequested,
+                summary: "repair is incomplete".into(),
+                findings: vec![],
+                requested_changes: vec!["finish the requested extraction".into()],
+                suggested_additional_checks: vec![],
+            })?,
+        )
+        .await?;
+    ctx.store
+        .complete_role_execution_success(&reviewer.id, Some(&state.state_id), Some(&review.id))
+        .await?;
+    record_later_failure(ctx, workflow_id, "REVIEWING", None, &state.state_id).await
+}
+
+fn fast_and_standard_runs(runs: &[VerificationRun], workspace_state_id: &str) -> Vec<String> {
+    runs.iter()
+        .filter(|run| {
+            run.workspace_state_id == workspace_state_id
+                && matches!(
+                    run.tier,
+                    Some(VerificationTier::Fast | VerificationTier::Standard)
+                )
+        })
+        .map(|run| run.id.clone())
+        .collect()
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
+async fn completed_repair_recovery_does_not_replay_after_a_later_failure() -> Result<()> {
+    let ctx = setup_test().await?;
+    enroll_sample_credentials(&ctx.engine.pool).await?;
+
+    // A completed repair whose matching failure handoff is still current means
+    // only the stage update was interrupted. Recovery must continue to VERIFYING.
+    let recovery_repo = tempfile::tempdir()?;
+    std::fs::write(
+        recovery_repo.path().join("candidate.txt"),
+        "unchanged candidate",
+    )?;
+    let (recovery_wf, recovery_state, recovery_role, recovery_failure) = seed_completed_repair(
+        &ctx,
+        "repair-recovery",
+        &format!("att-{}", id()),
+        recovery_repo.path(),
+        2,
+    )
+    .await?;
+    let recovery_executor = Arc::new(SimulatedRoleExecutor::with_approval());
+    let recovery_coordinator =
+        WorkflowCoordinator::new(ctx.engine.pool.clone(), recovery_executor.clone());
+    let recovery_runs_before = ctx
+        .store
+        .verification_store()
+        .list_runs(&recovery_wf.attempt_id)
+        .await?;
+    assert_eq!(
+        recovery_coordinator.step(&recovery_wf.id).await?,
+        WorkflowStepResult::Advanced {
+            from: WorkflowStage::Repairing,
+            to: WorkflowStage::Verifying,
+        }
+    );
+    let recovered = ctx.store.get_workflow_run(&recovery_wf.id).await?.unwrap();
+    assert_eq!(
+        recovered.current_workspace_state_id.as_deref(),
+        Some(recovery_state.state_id.as_str())
+    );
+    assert_eq!(recovered.iteration, 1);
+    assert_eq!(
+        ctx.store.list_role_executions(&recovery_wf.id).await?.len(),
+        1
+    );
+    assert_eq!(
+        recovery_role.handoff_input_id.as_deref(),
+        Some(recovery_failure.id.as_str())
+    );
+    assert!(recovery_executor.recorded_roles.lock().unwrap().is_empty());
+    let recovery_runs_after = ctx
+        .store
+        .verification_store()
+        .list_runs(&recovery_wf.attempt_id)
+        .await?;
+    assert_eq!(
+        fast_and_standard_runs(&recovery_runs_after, &recovery_state.state_id),
+        fast_and_standard_runs(&recovery_runs_before, &recovery_state.state_id)
+    );
+
+    // A reviewer CHANGES_REQUESTED after that repair creates new failure
+    // evidence. At the iteration limit, the workflow must exhaust rather than
+    // replaying the prior repair and verification against the same state.
+    let review_repo = tempfile::tempdir()?;
+    std::fs::write(
+        review_repo.path().join("candidate.txt"),
+        "unchanged candidate",
+    )?;
+    let (review_wf, review_state, _, prior_failure) = seed_completed_repair(
+        &ctx,
+        "review-repair-exhaustion",
+        &format!("att-{}", id()),
+        review_repo.path(),
+        1,
+    )
+    .await?;
+    let later_review_failure =
+        simulate_changes_requested_after_repair(&ctx, &review_wf.id, &review_state).await?;
+    assert_ne!(later_review_failure.id, prior_failure.id);
+    let review_executor = Arc::new(SimulatedRoleExecutor::with_approval());
+    let review_coordinator =
+        WorkflowCoordinator::new(ctx.engine.pool.clone(), review_executor.clone());
+    let review_runs_before = ctx
+        .store
+        .verification_store()
+        .list_runs(&review_wf.attempt_id)
+        .await?;
+    assert_eq!(
+        review_coordinator.step(&review_wf.id).await?,
+        WorkflowStepResult::Terminal(WorkflowStage::Exhausted)
+    );
+    assert_eq!(
+        ctx.store
+            .get_workflow_run(&review_wf.id)
+            .await?
+            .unwrap()
+            .status,
+        WorkflowStage::Exhausted
+    );
+    assert_eq!(
+        ctx.store.list_role_executions(&review_wf.id).await?.len(),
+        2
+    );
+    assert!(review_executor.recorded_roles.lock().unwrap().is_empty());
+    let review_runs_after = ctx
+        .store
+        .verification_store()
+        .list_runs(&review_wf.attempt_id)
+        .await?;
+    assert_eq!(
+        fast_and_standard_runs(&review_runs_after, &review_state.state_id),
+        fast_and_standard_runs(&review_runs_before, &review_state.state_id)
+    );
+
+    // Below the limit, the same later reviewer finding must start a new
+    // repair execution at the next iteration instead of reusing iteration 1.
+    let next_repo = tempfile::tempdir()?;
+    std::fs::write(
+        next_repo.path().join("candidate.txt"),
+        "unchanged candidate",
+    )?;
+    let (next_wf, next_state, previous_repair, _) = seed_completed_repair(
+        &ctx,
+        "review-repair-next-iteration",
+        &format!("att-{}", id()),
+        next_repo.path(),
+        2,
+    )
+    .await?;
+    simulate_changes_requested_after_repair(&ctx, &next_wf.id, &next_state).await?;
+    let next_executor = Arc::new(SimulatedRoleExecutor::with_approval());
+    let next_coordinator = WorkflowCoordinator::new(ctx.engine.pool.clone(), next_executor.clone());
+    assert_eq!(
+        next_coordinator.step(&next_wf.id).await?,
+        WorkflowStepResult::Advanced {
+            from: WorkflowStage::Repairing,
+            to: WorkflowStage::Verifying,
+        }
+    );
+    let next_workflow = ctx.store.get_workflow_run(&next_wf.id).await?.unwrap();
+    assert_eq!(next_workflow.iteration, 2);
+    let next_roles = ctx.store.list_role_executions(&next_wf.id).await?;
+    let next_repair = next_roles
+        .iter()
+        .find(|role| role.stage == "REPAIRING" && role.iteration == 2)
+        .expect("later failure starts a new repair iteration");
+    assert_ne!(next_repair.id, previous_repair.id);
+    assert_eq!(next_repair.status, RoleExecutionStatus::Succeeded);
+    assert_ne!(
+        next_repair.output_workspace_state_id.as_deref(),
+        Some(next_state.state_id.as_str())
+    );
+    assert_eq!(
+        next_workflow.current_workspace_state_id,
+        next_repair.output_workspace_state_id
+    );
+    assert_eq!(
+        next_roles
+            .iter()
+            .filter(|role| role.stage == "REPAIRING")
+            .count(),
+        2
+    );
+    assert_eq!(
+        *next_executor.recorded_roles.lock().unwrap(),
+        vec!["implementer".to_string()]
+    );
+    let active_locks: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM orbit_attempt_workspace_locks WHERE attempt_id = $1 AND revoked_at_ms IS NULL",
+    )
+    .bind(&next_wf.attempt_id)
+    .fetch_one(&ctx.engine.pool)
+    .await?;
+    assert_eq!(active_locks, 0);
+
+    // A FAST/STANDARD failure after a completed repair follows the same rule.
+    let verification_repo = tempfile::tempdir()?;
+    std::fs::write(
+        verification_repo.path().join("candidate.txt"),
+        "unchanged candidate",
+    )?;
+    let (verification_wf, verification_state, _, verification_prior_failure) =
+        seed_completed_repair(
+            &ctx,
+            "verification-repair-exhaustion",
+            &format!("att-{}", id()),
+            verification_repo.path(),
+            1,
+        )
+        .await?;
+    ctx.store
+        .transition_workflow_stage(
+            &verification_wf.id,
+            WorkflowStage::Verifying,
+            Some(&verification_state.state_id),
+            None,
+            None,
+        )
+        .await?;
+    let verification_failure = record_later_failure(
+        &ctx,
+        &verification_wf.id,
+        "VERIFYING_STANDARD",
+        Some("fixture-verification-run"),
+        &verification_state.state_id,
+    )
+    .await?;
+    assert_ne!(verification_failure.id, verification_prior_failure.id);
+    let verification_executor = Arc::new(SimulatedRoleExecutor::with_approval());
+    let verification_coordinator =
+        WorkflowCoordinator::new(ctx.engine.pool.clone(), verification_executor.clone());
+    let verification_runs_before = ctx
+        .store
+        .verification_store()
+        .list_runs(&verification_wf.attempt_id)
+        .await?;
+    assert_eq!(
+        verification_coordinator.step(&verification_wf.id).await?,
+        WorkflowStepResult::Terminal(WorkflowStage::Exhausted)
+    );
+    assert_eq!(
+        ctx.store
+            .get_workflow_run(&verification_wf.id)
+            .await?
+            .unwrap()
+            .status,
+        WorkflowStage::Exhausted
+    );
+    assert_eq!(
+        ctx.store
+            .list_role_executions(&verification_wf.id)
+            .await?
+            .len(),
+        1
+    );
+    assert!(
+        verification_executor
+            .recorded_roles
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+    let verification_runs_after = ctx
+        .store
+        .verification_store()
+        .list_runs(&verification_wf.attempt_id)
+        .await?;
+    assert_eq!(
+        fast_and_standard_runs(&verification_runs_after, &verification_state.state_id),
+        fast_and_standard_runs(&verification_runs_before, &verification_state.state_id)
+    );
+
+    teardown_test(ctx).await
 }
 
 #[tokio::test]

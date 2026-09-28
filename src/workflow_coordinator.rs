@@ -1281,11 +1281,25 @@ impl WorkflowCoordinator {
             return Ok(None);
         }
         let roles = self.store.list_role_executions(&wf.id).await?;
+        let current_repair_failure = if wf.status == WorkflowStage::Repairing {
+            self.store
+                .get_latest_handoff_of_type(&wf.id, HandoffType::FailureEvidence)
+                .await?
+        } else {
+            None
+        };
         let Some(role) = roles.iter().rev().find(|role| {
             role.stage == wf.status.as_str()
                 && role.iteration == wf.iteration
                 && role.status == RoleExecutionStatus::Succeeded
                 && role.handoff_output_id.is_some()
+                && (wf.status != WorkflowStage::Repairing
+                    || (role.handoff_input_id.as_deref()
+                        == current_repair_failure
+                            .as_ref()
+                            .map(|handoff| handoff.id.as_str())
+                        && role.input_workspace_state_id.as_deref()
+                            == wf.current_workspace_state_id.as_deref()))
         }) else {
             return Ok(None);
         };
