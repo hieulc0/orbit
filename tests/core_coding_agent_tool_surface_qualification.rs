@@ -78,6 +78,192 @@ async fn setup_test() -> Result<TestContext> {
     Ok(TestContext { database, store })
 }
 
+async fn start_fixture_agent_execution(
+    ctx: &TestContext,
+    role_execution: &RoleExecution,
+) -> Result<(String, ResolvedExecutionTarget)> {
+    let target = ResolvedExecutionTarget {
+        provider: "fixture".into(),
+        runtime_interface: "fixture-callback".into(),
+        credential_id: Some("synthetic-fixture-account".into()),
+        credential_generation: Some(1),
+        requested_model: Some("fixture-model".into()),
+        resolved_model: Some("fixture-model".into()),
+        runtime_image_digest: None,
+        resolution_reason: "deterministic callback fixture".into(),
+    };
+    ctx.store
+        .set_role_execution_resolved(&role_execution.id, &target)
+        .await?;
+
+    let running_role = ctx
+        .store
+        .get_role_execution(&role_execution.id)
+        .await?
+        .context("fixture RoleExecution was not persisted")?;
+    ensure!(
+        running_role.status == RoleExecutionStatus::Running,
+        "fixture RoleExecution did not enter RUNNING after target resolution"
+    );
+
+    let agent_execution_id = format!("fixture-exec-{}", id());
+    let started_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis() as i64;
+    let initial_metadata = json!({
+        "provider": target.provider,
+        "account_reference": target.credential_id,
+        "credential_generation": target.credential_generation,
+        "requested_model": target.requested_model,
+        "resolved_model": target.resolved_model,
+        "expected_runtime_identity": target.runtime_interface,
+        "observed_model": null,
+        "cleanup_confirmed": false,
+        "tool_call_audit": {
+            "summary": {
+                "total": 0,
+                "successful": 0,
+                "unsuccessful": 0,
+                "mutating": 0,
+                "mutating_unknown": 0,
+                "denied": 0,
+                "unmatched_provider_calls": 0,
+                "unmatched_callbacks": 0
+            },
+            "entries": [],
+            "omitted_count": 0,
+            "provider_tool_names_omitted": 0
+        }
+    });
+    ctx.store
+        .start_agent_execution(
+            &agent_execution_id,
+            &role_execution.id,
+            "fixture-callback",
+            Some(&target.provider),
+            target.resolved_model.as_deref(),
+            started_at_ms,
+            target.requested_model.as_deref(),
+            target.resolved_model.as_deref(),
+            &initial_metadata,
+        )
+        .await?;
+
+    let linked_role = ctx
+        .store
+        .get_role_execution(&role_execution.id)
+        .await?
+        .context("fixture RoleExecution disappeared after AgentExecution start")?;
+    ensure!(
+        linked_role
+            .agent_execution_ids
+            .contains(&agent_execution_id),
+        "fixture AgentExecution was not linked to its RoleExecution"
+    );
+    Ok((agent_execution_id, target))
+}
+
+async fn finish_fixture_agent_execution(
+    ctx: &TestContext,
+    role_execution: &RoleExecution,
+    agent_execution_id: &str,
+    target: &ResolvedExecutionTarget,
+    state: &AcpTurnState<'_>,
+) -> Result<()> {
+    let finished_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis() as i64;
+    ctx.store
+        .finish_agent_execution(
+            agent_execution_id,
+            &role_execution.id,
+            finished_at_ms,
+            "SUCCEEDED",
+            Some("CALLBACK_FIXTURE_COMPLETED"),
+            None,
+            Some("deterministic callback fixture completed"),
+            target.requested_model.as_deref(),
+            target.resolved_model.as_deref(),
+            None,
+            1,
+            state.tool_calls as i64,
+            state.tool_successes as i64,
+            state.tool_failures as i64,
+            &serde_json::to_value(&state.tool_counts)?,
+            &json!({
+                "cleanup_confirmed": true,
+                "lifecycle": {
+                    "phase": "TERMINAL",
+                    "outcome": "SUCCEEDED",
+                    "normalized_reason": "CALLBACK_FIXTURE_COMPLETED",
+                    "cleanup_state": "NO_RUNTIME_RESOURCE_CREATED",
+                    "tool_audit_applicability": "TOOL_PHASE_REACHED"
+                }
+            }),
+        )
+        .await
+}
+
+async fn dispatch_correlated_fixture_callback(
+    server_wire: &mut Wire,
+    client_wire: &mut Wire,
+    state: &mut AcpTurnState<'_>,
+    callback: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let callback_id = callback
+        .get("id")
+        .and_then(serde_json::Value::as_u64)
+        .context("fixture callback id must be an unsigned integer")?;
+    let method = callback
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        .context("fixture callback method is missing")?;
+    let tool_kind = if method.starts_with("terminal/") {
+        "execute"
+    } else if matches!(
+        method,
+        "fs/write_text_file"
+            | "fs/edit_file"
+            | "fs/create_directory"
+            | "fs/move"
+            | "fs/copy"
+            | "fs/delete_file"
+            | "fs/delete_directory"
+    ) {
+        "edit"
+    } else {
+        "read"
+    };
+    let invocation = orbit::acp_wire::OrbitToolInvocationMeta::new(
+        &format!("oti-fixture-{callback_id}"),
+        &format!("provider-call-fixture-{callback_id}"),
+    )?;
+    handle_acp_message(
+        server_wire,
+        state,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": invocation.provider_tool_call_id,
+                    "title": method,
+                    "kind": tool_kind,
+                    "status": "in_progress"
+                }
+            },
+            "_meta": invocation.envelope_metadata()
+        }),
+    )
+    .await?;
+
+    let mut callback = callback;
+    callback["_meta"] = invocation.envelope_metadata();
+    handle_acp_message(server_wire, state, callback).await?;
+    client_wire.read().await
+}
+
 const LIVE_PROVIDER_OPT_IN: &str = "I_AUTHORIZE_LIVE_PROVIDER_CALLS";
 const LIVE_PROVIDER_OPT_IN_ENV: &str = "ORBIT_B34_LIVE_PROVIDER_OPT_IN";
 const LIVE_CREDENTIAL_URL_FILE_ENV: &str = "ORBIT_B34_LIVE_CREDENTIAL_DATABASE_URL_FILE";
@@ -1376,71 +1562,105 @@ fn rendered_tool_audit_contains_only_bounded_safe_correlation_ids() {
 async fn agent_tool_audit_reads_persisted_counter_columns() -> Result<()> {
     let ctx = setup_test().await?;
     let fixture_result = async {
-        let execution_id = format!("execution-{}", id());
-        let tool_counts = json!({"fs.read_text_file": 1});
-        let metadata = json!({
-            "tool_call_audit": {
-                "summary": {
-                    "total": 1,
-                    "successful": 1,
-                    "unsuccessful": 0,
-                    "mutating": 0,
-                    "mutating_unknown": 0,
-                    "denied": 0,
-                    "unmatched_provider_calls": 0
-                },
-                "entries": [{
-                    "sequence": 1,
-                    "provider_tool_name": "orbit_read_file",
-                    "provider_name_mapping": "MATCH",
-                    "canonical_tool_name": "fs.read_text_file",
-                    "advertised_to_provider": true,
-                    "role_allowed": true,
-                    "outcome": "SUCCESS",
-                    "error_code": null,
-                    "mutating": false,
-                    "mutation_applied": false,
-                    "later_callback_observed": false,
-                    "turn_completed": true
-                }],
-                "omitted_count": 0,
-                "provider_tool_names_omitted": 0
-            }
-        });
-        sqlx::query(
-            "INSERT INTO orbit_agent_executions \
-             (id, agent_type, started_at_ms, status, tool_call_count, tool_success_count, \
-              tool_failure_count, tool_counts, metadata) \
-             VALUES ($1, 'fixture', 1, 'SUCCEEDED', 1, 1, 0, $2, $3)",
+        let repo = tempdir()?;
+        fs::write(repo.path().join("README.md"), "fixture read\n")?;
+        let attempt_id = format!("att-{}", id());
+        let repo_path = repo.path().to_string_lossy().into_owned();
+        let workflow = ctx
+            .store
+            .create_workflow_run_full(
+                "software_change_v1",
+                &attempt_id,
+                1,
+                None,
+                None,
+                None,
+                Some("read persisted callback audit counters"),
+                Some(&repo_path),
+                None,
+            )
+            .await?;
+        let role = RoleDefinition::implementer_v1();
+        let role_execution = ctx
+            .store
+            .create_role_execution(&workflow.id, &role, "IMPLEMENTING", 0, None, None)
+            .await?;
+        let (agent_execution_id, target) =
+            start_fixture_agent_execution(&ctx, &role_execution).await?;
+
+        let mut state = AcpTurnState::new(repo.path(), WorkspaceAccess::ReadWrite);
+        state.role_id = Some("implementer".into());
+        state.workspace_identity = Some(repo.path().canonicalize()?.to_string_lossy().into_owned());
+        state.wf_attempt_id = Some(attempt_id);
+        state.role_exec_id = Some(role_execution.id.clone());
+        state.agent_exec_id = Some(agent_execution_id.clone());
+        state.pool = Some(&ctx.engine.pool);
+
+        let (server_in, client_out) = tokio::io::duplex(65536);
+        let (client_in, server_out) = tokio::io::duplex(65536);
+        let mut server_wire = Wire::new(server_in, server_out, 16 * 1024 * 1024);
+        let mut client_wire = Wire::new(client_in, client_out, 16 * 1024 * 1024);
+        let response = dispatch_correlated_fixture_callback(
+            &mut server_wire,
+            &mut client_wire,
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "fs/read_text_file",
+                "params": {"path": "README.md"}
+            }),
         )
-        .bind(&execution_id)
-        .bind(&tool_counts)
-        .bind(&metadata)
-        .execute(&ctx.engine.pool)
+        .await?;
+        ensure!(
+            response["result"]["content"].as_str() == Some("fixture read\n"),
+            "correlated fixture read returned unexpected content"
+        );
+        ensure!(state.tool_calls == 1 && state.tool_successes == 1 && state.tool_failures == 0,
+            "correlated fixture read produced unexpected counters");
+        finish_fixture_agent_execution(
+            &ctx,
+            &role_execution,
+            &agent_execution_id,
+            &target,
+            &state,
+        )
         .await?;
 
+        let tool_counts = json!({"read_file": 1, "fs.read_text_file": 1});
         let (status, calls, successes, failures, persisted_tool_counts, persisted_metadata) =
-            load_agent_tool_audit(&ctx.engine.pool, &execution_id).await?;
+            load_agent_tool_audit(&ctx.engine.pool, &agent_execution_id).await?;
         ensure!(
             status == "SUCCEEDED" && calls == 1 && successes == 1 && failures == 0,
-            "agent tool audit returned incorrect synthetic counters"
+            "agent tool audit returned incorrect callback counters"
         );
         ensure!(
             persisted_tool_counts == tool_counts,
-            "agent tool audit returned incorrect synthetic tool counts"
+            "agent tool audit returned incorrect callback tool counts"
         );
         ensure!(
-            persisted_metadata == metadata,
-            "agent tool audit returned incorrect synthetic metadata"
+            persisted_metadata["tool_call_audit"]["summary"]["total"] == 1
+                && persisted_metadata["tool_call_audit"]["summary"]["callback_count"] == 1
+                && persisted_metadata["tool_call_audit"]["summary"]["provider_notification_count"] == 1
+                && persisted_metadata["tool_call_audit"]["correlation_capability"] == "SUPPORTED"
+                && persisted_metadata["tool_call_audit"]["summary"]["unmatched_provider_calls"] == 0
+                && persisted_metadata["tool_call_audit"]["summary"]["unmatched_callbacks"] == 0
+                && persisted_metadata["tool_call_audit"]["entries"][0]["terminal_state"]
+                    == "SUCCESS"
+                && persisted_metadata["tool_call_audit"]["entries"][0]["provider_update_correlation"]
+                    == "CORRELATED",
+            "agent tool audit returned incorrect callback metadata"
         );
         let report = render_tool_call_audit(&persisted_metadata);
         ensure!(
-            report.contains("orbit_read_file")
+            report.contains("fs/read_text_file")
                 && report.contains("| MATCH |")
                 && report.contains("fs.read_text_file")
                 && report.contains("SUCCESS")
+                && report.contains("oti-fixture-1")
+                && report.contains("provider-call-fixture-1")
                 && !report.contains("provider-secret"),
-            "tool-call audit renderer returned incorrect synthetic report"
+            "tool-call audit renderer returned incorrect correlated report"
         );
         Ok(())
     }
@@ -2087,12 +2307,14 @@ async fn attempt_mutation_lock_enforcement() -> Result<()> {
         .store
         .create_role_execution(&wf.id, &role, "IMPLEMENTING", 0, None, None)
         .await?;
+    let (agent_execution_id, target) = start_fixture_agent_execution(&ctx, &role_exec).await?;
 
     let mut state = AcpTurnState::new(repo.path(), WorkspaceAccess::ReadWrite);
     state.role_id = Some("implementer".into());
     state.workspace_identity = Some(repo.path().canonicalize()?.to_string_lossy().into_owned());
     state.wf_attempt_id = Some(att_id.clone());
     state.role_exec_id = Some(role_exec.id.clone());
+    state.agent_exec_id = Some(agent_execution_id.clone());
     state.pool = Some(&ctx.engine.pool);
 
     // 1. Without lock: mutating call denied with ERR_MUTATION_LOCK_REQUIRED
@@ -2105,8 +2327,9 @@ async fn attempt_mutation_lock_enforcement() -> Result<()> {
             "content": "payload"
         }
     });
-    handle_acp_message(&mut server_wire, &mut state, msg1).await?;
-    let resp1 = client_wire.read().await?;
+    let resp1 =
+        dispatch_correlated_fixture_callback(&mut server_wire, &mut client_wire, &mut state, msg1)
+            .await?;
     assert!(resp1.get("error").is_some());
     assert!(
         resp1["error"]["message"]
@@ -2129,10 +2352,26 @@ async fn attempt_mutation_lock_enforcement() -> Result<()> {
             "content": "payload"
         }
     });
-    handle_acp_message(&mut server_wire, &mut state, msg2).await?;
-    let resp2 = client_wire.read().await?;
+    let resp2 =
+        dispatch_correlated_fixture_callback(&mut server_wire, &mut client_wire, &mut state, msg2)
+            .await?;
     assert!(resp2.get("result").is_some());
     assert_eq!(fs::read_to_string(repo.path().join("test.txt"))?, "payload");
+
+    finish_fixture_agent_execution(&ctx, &role_exec, &agent_execution_id, &target, &state).await?;
+
+    let (status, calls, successes, failures, _, metadata) =
+        load_agent_tool_audit(&ctx.engine.pool, &agent_execution_id).await?;
+    ensure!(
+        status == "SUCCEEDED" && calls == 2 && successes == 1 && failures == 1,
+        "mutation lock fixture did not persist the completed execution counters"
+    );
+    ensure!(
+        metadata["tool_call_audit"]["correlation_capability"] == "SUPPORTED"
+            && metadata["tool_call_audit"]["summary"]["unmatched_provider_calls"] == 0
+            && metadata["tool_call_audit"]["summary"]["unmatched_callbacks"] == 0,
+        "mutation lock fixture did not persist exact callback correlation"
+    );
 
     teardown_test(ctx).await?;
     Ok(())
@@ -2479,6 +2718,7 @@ async fn coordinator_wire_dispatch_enforces_cli_workflow_gates() -> Result<()> {
         .store
         .create_role_execution(&workflow.id, &role, "IMPLEMENTING", 0, None, None)
         .await?;
+    let (agent_execution_id, target) = start_fixture_agent_execution(&ctx, &role_execution).await?;
     ctx.store
         .acquire_workspace_mutation_lock(&attempt_id, &role_execution.id)
         .await?;
@@ -2493,11 +2733,13 @@ async fn coordinator_wire_dispatch_enforces_cli_workflow_gates() -> Result<()> {
     state.workspace_identity = Some(p.canonicalize()?.to_string_lossy().into_owned());
     state.wf_attempt_id = Some(attempt_id.clone());
     state.role_exec_id = Some(role_execution.id.clone());
+    state.agent_exec_id = Some(agent_execution_id.clone());
     state.pool = Some(&ctx.engine.pool);
 
     // 1. fs/create_directory
-    handle_acp_message(
+    let resp = dispatch_correlated_fixture_callback(
         &mut server_wire,
+        &mut client_wire,
         &mut state,
         json!({
             "jsonrpc": "2.0",
@@ -2507,12 +2749,12 @@ async fn coordinator_wire_dispatch_enforces_cli_workflow_gates() -> Result<()> {
         }),
     )
     .await?;
-    let resp = client_wire.read().await?;
     assert!(resp.get("result").is_some());
 
     // 2. fs/write_text_file
-    handle_acp_message(
+    let resp = dispatch_correlated_fixture_callback(
         &mut server_wire,
+        &mut client_wire,
         &mut state,
         json!({
             "jsonrpc": "2.0",
@@ -2522,12 +2764,12 @@ async fn coordinator_wire_dispatch_enforces_cli_workflow_gates() -> Result<()> {
         }),
     )
     .await?;
-    let resp = client_wire.read().await?;
     assert!(resp.get("result").is_some());
 
     // 3. fs/edit_file
-    handle_acp_message(
+    let resp = dispatch_correlated_fixture_callback(
         &mut server_wire,
+        &mut client_wire,
         &mut state,
         json!({
             "jsonrpc": "2.0",
@@ -2537,12 +2779,12 @@ async fn coordinator_wire_dispatch_enforces_cli_workflow_gates() -> Result<()> {
         }),
     )
     .await?;
-    let resp = client_wire.read().await?;
     assert!(resp.get("result").is_some());
 
     // 4. fs/read_text_file
-    handle_acp_message(
+    let resp = dispatch_correlated_fixture_callback(
         &mut server_wire,
+        &mut client_wire,
         &mut state,
         json!({
             "jsonrpc": "2.0",
@@ -2552,7 +2794,6 @@ async fn coordinator_wire_dispatch_enforces_cli_workflow_gates() -> Result<()> {
         }),
     )
     .await?;
-    let resp = client_wire.read().await?;
     assert!(
         resp["result"]["content"]
             .as_str()
@@ -2561,8 +2802,9 @@ async fn coordinator_wire_dispatch_enforces_cli_workflow_gates() -> Result<()> {
     );
 
     // 5. fs/copy
-    handle_acp_message(
+    let resp = dispatch_correlated_fixture_callback(
         &mut server_wire,
+        &mut client_wire,
         &mut state,
         json!({
             "jsonrpc": "2.0",
@@ -2572,12 +2814,12 @@ async fn coordinator_wire_dispatch_enforces_cli_workflow_gates() -> Result<()> {
         }),
     )
     .await?;
-    let resp = client_wire.read().await?;
     assert!(resp.get("result").is_some());
 
     // 6. fs/list_directory
-    handle_acp_message(
+    let resp = dispatch_correlated_fixture_callback(
         &mut server_wire,
+        &mut client_wire,
         &mut state,
         json!({
             "jsonrpc": "2.0",
@@ -2587,12 +2829,12 @@ async fn coordinator_wire_dispatch_enforces_cli_workflow_gates() -> Result<()> {
         }),
     )
     .await?;
-    let resp = client_wire.read().await?;
     assert!(resp.get("result").is_some());
 
     // 7. fs/find_path
-    handle_acp_message(
+    let resp = dispatch_correlated_fixture_callback(
         &mut server_wire,
+        &mut client_wire,
         &mut state,
         json!({
             "jsonrpc": "2.0",
@@ -2602,12 +2844,12 @@ async fn coordinator_wire_dispatch_enforces_cli_workflow_gates() -> Result<()> {
         }),
     )
     .await?;
-    let resp = client_wire.read().await?;
     assert!(resp.get("result").is_some());
 
     // 8. search/grep
-    handle_acp_message(
+    let resp = dispatch_correlated_fixture_callback(
         &mut server_wire,
+        &mut client_wire,
         &mut state,
         json!({
             "jsonrpc": "2.0",
@@ -2617,12 +2859,12 @@ async fn coordinator_wire_dispatch_enforces_cli_workflow_gates() -> Result<()> {
         }),
     )
     .await?;
-    let resp = client_wire.read().await?;
     assert!(resp.get("result").is_some());
 
     // 9. git/status
-    handle_acp_message(
+    let resp = dispatch_correlated_fixture_callback(
         &mut server_wire,
+        &mut client_wire,
         &mut state,
         json!({
             "jsonrpc": "2.0",
@@ -2632,13 +2874,13 @@ async fn coordinator_wire_dispatch_enforces_cli_workflow_gates() -> Result<()> {
         }),
     )
     .await?;
-    let resp = client_wire.read().await?;
     assert!(resp.get("result").is_some());
 
     // 10. terminal/create is always denied until the CLI has a confined owner.
     let terminal_marker = p.join("terminal-must-not-run");
-    handle_acp_message(
+    let resp = dispatch_correlated_fixture_callback(
         &mut server_wire,
+        &mut client_wire,
         &mut state,
         json!({
             "jsonrpc": "2.0",
@@ -2651,7 +2893,6 @@ async fn coordinator_wire_dispatch_enforces_cli_workflow_gates() -> Result<()> {
         }),
     )
     .await?;
-    let resp = client_wire.read().await?;
     assert!(resp.get("error").is_some());
     assert!(
         resp["error"]["message"]
@@ -2671,6 +2912,32 @@ async fn coordinator_wire_dispatch_enforces_cli_workflow_gates() -> Result<()> {
     ctx.store
         .release_workspace_mutation_lock(&attempt_id, &role_execution.id)
         .await?;
+    finish_fixture_agent_execution(&ctx, &role_execution, &agent_execution_id, &target, &state)
+        .await?;
+
+    let (status, calls, successes, failures, _, metadata) =
+        load_agent_tool_audit(&ctx.engine.pool, &agent_execution_id).await?;
+    ensure!(
+        status == "SUCCEEDED" && calls == 10 && successes == 9 && failures == 1,
+        "wire dispatch fixture did not persist the expected execution counters"
+    );
+    ensure!(
+        metadata["tool_call_audit"]["correlation_capability"] == "SUPPORTED"
+            && metadata["tool_call_audit"]["summary"]["provider_notification_count"] == 10
+            && metadata["tool_call_audit"]["summary"]["callback_count"] == 10
+            && metadata["tool_call_audit"]["summary"]["unmatched_provider_calls"] == 0
+            && metadata["tool_call_audit"]["summary"]["unmatched_callbacks"] == 0,
+        "wire dispatch fixture did not persist exact invocation correlation"
+    );
+    ensure!(
+        metadata["tool_call_audit"]["entries"]
+            .as_array()
+            .is_some_and(|entries| entries.iter().all(|entry| {
+                entry["provider_update_correlation"] == "CORRELATED"
+                    && entry["terminal_state"] != "UNRESOLVED"
+            })),
+        "wire dispatch fixture contains an unresolved tool invocation"
+    );
     teardown_test(ctx).await?;
     Ok(())
 }
@@ -2716,6 +2983,16 @@ async fn real_acp_execution_row_survives_credential_resolution_failure() -> Resu
         ctx.store
             .set_role_execution_resolved(&role_execution.id, &target)
             .await?;
+        let running_role = ctx
+            .store
+            .get_role_execution(&role_execution.id)
+            .await?
+            .context("early-failure RoleExecution was not persisted")?;
+        ensure!(
+            running_role.status == RoleExecutionStatus::Running
+                && running_role.resolved_target.as_ref() == Some(&target),
+            "early-failure fixture did not complete normal target resolution"
+        );
         let error = match RealAcpRoleExecutor
             .execute_role_with_credential_catalog(
                 &ctx.engine.pool,
@@ -2742,12 +3019,22 @@ async fn real_acp_execution_row_survives_credential_resolution_failure() -> Resu
         );
 
         let row = sqlx::query(
-            "SELECT status, provider, requested_model, resolved_model, actual_model, termination_reason, tool_call_count, tool_success_count, tool_failure_count, metadata FROM orbit_agent_executions WHERE role_execution_id = $1",
+            "SELECT id, status, provider, requested_model, resolved_model, actual_model, termination_reason, tool_call_count, tool_success_count, tool_failure_count, metadata FROM orbit_agent_executions WHERE role_execution_id = $1",
         )
         .bind(&role_execution.id)
         .fetch_one(&ctx.engine.pool)
         .await?;
+        let agent_execution_id: String = row.try_get("id")?;
         let metadata: serde_json::Value = row.try_get("metadata")?;
+        let linked_role = ctx
+            .store
+            .get_role_execution(&role_execution.id)
+            .await?
+            .context("early-failure RoleExecution disappeared")?;
+        ensure!(
+            linked_role.agent_execution_ids.contains(&agent_execution_id),
+            "early-failure AgentExecution was not linked to its RoleExecution"
+        );
         ensure!(row.try_get::<String, _>("status")? == "FAILED", "unexpected AE status");
         ensure!(row.try_get::<String, _>("provider")? == "codex", "provider was not persisted");
         ensure!(

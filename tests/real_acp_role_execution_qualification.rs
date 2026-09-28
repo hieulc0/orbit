@@ -9,7 +9,7 @@
 
 use anyhow::{Context, Result, ensure};
 use orbit::{
-    acp_wire::Wire,
+    acp_wire::{OrbitToolInvocationMeta, Wire},
     model::id,
     regression_strategy::{
         RegressionFallbackBehavior, RegressionPolicy, RegressionStore, SelectionPolicy,
@@ -122,6 +122,13 @@ struct OfflineRoleCallbacks {
     tool_failures: u64,
 }
 
+struct OfflineRoleTurn {
+    raw_output: String,
+    tool_calls: u64,
+    tool_successes: u64,
+    tool_failures: u64,
+}
+
 #[derive(Default)]
 struct DeterministicAcpTransport {
     callbacks: Mutex<Vec<OfflineRoleCallbacks>>,
@@ -134,11 +141,12 @@ struct OfflineRoleContext<'a> {
     role: &'a RoleDefinition,
     target: &'a ResolvedExecutionTarget,
     repo_path: &'a Path,
+    agent_exec_id: &'a str,
     input_handoff: Option<&'a HandoffArtifact>,
 }
 
 impl DeterministicAcpTransport {
-    async fn run_role(&self, context: OfflineRoleContext<'_>) -> Result<String> {
+    async fn run_role(&self, context: OfflineRoleContext<'_>) -> Result<OfflineRoleTurn> {
         let OfflineRoleContext {
             pool,
             wf_run,
@@ -146,6 +154,7 @@ impl DeterministicAcpTransport {
             role,
             target,
             repo_path,
+            agent_exec_id,
             input_handoff,
         } = context;
         let (orbit_read, peer_write) = tokio::io::duplex(65_536);
@@ -159,6 +168,7 @@ impl DeterministicAcpTransport {
         state.pool = Some(pool);
         state.wf_attempt_id = Some(wf_run.attempt_id.clone());
         state.role_exec_id = Some(role_exec.id.clone());
+        state.agent_exec_id = Some(agent_exec_id.to_owned());
 
         let read_response = Self::dispatch_callback(
             &mut orbit_wire,
@@ -333,7 +343,12 @@ impl DeterministicAcpTransport {
                 tool_failures: state.tool_failures,
             });
 
-        Ok(state.agent_output)
+        Ok(OfflineRoleTurn {
+            raw_output: state.agent_output,
+            tool_calls: state.tool_calls,
+            tool_successes: state.tool_successes,
+            tool_failures: state.tool_failures,
+        })
     }
 
     async fn dispatch_callback(
@@ -344,12 +359,38 @@ impl DeterministicAcpTransport {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value> {
+        let provider_tool_call_id = format!("provider-{request_id}");
+        let invocation =
+            OrbitToolInvocationMeta::new(&format!("oti-{request_id}"), &provider_tool_call_id)?;
+        let kind = match method {
+            "fs/read_text_file" => "read",
+            "fs/write_text_file" => "edit",
+            _ => "other",
+        };
+        peer_wire
+            .notify_with_tool_invocation(
+                "session/update",
+                serde_json::json!({
+                    "update": {
+                        "sessionUpdate":"tool_call",
+                        "toolCallId":provider_tool_call_id,
+                        "title":method,
+                        "kind":kind,
+                        "status":"in_progress"
+                    }
+                }),
+                &invocation,
+            )
+            .await?;
+        let update = orbit_wire.read().await?;
+        handle_acp_message(orbit_wire, state, update).await?;
         peer_wire
             .send(serde_json::json!({
                 "jsonrpc":"2.0",
                 "id":request_id,
                 "method":method,
-                "params":params
+                "params":params,
+                "_meta":invocation.envelope_metadata()
             }))
             .await?;
         let callback = orbit_wire.read().await?;
@@ -406,7 +447,43 @@ impl RoleAgentExecutor for OfflineAcpRoleExecutor {
             other => anyhow::bail!("unexpected role in offline ACP executor: {other}"),
         }
 
-        let raw_output = self
+        let agent_exec_id = format!("acp-exec-{}", id());
+        let started_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis() as i64;
+        let store = WorkflowStore::new(pool.clone());
+        let initial_metadata = serde_json::json!({
+            "provider": target.provider,
+            "account_reference": target.credential_id,
+            "credential_generation": target.credential_generation,
+            "requested_model": target.requested_model,
+            "resolved_model": target.resolved_model,
+            "expected_runtime_identity": target.runtime_interface,
+            "expected_runtime_profile": target.runtime_image_digest,
+            "execution_mode": "deterministic_offline_fixture",
+            "cleanup_confirmed": false,
+            "observed_model": null,
+            "lifecycle": {
+                "phase": "SESSION_READY",
+                "tool_audit_applicability": "APPLICABLE",
+                "milestones": ["SESSION_READY"]
+            }
+        });
+        store
+            .start_agent_execution(
+                &agent_exec_id,
+                &role_exec.id,
+                &format!("{}-acp", target.provider),
+                Some(&target.provider),
+                target.resolved_model.as_deref(),
+                started_at_ms,
+                target.requested_model.as_deref(),
+                target.resolved_model.as_deref(),
+                &initial_metadata,
+            )
+            .await?;
+
+        let turn = self
             .transport
             .run_role(OfflineRoleContext {
                 pool,
@@ -415,13 +492,50 @@ impl RoleAgentExecutor for OfflineAcpRoleExecutor {
                 role,
                 target,
                 repo_path,
+                agent_exec_id: &agent_exec_id,
                 input_handoff,
             })
             .await?;
+        let finished_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis() as i64;
+        let terminal_metadata = serde_json::json!({
+            "cleanup_confirmed": true,
+            "observed_model": null,
+            "execution_mode": "deterministic_offline_fixture",
+            "lifecycle": {
+                "phase": "TERMINAL",
+                "outcome": "SUCCEEDED",
+                "normalized_reason": "OFFLINE_FIXTURE_COMPLETED",
+                "tool_audit_applicability": "APPLICABLE",
+                "cleanup_state": "CONFIRMED",
+                "runtime_resource_created": false
+            }
+        });
+        store
+            .finish_agent_execution(
+                &agent_exec_id,
+                &role_exec.id,
+                finished_at_ms,
+                "SUCCEEDED",
+                Some("OFFLINE_FIXTURE_COMPLETED"),
+                Some(0),
+                Some("deterministic offline ACP peer completed"),
+                target.requested_model.as_deref(),
+                target.resolved_model.as_deref(),
+                None,
+                1,
+                turn.tool_calls as i64,
+                turn.tool_successes as i64,
+                turn.tool_failures as i64,
+                &serde_json::json!({}),
+                &terminal_metadata,
+            )
+            .await?;
         Ok(RoleExecutionOutcome {
-            raw_output,
-            agent_execution_ids: vec![],
-            termination_reason: Some("deterministic offline ACP peer; endpoints dropped".into()),
+            raw_output: turn.raw_output,
+            agent_execution_ids: vec![agent_exec_id],
+            termination_reason: Some("OFFLINE_FIXTURE_COMPLETED".into()),
         })
     }
 }
@@ -1185,13 +1299,57 @@ async fn full_coordinator_offline_acp_callbacks_handoffs_and_verification() -> R
             .with_context(|| format!("{expected_role} has no durable resolved target"))?;
         let expected = match expected_role {
             "planner" | "implementer" => ("codex", "codex-main", "gpt-6-luna"),
-            "reviewer" => ("antigravity", "antigravity-ch9b2013", "gemini-3.8-flash"),
+            "reviewer" => ("codex", "codex-main", "gpt-6-luna"),
             _ => unreachable!(),
         };
         assert_eq!(target.provider, expected.0);
         assert_eq!(target.credential_id.as_deref(), Some(expected.1));
         assert_eq!(target.resolved_model.as_deref(), Some(expected.2));
         assert!(target.resolution_reason.contains("reset-aware rank=1"));
+        assert!(
+            target
+                .resolution_reason
+                .contains("tool_audit_correlation=EXACT")
+        );
+        if expected_role == "reviewer" {
+            assert!(
+                target
+                    .resolution_reason
+                    .contains("antigravity-acp:antigravity-ch9b2013:CAPABILITY_MISMATCH")
+            );
+            assert!(target.resolution_reason.contains("provided=PARTIAL"));
+        }
+
+        assert_eq!(execution.agent_execution_ids.len(), 1);
+        let agent_execution_id = &execution.agent_execution_ids[0];
+        let (agent_status, finished_at_ms, tool_call_count, metadata): (
+            String,
+            Option<i64>,
+            i64,
+            serde_json::Value,
+        ) = sqlx::query_as(
+            "SELECT status, finished_at_ms, tool_call_count, metadata FROM orbit_agent_executions WHERE id = $1 AND role_execution_id = $2",
+        )
+        .bind(agent_execution_id)
+        .bind(&execution.id)
+        .fetch_one(&ctx.engine.pool)
+        .await?;
+        assert_eq!(agent_status, "SUCCEEDED");
+        assert!(finished_at_ms.is_some());
+        assert!(tool_call_count > 0);
+        assert_eq!(metadata["cleanup_confirmed"], true);
+        assert_eq!(
+            metadata["tool_call_audit"]["correlation_capability"],
+            "SUPPORTED"
+        );
+        assert_eq!(
+            metadata["tool_call_audit"]["summary"]["unmatched_provider_calls"],
+            0
+        );
+        assert_eq!(
+            metadata["tool_call_audit"]["summary"]["unmatched_callbacks"],
+            0
+        );
     }
 
     {

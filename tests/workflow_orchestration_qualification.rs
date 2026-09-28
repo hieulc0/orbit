@@ -173,15 +173,16 @@ async fn real_planner_codex_acp() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
-async fn real_antigravity_role_execution() -> Result<()> {
+async fn reviewer_excludes_runtime_without_exact_tool_audit() -> Result<()> {
     let ctx = setup_test().await?;
     enroll_sample_credentials(&ctx.engine.pool).await?;
 
     let role = RoleDefinition::reviewer_v1();
     let target = RoleRuntimeResolver::resolve_target_live(&ctx.engine.pool, &role, None).await?;
-    assert_eq!(target.provider, "antigravity");
-    assert_eq!(target.runtime_interface, "antigravity-acp");
-    assert_eq!(target.requested_model.as_deref(), Some("gemini-3.8-flash"));
+    assert_eq!(target.provider, "codex");
+    assert_eq!(target.runtime_interface, "codex-acp");
+    assert_eq!(target.requested_model.as_deref(), Some("gpt-6-luna"));
+    assert!(target.resolution_reason.contains("CAPABILITY_MISMATCH"));
 
     teardown_test(ctx).await
 }

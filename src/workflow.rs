@@ -3238,10 +3238,10 @@ mod tests {
         let stale_reason = runtime_candidate_selection_reason(&unknown_stale, 2, "[]");
         let absent_reason = runtime_candidate_selection_reason(&unknown_absent, 3, "[]");
         assert!(stale_reason.contains(
-            "weekly_reset_unknown_or_not_applicable; quota_snapshot_freshness=STALE; availability=Unknown; 5h_remaining=unknown; 7d_remaining=unknown; 7d_reset_at_ms=unknown"
+            "weekly_reset_unknown_or_not_applicable; tool_audit_correlation=EXACT; quota_snapshot_freshness=STALE; availability=Unknown; 5h_remaining=unknown; 7d_remaining=unknown; 7d_reset_at_ms=unknown"
         ));
         assert!(absent_reason.contains(
-            "weekly_reset_unknown_or_not_applicable; quota_snapshot_freshness=ABSENT; availability=Unknown; 5h_remaining=unknown; 7d_remaining=unknown; 7d_reset_at_ms=unknown"
+            "weekly_reset_unknown_or_not_applicable; tool_audit_correlation=EXACT; quota_snapshot_freshness=ABSENT; availability=Unknown; 5h_remaining=unknown; 7d_remaining=unknown; 7d_reset_at_ms=unknown"
         ));
 
         let mut ranked = vec![unknown_stale, known_fresh.clone(), unknown_absent];
