@@ -79,6 +79,14 @@ impl acp::Client for Client {
 
 #[async_trait::async_trait(?Send)]
 impl OrbitAcpClient for Client {
+    async fn list_directory(&self, path: &Path, recursive: bool) -> Result<String> {
+        self.record(
+            "list_directory",
+            json!({"path": path.to_string_lossy(), "recursive": recursive}),
+        );
+        Ok("Repository entries listed.".into())
+    }
+
     async fn create_directory(&self, path: &Path, recursive: bool) -> Result<String> {
         self.record(
             "create_directory",
@@ -165,6 +173,66 @@ fn call(id: &str, tool: &str, arguments: Value) -> ToolCall {
     serde_json::from_value(json!({"threadId":"thread-1","turnId":"turn-1","callId":id,
         "namespace":null,"tool":tool,"arguments":arguments}))
     .unwrap()
+}
+
+#[tokio::test]
+async fn codex_bridge_lists_virtual_workspace_root_without_opening_root_mutations() -> Result<()> {
+    let client = Client::default();
+    let mut router = ToolRouter::new(
+        "session-1",
+        "thread-1",
+        "turn-1",
+        Path::new("/workspace"),
+        &[
+            "list_directory".into(),
+            "read_file".into(),
+            "write_file".into(),
+            "delete_directory".into(),
+        ],
+        16,
+    )?;
+
+    let listed = router
+        .dispatch(
+            &client,
+            call(
+                "list-root",
+                "orbit_list_directory",
+                json!({"path":"/workspace"}),
+            ),
+        )
+        .await?;
+    assert_eq!(listed["success"], true);
+    assert_eq!(client.calls.borrow()[0].1["path"], "/workspace/.");
+
+    for (id, tool, arguments) in [
+        ("read-root", "orbit_read_file", json!({"path":"/workspace"})),
+        (
+            "write-root",
+            "orbit_write_file",
+            json!({"path":"/workspace","content":"invalid"}),
+        ),
+        (
+            "delete-root",
+            "orbit_delete_directory",
+            json!({"path":"/workspace","recursive":true}),
+        ),
+        (
+            "list-outside",
+            "orbit_list_directory",
+            json!({"path":"/workspace-private"}),
+        ),
+        ("list-empty", "orbit_list_directory", json!({"path":""})),
+    ] {
+        assert!(
+            router
+                .dispatch(&client, call(id, tool, arguments))
+                .await
+                .is_err()
+        );
+    }
+    assert_eq!(client.calls.borrow().len(), 1);
+    Ok(())
 }
 
 #[test]

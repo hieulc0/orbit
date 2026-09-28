@@ -241,24 +241,31 @@ impl ToolRouter {
                 | "list_directory"
         ) {
             let path = arguments["path"].as_str().context("tool path missing")?;
-            arguments["path"] = json!(normalize_workspace_path(&self.workspace, path)?);
+            arguments["path"] = json!(normalize_workspace_path(
+                &self.workspace,
+                path,
+                tool == "list_directory",
+            )?);
         } else if matches!(
             tool,
             "find_path" | "grep" | "git_status" | "git_diff" | "git_show"
         ) {
             if let Some(p) = arguments.get("path").and_then(|v| v.as_str()) {
-                arguments["path"] = json!(normalize_workspace_path(&self.workspace, p)?);
+                arguments["path"] = json!(normalize_workspace_path(&self.workspace, p, true)?);
             }
         } else if matches!(tool, "move" | "copy") {
             let source = arguments["source"]
                 .as_str()
                 .context("tool source missing")?;
-            arguments["source"] = json!(normalize_workspace_path(&self.workspace, source)?);
+            arguments["source"] = json!(normalize_workspace_path(&self.workspace, source, false)?);
             let destination = arguments["destination"]
                 .as_str()
                 .context("tool destination missing")?;
-            arguments["destination"] =
-                json!(normalize_workspace_path(&self.workspace, destination)?);
+            arguments["destination"] = json!(normalize_workspace_path(
+                &self.workspace,
+                destination,
+                false
+            )?);
         }
         crate::coding_agent::tool_command(tool, &arguments, 1)?;
         self.seen.insert(call.call_id);
@@ -469,7 +476,7 @@ impl ToolRouter {
 /// Codex Code Mode may hand Orbit a path rooted at the virtual ACP workspace.
 /// Normalize only that exact root; shared validation and the workspace jail still
 /// reject parent traversal, other absolute paths and symlink escapes.
-fn normalize_workspace_path(workspace: &Path, value: &str) -> Result<String> {
+fn normalize_workspace_path(workspace: &Path, value: &str, allow_root: bool) -> Result<String> {
     let path = Path::new(value);
     let relative = if path.is_absolute() {
         path.strip_prefix(workspace)
@@ -480,6 +487,9 @@ fn normalize_workspace_path(workspace: &Path, value: &str) -> Result<String> {
     let normalized = relative
         .to_str()
         .context("Codex tool path is not valid UTF-8")?;
+    if normalized.is_empty() && path.is_absolute() && allow_root {
+        return Ok(".".to_owned());
+    }
     ensure!(
         !normalized.is_empty(),
         "Codex tool path names the workspace root"

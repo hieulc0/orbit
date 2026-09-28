@@ -437,7 +437,7 @@ pub fn tool_definitions(names: &[String]) -> Result<Vec<Value>> {
             "delete_file" => ("Delete a single file inside the repository workspace.", json!({"path":{"type":"string"}}), vec!["path"]),
             "delete_directory" => ("Remove an empty directory, or recursively only when explicitly requested, inside the repository workspace.", json!({"path":{"type":"string"},"recursive":{"type":"boolean"}}), vec!["path"]),
             "shell" => ("Run a bounded shell command in the isolated workspace, including tests.", json!({"command":{"type":"string"}}), vec!["command"]),
-            "list_directory" => ("List entries in a workspace directory.", json!({"path":{"type":"string"},"recursive":{"type":"boolean"}}), vec!["path"]),
+            "list_directory" => ("List entries in a workspace directory.", json!({"path":{"type":"string","description":"Workspace-relative directory; use '.' or the virtual workspace root to list the repository root."},"recursive":{"type":"boolean"}}), vec!["path"]),
             "find_path" => ("Discover paths matching a pattern.", json!({"pattern":{"type":"string"},"path":{"type":"string"}}), vec!["pattern"]),
             "grep" => ("Search text across workspace files.", json!({"query":{"type":"string"},"path":{"type":"string"},"case_sensitive":{"type":"boolean"}}), vec!["query"]),
             "edit_file" => ("Targeted file editing replacing exact match text.", json!({"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"},"replace_all":{"type":"boolean"}}), vec!["path","old_text","new_text"]),
