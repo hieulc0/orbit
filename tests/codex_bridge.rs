@@ -7,6 +7,7 @@ use std::{cell::RefCell, path::Path};
 #[derive(Default)]
 struct Client {
     calls: RefCell<Vec<(&'static str, Value)>>,
+    read_meta: RefCell<Option<acp::Meta>>,
     fail_wait: bool,
     exit_code: Option<u32>,
 }
@@ -33,7 +34,7 @@ impl acp::Client for Client {
         request: acp::ReadTextFileRequest,
     ) -> acp::Result<acp::ReadTextFileResponse> {
         self.record("read", request);
-        Ok(acp::ReadTextFileResponse::new("fixture file"))
+        Ok(acp::ReadTextFileResponse::new("fixture file").meta(self.read_meta.borrow_mut().take()))
     }
     async fn write_text_file(
         &self,
@@ -363,16 +364,25 @@ async fn codex_bridge_routes_file_and_terminal_effects_only_to_client() -> Resul
         )
         .await?;
     assert_eq!(read["contentItems"][0]["text"], "fixture file");
-    router
+    client.read_meta.replace(Some(serde_json::from_value(json!({
+        "orbit": {"truncated": true, "total_bytes": 90_000, "next_line": 42}
+    }))?));
+    let ranged_read = router
         .dispatch(
             &client,
             call(
                 "read-absolute-1",
                 "orbit_read_file",
-                json!({"path":"/workspace/src/file"}),
+                json!({"path":"/workspace/src/file", "line":12, "limit":30}),
             ),
         )
         .await?;
+    assert!(
+        ranged_read["contentItems"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("continue reading this path with line=42")
+    );
     router
         .dispatch(
             &client,
@@ -400,6 +410,8 @@ async fn codex_bridge_routes_file_and_terminal_effects_only_to_client() -> Resul
     );
     assert_eq!(requests[0].1["path"], "/workspace/src/file");
     assert_eq!(requests[1].1["path"], "/workspace/src/file");
+    assert_eq!(requests[1].1["line"], 12);
+    assert_eq!(requests[1].1["limit"], 30);
     assert_eq!(requests[3].1["command"], "sh");
     assert_eq!(requests[3].1["args"], json!(["-c", "sh test.sh"]));
     assert_eq!(requests[3].1["outputByteLimit"], 65536);

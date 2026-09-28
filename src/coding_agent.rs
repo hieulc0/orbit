@@ -427,10 +427,20 @@ pub fn tool_permissions(name: &str) -> Option<&'static [&'static str]> {
     }
 }
 
+const DEFAULT_READ_FILE_LINE_LIMIT: u32 = 200;
+
 pub fn tool_definitions(names: &[String]) -> Result<Vec<Value>> {
     names.iter().map(|name| {
         let (description, properties, required) = match name.as_str() {
-            "read_file" => ("Read a workspace text file (up to 64 KiB).", json!({"path":{"type":"string"}}), vec!["path"]),
+            "read_file" => (
+                "Read a workspace text file. Optional line and limit request a bounded 1-based line range. Output is bounded and may be truncated.",
+                json!({
+                    "path":{"type":"string"},
+                    "line":{"type":"integer","minimum":1,"description":"Optional 1-based line to start reading from."},
+                    "limit":{"type":"integer","minimum":1,"description":"Optional maximum number of lines to read."}
+                }),
+                vec!["path"],
+            ),
             "write_file" => ("Write a workspace text file (up to 64 KiB).", json!({"path":{"type":"string"},"content":{"type":"string"}}), vec!["path","content"]),
             "create_directory" => ("Create a directory inside the repository workspace.", json!({"path":{"type":"string"},"recursive":{"type":"boolean"}}), vec!["path"]),
             "move" => ("Move or rename a file or directory inside the repository workspace.", json!({"source":{"type":"string"},"destination":{"type":"string"}}), vec!["source","destination"]),
@@ -465,6 +475,8 @@ pub fn tool_command(name: &str, arguments: &Value, timeout: u64) -> Result<Comma
     #[serde(deny_unknown_fields)]
     struct Read {
         path: String,
+        line: Option<u32>,
+        limit: Option<u32>,
     }
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -573,13 +585,39 @@ pub fn tool_command(name: &str, arguments: &Value, timeout: u64) -> Result<Comma
         "read_file" => {
             let args: Read = serde_json::from_value(arguments.clone())?;
             path(&args.path)?;
-            vec![
-                "head".into(),
-                "-c".into(),
-                "65536".into(),
-                "--".into(),
-                args.path,
-            ]
+            ensure!(
+                args.line.is_none_or(|line| line > 0),
+                "read line must be positive"
+            );
+            ensure!(
+                args.limit.is_none_or(|limit| limit > 0),
+                "read limit must be positive"
+            );
+            if args.line.is_some() || args.limit.is_some() {
+                let start = args.line.unwrap_or(1);
+                let end = args
+                    .limit
+                    .map(|limit| u64::from(start) + u64::from(limit) - 1)
+                    .unwrap_or_else(|| {
+                        u64::from(start) + u64::from(DEFAULT_READ_FILE_LINE_LIMIT) - 1
+                    })
+                    .to_string();
+                vec![
+                    "sed".into(),
+                    "-n".into(),
+                    format!("{start},{end}p"),
+                    "--".into(),
+                    args.path,
+                ]
+            } else {
+                vec![
+                    "head".into(),
+                    "-c".into(),
+                    "65536".into(),
+                    "--".into(),
+                    args.path,
+                ]
+            }
         }
         "write_file" => {
             let args: Write = serde_json::from_value(arguments.clone())?;
@@ -718,7 +756,43 @@ pub fn tool_command(name: &str, arguments: &Value, timeout: u64) -> Result<Comma
 
 #[cfg(test)]
 mod tests {
-    use super::{durable_tool_result, tool_definitions};
+    use super::{durable_tool_result, tool_command, tool_definitions};
+
+    #[test]
+    fn read_file_schema_and_command_support_bounded_line_ranges() -> anyhow::Result<()> {
+        let definition = &tool_definitions(&["read_file".into()])?[0];
+        let properties = &definition["parameters"]["properties"];
+        assert_eq!(properties["line"]["minimum"], 1);
+        assert_eq!(properties["limit"]["minimum"], 1);
+        let description = definition["description"].as_str().unwrap_or_default();
+        assert!(description.contains("Output is bounded and may be truncated"));
+        assert!(!description.contains("next_line"));
+
+        let command = tool_command(
+            "read_file",
+            &serde_json::json!({"path":"src/file.rs", "line":12, "limit":30}),
+            10,
+        )?;
+        assert_eq!(command.argv, ["sed", "-n", "12,41p", "--", "src/file.rs"]);
+        let line_only = tool_command(
+            "read_file",
+            &serde_json::json!({"path":"src/file.rs", "line":12}),
+            10,
+        )?;
+        assert_eq!(
+            line_only.argv,
+            ["sed", "-n", "12,211p", "--", "src/file.rs"]
+        );
+        assert!(
+            tool_command(
+                "read_file",
+                &serde_json::json!({"path":"src/file.rs", "line":0}),
+                10,
+            )
+            .is_err()
+        );
+        Ok(())
+    }
 
     #[test]
     fn git_path_filter_schema_explains_workspace_relative_contract() -> anyhow::Result<()> {

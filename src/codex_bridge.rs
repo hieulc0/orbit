@@ -271,18 +271,35 @@ impl ToolRouter {
         self.seen.insert(call.call_id);
         let text = match tool {
             "read_file" => {
+                let line = optional_positive_u32(&arguments, "line")?;
+                let limit = optional_positive_u32(&arguments, "limit")?;
                 let response = client
-                    .read_text_file(acp::ReadTextFileRequest::new(
-                        self.session.clone(),
-                        self.workspace.join(arguments["path"].as_str().unwrap()),
-                    ))
+                    .read_text_file(
+                        acp::ReadTextFileRequest::new(
+                            self.session.clone(),
+                            self.workspace.join(arguments["path"].as_str().unwrap()),
+                        )
+                        .line(line)
+                        .limit(limit),
+                    )
                     .await
                     .map_err(|_| anyhow::anyhow!("ACP read failed"))?;
-                ensure!(
-                    response.content.len() <= 65536,
-                    "ACP file response too large"
-                );
-                response.content
+                let continuation = response
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.get("orbit"))
+                    .filter(|meta| meta.get("truncated").and_then(Value::as_bool) == Some(true))
+                    .and_then(|meta| meta.get("next_line").and_then(Value::as_u64));
+                let text = if let Some(next_line) = continuation {
+                    format!(
+                        "{}\n[Orbit file page truncated; continue reading this path with line={next_line}.]",
+                        response.content
+                    )
+                } else {
+                    response.content
+                };
+                ensure!(text.len() <= 65536, "ACP file response too large");
+                text
             }
             "write_file" => {
                 client
@@ -471,6 +488,18 @@ impl ToolRouter {
             .map_err(|_| anyhow::anyhow!("ACP terminal release unconfirmed"))?;
         result
     }
+}
+
+fn optional_positive_u32(arguments: &Value, name: &str) -> Result<Option<u32>> {
+    let Some(value) = arguments.get(name) else {
+        return Ok(None);
+    };
+    let number = value
+        .as_u64()
+        .with_context(|| format!("read {name} must be a positive integer"))?;
+    let number = u32::try_from(number).with_context(|| format!("read {name} is too large"))?;
+    ensure!(number > 0, "read {name} must be positive");
+    Ok(Some(number))
 }
 
 /// Codex Code Mode may hand Orbit a path rooted at the virtual ACP workspace.

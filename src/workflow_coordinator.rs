@@ -2194,7 +2194,9 @@ fn build_role_prompt(
             task_text = task_text,
         ),
     };
-    let prompt = format!("{prompt}\n\nORBIT/ACP TOOL NAMES: {orbit_acp_tool_names}");
+    let prompt = format!(
+        "{prompt}\n\nORBIT/ACP TOOL NAMES: {orbit_acp_tool_names}\n\nFile reads are bounded pages. Read result metadata is under `_meta.orbit` and includes `truncated`, `total_bytes`, and `next_line`; when truncated, repeat the same read with `line` set to `next_line`. The `line` argument is a 1-based line number and `limit`, when supplied, is a maximum line count."
+    );
     let prompt = if role.role_id == "reviewer" {
         format!(
             "{prompt}\n\nCONFIGURED VERIFICATION CHECK IDS: {}\nThe suggested_additional_checks field accepts only exact IDs from this list. Use [] when no additional configured check is needed. Put advice about commands or future checks in the review summary, not in suggested_additional_checks.",
@@ -2266,6 +2268,7 @@ const TOOL_CALL_AUDIT_LIMIT: usize = 64;
 const PROVIDER_TOOL_NAME_QUEUE_LIMIT: usize = 64;
 const TOOL_PATH_INPUT_LIMIT: usize = 4096;
 const TOOL_PATH_DISPLAY_LIMIT: usize = 192;
+const READ_FILE_CONTINUATION_RESERVE_BYTES: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -2769,6 +2772,13 @@ impl ToolCallAudit {
         }
     }
 
+    fn operation_error_code(&self, sequence: u64) -> Option<&'static str> {
+        self.active_call
+            .as_ref()
+            .filter(|active| active.sequence == sequence)
+            .and_then(|active| active.operation_error_code)
+    }
+
     fn record_mutating(&mut self, mutating: Option<bool>) {
         if mutating == Some(true) {
             self.mutating_count = self.mutating_count.saturating_add(1);
@@ -3243,12 +3253,171 @@ fn tool_request_has_valid_required_args(
         Tool::FsFindPath => &[("pattern", false)],
         _ => return true,
     };
-    required.iter().all(|(field, nonempty)| {
+    let required_args_valid = required.iter().all(|(field, nonempty)| {
         params
             .get(*field)
             .and_then(serde_json::Value::as_str)
             .is_some_and(|value| !*nonempty || !value.is_empty())
-    })
+    });
+    let read_range_valid = tool != Tool::FsReadTextFile
+        || (params.get("line").is_none_or(|line| {
+            line.as_u64()
+                .is_some_and(|line| (1..=u32::MAX as u64).contains(&line))
+        }) && params.get("limit").is_none_or(|limit| {
+            limit
+                .as_u64()
+                .is_some_and(|limit| (1..=u32::MAX as u64).contains(&limit))
+        }));
+    required_args_valid && read_range_valid
+}
+
+fn requested_text_read_range(params: &serde_json::Value) -> Result<(u32, Option<u32>)> {
+    let line = params
+        .get("line")
+        .map(|line| {
+            line.as_u64()
+                .context("INVALID_REQUEST: file read line must be a positive integer")
+                .and_then(|line| {
+                    u32::try_from(line)
+                        .context("INVALID_REQUEST: file read line is outside the supported range")
+                })
+        })
+        .transpose()?
+        .unwrap_or(1);
+    ensure!(line > 0, "INVALID_REQUEST: file read line must be positive");
+    let limit = params
+        .get("limit")
+        .map(|limit| {
+            limit
+                .as_u64()
+                .context("INVALID_REQUEST: file read limit must be a positive integer")
+                .and_then(|limit| {
+                    u32::try_from(limit)
+                        .context("INVALID_REQUEST: file read limit is outside the supported range")
+                })
+        })
+        .transpose()?;
+    ensure!(
+        limit.is_none_or(|limit| limit > 0),
+        "INVALID_REQUEST: file read limit must be positive"
+    );
+    Ok((line, limit))
+}
+
+fn text_read_window(content: &str, start_line: u32, line_limit: Option<u32>) -> (usize, usize) {
+    let start = if start_line == 1 {
+        0
+    } else {
+        let mut current_line = 1u32;
+        content
+            .match_indices('\n')
+            .find_map(|(index, _)| {
+                current_line = current_line.saturating_add(1);
+                (current_line == start_line).then_some(index + 1)
+            })
+            .unwrap_or(content.len())
+    };
+    if start == content.len() {
+        return (start, start);
+    }
+
+    let Some(line_limit) = line_limit else {
+        return (start, content.len());
+    };
+    let mut lines_seen = 1u32;
+    for (relative_index, byte) in content[start..].bytes().enumerate() {
+        if byte == b'\n' {
+            if lines_seen == line_limit {
+                return (start, start + relative_index + 1);
+            }
+            lines_seen = lines_seen.saturating_add(1);
+        }
+    }
+    (start, content.len())
+}
+
+fn text_line_count(content: &str) -> u32 {
+    if content.is_empty() {
+        0
+    } else {
+        let newlines = content.bytes().filter(|byte| *byte == b'\n').count() as u32;
+        newlines.saturating_add(u32::from(!content.ends_with('\n')))
+    }
+}
+
+fn bounded_text_read_result(
+    content: &str,
+    start_line: u32,
+    line_limit: Option<u32>,
+    output_limit: usize,
+) -> Result<serde_json::Value> {
+    let (start, window_end) = text_read_window(content, start_line, line_limit);
+    let window = &content[start..window_end];
+    let mut low = 0usize;
+    let mut high = window.len();
+    let mut best = None;
+    while low <= high {
+        let midpoint = low + (high - low) / 2;
+        let end = if midpoint == window.len() {
+            midpoint
+        } else {
+            window.as_bytes()[..midpoint]
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map_or(0, |index| index + 1)
+        };
+        if end == 0 && low == 0 && !window.is_empty() {
+            low = window
+                .as_bytes()
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(window.len(), |index| index + 1);
+            continue;
+        }
+        if end < low {
+            if low >= window.len() {
+                break;
+            }
+            let next_boundary = window.as_bytes()[low..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(window.len(), |index| low + index + 1);
+            if next_boundary <= low {
+                break;
+            }
+            low = next_boundary;
+            continue;
+        }
+        let next_byte = start + end;
+        let truncated = next_byte < content.len();
+        let page = &window[..end];
+        let next_line = start_line.saturating_add(text_line_count(page));
+        let result = serde_json::json!({
+            "content": page,
+            "_meta": {
+                "orbit": {
+                    "line": start_line,
+                    "total_bytes": content.len(),
+                    "truncated": truncated,
+                    "next_line": truncated.then_some(next_line),
+                }
+            },
+        });
+        if (end > 0 || window.is_empty()) && serde_json::to_vec(&result)?.len() <= output_limit {
+            best = Some(result);
+            if end == window.len() {
+                break;
+            }
+            low = end + 1;
+        } else {
+            if end == 0 {
+                break;
+            }
+            high = end - 1;
+        }
+    }
+
+    best.context("OUTPUT_LIMIT: no complete text line fits in the response limit")
 }
 
 fn path_arguments_for_tool(
@@ -3961,23 +4130,51 @@ async fn handle_acp_message_inner(
             match tool {
                 crate::tool_surface::CanonicalToolName::FsReadTextFile => {
                     let rel_path_str = params.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                    let (start_line, line_limit) = match requested_text_read_range(&params) {
+                        Ok(range) => range,
+                        Err(error) => {
+                            state
+                                .tool_call_audit
+                                .record_operation_error(audit_sequence, &error);
+                            state.tool_failures = state.tool_failures.saturating_add(1);
+                            wire.response_error(req_id, -32602, "INVALID_REQUEST")
+                                .await?;
+                            return Ok(());
+                        }
+                    };
                     match crate::fs_tools::read_text_confined(state.repo_path, rel_path_str) {
                         Ok(content) => {
-                            let bounded_content = if content.len() > 65536 {
-                                let mut end = 65536;
-                                while end > 0 && !content.is_char_boundary(end) {
-                                    end -= 1;
+                            match bounded_text_read_result(
+                                &content,
+                                start_line,
+                                line_limit,
+                                meta.max_output_bytes
+                                    .saturating_sub(READ_FILE_CONTINUATION_RESERVE_BYTES),
+                            ) {
+                                Ok(result) => {
+                                    state.tool_successes += 1;
+                                    wire.response_ok(req_id, result).await?;
                                 }
-                                &content[..end]
-                            } else {
-                                &content
-                            };
-                            state.tool_successes += 1;
-                            wire.response_ok(
-                                req_id,
-                                serde_json::json!({ "content": bounded_content }),
-                            )
-                            .await?;
+                                Err(error) => {
+                                    state
+                                        .tool_call_audit
+                                        .record_operation_error(audit_sequence, &error);
+                                    state.tool_failures = state.tool_failures.saturating_add(1);
+                                    let invalid_offset =
+                                        normalized_tool_error_code(&error) == "INVALID_REQUEST";
+                                    if invalid_offset {
+                                        wire.response_error(req_id, -32602, "INVALID_REQUEST")
+                                            .await?;
+                                    } else {
+                                        wire.response_error(
+                                            req_id,
+                                            -32603,
+                                            crate::tool_surface::ERR_OUTPUT_LIMIT,
+                                        )
+                                        .await?;
+                                    }
+                                }
+                            }
                         }
                         Err(e) => {
                             state
@@ -4644,7 +4841,9 @@ async fn handle_acp_message_inner(
                 ToolCallOutcome::ExecutionFailure,
                 Some(crate::tool_surface::ERR_OUTPUT_LIMIT),
             )
-        } else if !tool_request_has_valid_required_args(tool, &params) {
+        } else if !tool_request_has_valid_required_args(tool, &params)
+            || state.tool_call_audit.operation_error_code(audit_sequence) == Some("INVALID_REQUEST")
+        {
             (ToolCallOutcome::InvalidRequest, Some("INVALID_REQUEST"))
         } else {
             (ToolCallOutcome::ExecutionFailure, None)
@@ -6204,6 +6403,20 @@ impl RoleAgentExecutor for RealAcpRoleExecutor {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn bounded_text_read_searches_the_first_complete_line_boundary() -> Result<()> {
+        let short = bounded_text_read_result("a\n", 1, None, 65_280)?;
+        assert_eq!(short["content"], "a\n");
+        assert_eq!(short["_meta"]["orbit"]["truncated"], false);
+
+        let content = format!("{}\n{}\n", "x".repeat(800), "y".repeat(500));
+        let first_page = bounded_text_read_result(&content, 1, None, 1_024)?;
+        assert_eq!(first_page["content"], format!("{}\n", "x".repeat(800)));
+        assert_eq!(first_page["_meta"]["orbit"]["truncated"], true);
+        assert_eq!(first_page["_meta"]["orbit"]["next_line"], 2);
+        Ok(())
+    }
 
     fn cleanup_receipt(exit_code: i32) -> crate::acp_process::CleanupReceiptEvidence {
         crate::acp_process::CleanupReceiptEvidence {

@@ -2161,7 +2161,8 @@ async fn missing_mutation_lock_context_is_denied() -> Result<()> {
 #[tokio::test]
 async fn dispatch_enforces_reviewer_identity_call_and_output_limits() -> Result<()> {
     let repo = tempdir()?;
-    fs::write(repo.path().join("large.txt"), "x".repeat(70_000))?;
+    let file_content = "e\u{301}\n".repeat(30_000);
+    fs::write(repo.path().join("large.txt"), &file_content)?;
     let (server_in, client_out) = tokio::io::duplex(131_072);
     let (client_in, server_out) = tokio::io::duplex(131_072);
     let mut server_wire = Wire::new(server_in, server_out, 16 * 1024 * 1024);
@@ -2207,29 +2208,89 @@ async fn dispatch_enforces_reviewer_identity_call_and_output_limits() -> Result<
     );
 
     state.workspace_identity = Some(repo.path().canonicalize()?.to_string_lossy().into_owned());
+    let mut line = 1u32;
+    let mut request_id = 3u64;
+    let mut assembled = String::new();
+    loop {
+        let mut params = json!({"path":"large.txt"});
+        params["line"] = json!(line);
+        if request_id == 3 {
+            params["limit"] = json!(25_000);
+        }
+        handle_acp_message(
+            &mut server_wire,
+            &mut state,
+            json!({
+                "jsonrpc":"2.0", "id":request_id, "method":"fs/read_text_file",
+                "params":params
+            }),
+        )
+        .await?;
+        let response = client_wire.read().await?;
+        let result = response
+            .get("result")
+            .context("large file read returned a JSON-RPC error")?;
+        assert!(serde_json::to_vec(result)?.len() <= 65536);
+        let metadata = &result["_meta"]["orbit"];
+        assert_eq!(metadata["line"].as_u64(), Some(u64::from(line)));
+        assert_eq!(
+            metadata["total_bytes"].as_u64(),
+            Some(file_content.len() as u64)
+        );
+        assembled.push_str(
+            result["content"]
+                .as_str()
+                .context("read page omitted content")?,
+        );
+
+        match metadata["next_line"].as_u64() {
+            Some(next_line) => {
+                assert!(metadata["truncated"].as_bool().unwrap_or(false));
+                assert!(next_line > u64::from(line));
+                assert!(result["content"].as_str().unwrap().ends_with('\n'));
+                line = u32::try_from(next_line)?;
+                request_id += 1;
+            }
+            None => {
+                assert_eq!(metadata["truncated"], false);
+                break;
+            }
+        }
+    }
+    assert_eq!(assembled, file_content);
+
+    let invalid_range_id = request_id + 1;
     handle_acp_message(
         &mut server_wire,
         &mut state,
         json!({
-            "jsonrpc":"2.0", "id":3, "method":"fs/read_text_file",
-            "params":{"path":"large.txt"}
+            "jsonrpc":"2.0", "id":invalid_range_id, "method":"fs/read_text_file",
+            "params":{"path":"large.txt", "line":0}
         }),
     )
     .await?;
     let response = client_wire.read().await?;
-    assert!(
-        response["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("OUTPUT_LIMIT")
-    );
+    assert_eq!(response["error"]["message"], "INVALID_REQUEST");
+
+    fs::write(repo.path().join("long-line.txt"), "x".repeat(70_000))?;
+    handle_acp_message(
+        &mut server_wire,
+        &mut state,
+        json!({
+            "jsonrpc":"2.0", "id":invalid_range_id + 1, "method":"fs/read_text_file",
+            "params":{"path":"long-line.txt"}
+        }),
+    )
+    .await?;
+    let response = client_wire.read().await?;
+    assert_eq!(response["error"]["message"], "OUTPUT_LIMIT");
 
     state.tool_call_limit = state.tool_calls;
     handle_acp_message(
         &mut server_wire,
         &mut state,
         json!({
-            "jsonrpc":"2.0", "id":4, "method":"fs/read_text_file",
+            "jsonrpc":"2.0", "id":invalid_range_id + 2, "method":"fs/read_text_file",
             "params":{"path":"large.txt"}
         }),
     )
