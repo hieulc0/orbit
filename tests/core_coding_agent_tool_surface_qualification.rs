@@ -42,7 +42,7 @@ use orbit::{
     workflow_coordinator::*,
 };
 use serde_json::json;
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use std::time::Duration;
 use std::{collections::BTreeMap, ops::Deref};
 use std::{
@@ -774,23 +774,335 @@ fn render_live_fixture_audit(
         Some(_) => "observed_but_redacted".to_owned(),
         None => "UNKNOWN / unobserved".to_owned(),
     };
-    let summary = &metadata["tool_call_audit"]["summary"];
-    let count = |field: &str| summary[field].as_i64().unwrap_or(0);
+    let summary = metadata
+        .get("tool_call_audit")
+        .and_then(|audit| audit.get("summary"));
+    let count = |field: &str| {
+        summary
+            .and_then(|summary| summary.get(field))
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0)
+    };
+    let lifecycle = metadata.get("lifecycle");
+    let lifecycle_label = |field: &str, allowed: &[&str]| {
+        lifecycle
+            .and_then(|lifecycle| lifecycle.get(field))
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| allowed.contains(value))
+            .unwrap_or("UNKNOWN")
+    };
+    let milestones_contain_tool_activity = lifecycle
+        .and_then(|lifecycle| lifecycle.get("milestones"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|milestones| {
+            milestones
+                .iter()
+                .any(|value| value == "TOOL_ACTIVITY_OBSERVED")
+        });
+    let audit_present = metadata
+        .get("tool_call_audit")
+        .is_some_and(serde_json::Value::is_object);
+    let audit_applicability = if lifecycle_label(
+        "tool_audit_applicability",
+        &["NOT_APPLICABLE_BEFORE_TOOL_PHASE", "APPLICABLE"],
+    ) == "NOT_APPLICABLE_BEFORE_TOOL_PHASE"
+        && !milestones_contain_tool_activity
+    {
+        "NOT_APPLICABLE_BEFORE_TOOL_PHASE"
+    } else if audit_present {
+        "AVAILABLE"
+    } else {
+        "UNAVAILABLE_EVIDENCE_DEFECT"
+    };
+    let process_code = lifecycle
+        .and_then(|lifecycle| lifecycle.get("process_exit_code"))
+        .and_then(serde_json::Value::as_i64)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let process_signal = lifecycle
+        .and_then(|lifecycle| lifecycle.get("process_signal"))
+        .and_then(serde_json::Value::as_i64)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let reason = lifecycle
+        .and_then(|lifecycle| lifecycle.get("normalized_reason"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| {
+            value.len() <= 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+        })
+        .unwrap_or("UNKNOWN");
+    let supervisor_failure =
+        match lifecycle.and_then(|lifecycle| lifecycle.get("supervisor_failure")) {
+            Some(serde_json::Value::Null) => "NONE",
+            Some(serde_json::Value::String(value))
+                if [
+                    "SUPERVISOR_SIGNALED",
+                    "SUPERVISOR_NONZERO_EXIT",
+                    "SUPERVISOR_EXIT_UNCONFIRMED",
+                    "CLEANUP_RECEIPT_MISMATCH",
+                    "CLEANUP_RECEIPT_UNCONFIRMED",
+                ]
+                .contains(&value.as_str()) =>
+            {
+                value
+            }
+            _ => "UNKNOWN",
+        };
+    let failed_phase = match lifecycle.and_then(|lifecycle| lifecycle.get("failed_phase")) {
+        Some(serde_json::Value::Null) => "NONE",
+        Some(serde_json::Value::String(value))
+            if [
+                "AGENT_EXECUTION_CREATED",
+                "CREDENTIAL_RESOLUTION",
+                "CREDENTIAL_RESOLVED",
+                "CREDENTIAL_STAGING",
+                "CREDENTIAL_STAGED",
+                "RUNTIME_PREPARATION",
+                "RUNTIME_PREPARED",
+                "SUPERVISOR_START",
+                "SUPERVISOR_STARTED",
+                "ACP_INITIALIZE",
+                "ACP_INITIALIZED",
+                "SESSION_CREATION",
+                "SESSION_CREATED",
+                "PROMPT_DISPATCH",
+                "PROMPT_IN_FLIGHT",
+                "PROMPT_RESPONSE_RECEIVED",
+                "TOOL_ACTIVITY",
+                "CLEANUP",
+                "SUPERVISOR_EXIT_OBSERVED",
+                "CLEANUP_CONFIRMED",
+                "CLEANUP_UNCONFIRMED",
+            ]
+            .contains(&value.as_str()) =>
+        {
+            value
+        }
+        _ => "UNKNOWN",
+    };
+    let receipt = lifecycle.and_then(|lifecycle| lifecycle.get("supervisor_receipt"));
+    let receipt_summary = receipt.map(|receipt| {
+        let version = receipt
+            .get("format_version")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let runtime = match receipt.get("runtime").and_then(serde_json::Value::as_str) {
+            Some("podman") => "podman",
+            _ => "unknown",
+        };
+        let launch_stage = match receipt.get("launch_stage").and_then(serde_json::Value::as_str) {
+            Some("app_server_protocol") => "app_server_protocol",
+            Some("completed_turn_cleanup") => "completed_turn_cleanup",
+            Some("supervisor_deadline") => "supervisor_deadline",
+            Some("container_startup") => "container_startup",
+            Some("transport") => "transport",
+            Some("container_process") => "container_process",
+            Some("unknown") => "unknown",
+            _ => "unknown",
+        };
+        let image_matches = receipt
+            .get("expected_image_matches")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let container_exit_code = receipt
+            .get("exit_code")
+            .and_then(serde_json::Value::as_i64)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let diagnostic_present = receipt
+            .get("diagnostic_present")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let diagnostic_truncated = receipt
+            .get("diagnostic_truncated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let session_summary = receipt
+            .get("codex_session")
+            .filter(|value| value.is_object())
+            .map(|session| {
+                let label = |field: &str, allowed: &[&str]| {
+                    session
+                        .get(field)
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|value| allowed.contains(value))
+                        .unwrap_or("unknown")
+                };
+                let request_count = session
+                    .get("server_request_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|value| value.min(64))
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                let bool_field = |field: &str| {
+                    session
+                        .get(field)
+                        .and_then(serde_json::Value::as_bool)
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "unknown".to_string())
+                };
+                format!(
+                    "Codex session receipt: trigger={}, phase={}, last_activity={}, pending_request={}, outcome={}, turn_outcome={}, server_request_count={request_count}, peer_eof_observed={}, app_server_stdout_eof_observed={}",
+                    label("supervisor_trigger", &["bridge_returned", "bridge_error", "peer_eof_after_end_turn", "child_exit", "supervisor_deadline"]),
+                    label("phase", &["bridge_start", "initializing", "session_setup", "turn_start", "cancelling", "protocol", "bridge_request", "session_ready", "prompt_received", "turn_running", "turn_completed"]),
+                    label("last_activity", &["none", "app_server_request_sent", "server_request_received", "dynamic_tool_request_received", "server_error_notification", "turn_started_notification", "turn_completed_notification", "item_lifecycle_notification", "agent_message_notification", "server_warning_notification", "server_notification", "app_server_stdout_eof", "app_server_stdout_read_error", "acp_peer_eof", "acp_peer_read_error", "response_correlation_failure", "correlated_protocol_rejection", "app_server_response_received", "server_request_rejected", "app_server_error_notification", "acp_request_received", "initialized_notification_sent", "session_created", "prompt_received", "acp_request_rejected", "acp_end_turn_response_sent", "acp_cancel_received", "turn_start_response_received", "dynamic_tool_result_sent", "turn_completed_not_successful"]),
+                    label("pending_request", &["none", "initialize", "account_read", "thread_start", "turn_start", "turn_interrupt", "other_request"]),
+                    label("outcome", &["running", "app_server_eof", "protocol_read_failure", "peer_eof_after_end_turn", "peer_eof", "correlation_failure", "protocol_rejection", "server_request_rejected", "app_server_error_notification", "cancelled", "turn_incomplete", "end_turn", "tool_callback_failed"]),
+                    label("turn_outcome", &["not_started", "start_pending", "running", "end_turn", "app_server_error_notification"]),
+                    bool_field("peer_eof_observed"),
+                    bool_field("app_server_stdout_eof_observed")
+                )
+            });
+        let mut summary = format!(
+            "Supervisor receipt: version={version}, runtime={runtime}, launch_stage={launch_stage}, container_exit_code={container_exit_code}, expected_image_matches={image_matches}, diagnostic_present={diagnostic_present}, diagnostic_truncated={diagnostic_truncated}"
+        );
+        if let Some(session) = session_summary {
+            summary.push('\n');
+            summary.push_str(&session);
+        }
+        summary
+    });
     format!(
-        "RoleExecution ID: {}\nAgentExecution ID: {}\nExecution status: {safe_status}\nActual model: {actual_model}\nAggregate tool counts: total={tool_call_count}, success={tool_success_count}, failure={tool_failure_count}, mutating={}, denied={}, unmatched={}\n{}",
+        "RoleExecution ID: {}\nAgentExecution ID: {}\nExecution status: {safe_status}\nActual model: {actual_model}\nACP lifecycle: phase={}, attempted_phase={}, failed_phase={failed_phase}, last_confirmed_phase={}, outcome={}, normalized_reason={reason}, prompt_uncertainty={}, process_exit_code={process_code}, process_signal={process_signal}, supervisor_outcome={}, supervisor_failure={supervisor_failure}, cleanup_state={}, persistence_state={}\nTool audit applicability: {audit_applicability}\nAggregate tool counts: total={tool_call_count}, success={tool_success_count}, failure={tool_failure_count}, mutating={}, denied={}, unmatched={}\n{}\n{}",
         safe_id(role_execution_id),
         safe_id(agent_execution_id),
+        lifecycle_label(
+            "phase",
+            &[
+                "AGENT_EXECUTION_CREATED",
+                "CREDENTIAL_RESOLUTION",
+                "CREDENTIAL_RESOLVED",
+                "CREDENTIAL_STAGING",
+                "CREDENTIAL_STAGED",
+                "RUNTIME_PREPARATION",
+                "RUNTIME_PREPARED",
+                "SUPERVISOR_START",
+                "SUPERVISOR_STARTED",
+                "ACP_INITIALIZE",
+                "ACP_INITIALIZED",
+                "SESSION_CREATION",
+                "SESSION_CREATED",
+                "PROMPT_DISPATCH",
+                "PROMPT_IN_FLIGHT",
+                "PROMPT_RESPONSE_RECEIVED",
+                "TOOL_ACTIVITY",
+                "CLEANUP",
+                "SUPERVISOR_EXIT_OBSERVED",
+                "CLEANUP_CONFIRMED",
+                "CLEANUP_UNCONFIRMED",
+                "TERMINAL"
+            ]
+        ),
+        lifecycle_label(
+            "attempted_phase",
+            &[
+                "AGENT_EXECUTION_CREATED",
+                "CREDENTIAL_RESOLUTION",
+                "CREDENTIAL_RESOLVED",
+                "CREDENTIAL_STAGING",
+                "CREDENTIAL_STAGED",
+                "RUNTIME_PREPARATION",
+                "RUNTIME_PREPARED",
+                "SUPERVISOR_START",
+                "SUPERVISOR_STARTED",
+                "ACP_INITIALIZE",
+                "ACP_INITIALIZED",
+                "SESSION_CREATION",
+                "SESSION_CREATED",
+                "PROMPT_DISPATCH",
+                "PROMPT_IN_FLIGHT",
+                "PROMPT_RESPONSE_RECEIVED",
+                "TOOL_ACTIVITY",
+                "CLEANUP",
+                "SUPERVISOR_EXIT_OBSERVED",
+                "CLEANUP_CONFIRMED",
+                "CLEANUP_UNCONFIRMED",
+                "TERMINAL"
+            ]
+        ),
+        lifecycle_label(
+            "last_confirmed_phase",
+            &[
+                "AGENT_EXECUTION_CREATED",
+                "CREDENTIAL_RESOLVED",
+                "CREDENTIAL_STAGED",
+                "RUNTIME_PREPARED",
+                "SUPERVISOR_STARTED",
+                "ACP_INITIALIZED",
+                "SESSION_CREATED",
+                "PROMPT_RESPONSE_RECEIVED",
+                "SUPERVISOR_EXIT_OBSERVED",
+                "CLEANUP_CONFIRMED"
+            ]
+        ),
+        lifecycle_label("outcome", &["IN_PROGRESS", "SUCCEEDED", "FAILED"]),
+        lifecycle_label(
+            "prompt_uncertainty",
+            &[
+                "NOT_DISPATCHED",
+                "IN_FLIGHT",
+                "RESOLVED",
+                "UNRESOLVED_PENDING_MODEL_CALL",
+                "UNRESOLVED_NO_PENDING_MODEL_CALL",
+                "UNRESOLVED_UNKNOWN"
+            ]
+        ),
+        lifecycle_label(
+            "supervisor_outcome",
+            &[
+                "NOT_OBSERVED",
+                "EXITED_ZERO",
+                "EXITED_NONZERO",
+                "SIGNALED",
+                "EXIT_UNCONFIRMED",
+            ]
+        ),
+        lifecycle_label(
+            "cleanup_state",
+            &["NO_RUNTIME_RESOURCE_CREATED", "UNCONFIRMED", "CONFIRMED"]
+        ),
+        lifecycle_label("persistence_state", &["CONFIRMED", "UNCONFIRMED"]),
         count("mutating"),
         count("denied"),
         count("unmatched_provider_calls"),
+        receipt_summary.unwrap_or_default(),
         render_tool_call_audit(metadata),
     )
+}
+
+#[derive(Clone, Copy)]
+enum AgentExecutionLookupFailure {
+    MissingRoleExecutionId,
+    QueryFailed,
+    NoRows,
+}
+
+fn render_agent_execution_lookup_failure(failure: AgentExecutionLookupFailure) -> &'static str {
+    match failure {
+        AgentExecutionLookupFailure::MissingRoleExecutionId => {
+            "AgentExecution query not attempted: role execution ID missing; tool audit: UNAVAILABLE_EVIDENCE_DEFECT."
+        }
+        AgentExecutionLookupFailure::QueryFailed => {
+            "AgentExecution query failed; lifecycle evidence unavailable; tool audit: UNAVAILABLE_EVIDENCE_DEFECT."
+        }
+        AgentExecutionLookupFailure::NoRows => {
+            "AgentExecution row missing; lifecycle evidence unavailable; tool audit: UNAVAILABLE_EVIDENCE_DEFECT."
+        }
+    }
 }
 
 async fn print_live_fixture_audit(pool: &PgPool, role_execution_id: Option<&str>) {
     println!("Live fixture execution audit:");
     let Some(role_execution_id) = role_execution_id else {
-        println!("Tool-call audit unavailable.");
+        println!(
+            "{}",
+            render_agent_execution_lookup_failure(
+                AgentExecutionLookupFailure::MissingRoleExecutionId
+            )
+        );
         return;
     };
     match load_role_tool_audits(pool, role_execution_id).await {
@@ -813,7 +1125,14 @@ async fn print_live_fixture_audit(pool: &PgPool, role_execution_id: Option<&str>
                 );
             }
         }
-        _ => println!("Tool-call audit unavailable."),
+        Ok(_) => println!(
+            "{}",
+            render_agent_execution_lookup_failure(AgentExecutionLookupFailure::NoRows)
+        ),
+        Err(_) => println!(
+            "{}",
+            render_agent_execution_lookup_failure(AgentExecutionLookupFailure::QueryFailed)
+        ),
     }
 }
 
@@ -876,6 +1195,7 @@ fn live_fixture_audit_report_includes_ids_counts_and_bounded_safe_details() {
     assert!(report.contains("AgentExecution ID: agent-execution-456"));
     assert!(report.contains("Execution status: SUCCEEDED"));
     assert!(report.contains("Actual model: UNKNOWN / unobserved"));
+    assert!(report.contains("Tool audit applicability: AVAILABLE"));
     assert!(report.contains(
         "Aggregate tool counts: total=100, success=100, failure=0, mutating=2, denied=0, unmatched=0"
     ));
@@ -884,6 +1204,102 @@ fn live_fixture_audit_report_includes_ids_counts_and_bounded_safe_details() {
     assert!(!report.contains("/private/host/path"));
     assert!(report.matches("orbit_read_file | MATCH").count() <= 64);
     assert!(report.len() < 20_000);
+}
+
+#[test]
+fn lifecycle_report_distinguishes_pre_tool_phase_from_missing_audit_evidence() {
+    let pre_tool = json!({
+        "tool_call_audit": { "summary": { "total": 0 }, "entries": [] },
+        "lifecycle": {
+            "phase": "ACP_INITIALIZE",
+            "attempted_phase": "ACP_INITIALIZE",
+            "failed_phase": "ACP_INITIALIZE",
+            "last_confirmed_phase": "SUPERVISOR_STARTED",
+            "outcome": "FAILED",
+            "normalized_reason": "ACP_INITIALIZE_FAILED",
+            "tool_audit_applicability": "NOT_APPLICABLE_BEFORE_TOOL_PHASE",
+            "milestones": ["TARGET_COMMITTED", "AGENT_EXECUTION_CREATED", "SUPERVISOR_STARTED"],
+            "cleanup_state": "CONFIRMED",
+            "persistence_state": "CONFIRMED",
+            "prompt_uncertainty": "NOT_DISPATCHED",
+            "process_exit_code": 125,
+            "supervisor_outcome": "EXITED_NONZERO",
+            "supervisor_failure": "SUPERVISOR_NONZERO_EXIT",
+            "supervisor_receipt": {
+                "format_version": 4,
+                "runtime": "podman",
+                "launch_stage": "container_startup",
+                "expected_image_matches": true,
+                "diagnostic_present": true,
+                "diagnostic_truncated": true,
+                "raw_output": "private payload must not appear",
+                "codex_session": {
+                    "supervisor_trigger": "bridge_error",
+                    "phase": "session_setup",
+                    "last_activity": "app_server_response_received",
+                    "pending_request": "thread_start",
+                    "outcome": "app_server_error_notification",
+                    "turn_outcome": "start_pending",
+                    "server_request_count": 2,
+                    "peer_eof_observed": false,
+                    "app_server_stdout_eof_observed": false
+                }
+            }
+        }
+    });
+    let report = render_live_fixture_audit("role-1", "agent-1", "FAILED", 0, 0, 0, None, &pre_tool);
+    assert!(report.contains("Tool audit applicability: NOT_APPLICABLE_BEFORE_TOOL_PHASE"));
+    assert!(report.contains("normalized_reason=ACP_INITIALIZE_FAILED"));
+    assert!(report.contains("attempted_phase=ACP_INITIALIZE, failed_phase=ACP_INITIALIZE"));
+    assert!(report.contains("last_confirmed_phase=SUPERVISOR_STARTED"));
+    assert!(
+        report.contains(
+            "supervisor_outcome=EXITED_NONZERO, supervisor_failure=SUPERVISOR_NONZERO_EXIT"
+        )
+    );
+    assert!(
+        report.contains(
+            "Supervisor receipt: version=4, runtime=podman, launch_stage=container_startup"
+        )
+    );
+    assert!(report.contains("Codex session receipt: trigger=bridge_error, phase=session_setup"));
+    assert!(report.contains("pending_request=thread_start, outcome=app_server_error_notification"));
+    assert!(!report.contains("private payload must not appear"));
+
+    let missing_after_tool = json!({
+        "lifecycle": {
+            "phase": "TOOL_ACTIVITY",
+            "last_confirmed_phase": "SESSION_CREATED",
+            "outcome": "FAILED",
+            "tool_audit_applicability": "APPLICABLE",
+            "milestones": ["SESSION_CREATED", "TOOL_ACTIVITY_OBSERVED"]
+        }
+    });
+    let report = render_live_fixture_audit(
+        "role-1",
+        "agent-1",
+        "FAILED",
+        1,
+        0,
+        1,
+        None,
+        &missing_after_tool,
+    );
+    assert!(report.contains("Tool audit applicability: UNAVAILABLE_EVIDENCE_DEFECT"));
+    assert!(report.contains("Tool-call audit unavailable."));
+
+    assert_ne!(
+        render_agent_execution_lookup_failure(AgentExecutionLookupFailure::NoRows),
+        render_agent_execution_lookup_failure(AgentExecutionLookupFailure::QueryFailed)
+    );
+    assert!(
+        render_agent_execution_lookup_failure(AgentExecutionLookupFailure::NoRows)
+            .contains("AgentExecution row missing")
+    );
+    assert!(
+        render_agent_execution_lookup_failure(AgentExecutionLookupFailure::QueryFailed)
+            .contains("AgentExecution query failed")
+    );
 }
 
 #[test]
@@ -2255,6 +2671,147 @@ async fn coordinator_wire_dispatch_enforces_cli_workflow_gates() -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "fault-injection")]
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
+async fn real_acp_execution_row_survives_credential_resolution_failure() -> Result<()> {
+    let ctx = setup_test().await?;
+    let fixture_result = async {
+        let repo = tempdir()?;
+        let repo_path = repo.path().canonicalize()?.to_string_lossy().into_owned();
+        let attempt_id = format!("att-{}", id());
+        let workflow = ctx
+            .store
+            .create_workflow_run_full(
+                "software_change_v1",
+                &attempt_id,
+                1,
+                None,
+                None,
+                None,
+                Some("exercise durable early ACP failure evidence"),
+                Some(&repo_path),
+                None,
+            )
+            .await?;
+        let role = RoleDefinition::implementer_v1();
+        let role_execution = ctx
+            .store
+            .create_role_execution(&workflow.id, &role, "IMPLEMENTING", 0, None, None)
+            .await?;
+        let target = ResolvedExecutionTarget {
+            provider: "codex".into(),
+            runtime_interface: "codex-acp".into(),
+            credential_id: Some("synthetic-missing-account".into()),
+            credential_generation: Some(7),
+            requested_model: Some("gpt-6-luna".into()),
+            resolved_model: Some("gpt-6-luna".into()),
+            runtime_image_digest: None,
+            resolution_reason: "synthetic deterministic test target".into(),
+        };
+        ctx.store
+            .set_role_execution_resolved(&role_execution.id, &target)
+            .await?;
+        let error = match RealAcpRoleExecutor
+            .execute_role_with_credential_catalog(
+                &ctx.engine.pool,
+                &ctx.engine.pool,
+                &workflow,
+                &role_execution,
+                &role,
+                &target,
+                "A deterministic prompt that fails before runtime startup.",
+                repo.path(),
+                None,
+                tokio::sync::watch::channel(false).1,
+            )
+            .await
+        {
+            Ok(_) => anyhow::bail!(
+                "synthetic credential is absent, so execution must fail before runtime"
+            ),
+            Err(error) => error,
+        };
+        ensure!(
+            error.to_string() == "CREDENTIAL_RESOLUTION_FAILED",
+            "early execution failure was not preserved as the normalized credential-resolution reason"
+        );
+
+        let row = sqlx::query(
+            "SELECT status, provider, requested_model, resolved_model, actual_model, termination_reason, tool_call_count, tool_success_count, tool_failure_count, metadata FROM orbit_agent_executions WHERE role_execution_id = $1",
+        )
+        .bind(&role_execution.id)
+        .fetch_one(&ctx.engine.pool)
+        .await?;
+        let metadata: serde_json::Value = row.try_get("metadata")?;
+        ensure!(row.try_get::<String, _>("status")? == "FAILED", "unexpected AE status");
+        ensure!(row.try_get::<String, _>("provider")? == "codex", "provider was not persisted");
+        ensure!(
+            row.try_get::<String, _>("requested_model")? == "gpt-6-luna",
+            "requested model was not persisted"
+        );
+        ensure!(
+            row.try_get::<String, _>("resolved_model")? == "gpt-6-luna",
+            "resolved model was not persisted"
+        );
+        ensure!(row.try_get::<Option<String>, _>("actual_model")?.is_none(), "actual model must remain unobserved");
+        ensure!(
+            row.try_get::<Option<String>, _>("termination_reason")?.as_deref()
+                == Some("CREDENTIAL_RESOLUTION_FAILED"),
+            "normalized early failure reason was not persisted"
+        );
+        ensure!(row.try_get::<i64, _>("tool_call_count")? == 0, "unexpected tool calls");
+        ensure!(row.try_get::<i64, _>("tool_success_count")? == 0, "unexpected successful tool calls");
+        ensure!(row.try_get::<i64, _>("tool_failure_count")? == 0, "unexpected failed tool calls");
+        ensure!(metadata["account_reference"] == "synthetic-missing-account", "account reference was not persisted");
+        ensure!(metadata["credential_generation"] == 7, "credential generation was not persisted");
+        ensure!(metadata["expected_runtime_identity"] == "codex-acp", "runtime identity was not persisted");
+        ensure!(
+            metadata["expected_runtime_profile"]
+                == orbit::codex_credential_enrollment::CODEX_IMAGE,
+            "expected runtime profile was not persisted"
+        );
+        ensure!(metadata["lifecycle"]["phase"] == "TERMINAL", "lifecycle was not finalized");
+        ensure!(
+            metadata["lifecycle"]["last_confirmed_phase"] == "AGENT_EXECUTION_CREATED",
+            "last confirmed phase was not preserved"
+        );
+        ensure!(
+            metadata["lifecycle"]["attempted_phase"] == "CREDENTIAL_RESOLUTION",
+            "attempted phase was not preserved"
+        );
+        ensure!(
+            metadata["lifecycle"]["failed_phase"] == "CREDENTIAL_RESOLUTION",
+            "failed phase was not recorded"
+        );
+        ensure!(
+            metadata["lifecycle"]["normalized_reason"] == "CREDENTIAL_RESOLUTION_FAILED",
+            "lifecycle reason was not persisted"
+        );
+        ensure!(
+            metadata["lifecycle"]["cleanup_state"] == "NO_RUNTIME_RESOURCE_CREATED",
+            "early failure incorrectly claims runtime cleanup"
+        );
+        ensure!(
+            metadata["lifecycle"]["prompt_uncertainty"] == "NOT_DISPATCHED",
+            "prompt state was not preserved"
+        );
+        ensure!(
+            metadata["lifecycle"]["tool_audit_applicability"]
+                == "NOT_APPLICABLE_BEFORE_TOOL_PHASE",
+            "pre-tool audit applicability was not recorded"
+        );
+        let entries = metadata["tool_call_audit"]["entries"]
+            .as_array()
+            .context("tool audit entries missing")?;
+        ensure!(entries.is_empty(), "early failure fabricated tool audit rows");
+
+        Ok(())
+    }
+    .await;
+    finish_test_context(ctx, fixture_result).await
+}
+
 // -----------------------------------------------------------------------------
 // Live Codex and Antigravity role fixtures
 // -----------------------------------------------------------------------------
@@ -2360,7 +2917,7 @@ async fn real_codex_coding_fixture() -> Result<()> {
                 tokio::sync::watch::channel(false).1,
             )
             .await
-            .map_err(|_| anyhow::anyhow!("live provider fixture execution failed"))?;
+            .map_err(|error| anyhow::anyhow!("live provider fixture execution failed: {error}"))?;
 
         ensure!(
             outcome.raw_output.contains("ORBIT_HANDOFF_START"),
@@ -2525,7 +3082,7 @@ async fn real_antigravity_review_fixture() -> Result<()> {
                 tokio::sync::watch::channel(false).1,
             )
             .await
-            .map_err(|_| anyhow::anyhow!("live provider fixture execution failed"))?;
+            .map_err(|error| anyhow::anyhow!("live provider fixture execution failed: {error}"))?;
 
         ensure!(
             outcome.raw_output.contains("ORBIT_HANDOFF_START"),

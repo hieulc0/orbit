@@ -4703,50 +4703,362 @@ fn role_model_evidence<'a>(
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+struct AcpRoleLifecycle {
+    schema_version: u8,
+    phase: &'static str,
+    attempted_phase: &'static str,
+    failed_phase: Option<&'static str>,
+    last_confirmed_phase: &'static str,
+    milestones: Vec<&'static str>,
+    outcome: &'static str,
+    normalized_reason: Option<&'static str>,
+    prompt_uncertainty: &'static str,
+    cleanup_state: &'static str,
+    persistence_state: &'static str,
+    process_exit_code: Option<i32>,
+    process_signal: Option<i32>,
+    supervisor_outcome: &'static str,
+    supervisor_failure: Option<&'static str>,
+    supervisor_receipt: Option<crate::acp_process::CleanupReceiptEvidence>,
+    tool_audit_applicability: &'static str,
+    #[serde(skip)]
+    finalization_attempted: bool,
+}
+
+impl AcpRoleLifecycle {
+    fn new() -> Self {
+        Self {
+            schema_version: 1,
+            phase: "AGENT_EXECUTION_CREATED",
+            attempted_phase: "AGENT_EXECUTION_CREATED",
+            failed_phase: None,
+            last_confirmed_phase: "AGENT_EXECUTION_CREATED",
+            milestones: vec!["TARGET_COMMITTED", "AGENT_EXECUTION_CREATED"],
+            outcome: "IN_PROGRESS",
+            normalized_reason: None,
+            prompt_uncertainty: "NOT_DISPATCHED",
+            cleanup_state: "NO_RUNTIME_RESOURCE_CREATED",
+            persistence_state: "CONFIRMED",
+            process_exit_code: None,
+            process_signal: None,
+            supervisor_outcome: "NOT_OBSERVED",
+            supervisor_failure: None,
+            supervisor_receipt: None,
+            tool_audit_applicability: "NOT_APPLICABLE_BEFORE_TOOL_PHASE",
+            finalization_attempted: false,
+        }
+    }
+
+    fn enter(&mut self, phase: &'static str) {
+        self.phase = phase;
+        self.attempted_phase = phase;
+    }
+
+    fn confirm(&mut self, phase: &'static str) {
+        self.phase = phase;
+        self.attempted_phase = phase;
+        self.last_confirmed_phase = phase;
+        if self.milestones.last().copied() != Some(phase) && self.milestones.len() < 16 {
+            self.milestones.push(phase);
+        }
+    }
+
+    fn note_tool_activity(&mut self) {
+        self.tool_audit_applicability = "APPLICABLE";
+        const OBSERVED: &str = "TOOL_ACTIVITY_OBSERVED";
+        if !self.milestones.contains(&OBSERVED) && self.milestones.len() < 16 {
+            self.milestones.push(OBSERVED);
+        }
+    }
+
+    fn normalized_failure(&self, error: &anyhow::Error) -> &'static str {
+        if error.is::<RoleLifecyclePersistenceFailed>() {
+            return "AGENT_EXECUTION_LIFECYCLE_PERSISTENCE_FAILED";
+        }
+        if error.is::<RoleTerminalPersistenceUnconfirmed>() {
+            return "AGENT_EXECUTION_TERMINAL_PERSISTENCE_UNCONFIRMED";
+        }
+        if let Some(error) = error.downcast_ref::<RoleSupervisorOutcomeFailure>() {
+            return error.0;
+        }
+        if error.is::<RoleHandoffResponseMissing>() {
+            return "HANDOFF_RESPONSE_MISSING";
+        }
+        if error.is::<RoleTerminalCleanupFailed>() {
+            return "TERMINAL_CLEANUP_FAILED";
+        }
+        if error.is::<crate::acp_runtime::TurnTimeout>() {
+            return "ACP_PROMPT_TIMEOUT";
+        }
+        if error.is::<RoleExecutionCancelled>() {
+            return "ROLE_EXECUTION_CANCELLED";
+        }
+        if error.is::<RoleSupervisorTimeout>() {
+            return "SUPERVISOR_TIMEOUT";
+        }
+        match self.phase {
+            "CREDENTIAL_RESOLUTION" => "CREDENTIAL_RESOLUTION_FAILED",
+            "CREDENTIAL_STAGING" => "CREDENTIAL_STAGING_FAILED",
+            "RUNTIME_PREPARATION" => "RUNTIME_PREPARATION_FAILED",
+            "SUPERVISOR_START" => "SUPERVISOR_START_FAILED",
+            "ACP_INITIALIZE" => "ACP_INITIALIZE_FAILED",
+            "SESSION_CREATION" => "ACP_SESSION_CREATION_FAILED",
+            "PROMPT_DISPATCH" | "PROMPT_IN_FLIGHT" => "ACP_PROMPT_FAILED",
+            "CLEANUP" => "ACP_CLEANUP_FAILED",
+            "HANDOFF" => "HANDOFF_PARSE_FAILED",
+            _ => "ACP_EXECUTION_FAILED",
+        }
+    }
+
+    fn record_error(&mut self, error: &anyhow::Error) {
+        let reason = self.normalized_failure(error);
+        self.failed_phase = Some(self.phase);
+        if reason == "ACP_PROMPT_TIMEOUT" {
+            let pending = error
+                .downcast_ref::<crate::acp_runtime::TurnTimeout>()
+                .and_then(|timeout| timeout.pending_model_call);
+            self.prompt_uncertainty = match pending {
+                Some(true) => "UNRESOLVED_PENDING_MODEL_CALL",
+                Some(false) => "UNRESOLVED_NO_PENDING_MODEL_CALL",
+                None => "UNRESOLVED_UNKNOWN",
+            };
+        } else if self.prompt_uncertainty == "IN_FLIGHT" {
+            self.prompt_uncertainty = "UNRESOLVED_UNKNOWN";
+        }
+        self.outcome = "FAILED";
+        self.normalized_reason = Some(reason);
+        self.phase = "TERMINAL";
+    }
+
+    fn finish_success(&mut self) {
+        if self.prompt_uncertainty == "IN_FLIGHT" {
+            self.prompt_uncertainty = "RESOLVED";
+        }
+        self.outcome = "SUCCEEDED";
+        self.normalized_reason = Some("COMPLETED");
+        self.phase = "TERMINAL";
+        self.attempted_phase = "TERMINAL";
+    }
+
+    fn restore_after_persistence_failure(
+        &mut self,
+        previous: &Self,
+        attempted_phase: &'static str,
+    ) {
+        *self = previous.clone();
+        self.persistence_state = "UNCONFIRMED";
+        self.enter(attempted_phase);
+    }
+
+    fn preserve_cleanup_state_for_failure_finalization(&mut self) {
+        if !matches!(
+            self.cleanup_state,
+            "NO_RUNTIME_RESOURCE_CREATED" | "CONFIRMED"
+        ) {
+            self.cleanup_state = "UNCONFIRMED";
+        }
+    }
+
+    fn needs_failure_finalization(&self) -> bool {
+        !self.finalization_attempted
+    }
+
+    fn note_terminal_persistence_attempt(&mut self) {
+        self.finalization_attempted = true;
+    }
+
+    fn note_terminal_persistence_failure(&mut self) {
+        self.finalization_attempted = true;
+        self.persistence_state = "UNCONFIRMED";
+    }
+
+    fn value(&self) -> serde_json::Value {
+        serde_json::to_value(self).expect("bounded ACP lifecycle serializes")
+    }
+}
+
 #[derive(Debug)]
 struct SupervisorEvidence {
     exit_code: Option<i32>,
+    signal: Option<i32>,
     cleanup_confirmed: bool,
-    failure: Option<String>,
+    failure: Option<&'static str>,
+    receipt: Option<crate::acp_process::CleanupReceiptEvidence>,
+}
+
+#[derive(Debug)]
+struct RoleExecutionCancelled;
+
+impl std::fmt::Display for RoleExecutionCancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("role execution cancelled")
+    }
+}
+
+impl std::error::Error for RoleExecutionCancelled {}
+
+#[derive(Debug)]
+struct RoleSupervisorTimeout;
+
+impl std::fmt::Display for RoleSupervisorTimeout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("role supervisor deadline elapsed")
+    }
+}
+
+impl std::error::Error for RoleSupervisorTimeout {}
+
+#[derive(Debug)]
+struct RoleLifecyclePersistenceFailed;
+
+impl std::fmt::Display for RoleLifecyclePersistenceFailed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("agent execution lifecycle evidence persistence failed")
+    }
+}
+
+impl std::error::Error for RoleLifecyclePersistenceFailed {}
+
+#[derive(Debug)]
+struct RoleTerminalPersistenceUnconfirmed;
+
+impl std::fmt::Display for RoleTerminalPersistenceUnconfirmed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("terminal AgentExecution persistence is unconfirmed")
+    }
+}
+
+impl std::error::Error for RoleTerminalPersistenceUnconfirmed {}
+
+#[derive(Debug)]
+struct RoleSupervisorOutcomeFailure(&'static str);
+
+impl std::fmt::Display for RoleSupervisorOutcomeFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for RoleSupervisorOutcomeFailure {}
+
+#[derive(Debug)]
+struct RoleHandoffResponseMissing;
+
+impl std::fmt::Display for RoleHandoffResponseMissing {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("handoff response envelope missing")
+    }
+}
+
+impl std::error::Error for RoleHandoffResponseMissing {}
+
+#[derive(Debug)]
+struct RoleTerminalCleanupFailed;
+
+impl std::fmt::Display for RoleTerminalCleanupFailed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("terminal cleanup failed")
+    }
+}
+
+impl std::error::Error for RoleTerminalCleanupFailed {}
+
+async fn persist_agent_lifecycle_phase(
+    store: &WorkflowStore,
+    lifecycle: &mut AcpRoleLifecycle,
+    agent_execution_id: &str,
+    role_execution_id: &str,
+    phase: &'static str,
+) -> Result<()> {
+    let previous = lifecycle.clone();
+    lifecycle.enter(phase);
+    if let Err(_error) = store
+        .update_running_agent_execution_lifecycle(
+            agent_execution_id,
+            role_execution_id,
+            &lifecycle.value(),
+        )
+        .await
+    {
+        lifecycle.restore_after_persistence_failure(&previous, phase);
+        return Err(RoleLifecyclePersistenceFailed.into());
+    }
+    Ok(())
+}
+
+async fn confirm_agent_lifecycle_phase(
+    store: &WorkflowStore,
+    lifecycle: &mut AcpRoleLifecycle,
+    agent_execution_id: &str,
+    role_execution_id: &str,
+    phase: &'static str,
+) -> Result<()> {
+    let previous = lifecycle.clone();
+    lifecycle.confirm(phase);
+    if let Err(_error) = store
+        .update_running_agent_execution_lifecycle(
+            agent_execution_id,
+            role_execution_id,
+            &lifecycle.value(),
+        )
+        .await
+    {
+        lifecycle.restore_after_persistence_failure(&previous, phase);
+        return Err(RoleLifecyclePersistenceFailed.into());
+    }
+    Ok(())
 }
 
 fn classify_supervisor_evidence(
     status: std::process::ExitStatus,
-    cleanup: Result<i32>,
+    cleanup: Result<crate::acp_process::CleanupReceiptEvidence>,
 ) -> SupervisorEvidence {
     use std::os::unix::process::ExitStatusExt;
-    let exit_code = status
-        .code()
-        .or_else(|| status.signal().map(|signal| 128 + signal));
-    let mut failure = (!status.success()).then(|| format!("ROLE_SUPERVISOR_EXIT_FAILED: {status}"));
-    let cleanup_confirmed = match cleanup {
-        Ok(receipt_code) if Some(receipt_code) == exit_code => true,
-        Ok(receipt_code) => {
-            failure.get_or_insert_with(|| format!(
-                "ROLE_CLEANUP_UNCONFIRMED: supervisor exit {exit_code:?} differs from receipt {receipt_code}"
-            ));
-            false
+    let exit_code = status.code();
+    let signal = status.signal();
+    let mut failure = if signal.is_some() {
+        Some("SUPERVISOR_SIGNALED")
+    } else if !status.success() {
+        Some("SUPERVISOR_NONZERO_EXIT")
+    } else {
+        None
+    };
+    let (receipt, cleanup_confirmed) = match cleanup {
+        Ok(receipt)
+            if receipt.runtime == "podman"
+                && receipt.expected_image_matches
+                && (exit_code == Some(receipt.exit_code) || signal.is_some()) =>
+        {
+            (Some(receipt), true)
         }
-        Err(error) => {
-            failure.get_or_insert_with(|| format!("ROLE_CLEANUP_UNCONFIRMED: {error:#}"));
-            false
+        Ok(receipt) => {
+            failure.get_or_insert("CLEANUP_RECEIPT_MISMATCH");
+            (Some(receipt), false)
+        }
+        Err(_) => {
+            failure.get_or_insert("CLEANUP_RECEIPT_UNCONFIRMED");
+            (None, false)
         }
     };
     SupervisorEvidence {
         exit_code,
+        signal,
         cleanup_confirmed,
         failure,
+        receipt,
     }
 }
 
+#[cfg(test)]
 fn validate_role_turn_completion(output: &str, evidence: &SupervisorEvidence) -> Result<()> {
     if let Some(reason) = evidence.failure.as_deref() {
         bail!("{reason}");
     }
-    ensure!(evidence.cleanup_confirmed, "ROLE_CLEANUP_UNCONFIRMED");
+    ensure!(evidence.cleanup_confirmed, "CLEANUP_RECEIPT_UNCONFIRMED");
     ensure!(
         output.contains(ORBIT_HANDOFF_START) && output.contains(ORBIT_HANDOFF_END),
-        "ROLE_OUTPUT_INVALID: missing structured handoff block"
+        "HANDOFF_PARSE_FAILED"
     );
     Ok(())
 }
@@ -4777,6 +5089,107 @@ async fn wait_cli_supervisor(
     }
 }
 
+fn record_supervisor_evidence(lifecycle: &mut AcpRoleLifecycle, evidence: &SupervisorEvidence) {
+    lifecycle.process_exit_code = evidence.exit_code;
+    lifecycle.process_signal = evidence.signal;
+    lifecycle.supervisor_outcome = if evidence.signal.is_some() {
+        "SIGNALED"
+    } else {
+        match evidence.exit_code {
+            Some(0) => "EXITED_ZERO",
+            Some(_) => "EXITED_NONZERO",
+            None => "EXIT_UNCONFIRMED",
+        }
+    };
+    lifecycle.supervisor_failure = evidence.failure;
+    lifecycle.cleanup_state = if evidence.cleanup_confirmed {
+        "CONFIRMED"
+    } else {
+        "UNCONFIRMED"
+    };
+    lifecycle.supervisor_receipt = evidence.receipt.clone();
+    if evidence.exit_code.is_some() || evidence.signal.is_some() {
+        lifecycle.confirm("SUPERVISOR_EXIT_OBSERVED");
+    }
+    if evidence.cleanup_confirmed {
+        lifecycle.confirm("CLEANUP_CONFIRMED");
+    } else {
+        lifecycle.phase = "CLEANUP_UNCONFIRMED";
+    }
+}
+
+fn preserve_primary_failure(primary: &mut Option<anyhow::Error>, secondary: anyhow::Error) {
+    primary.get_or_insert(secondary);
+}
+
+fn add_supervisor_failure_if_primary_missing(
+    failure: &mut Option<anyhow::Error>,
+    evidence: &SupervisorEvidence,
+) {
+    if failure.is_some() {
+        return;
+    }
+    if let Some(reason) = evidence.failure {
+        preserve_primary_failure(failure, RoleSupervisorOutcomeFailure(reason).into());
+    } else if !evidence.cleanup_confirmed {
+        preserve_primary_failure(
+            failure,
+            RoleSupervisorOutcomeFailure("CLEANUP_RECEIPT_UNCONFIRMED").into(),
+        );
+    }
+}
+
+async fn terminate_supervisor_after_evidence_failure(
+    child: &mut tokio::process::Child,
+    request_path: &Path,
+    attempt_id: &str,
+    expected_image: &str,
+) -> SupervisorEvidence {
+    // Closing the worker lifeline asks the supervisor to stop its container
+    // and write the cleanup receipt before escalation.
+    drop(child.stdin.take());
+    match wait_cli_supervisor(child, Duration::from_secs(5), Duration::from_secs(5)).await {
+        Ok(status) => classify_supervisor_evidence(
+            status,
+            crate::acp_process::read_cleanup_evidence(
+                request_path,
+                Some(attempt_id),
+                expected_image,
+            ),
+        ),
+        Err(_) => {
+            if let Some(pid) = child.id() {
+                unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+            }
+            let _ = child.start_kill();
+            let reap = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+            if let Ok(Ok(status)) = reap {
+                return classify_supervisor_evidence(
+                    status,
+                    crate::acp_process::read_cleanup_evidence(
+                        request_path,
+                        Some(attempt_id),
+                        expected_image,
+                    ),
+                );
+            }
+            let receipt = crate::acp_process::read_cleanup_evidence(
+                request_path,
+                Some(attempt_id),
+                expected_image,
+            )
+            .ok();
+            SupervisorEvidence {
+                exit_code: None,
+                signal: None,
+                cleanup_confirmed: false,
+                failure: Some("SUPERVISOR_EXIT_UNCONFIRMED"),
+                receipt,
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_real_acp_turn(
     workflow_state_pool: &PgPool,
@@ -4788,12 +5201,149 @@ async fn execute_real_acp_turn(
     task_text: &str,
     repo_path: &Path,
     input_handoff: Option<&HandoffArtifact>,
-    mut cancellation: tokio::sync::watch::Receiver<bool>,
+    cancellation: tokio::sync::watch::Receiver<bool>,
     suppress_diagnostics: bool,
 ) -> Result<RoleExecutionOutcome> {
     let agent_exec_id = format!("acp-exec-{}", id());
     let started_at_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
+    let store = WorkflowStore::new(workflow_state_pool.clone());
+    let mut lifecycle = AcpRoleLifecycle::new();
+    let initial_audit = ToolCallAudit::default().metadata(0, 0, 0);
+    let expected_runtime_profile =
+        target
+            .runtime_image_digest
+            .clone()
+            .or_else(|| match target.provider.as_str() {
+                "codex" => Some(crate::codex_credential_enrollment::CODEX_IMAGE.to_string()),
+                "antigravity" => Some(ANTIGRAVITY_IMAGE.to_string()),
+                _ => None,
+            });
+    let initial_metadata = serde_json::json!({
+        "provider": target.provider,
+        "account_reference": target.credential_id,
+        "credential_generation": target.credential_generation,
+        "requested_model": target.requested_model,
+        "resolved_model": target.resolved_model,
+        "expected_runtime_identity": target.runtime_interface,
+        "expected_runtime_profile": expected_runtime_profile,
+        "cleanup_confirmed": false,
+        "observed_model": null,
+        "tool_call_audit": initial_audit,
+        "lifecycle": lifecycle.value(),
+    });
+    store
+        .start_agent_execution(
+            &agent_exec_id,
+            &role_exec.id,
+            &format!("{}-acp", target.provider),
+            Some(&target.provider),
+            target.resolved_model.as_deref(),
+            started_at_ms,
+            target.requested_model.as_deref(),
+            target.resolved_model.as_deref(),
+            &initial_metadata,
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("AGENT_EXECUTION_START_FAILED"))?;
 
+    let result = execute_real_acp_turn_body(
+        workflow_state_pool,
+        credential_catalog_pool,
+        wf_run,
+        role_exec,
+        role,
+        target,
+        task_text,
+        repo_path,
+        input_handoff,
+        cancellation,
+        suppress_diagnostics,
+        &agent_exec_id,
+        &mut lifecycle,
+    )
+    .await;
+
+    if !lifecycle.needs_failure_finalization() {
+        return result;
+    }
+
+    let normalized_reason = match &result {
+        Err(error) => lifecycle.normalized_failure(error),
+        Ok(_) => "ACP_EXECUTION_NOT_FINALIZED",
+    };
+    if let Err(error) = &result {
+        lifecycle.record_error(error);
+    } else {
+        lifecycle.failed_phase = Some(lifecycle.phase);
+        lifecycle.outcome = "FAILED";
+        lifecycle.normalized_reason = Some(normalized_reason);
+        lifecycle.phase = "TERMINAL";
+    }
+    lifecycle.preserve_cleanup_state_for_failure_finalization();
+    let finished_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    let failure_metadata = serde_json::json!({
+        "cleanup_confirmed": lifecycle.cleanup_state == "CONFIRMED",
+        "observed_model": null,
+        "lifecycle": lifecycle.value(),
+    });
+    lifecycle.note_terminal_persistence_attempt();
+    if store
+        .finish_agent_execution(
+            &agent_exec_id,
+            &role_exec.id,
+            finished_at_ms,
+            "FAILED",
+            Some(normalized_reason),
+            lifecycle.process_exit_code,
+            Some(normalized_reason),
+            target.requested_model.as_deref(),
+            target.resolved_model.as_deref(),
+            None,
+            0,
+            0,
+            0,
+            0,
+            &serde_json::json!({}),
+            &failure_metadata,
+        )
+        .await
+        .is_err()
+    {
+        lifecycle.note_terminal_persistence_failure();
+        return Err(RoleTerminalPersistenceUnconfirmed.into());
+    }
+    Err(anyhow::anyhow!(normalized_reason))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_real_acp_turn_body(
+    workflow_state_pool: &PgPool,
+    credential_catalog_pool: &PgPool,
+    wf_run: &WorkflowRun,
+    role_exec: &RoleExecution,
+    role: &RoleDefinition,
+    target: &ResolvedExecutionTarget,
+    task_text: &str,
+    repo_path: &Path,
+    input_handoff: Option<&HandoffArtifact>,
+    mut cancellation: tokio::sync::watch::Receiver<bool>,
+    suppress_diagnostics: bool,
+    agent_exec_id: &str,
+    lifecycle: &mut AcpRoleLifecycle,
+) -> Result<RoleExecutionOutcome> {
+    let store = WorkflowStore::new(workflow_state_pool.clone());
+
+    persist_agent_lifecycle_phase(
+        &store,
+        lifecycle,
+        agent_exec_id,
+        &role_exec.id,
+        "CREDENTIAL_RESOLUTION",
+    )
+    .await?;
     let cred_store = CredentialStore::new(credential_catalog_pool);
     let credential_ref = target
         .credential_id
@@ -4804,7 +5354,23 @@ async fn execute_real_acp_turn(
         .await?
         .context("target credential not found")?;
     validate_role_credential_target(target, &credential)?;
+    confirm_agent_lifecycle_phase(
+        &store,
+        lifecycle,
+        agent_exec_id,
+        &role_exec.id,
+        "CREDENTIAL_RESOLVED",
+    )
+    .await?;
 
+    persist_agent_lifecycle_phase(
+        &store,
+        lifecycle,
+        agent_exec_id,
+        &role_exec.id,
+        "CREDENTIAL_STAGING",
+    )
+    .await?;
     let backend = LocalPrivateSecretBackend::default_for_operator()?;
 
     let scratch_dir = tempfile::Builder::new()
@@ -4830,6 +5396,22 @@ async fn execute_real_acp_turn(
         let auth_file = auth_store_dir.join("auth.json");
         tokio::fs::write(&auth_file, secret_bytes.expose()).await?;
         std::fs::set_permissions(&auth_file, std::fs::Permissions::from_mode(0o600))?;
+        confirm_agent_lifecycle_phase(
+            &store,
+            lifecycle,
+            agent_exec_id,
+            &role_exec.id,
+            "CREDENTIAL_STAGED",
+        )
+        .await?;
+        persist_agent_lifecycle_phase(
+            &store,
+            lifecycle,
+            agent_exec_id,
+            &role_exec.id,
+            "RUNTIME_PREPARATION",
+        )
+        .await?;
 
         use crate::codex_credential_enrollment as enrolled;
         let binding_name = "codex-role-v1";
@@ -4935,6 +5517,22 @@ async fn execute_real_acp_turn(
         let settings_file = auth_store_dir.join("settings.json");
         tokio::fs::write(&settings_file, settings.expose()).await?;
         std::fs::set_permissions(&settings_file, std::fs::Permissions::from_mode(0o600))?;
+        confirm_agent_lifecycle_phase(
+            &store,
+            lifecycle,
+            agent_exec_id,
+            &role_exec.id,
+            "CREDENTIAL_STAGED",
+        )
+        .await?;
+        persist_agent_lifecycle_phase(
+            &store,
+            lifecycle,
+            agent_exec_id,
+            &role_exec.id,
+            "RUNTIME_PREPARATION",
+        )
+        .await?;
 
         let binding_name = "antigravity-role-v1";
         let launch = Launch {
@@ -5038,7 +5636,23 @@ async fn execute_real_acp_turn(
     };
     tokio::fs::write(&request_path, serde_json::to_vec(&req)?).await?;
     std::fs::set_permissions(&request_path, std::fs::Permissions::from_mode(0o600))?;
+    confirm_agent_lifecycle_phase(
+        &store,
+        lifecycle,
+        agent_exec_id,
+        &role_exec.id,
+        "RUNTIME_PREPARED",
+    )
+    .await?;
 
+    persist_agent_lifecycle_phase(
+        &store,
+        lifecycle,
+        agent_exec_id,
+        &role_exec.id,
+        "SUPERVISOR_START",
+    )
+    .await?;
     let mut command = tokio::process::Command::new(crate::worker::current_executable()?);
     command
         .arg("acp-supervisor")
@@ -5068,16 +5682,52 @@ async fn execute_real_acp_turn(
         command.env("XDG_RUNTIME_DIR", val);
     }
 
-    let mut child = command.spawn().context("failed to spawn acp-supervisor")?;
+    let mut child = command
+        .spawn()
+        .map_err(|_| anyhow::anyhow!("SUPERVISOR_START_FAILED"))?;
+    lifecycle.cleanup_state = "UNCONFIRMED";
+    if let Err(error) = confirm_agent_lifecycle_phase(
+        &store,
+        lifecycle,
+        agent_exec_id,
+        &role_exec.id,
+        "SUPERVISOR_STARTED",
+    )
+    .await
+    {
+        let evidence = terminate_supervisor_after_evidence_failure(
+            &mut child,
+            &request_path,
+            &req.attempt_id,
+            &req.runtime.launch.image,
+        )
+        .await;
+        record_supervisor_evidence(lifecycle, &evidence);
+        return Err(error);
+    }
 
-    let child_out = child
-        .stdout
-        .take()
-        .ok_or_else(|| UnconfirmedRoleCleanup("supervisor stdout missing".into()))?;
-    let child_in = child
-        .stdin
-        .take()
-        .ok_or_else(|| UnconfirmedRoleCleanup("supervisor stdin missing".into()))?;
+    let Some(child_out) = child.stdout.take() else {
+        let evidence = terminate_supervisor_after_evidence_failure(
+            &mut child,
+            &request_path,
+            &req.attempt_id,
+            &req.runtime.launch.image,
+        )
+        .await;
+        record_supervisor_evidence(lifecycle, &evidence);
+        return Err(anyhow::anyhow!("SUPERVISOR_STDOUT_UNAVAILABLE"));
+    };
+    let Some(child_in) = child.stdin.take() else {
+        let evidence = terminate_supervisor_after_evidence_failure(
+            &mut child,
+            &request_path,
+            &req.attempt_id,
+            &req.runtime.launch.image,
+        )
+        .await;
+        record_supervisor_evidence(lifecycle, &evidence);
+        return Err(anyhow::anyhow!("SUPERVISOR_STDIN_UNAVAILABLE"));
+    };
     let mut wire = Wire::new(child_out, child_in, 16 * 1024 * 1024);
 
     let mut state = AcpTurnState {
@@ -5095,13 +5745,20 @@ async fn execute_real_acp_turn(
         terminals: BTreeMap::new(),
         wf_attempt_id: Some(wf_run.attempt_id.clone()),
         role_exec_id: Some(role_exec.id.clone()),
-        agent_exec_id: Some(agent_exec_id.clone()),
+        agent_exec_id: Some(agent_exec_id.to_string()),
         pool: Some(workflow_state_pool),
     };
 
-    let store = WorkflowStore::new(workflow_state_pool.clone());
     let turn = tokio::select! {
         result = async {
+    persist_agent_lifecycle_phase(
+        &store,
+        lifecycle,
+        agent_exec_id,
+        &role_exec.id,
+        "ACP_INITIALIZE",
+    )
+    .await?;
     let _init_res = acp_call(
         &mut wire,
         &mut state,
@@ -5140,6 +5797,22 @@ async fn execute_real_acp_turn(
     .await
     .context("ACP initialize failed")?;
 
+    confirm_agent_lifecycle_phase(
+        &store,
+        lifecycle,
+        agent_exec_id,
+        &role_exec.id,
+        "ACP_INITIALIZED",
+    )
+    .await?;
+    persist_agent_lifecycle_phase(
+        &store,
+        lifecycle,
+        agent_exec_id,
+        &role_exec.id,
+        "SESSION_CREATION",
+    )
+    .await?;
     let new_res = acp_call(
         &mut wire,
         &mut state,
@@ -5157,6 +5830,14 @@ async fn execute_real_acp_turn(
         .and_then(|v| v.as_str())
         .context("sessionId missing in session/new response")?
         .to_string();
+    confirm_agent_lifecycle_phase(
+        &store,
+        lifecycle,
+        agent_exec_id,
+        &role_exec.id,
+        "SESSION_CREATED",
+    )
+    .await?;
 
     if target.provider == "antigravity" {
         let _ = acp_call(
@@ -5190,26 +5871,23 @@ async fn execute_real_acp_turn(
         git_diff.as_deref(),
     );
 
-    let initial_audit = state.tool_call_audit.metadata(0, 0, 0);
-    store
-        .start_agent_execution(
-            &agent_exec_id,
-            &role_exec.id,
-            &format!("{}-acp", target.provider),
-            Some(&target.provider),
-            target.resolved_model.as_deref(),
-            started_at_ms,
-            target.requested_model.as_deref(),
-            target.resolved_model.as_deref(),
-            &serde_json::json!({
-                "provider": target.provider,
-                "cleanup_confirmed": false,
-                "observed_model": null,
-                "tool_call_audit": initial_audit,
-            }),
-        )
-        .await?;
-
+    persist_agent_lifecycle_phase(
+        &store,
+        lifecycle,
+        agent_exec_id,
+        &role_exec.id,
+        "PROMPT_DISPATCH",
+    )
+    .await?;
+    lifecycle.prompt_uncertainty = "IN_FLIGHT";
+    persist_agent_lifecycle_phase(
+        &store,
+        lifecycle,
+        agent_exec_id,
+        &role_exec.id,
+        "PROMPT_IN_FLIGHT",
+    )
+    .await?;
     let prompt_res = acp_call(
         &mut wire,
         &mut state,
@@ -5226,6 +5904,15 @@ async fn execute_real_acp_turn(
     )
     .await
     .context("ACP session/prompt failed")?;
+    lifecycle.prompt_uncertainty = "RESOLVED";
+    confirm_agent_lifecycle_phase(
+        &store,
+        lifecycle,
+        agent_exec_id,
+        &role_exec.id,
+        "PROMPT_RESPONSE_RECEIVED",
+    )
+    .await?;
 
     if !state.agent_output.contains(ORBIT_HANDOFF_START) {
         extract_text_from_json(&prompt_res, &mut state.agent_output);
@@ -5238,10 +5925,14 @@ async fn execute_real_acp_turn(
                 if *cancellation.borrow() { return; }
             }
             std::future::pending::<()>().await;
-        } => Err(anyhow::anyhow!("ROLE_EXECUTION_CANCELLED")),
-        _ = tokio::time::sleep(Duration::from_secs(600)) => Err(anyhow::anyhow!("ROLE_SUPERVISOR_TIMEOUT")),
+        } => Err(anyhow::Error::new(RoleExecutionCancelled)),
+        _ = tokio::time::sleep(Duration::from_secs(600)) => Err(anyhow::Error::new(RoleSupervisorTimeout)),
     };
 
+    let failure_phase = lifecycle.phase;
+    let cleanup_phase_result =
+        persist_agent_lifecycle_phase(&store, lifecycle, agent_exec_id, &role_exec.id, "CLEANUP")
+            .await;
     drop(wire);
     let wait_limit = if turn.is_err() { 5 } else { 60 };
     let status = wait_cli_supervisor(
@@ -5249,23 +5940,77 @@ async fn execute_real_acp_turn(
         Duration::from_secs(wait_limit),
         Duration::from_secs(10),
     )
-    .await?;
-    let evidence = classify_supervisor_evidence(
-        status,
-        crate::acp_process::read_cleanup(&request_path, Some(&req.attempt_id)),
-    );
-    for (_tid, term) in std::mem::take(&mut state.terminals) {
-        term.kill()
+    .await;
+    let evidence = match status {
+        Ok(status) => classify_supervisor_evidence(
+            status,
+            crate::acp_process::read_cleanup_evidence(
+                &request_path,
+                Some(&req.attempt_id),
+                &req.runtime.launch.image,
+            ),
+        ),
+        Err(_) => {
+            terminate_supervisor_after_evidence_failure(
+                &mut child,
+                &request_path,
+                &req.attempt_id,
+                &req.runtime.launch.image,
+            )
             .await
-            .map_err(|error| UnconfirmedRoleCleanup(format!("terminal cleanup failed: {error}")))?;
+        }
+    };
+    record_supervisor_evidence(lifecycle, &evidence);
+    if state.tool_calls > 0
+        || !state.tool_call_audit.provider_tool_invocations.is_empty()
+        || !state.tool_call_audit.unmatched_provider_updates.is_empty()
+        || state.tool_call_audit.provider_tool_names_omitted > 0
+    {
+        lifecycle.note_tool_activity();
+    }
+    let mut terminal_cleanup_failed = false;
+    for (_tid, term) in std::mem::take(&mut state.terminals) {
+        if term.kill().await.is_err() {
+            terminal_cleanup_failed = true;
+        }
     }
 
     let finished_at_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
 
     let mut failure = turn.err();
-    if let Err(error) = validate_role_turn_completion(&state.agent_output, &evidence) {
-        failure.get_or_insert(error);
+    if let Err(error) = cleanup_phase_result {
+        preserve_primary_failure(&mut failure, error);
     }
+    if terminal_cleanup_failed {
+        preserve_primary_failure(&mut failure, RoleTerminalCleanupFailed.into());
+        lifecycle.cleanup_state = "UNCONFIRMED";
+    }
+    add_supervisor_failure_if_primary_missing(&mut failure, &evidence);
+    if failure.is_none()
+        && (!state.agent_output.contains(ORBIT_HANDOFF_START)
+            || !state.agent_output.contains(ORBIT_HANDOFF_END))
+    {
+        preserve_primary_failure(&mut failure, RoleHandoffResponseMissing.into());
+    }
+    if let Some(error) = failure.as_ref() {
+        lifecycle.phase = failure_phase;
+        lifecycle.record_error(error);
+    } else {
+        lifecycle.finish_success();
+    }
+    lifecycle.cleanup_state = if evidence.cleanup_confirmed {
+        if terminal_cleanup_failed {
+            "UNCONFIRMED"
+        } else {
+            "CONFIRMED"
+        }
+    } else {
+        "UNCONFIRMED"
+    };
+    lifecycle.process_exit_code = evidence.exit_code;
+    lifecycle.process_signal = evidence.signal;
+    lifecycle.supervisor_receipt = evidence.receipt.clone();
+    lifecycle.phase = "TERMINAL";
     state.tool_call_audit.finish_interrupted_call(
         &mut state.tool_successes,
         &mut state.tool_failures,
@@ -5279,24 +6024,19 @@ async fn execute_real_acp_turn(
     } else {
         "SUCCEEDED"
     };
-    let reason = if failure.is_some() {
-        "local execution unconfirmed"
-    } else {
-        "completed"
-    };
-    let failure_message = failure.as_ref().map(|error| {
-        if suppress_diagnostics {
-            "live provider fixture execution failed".to_owned()
-        } else {
-            error.to_string().chars().take(512).collect::<String>()
-        }
-    });
+    let reason = lifecycle.normalized_reason.unwrap_or("COMPLETED");
+    let failure_message = failure.as_ref().map(|_| reason.to_owned());
     let model_evidence = role_model_evidence(target, None);
     let tool_call_audit =
         state
             .tool_call_audit
             .metadata(state.tool_calls, state.tool_successes, state.tool_failures);
-    store
+    let tool_counts = serde_json::to_value(&state.tool_counts).map_err(|_| {
+        lifecycle.note_terminal_persistence_failure();
+        anyhow::Error::new(RoleTerminalPersistenceUnconfirmed)
+    })?;
+    lifecycle.note_terminal_persistence_attempt();
+    if store
         .finish_agent_execution(
             &agent_exec_id,
             &role_exec.id,
@@ -5308,34 +6048,42 @@ async fn execute_real_acp_turn(
             model_evidence.requested,
             model_evidence.configured,
             model_evidence.observed,
-            1,
+            i64::from(lifecycle.prompt_uncertainty != "NOT_DISPATCHED"),
             state.tool_calls as i64,
             state.tool_successes as i64,
             state.tool_failures as i64,
-            &serde_json::to_value(&state.tool_counts)?,
+            &tool_counts,
             &serde_json::json!({
                 "provider": target.provider,
                 "cleanup_confirmed": evidence.cleanup_confirmed,
                 "observed_model": null,
                 "tool_call_audit": tool_call_audit,
+                "lifecycle": lifecycle.value(),
             }),
         )
-        .await?;
+        .await
+        .is_err()
+    {
+        lifecycle.note_terminal_persistence_failure();
+        return Err(RoleTerminalPersistenceUnconfirmed.into());
+    }
+    lifecycle.note_terminal_persistence_attempt();
 
     if !evidence.cleanup_confirmed {
-        return Err(UnconfirmedRoleCleanup(
-            failure_message.unwrap_or_else(|| "missing matching cleanup receipt".into()),
-        )
-        .into());
+        return Err(anyhow::anyhow!(
+            lifecycle
+                .normalized_reason
+                .unwrap_or("CLEANUP_RECEIPT_UNCONFIRMED")
+        ));
     }
 
-    if let Some(error) = failure {
-        return Err(error);
+    if failure.is_some() {
+        return Err(anyhow::anyhow!(reason));
     }
 
     Ok(RoleExecutionOutcome {
         raw_output: state.agent_output,
-        agent_execution_ids: vec![agent_exec_id],
+        agent_execution_ids: vec![agent_exec_id.to_string()],
         termination_reason: Some("completed".into()),
     })
 }
@@ -5414,6 +6162,285 @@ impl RoleAgentExecutor for RealAcpRoleExecutor {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn cleanup_receipt(exit_code: i32) -> crate::acp_process::CleanupReceiptEvidence {
+        crate::acp_process::CleanupReceiptEvidence {
+            format_version: 4,
+            runtime: "podman",
+            launch_stage: "container_wait",
+            exit_code,
+            expected_image_matches: true,
+            diagnostic_present: false,
+            diagnostic_truncated: false,
+            codex_session: None,
+        }
+    }
+
+    #[test]
+    fn lifecycle_attempted_phases_do_not_claim_completion() {
+        let cases = [
+            ("CREDENTIAL_RESOLUTION", "CREDENTIAL_RESOLUTION_FAILED"),
+            ("CREDENTIAL_STAGING", "CREDENTIAL_STAGING_FAILED"),
+            ("RUNTIME_PREPARATION", "RUNTIME_PREPARATION_FAILED"),
+            ("SUPERVISOR_START", "SUPERVISOR_START_FAILED"),
+            ("ACP_INITIALIZE", "ACP_INITIALIZE_FAILED"),
+            ("SESSION_CREATION", "ACP_SESSION_CREATION_FAILED"),
+            ("PROMPT_IN_FLIGHT", "ACP_PROMPT_FAILED"),
+        ];
+        for (phase, reason) in cases {
+            let mut lifecycle = AcpRoleLifecycle::new();
+            lifecycle.enter(phase);
+            lifecycle.record_error(&anyhow::anyhow!("synthetic stage failure"));
+            assert_eq!(lifecycle.normalized_reason, Some(reason));
+            assert_eq!(lifecycle.last_confirmed_phase, "AGENT_EXECUTION_CREATED");
+            assert_eq!(lifecycle.attempted_phase, phase);
+            assert_eq!(lifecycle.failed_phase, Some(phase));
+            assert!(!lifecycle.milestones.contains(&phase));
+            assert_eq!(lifecycle.phase, "TERMINAL");
+        }
+
+        let mut initialized = AcpRoleLifecycle::new();
+        initialized.confirm("SUPERVISOR_STARTED");
+        initialized.enter("ACP_INITIALIZE");
+        initialized.record_error(&anyhow::anyhow!("initialize failed"));
+        assert_eq!(initialized.last_confirmed_phase, "SUPERVISOR_STARTED");
+        assert!(!initialized.milestones.contains(&"ACP_INITIALIZED"));
+
+        let mut session = AcpRoleLifecycle::new();
+        session.confirm("ACP_INITIALIZED");
+        session.enter("SESSION_CREATION");
+        session.record_error(&anyhow::anyhow!("session creation failed"));
+        assert_eq!(session.last_confirmed_phase, "ACP_INITIALIZED");
+        assert!(!session.milestones.contains(&"SESSION_CREATED"));
+    }
+
+    #[test]
+    fn phase_persistence_failure_retains_attempt_and_last_confirmation() {
+        let mut lifecycle = AcpRoleLifecycle::new();
+        lifecycle.confirm("SUPERVISOR_STARTED");
+        let previous = lifecycle.clone();
+        lifecycle.confirm("ACP_INITIALIZED");
+        lifecycle.restore_after_persistence_failure(&previous, "ACP_INITIALIZED");
+        lifecycle.record_error(&RoleLifecyclePersistenceFailed.into());
+
+        assert_eq!(lifecycle.failed_phase, Some("ACP_INITIALIZED"));
+        assert_eq!(lifecycle.attempted_phase, "ACP_INITIALIZED");
+        assert_eq!(lifecycle.phase, "TERMINAL");
+        assert_eq!(lifecycle.last_confirmed_phase, "SUPERVISOR_STARTED");
+        assert_eq!(lifecycle.persistence_state, "UNCONFIRMED");
+        assert_eq!(
+            lifecycle.normalized_reason,
+            Some("AGENT_EXECUTION_LIFECYCLE_PERSISTENCE_FAILED")
+        );
+    }
+
+    #[test]
+    fn lifecycle_keeps_timeout_cancellation_and_persistence_outcomes_typed() {
+        let mut pending = AcpRoleLifecycle::new();
+        pending.enter("PROMPT_IN_FLIGHT");
+        pending.prompt_uncertainty = "IN_FLIGHT";
+        pending.record_error(
+            &crate::acp_runtime::TurnTimeout {
+                diagnostic: "pending_model_call=true private-payload-redacted".into(),
+                pending_model_call: Some(true),
+            }
+            .into(),
+        );
+        assert_eq!(pending.normalized_reason, Some("ACP_PROMPT_TIMEOUT"));
+        assert_eq!(pending.prompt_uncertainty, "UNRESOLVED_PENDING_MODEL_CALL");
+        assert!(
+            !pending
+                .value()
+                .to_string()
+                .contains("private-payload-redacted")
+        );
+
+        let mut no_pending = AcpRoleLifecycle::new();
+        no_pending.enter("PROMPT_IN_FLIGHT");
+        no_pending.prompt_uncertainty = "IN_FLIGHT";
+        no_pending.record_error(
+            &crate::acp_runtime::TurnTimeout {
+                diagnostic: "safe diagnostic".into(),
+                pending_model_call: Some(false),
+            }
+            .into(),
+        );
+        assert_eq!(
+            no_pending.prompt_uncertainty,
+            "UNRESOLVED_NO_PENDING_MODEL_CALL"
+        );
+
+        let mut cancelled = AcpRoleLifecycle::new();
+        cancelled.enter("PROMPT_IN_FLIGHT");
+        cancelled.prompt_uncertainty = "IN_FLIGHT";
+        cancelled.record_error(&RoleExecutionCancelled.into());
+        assert_eq!(
+            cancelled.normalized_reason,
+            Some("ROLE_EXECUTION_CANCELLED")
+        );
+        assert_eq!(cancelled.prompt_uncertainty, "UNRESOLVED_UNKNOWN");
+
+        let mut persistence = AcpRoleLifecycle::new();
+        persistence.confirm("SUPERVISOR_STARTED");
+        persistence.enter("ACP_INITIALIZE");
+        persistence.persistence_state = "UNCONFIRMED";
+        persistence.record_error(&RoleLifecyclePersistenceFailed.into());
+        assert_eq!(
+            persistence.normalized_reason,
+            Some("AGENT_EXECUTION_LIFECYCLE_PERSISTENCE_FAILED")
+        );
+        assert_eq!(persistence.last_confirmed_phase, "SUPERVISOR_STARTED");
+        assert_eq!(persistence.persistence_state, "UNCONFIRMED");
+
+        let mut missing_handoff = AcpRoleLifecycle::new();
+        missing_handoff.confirm("PROMPT_RESPONSE_RECEIVED");
+        missing_handoff.record_error(&RoleHandoffResponseMissing.into());
+        assert_eq!(
+            missing_handoff.normalized_reason,
+            Some("HANDOFF_RESPONSE_MISSING")
+        );
+        assert_eq!(
+            missing_handoff.last_confirmed_phase,
+            "PROMPT_RESPONSE_RECEIVED"
+        );
+    }
+
+    #[test]
+    fn post_spawn_failure_keeps_receipt_confirmed_cleanup() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let evidence = classify_supervisor_evidence(
+            std::process::ExitStatus::from_raw(0),
+            Ok(cleanup_receipt(0)),
+        );
+        let mut lifecycle = AcpRoleLifecycle::new();
+        lifecycle.cleanup_state = "UNCONFIRMED";
+        record_supervisor_evidence(&mut lifecycle, &evidence);
+        lifecycle.enter("ACP_INITIALIZE");
+        lifecycle.record_error(&anyhow::anyhow!("initialize failed"));
+        lifecycle.preserve_cleanup_state_for_failure_finalization();
+
+        assert_eq!(lifecycle.normalized_reason, Some("ACP_INITIALIZE_FAILED"));
+        assert_eq!(lifecycle.cleanup_state, "CONFIRMED");
+        assert_eq!(lifecycle.supervisor_outcome, "EXITED_ZERO");
+        assert_eq!(lifecycle.supervisor_failure, None);
+
+        let mut no_runtime = AcpRoleLifecycle::new();
+        no_runtime.preserve_cleanup_state_for_failure_finalization();
+        assert_eq!(no_runtime.cleanup_state, "NO_RUNTIME_RESOURCE_CREATED");
+    }
+
+    #[test]
+    fn cleanup_failures_preserve_primary_timeout_and_pending_model_evidence() {
+        let mut lifecycle = AcpRoleLifecycle::new();
+        lifecycle.enter("PROMPT_IN_FLIGHT");
+        lifecycle.prompt_uncertainty = "IN_FLIGHT";
+        let mut failure = Some(anyhow::Error::new(crate::acp_runtime::TurnTimeout {
+            diagnostic: "pending_model_call=true redacted".into(),
+            pending_model_call: Some(true),
+        }));
+
+        preserve_primary_failure(&mut failure, RoleLifecyclePersistenceFailed.into());
+        lifecycle.persistence_state = "UNCONFIRMED";
+        preserve_primary_failure(&mut failure, RoleTerminalCleanupFailed.into());
+        lifecycle.cleanup_state = "UNCONFIRMED";
+        lifecycle.record_error(failure.as_ref().expect("primary timeout retained"));
+
+        assert_eq!(lifecycle.normalized_reason, Some("ACP_PROMPT_TIMEOUT"));
+        assert_eq!(
+            lifecycle.prompt_uncertainty,
+            "UNRESOLVED_PENDING_MODEL_CALL"
+        );
+        assert_eq!(lifecycle.persistence_state, "UNCONFIRMED");
+        assert_eq!(lifecycle.cleanup_state, "UNCONFIRMED");
+        let encoded = lifecycle.value().to_string();
+        assert!(!encoded.contains("pending_model_call=true"));
+        assert!(!encoded.contains("redacted"));
+    }
+
+    #[test]
+    fn unconfirmed_terminal_persistence_disables_zero_counter_fallback() {
+        let mut lifecycle = AcpRoleLifecycle::new();
+        assert!(lifecycle.needs_failure_finalization());
+        lifecycle.note_terminal_persistence_attempt();
+        lifecycle.note_terminal_persistence_failure();
+
+        assert!(!lifecycle.needs_failure_finalization());
+        assert_eq!(lifecycle.persistence_state, "UNCONFIRMED");
+        assert!(
+            anyhow::Error::new(RoleTerminalPersistenceUnconfirmed)
+                .is::<RoleTerminalPersistenceUnconfirmed>()
+        );
+    }
+
+    #[test]
+    fn supervisor_outcome_survives_acp_failure_without_fabricated_tool_audit() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let nonzero = classify_supervisor_evidence(
+            std::process::ExitStatus::from_raw(7 << 8),
+            Ok(cleanup_receipt(7)),
+        );
+        let mut lifecycle = AcpRoleLifecycle::new();
+        lifecycle.enter("ACP_INITIALIZE");
+        record_supervisor_evidence(&mut lifecycle, &nonzero);
+        let mut failure = Some(anyhow::anyhow!("initialize failed"));
+        add_supervisor_failure_if_primary_missing(&mut failure, &nonzero);
+        lifecycle.phase = "ACP_INITIALIZE";
+        lifecycle.record_error(failure.as_ref().expect("ACP failure remains primary"));
+
+        assert_eq!(lifecycle.outcome, "FAILED");
+        assert_eq!(lifecycle.normalized_reason, Some("ACP_INITIALIZE_FAILED"));
+        assert_eq!(lifecycle.process_exit_code, Some(7));
+        assert_eq!(lifecycle.process_signal, None);
+        assert_eq!(lifecycle.supervisor_outcome, "EXITED_NONZERO");
+        assert_eq!(
+            lifecycle.supervisor_failure,
+            Some("SUPERVISOR_NONZERO_EXIT")
+        );
+
+        let signaled = classify_supervisor_evidence(
+            std::process::ExitStatus::from_raw(libc::SIGTERM),
+            Ok(cleanup_receipt(0)),
+        );
+        let mut signaled_lifecycle = AcpRoleLifecycle::new();
+        record_supervisor_evidence(&mut signaled_lifecycle, &signaled);
+        let mut no_primary = None;
+        add_supervisor_failure_if_primary_missing(&mut no_primary, &signaled);
+        signaled_lifecycle.record_error(no_primary.as_ref().expect("signal is a failure"));
+        assert_eq!(signaled_lifecycle.outcome, "FAILED");
+        assert_eq!(
+            signaled_lifecycle.normalized_reason,
+            Some("SUPERVISOR_SIGNALED")
+        );
+        assert_eq!(signaled_lifecycle.process_exit_code, None);
+        assert_eq!(signaled_lifecycle.process_signal, Some(libc::SIGTERM));
+        assert_eq!(signaled_lifecycle.supervisor_outcome, "SIGNALED");
+
+        for _ in 0..2 {
+            let metadata = ToolCallAudit::default().metadata(0, 0, 0);
+            assert_eq!(metadata["correlation_capability"], "NOT_EXERCISED");
+            assert_eq!(metadata["summary"]["callback_count"], 0);
+            assert_eq!(metadata["summary"]["provider_notification_count"], 0);
+            assert_eq!(metadata["entries"], serde_json::json!([]));
+            assert_eq!(metadata["provider_updates"], serde_json::json!([]));
+        }
+    }
+
+    #[test]
+    fn lifecycle_tool_and_handoff_markers_describe_observation_not_schema_acceptance() {
+        let mut lifecycle = AcpRoleLifecycle::new();
+        lifecycle.confirm("SESSION_CREATED");
+        lifecycle.note_tool_activity();
+        assert_eq!(lifecycle.tool_audit_applicability, "APPLICABLE");
+        assert_eq!(lifecycle.last_confirmed_phase, "SESSION_CREATED");
+        assert!(lifecycle.milestones.contains(&"TOOL_ACTIVITY_OBSERVED"));
+
+        lifecycle.confirm("PROMPT_RESPONSE_RECEIVED");
+        assert_eq!(lifecycle.last_confirmed_phase, "PROMPT_RESPONSE_RECEIVED");
+        assert!(!lifecycle.milestones.contains(&"HANDOFF_SCHEMA_ACCEPTED"));
+        assert_eq!(lifecycle.outcome, "IN_PROGRESS");
+    }
 
     #[test]
     fn only_tool_call_session_updates_require_audit_persistence() {
@@ -7130,22 +8157,27 @@ mod tests {
     fn handoff_requires_successful_supervisor_and_matching_cleanup() {
         use std::os::unix::process::ExitStatusExt;
         let handoff = format!("{ORBIT_HANDOFF_START}\n{{}}\n{ORBIT_HANDOFF_END}");
-        let nonzero =
-            classify_supervisor_evidence(std::process::ExitStatus::from_raw(7 << 8), Ok(7));
+        let nonzero = classify_supervisor_evidence(
+            std::process::ExitStatus::from_raw(7 << 8),
+            Ok(cleanup_receipt(7)),
+        );
         assert!(nonzero.cleanup_confirmed);
         assert_eq!(nonzero.exit_code, Some(7));
+        assert_eq!(nonzero.signal, None);
         assert!(
             validate_role_turn_completion(&handoff, &nonzero)
                 .unwrap_err()
                 .to_string()
-                .contains("ROLE_SUPERVISOR_EXIT_FAILED")
+                .contains("SUPERVISOR_NONZERO_EXIT")
         );
 
         let signal = classify_supervisor_evidence(
             std::process::ExitStatus::from_raw(libc::SIGTERM),
-            Ok(128 + libc::SIGTERM),
+            Ok(cleanup_receipt(0)),
         );
-        assert_eq!(signal.exit_code, Some(128 + libc::SIGTERM));
+        assert_eq!(signal.exit_code, None);
+        assert_eq!(signal.signal, Some(libc::SIGTERM));
+        assert!(signal.cleanup_confirmed);
         assert!(validate_role_turn_completion(&handoff, &signal).is_err());
 
         let missing = classify_supervisor_evidence(
@@ -7157,11 +8189,46 @@ mod tests {
             validate_role_turn_completion(&handoff, &missing)
                 .unwrap_err()
                 .to_string()
-                .contains("ROLE_CLEANUP_UNCONFIRMED")
+                .contains("CLEANUP_RECEIPT_UNCONFIRMED")
         );
 
-        let successful = classify_supervisor_evidence(std::process::ExitStatus::from_raw(0), Ok(0));
+        let successful = classify_supervisor_evidence(
+            std::process::ExitStatus::from_raw(0),
+            Ok(cleanup_receipt(0)),
+        );
         assert!(validate_role_turn_completion(&handoff, &successful).is_ok());
+    }
+
+    #[tokio::test]
+    async fn lifecycle_persistence_failure_still_kills_and_reaps_supervisor() -> Result<()> {
+        let scratch = tempdir()?;
+        let request = scratch.path().join("request.json");
+        std::fs::write(&request, b"{}").unwrap();
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .args(["-c", "sleep 30"])
+            .process_group(0)
+            .kill_on_drop(true);
+        let mut child = command.spawn()?;
+        let pid = child.id().context("child PID missing")?;
+        let started = tokio::time::Instant::now();
+        let evidence = terminate_supervisor_after_evidence_failure(
+            &mut child,
+            &request,
+            "attempt-test",
+            "pinned-image",
+        )
+        .await;
+        assert!(started.elapsed() < Duration::from_secs(7));
+        assert!(evidence.exit_code.is_none());
+        assert_eq!(evidence.signal, Some(libc::SIGKILL));
+        assert!(!evidence.cleanup_confirmed);
+        assert!(evidence.receipt.is_none());
+        assert!(
+            child.try_wait()?.is_some(),
+            "supervisor child {pid} was not reaped"
+        );
+        Ok(())
     }
 
     #[tokio::test]

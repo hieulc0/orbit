@@ -1502,7 +1502,22 @@ impl WorkflowStore {
         let updated = sqlx::query(
             r#"
             UPDATE orbit_agent_executions ae
-            SET metadata = jsonb_set(ae.metadata, '{tool_call_audit}', $3, true)
+            SET metadata = jsonb_set(
+                jsonb_set(ae.metadata, '{tool_call_audit}', $3, true),
+                '{lifecycle}',
+                COALESCE(ae.metadata->'lifecycle', '{}'::jsonb) || jsonb_build_object(
+                    'phase', 'TOOL_ACTIVITY',
+                    'tool_audit_applicability', 'APPLICABLE',
+                    'milestones', CASE
+                        WHEN COALESCE(ae.metadata->'lifecycle'->'milestones', '[]'::jsonb) @> '["TOOL_ACTIVITY_OBSERVED"]'::jsonb
+                            THEN COALESCE(ae.metadata->'lifecycle'->'milestones', '[]'::jsonb)
+                        WHEN jsonb_array_length(COALESCE(ae.metadata->'lifecycle'->'milestones', '[]'::jsonb)) < 16
+                            THEN COALESCE(ae.metadata->'lifecycle'->'milestones', '[]'::jsonb) || '["TOOL_ACTIVITY_OBSERVED"]'::jsonb
+                        ELSE COALESCE(ae.metadata->'lifecycle'->'milestones', '[]'::jsonb)
+                    END
+                ),
+                true
+            )
             WHERE ae.id = $1 AND ae.role_execution_id = $2 AND ae.status = 'RUNNING'
               AND EXISTS (SELECT 1 FROM orbit_role_executions re
                           JOIN orbit_workflow_runs wf ON wf.id = re.workflow_run_id
@@ -1516,6 +1531,38 @@ impl WorkflowStore {
         .execute(&self.pool)
         .await
         .context("persist running ACP tool audit")?;
+        ensure!(
+            updated.rows_affected() == 1,
+            "AGENT_EXECUTION_FENCE_REJECTED"
+        );
+        Ok(())
+    }
+
+    /// Persist one bounded ACP lifecycle snapshot while the exact role and
+    /// workflow still authorize the active AgentExecution.
+    pub async fn update_running_agent_execution_lifecycle(
+        &self,
+        agent_execution_id: &str,
+        role_execution_id: &str,
+        lifecycle: &serde_json::Value,
+    ) -> Result<()> {
+        let updated = sqlx::query(
+            r#"
+            UPDATE orbit_agent_executions ae
+            SET metadata = jsonb_set(ae.metadata, '{lifecycle}', $3, true)
+            WHERE ae.id = $1 AND ae.role_execution_id = $2 AND ae.status = 'RUNNING'
+              AND EXISTS (SELECT 1 FROM orbit_role_executions re
+                          JOIN orbit_workflow_runs wf ON wf.id = re.workflow_run_id
+                          WHERE re.id = $2 AND re.status = 'RUNNING'
+                            AND wf.status NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'EXHAUSTED'))
+            "#,
+        )
+        .bind(agent_execution_id)
+        .bind(role_execution_id)
+        .bind(lifecycle)
+        .execute(&self.pool)
+        .await
+        .context("persist agent execution lifecycle")?;
         ensure!(
             updated.rows_affected() == 1,
             "AGENT_EXECUTION_FENCE_REJECTED"
@@ -1552,7 +1599,7 @@ impl WorkflowStore {
                 exit_code = $6, message = $7, actual_model = $8,
                 requested_model = $9, resolved_model = $10,
                 turn_count = $11, tool_call_count = $12, tool_success_count = $13,
-                tool_failure_count = $14, tool_counts = $15, metadata = $16
+                tool_failure_count = $14, tool_counts = $15, metadata = ae.metadata || $16
             WHERE ae.id = $1 AND ae.role_execution_id = $2 AND ae.status = 'RUNNING'
               AND EXISTS (SELECT 1 FROM orbit_role_executions re
                           JOIN orbit_workflow_runs wf ON wf.id = re.workflow_run_id

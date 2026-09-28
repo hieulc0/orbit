@@ -672,6 +672,7 @@ mod validation_tests {
     fn prompt_timeout_classification_survives_cleanup_context() {
         let timeout = anyhow::Error::new(crate::acp_runtime::TurnTimeout {
             diagnostic: "bounded protocol state".into(),
+            pending_model_call: None,
         })
         .context("cleanup confirmed");
         assert_eq!(coding_runtime_failure(&timeout).code, "turn_timeout");
@@ -698,6 +699,7 @@ mod validation_tests {
                 diagnostic: format!(
                     "session_digest=abc pending_model_call={pending_model_call} pending_tool_reservations=0 supervisor_state=running"
                 ),
+                pending_model_call: Some(pending_model_call),
             })
             .context("cleanup confirmed");
             let failure = coding_runtime_failure(&error);

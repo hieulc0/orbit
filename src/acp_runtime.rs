@@ -18,6 +18,7 @@ pub const WORKSPACE: &str = "/orbit/home/workspace";
 #[derive(Debug)]
 pub struct TurnTimeout {
     pub diagnostic: String,
+    pub pending_model_call: Option<bool>,
 }
 impl std::fmt::Display for TurnTimeout {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -478,6 +479,7 @@ impl Runtime {
                     .await;
                     return Err(TurnTimeout {
                         diagnostic: format!("{diagnostic} supervisor_state={supervisor_state}"),
+                        pending_model_call: Some(broker.pending_model_call),
                     }.into());
                 }
             };

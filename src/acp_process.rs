@@ -126,6 +126,223 @@ pub fn read_cleanup(request: &Path, attempt: Option<&str>) -> Result<i32> {
     )?)
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct CleanupSessionEvidence {
+    pub supervisor_trigger: &'static str,
+    pub phase: &'static str,
+    pub last_activity: &'static str,
+    pub pending_request: &'static str,
+    pub outcome: &'static str,
+    pub turn_outcome: &'static str,
+    pub server_request_count: Option<u8>,
+    pub peer_eof_observed: Option<bool>,
+    pub app_server_stdout_eof_observed: Option<bool>,
+}
+
+/// Safe structural fields parsed from the private supervisor receipt. No image
+/// string, auth data, provider response or process output is copied into this
+/// evidence object.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct CleanupReceiptEvidence {
+    pub format_version: u8,
+    pub runtime: &'static str,
+    pub launch_stage: &'static str,
+    pub exit_code: i32,
+    pub expected_image_matches: bool,
+    pub diagnostic_present: bool,
+    pub diagnostic_truncated: bool,
+    pub codex_session: Option<CleanupSessionEvidence>,
+}
+
+pub fn read_cleanup_evidence(
+    request: &Path,
+    attempt: Option<&str>,
+    expected_image: &str,
+) -> Result<CleanupReceiptEvidence> {
+    let exit_code = read_cleanup(request, attempt)?;
+    let root = Root::open(request.parent().context("cleanup directory missing")?)?;
+    let receipt = request.with_extension("cleanup.json");
+    let bytes = root.read_private(
+        receipt
+            .file_name()
+            .unwrap()
+            .to_str()
+            .context("invalid receipt path")?,
+        MAX_CLEANUP_RECEIPT_BYTES,
+    )?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let format = value["format"].as_str().unwrap_or_default();
+    let format_version = match format {
+        "orbit-process-cleanup/v1" => 1,
+        "orbit-process-cleanup/v2" => 2,
+        "orbit-process-cleanup/v3" => 3,
+        "orbit-process-cleanup/v4" => 4,
+        _ => anyhow::bail!("unsupported cleanup receipt format"),
+    };
+    let runtime = if value["runtime"] == "podman" {
+        "podman"
+    } else {
+        "unknown"
+    };
+    let launch_stage = safe_receipt_label(
+        value["launch_stage"].as_str(),
+        &[
+            "unknown",
+            "app_server_protocol",
+            "completed_turn_cleanup",
+            "supervisor_deadline",
+            "container_startup",
+            "transport",
+            "container_process",
+        ],
+    );
+    let codex_session = value.get("observation").and_then(|observation| {
+        let session = observation.get("session")?;
+        Some(CleanupSessionEvidence {
+            supervisor_trigger: safe_receipt_label(
+                observation
+                    .get("supervisor_trigger")
+                    .and_then(serde_json::Value::as_str),
+                &[
+                    "bridge_returned",
+                    "bridge_error",
+                    "peer_eof_after_end_turn",
+                    "child_exit",
+                    "supervisor_deadline",
+                ],
+            ),
+            phase: safe_receipt_label(
+                session.get("phase").and_then(serde_json::Value::as_str),
+                &[
+                    "bridge_start",
+                    "initializing",
+                    "session_setup",
+                    "turn_start",
+                    "cancelling",
+                    "protocol",
+                    "bridge_request",
+                    "session_ready",
+                    "prompt_received",
+                    "turn_running",
+                    "turn_completed",
+                ],
+            ),
+            last_activity: safe_receipt_label(
+                session
+                    .get("last_activity")
+                    .and_then(serde_json::Value::as_str),
+                &[
+                    "none",
+                    "app_server_request_sent",
+                    "server_request_received",
+                    "dynamic_tool_request_received",
+                    "server_error_notification",
+                    "turn_started_notification",
+                    "turn_completed_notification",
+                    "item_lifecycle_notification",
+                    "agent_message_notification",
+                    "server_warning_notification",
+                    "server_notification",
+                    "app_server_stdout_eof",
+                    "app_server_stdout_read_error",
+                    "acp_peer_eof",
+                    "acp_peer_read_error",
+                    "response_correlation_failure",
+                    "correlated_protocol_rejection",
+                    "app_server_response_received",
+                    "server_request_rejected",
+                    "app_server_error_notification",
+                    "acp_request_received",
+                    "initialized_notification_sent",
+                    "session_created",
+                    "prompt_received",
+                    "acp_request_rejected",
+                    "acp_end_turn_response_sent",
+                    "acp_cancel_received",
+                    "turn_start_response_received",
+                    "dynamic_tool_result_sent",
+                    "turn_completed_not_successful",
+                ],
+            ),
+            pending_request: safe_receipt_label(
+                session
+                    .get("pending_request")
+                    .and_then(serde_json::Value::as_str),
+                &[
+                    "none",
+                    "initialize",
+                    "account_read",
+                    "thread_start",
+                    "turn_start",
+                    "turn_interrupt",
+                    "other_request",
+                ],
+            ),
+            outcome: safe_receipt_label(
+                session.get("outcome").and_then(serde_json::Value::as_str),
+                &[
+                    "running",
+                    "app_server_eof",
+                    "protocol_read_failure",
+                    "peer_eof_after_end_turn",
+                    "peer_eof",
+                    "correlation_failure",
+                    "protocol_rejection",
+                    "server_request_rejected",
+                    "app_server_error_notification",
+                    "cancelled",
+                    "turn_incomplete",
+                    "end_turn",
+                    "tool_callback_failed",
+                ],
+            ),
+            turn_outcome: safe_receipt_label(
+                session
+                    .get("turn_outcome")
+                    .and_then(serde_json::Value::as_str),
+                &[
+                    "not_started",
+                    "start_pending",
+                    "running",
+                    "end_turn",
+                    "app_server_error_notification",
+                ],
+            ),
+            server_request_count: session
+                .get("server_request_count")
+                .and_then(serde_json::Value::as_u64)
+                .map(|value| value.min(64) as u8),
+            peer_eof_observed: session
+                .get("peer_eof_observed")
+                .and_then(serde_json::Value::as_bool),
+            app_server_stdout_eof_observed: session
+                .get("app_server_stdout_eof_observed")
+                .and_then(serde_json::Value::as_bool),
+        })
+    });
+    Ok(CleanupReceiptEvidence {
+        format_version,
+        runtime,
+        launch_stage,
+        exit_code,
+        expected_image_matches: value["image"].as_str() == Some(expected_image),
+        diagnostic_present: value["diagnostic_present"].as_bool().unwrap_or(false),
+        diagnostic_truncated: value["diagnostic_truncated"].as_bool().unwrap_or(false),
+        codex_session,
+    })
+}
+
+fn safe_receipt_label(value: Option<&str>, allowed: &[&'static str]) -> &'static str {
+    value
+        .and_then(|value| {
+            allowed
+                .iter()
+                .copied()
+                .find(|candidate| *candidate == value)
+        })
+        .unwrap_or("unknown")
+}
+
 pub fn read_cleanup_diagnostic(request: &Path, attempt: Option<&str>) -> Result<Option<String>> {
     let root = Root::open(request.parent().context("cleanup directory missing")?)?;
     let receipt = request.with_extension("cleanup.json");
@@ -810,9 +1027,14 @@ mod tests {
         let root = tempfile::tempdir()?;
         let request = root.path().join("request.json");
         let session = SessionDiagnostics {
+            phase: "session_setup",
+            last_activity: "dynamic_tool_request_received",
             outcome: "app_server_error_notification",
             turn_outcome: "app_server_error_notification",
             pending_request: Some("turn_start"),
+            server_request_count: 3,
+            peer_eof_observed: true,
+            app_server_stdout_eof_observed: false,
             ..Default::default()
         };
         let observation = ProcessObservation {
@@ -855,6 +1077,54 @@ mod tests {
         let diagnostic = super::read_cleanup_diagnostic(&request, Some("attempt"))?.unwrap();
         assert!(!diagnostic.contains("secret"));
         assert_eq!(super::read_cleanup(&request, Some("attempt"))?, 0);
+        let typed = super::read_cleanup_evidence(
+            &request,
+            Some("attempt"),
+            "localhost/orbit-codex@sha256:abc",
+        )?;
+        assert_eq!(typed.format_version, 4);
+        assert_eq!(typed.runtime, "podman");
+        assert_eq!(typed.launch_stage, "app_server_protocol");
+        assert!(typed.expected_image_matches);
+        let session = typed.codex_session.as_ref().unwrap();
+        assert_eq!(session.supervisor_trigger, "bridge_error");
+        assert_eq!(session.phase, "session_setup");
+        assert_eq!(session.last_activity, "dynamic_tool_request_received");
+        assert_eq!(session.pending_request, "turn_start");
+        assert_eq!(session.outcome, "app_server_error_notification");
+        assert_eq!(session.turn_outcome, "app_server_error_notification");
+        assert_eq!(session.server_request_count, Some(3));
+        assert_eq!(session.peer_eof_observed, Some(true));
+        let encoded_typed = serde_json::to_string(&typed)?;
+        assert!(!encoded_typed.contains("localhost/orbit-codex"));
+        assert!(!encoded_typed.contains("secret"));
+
+        let mut raw_receipt = receipt.clone();
+        raw_receipt["runtime"] = json!("provider-secret-runtime");
+        raw_receipt["launch_stage"] = json!("provider-secret-stage");
+        raw_receipt["observation"]["supervisor_trigger"] = json!("provider-secret-trigger");
+        raw_receipt["observation"]["session"]["phase"] = json!("provider-secret-phase");
+        raw_receipt["observation"]["session"]["last_activity"] =
+            json!("provider-secret-method-and-payload");
+        raw_receipt["observation"]["session"]["pending_request"] =
+            json!("provider-secret-request-id");
+        raw_receipt["observation"]["session"]["outcome"] = json!("provider-secret-outcome-payload");
+        std::fs::write(
+            request.with_extension("cleanup.json"),
+            serde_json::to_vec(&raw_receipt)?,
+        )?;
+        let sanitized = super::read_cleanup_evidence(&request, Some("attempt"), "different-image")?;
+        assert_eq!(sanitized.runtime, "unknown");
+        assert_eq!(sanitized.launch_stage, "unknown");
+        assert!(!sanitized.expected_image_matches);
+        let session = sanitized.codex_session.as_ref().unwrap();
+        assert_eq!(session.supervisor_trigger, "unknown");
+        assert_eq!(session.phase, "unknown");
+        assert_eq!(session.last_activity, "unknown");
+        assert_eq!(session.pending_request, "unknown");
+        assert_eq!(session.outcome, "unknown");
+        let encoded_sanitized = serde_json::to_string(&sanitized)?;
+        assert!(!encoded_sanitized.contains("provider-secret"));
         assert!(
             write_cleanup_receipt(
                 &root.path().join("oversized.json"),

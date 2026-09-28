@@ -92,6 +92,18 @@ Orbit tool invocation, provider `tool_call` update and callback. Its audit print
 only bounded, allowlisted correlation IDs and rejects unresolved or unsupported
 events; an event that cannot be correlated is not treated as a successful call.
 
+The ignored `real_acp_execution_row_survives_credential_resolution_failure`
+case uses only a synthetic missing credential and the disposable workflow
+database. It verifies that the selected target and early normalized failure are
+durable before any provider credential staging, supervisor, or ACP process
+starts. Run it without the live-provider opt-in, with
+`ORBIT_TEST_DATABASE_URL` pointed at the current disposable workflow database
+(port 55443 in the S8 qualification setup):
+
+```sh
+cargo test --locked --features fault-injection --test core_coding_agent_tool_surface_qualification -- --ignored --exact real_acp_execution_row_survives_credential_resolution_failure --nocapture
+```
+
 Verification policy ID/version pairs are immutable. Workflow runs pin the
 definition digest at creation and fail if that exact version is missing or its
 content changes. Every selected required check needs a declared command or a
