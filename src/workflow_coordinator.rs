@@ -2137,6 +2137,7 @@ fn build_role_prompt(
     base_revision: &str,
     input_handoff: Option<&HandoffArtifact>,
     git_diff: Option<&str>,
+    available_verification_check_ids: &[String],
 ) -> String {
     let orbit_acp_tool_names = repository_tools_for_role(role).join(", ");
     let workspace_path = crate::acp_runtime::WORKSPACE;
@@ -2194,6 +2195,14 @@ fn build_role_prompt(
         ),
     };
     let prompt = format!("{prompt}\n\nORBIT/ACP TOOL NAMES: {orbit_acp_tool_names}");
+    let prompt = if role.role_id == "reviewer" {
+        format!(
+            "{prompt}\n\nCONFIGURED VERIFICATION CHECK IDS: {}\nThe suggested_additional_checks field accepts only exact IDs from this list. Use [] when no additional configured check is needed. Put advice about commands or future checks in the review summary, not in suggested_additional_checks.",
+            serde_json::json!(available_verification_check_ids)
+        )
+    } else {
+        prompt
+    };
     let prompt = if role.role_id == "implementer" {
         format!(
             "{prompt}\n\nDiscover paths with list_directory, find_path, or grep before guessing names for files the task does not identify. If a lookup returns PATH_NOT_FOUND, inspect the workspace with those tools and retry using a discovered path."
@@ -5865,6 +5874,35 @@ async fn execute_real_acp_turn_body(
     };
 
     let base_rev = wf_run.base_revision.as_deref().unwrap_or("HEAD");
+    let available_verification_check_ids = if role.role_id == "reviewer" {
+        match (
+            wf_run.selection_policy_id.as_deref(),
+            wf_run.selection_policy_version,
+            wf_run.selection_policy_digest.as_deref(),
+        ) {
+            (Some(id), Some(version), Some(expected_digest)) => {
+                let policy = crate::regression_strategy::RegressionStore::new(
+                    workflow_state_pool.clone(),
+                )
+                .get_selection_policy(id, version)
+                .await?
+                .context("reviewer selection policy is missing")?;
+                ensure!(
+                    policy.digest() == expected_digest,
+                    "POLICY_DIGEST_MISMATCH: reviewer selection policy differs from workflow pin"
+                );
+                policy
+                    .checks
+                    .iter()
+                    .map(|check| check.check_id.clone())
+                    .collect::<Vec<_>>()
+            }
+            (None, None, None) => Vec::new(),
+            _ => bail!("INCOMPLETE_POLICY_PIN: reviewer selection policy reference is incomplete"),
+        }
+    } else {
+        Vec::new()
+    };
     let prompt_text = build_role_prompt(
         role,
         task_text,
@@ -5872,6 +5910,7 @@ async fn execute_real_acp_turn_body(
         base_rev,
         input_handoff,
         git_diff.as_deref(),
+        &available_verification_check_ids,
     );
 
     persist_agent_lifecycle_phase(
@@ -6561,6 +6600,7 @@ mod tests {
                 "HEAD",
                 None,
                 None,
+                &[],
             );
             assert!(prompt.contains(&format!("ORBIT/ACP TOOL NAMES: {}", tools.join(", "))));
             if role.role_id == "implementer" {
@@ -6588,6 +6628,7 @@ mod tests {
                 "HEAD",
                 None,
                 None,
+                &[],
             );
 
             assert!(prompt.contains(&format!(
@@ -6599,6 +6640,22 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn reviewer_prompt_names_only_configured_verification_check_ids() {
+        let prompt = build_role_prompt(
+            &RoleDefinition::reviewer_v1(),
+            "Review the candidate",
+            Path::new("/workspace"),
+            "HEAD",
+            None,
+            Some("diff --git a/README.md b/README.md"),
+            &["candidate-contract".into()],
+        );
+        assert!(prompt.contains("CONFIGURED VERIFICATION CHECK IDS: [\"candidate-contract\"]"));
+        assert!(prompt.contains("suggested_additional_checks field accepts only exact IDs"));
+        assert!(prompt.contains("Use [] when no additional configured check is needed"));
     }
 
     fn git_fixture(repo: &Path, args: &[&str]) -> Result<String> {
