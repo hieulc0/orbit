@@ -163,6 +163,49 @@ allowlist is not an argument-level policy for tools such as shells.
 
 The cleared environment also means Rust toolchains and authenticated agent CLIs
 may need a configured wrapper with explicit toolchain/cache/credential access.
+
+### Multi-role CLI workflows
+
+`workflow start` and `workflow run` require an explicit JSON verification
+environment file. It must identify a rootless Podman profile and pin the OCI
+image by digest; host verification profiles are rejected. For example:
+
+```json
+{
+  "execution_profile": "sandboxed-container",
+  "isolation": "rootless-podman",
+  "runtime_image": "docker.io/library/rust@sha256:<manifest-digest>",
+  "runtime_image_digest": "sha256:<local-image-id>",
+  "oci_runtime": "podman",
+  "architecture": "x86_64",
+  "os": "linux",
+  "orbit_version": "0.1.0"
+}
+```
+
+Use an immutable repository reference for `runtime_image`. Set
+`runtime_image_digest` to the exact local image ID returned by
+`podman image inspect IMAGE --format '{{.Id}}'`; the registry manifest digest
+and local image ID are different identities. Use the actual Orbit version in
+the file. The selected image must be available to the rootless Podman runtime
+when verification runs.
+
+```sh
+target/debug/orbit workflow start \
+  --task "Implement the requested repository change" \
+  --repo /absolute/path/to/repository \
+  --verification-environment /absolute/path/to/verification-environment.json
+
+target/debug/orbit workflow run WORKFLOW_ID \
+  --verification-environment /absolute/path/to/verification-environment.json
+```
+
+The profile is validated before workflow creation or provider execution. A
+detached start also requires the profile, creates workflow state, and exits
+without running agents. Supply the profile again to `workflow run`; the profile
+is not retained as an implicit resume setting. Keep using the same pinned image
+identity when continuing a workflow so its verification evidence remains
+consistent.
 The fixture tests do not claim that a Codex integration is installed or qualified.
 
 Before self-dogfooding, pin a known-good binary outside the candidate checkout.

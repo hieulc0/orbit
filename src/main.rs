@@ -301,7 +301,10 @@ enum WorkflowAction {
         /// Optional path to selection policy file
         #[arg(long)]
         selection_policy: Option<PathBuf>,
-        /// Detach execution to background instead of waiting for completion
+        /// JSON file containing the pinned rootless Podman verification environment identity
+        #[arg(long, value_name = "FILE", required = true)]
+        verification_environment: PathBuf,
+        /// Create workflow state without executing; resume later with `workflow run`
         #[arg(long)]
         detach: bool,
         #[arg(long, env = "ORBIT_DATABASE_URL_FILE", hide_env_values = true)]
@@ -310,6 +313,9 @@ enum WorkflowAction {
     /// Execute or resume an existing workflow run to completion.
     Run {
         workflow_run_id: String,
+        /// JSON file containing the pinned rootless Podman verification environment identity
+        #[arg(long, value_name = "FILE", required = true)]
+        verification_environment: PathBuf,
         #[arg(long, env = "ORBIT_DATABASE_URL_FILE", hide_env_values = true)]
         database_url_file: Option<PathBuf>,
     },
@@ -653,16 +659,37 @@ async fn connect_durable_catalog(database_url: &str) -> Result<sqlx::PgPool> {
     Ok(pool)
 }
 
-fn ensure_cli_workflow_execution_enabled(action: &WorkflowAction) -> Result<()> {
-    if matches!(
-        action,
-        WorkflowAction::Start { .. } | WorkflowAction::Run { .. }
-    ) {
-        anyhow::bail!(
-            "CLI_WORKFLOW_EXECUTION_GATED: workflow start and resume remain gated pending qualification"
-        );
-    }
-    Ok(())
+const MAX_VERIFICATION_ENVIRONMENT_BYTES: u64 = 64 * 1024;
+
+async fn read_pinned_verification_environment(
+    path: &Path,
+) -> Result<orbit::verification::EnvironmentIdentity> {
+    use tokio::io::AsyncReadExt;
+
+    let mut bytes = Vec::new();
+    tokio::fs::File::open(path)
+        .await
+        .with_context(|| format!("opening verification environment file {}", path.display()))?
+        .take(MAX_VERIFICATION_ENVIRONMENT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .context("reading verification environment file")?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_VERIFICATION_ENVIRONMENT_BYTES,
+        "verification environment file exceeds 64 KiB"
+    );
+    serde_json::from_slice(&bytes).context("parsing verification environment JSON")
+}
+
+fn workflow_coordinator_with_environment(
+    pool: sqlx::PgPool,
+    environment: orbit::verification::EnvironmentIdentity,
+) -> Result<orbit::workflow_coordinator::WorkflowCoordinator> {
+    orbit::workflow_coordinator::WorkflowCoordinator::new(
+        pool,
+        std::sync::Arc::new(orbit::workflow_coordinator::RealAcpRoleExecutor),
+    )
+    .with_verification_environment(environment)
 }
 
 const LIVE_QUALIFICATION_VERIFICATION_IMAGE: &str = "docker.io/library/alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b";
@@ -2942,7 +2969,6 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     if let Commands::Workflow(WorkflowArgs { action }) = &cli.command {
-        ensure_cli_workflow_execution_enabled(action)?;
         match action {
             WorkflowAction::QualifyLive {
                 repo,
@@ -2966,12 +2992,19 @@ async fn main() -> Result<()> {
                 policy,
                 regression_policy,
                 selection_policy,
+                verification_environment,
                 detach,
                 database_url_file,
             } => {
+                let verification_environment =
+                    read_pinned_verification_environment(verification_environment).await?;
                 let database_url = read_private_database_url(database_url_file.as_deref()).await?;
                 let (engine, scratch) =
                     connect_durable_catalog_engine(database_url.as_str()).await?;
+                let coordinator = workflow_coordinator_with_environment(
+                    engine.pool.clone(),
+                    verification_environment,
+                )?;
                 let store = orbit::workflow::WorkflowStore::new(engine.pool.clone());
                 let ver_store = orbit::verification::VerificationStore::new(engine.pool.clone());
                 let reg_store =
@@ -3063,17 +3096,11 @@ async fn main() -> Result<()> {
                         Output::Json => println!("{}", serde_json::to_string_pretty(&wf)?),
                         Output::Jsonl => println!("{}", serde_json::to_string(&wf)?),
                     }
+                    drop(coordinator);
                     engine.pool.close().await;
                     drop(scratch);
                     return Ok(());
                 }
-
-                let executor =
-                    std::sync::Arc::new(orbit::workflow_coordinator::RealAcpRoleExecutor);
-                let coordinator = orbit::workflow_coordinator::WorkflowCoordinator::new(
-                    engine.pool.clone(),
-                    executor,
-                );
                 let final_stage = coordinator.run_to_completion(&wf.id).await?;
                 let wf_final = store
                     .get_workflow_run(&wf.id)
@@ -3116,18 +3143,19 @@ async fn main() -> Result<()> {
             }
             WorkflowAction::Run {
                 workflow_run_id,
+                verification_environment,
                 database_url_file,
             } => {
+                let verification_environment =
+                    read_pinned_verification_environment(verification_environment).await?;
                 let database_url = read_private_database_url(database_url_file.as_deref()).await?;
                 let (engine, scratch) =
                     connect_durable_catalog_engine(database_url.as_str()).await?;
                 let store = orbit::workflow::WorkflowStore::new(engine.pool.clone());
-                let executor =
-                    std::sync::Arc::new(orbit::workflow_coordinator::RealAcpRoleExecutor);
-                let coordinator = orbit::workflow_coordinator::WorkflowCoordinator::new(
+                let coordinator = workflow_coordinator_with_environment(
                     engine.pool.clone(),
-                    executor,
-                );
+                    verification_environment,
+                )?;
                 let final_stage = coordinator.run_to_completion(workflow_run_id).await?;
                 let wf_final = store
                     .get_workflow_run(workflow_run_id)
@@ -4638,47 +4666,85 @@ mod durable_catalog_target_tests {
 }
 
 #[cfg(test)]
-mod workflow_execution_gate_tests {
+mod workflow_verification_environment_tests {
     use super::*;
 
     #[test]
-    fn production_start_and_resume_are_gated_before_database_access() {
-        let start = WorkflowAction::Start {
-            pos_task_id: None,
-            pos_attempt_id: None,
-            task_id: None,
-            attempt_id: None,
-            task: Some("task".into()),
-            task_file: None,
-            repo: None,
-            base_revision: None,
-            kind: "software-change".into(),
-            max_iterations: 3,
-            policy: None,
-            regression_policy: None,
-            selection_policy: None,
-            detach: true,
-            database_url_file: None,
-        };
-        let resume = WorkflowAction::Run {
-            workflow_run_id: "wf-1".into(),
-            database_url_file: None,
-        };
-        let show = WorkflowAction::Show {
-            workflow_run_id: "wf-1".into(),
-            database_url_file: None,
-        };
-        let qualify_live = WorkflowAction::QualifyLive {
-            repo: PathBuf::from("/tmp/orbit-live-cli-candidate"),
-            database_url_file: None,
-        };
+    fn start_and_run_require_an_explicit_verification_environment() {
+        let detached_start = Cli::try_parse_from([
+            "orbit",
+            "workflow",
+            "start",
+            "--task",
+            "task",
+            "--detach",
+            "--verification-environment",
+            "/tmp/verification-environment.json",
+        ]);
+        assert!(detached_start.is_ok());
 
-        for action in [&start, &resume] {
-            let error = ensure_cli_workflow_execution_enabled(action).unwrap_err();
-            assert!(error.to_string().contains("CLI_WORKFLOW_EXECUTION_GATED"));
-        }
-        assert!(ensure_cli_workflow_execution_enabled(&show).is_ok());
-        assert!(ensure_cli_workflow_execution_enabled(&qualify_live).is_ok());
+        let detached_without_profile =
+            Cli::try_parse_from(["orbit", "workflow", "start", "--task", "task", "--detach"]);
+        assert!(detached_without_profile.is_err());
+
+        let resume_without_profile = Cli::try_parse_from(["orbit", "workflow", "run", "wf-1"]);
+        assert!(resume_without_profile.is_err());
+    }
+
+    #[tokio::test]
+    async fn valid_explicit_verification_environment_is_accepted_before_execution() {
+        let temp = tempfile::tempdir().expect("create temporary profile directory");
+        let profile_path = temp.path().join("environment.json");
+        let digest = "a".repeat(64);
+        let environment = orbit::verification::EnvironmentIdentity {
+            execution_profile: "sandboxed-container".into(),
+            isolation: "rootless-podman".into(),
+            runtime_image: Some(format!("docker.io/library/alpine@sha256:{digest}")),
+            runtime_image_digest: Some(format!("sha256:{digest}")),
+            oci_runtime: Some("podman".into()),
+            architecture: "x86_64".into(),
+            os: "linux".into(),
+            orbit_version: "test".into(),
+            ..Default::default()
+        };
+        tokio::fs::write(&profile_path, serde_json::to_vec(&environment).unwrap())
+            .await
+            .expect("write profile");
+
+        let loaded = read_pinned_verification_environment(&profile_path)
+            .await
+            .expect("read profile");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://orbit:placeholder@127.0.0.1:55442/orbit_control_plane")
+            .expect("construct lazy pool without a database connection");
+        workflow_coordinator_with_environment(pool, loaded)
+            .expect("accept a valid pinned verification environment");
+    }
+
+    #[tokio::test]
+    async fn malformed_or_unpinned_environment_is_rejected_before_workflow_creation() {
+        let temp = tempfile::tempdir().expect("create temporary profile directory");
+        let profile_path = temp.path().join("environment.json");
+        let invalid_environment = orbit::verification::EnvironmentIdentity {
+            execution_profile: "host".into(),
+            ..Default::default()
+        };
+        tokio::fs::write(
+            &profile_path,
+            serde_json::to_vec(&invalid_environment).unwrap(),
+        )
+        .await
+        .expect("write invalid profile");
+        let loaded = read_pinned_verification_environment(&profile_path)
+            .await
+            .expect("profile JSON should deserialize");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://orbit:placeholder@127.0.0.1:55442/orbit_control_plane")
+            .expect("construct lazy pool without a database connection");
+        let error = workflow_coordinator_with_environment(pool, loaded)
+            .err()
+            .expect("reject an unpinned environment before workflow creation");
+        assert!(error.to_string().contains("VERIFICATION_PROFILE_REQUIRED"));
     }
 }
 
