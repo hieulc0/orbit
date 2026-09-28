@@ -1035,7 +1035,6 @@ mod tests {
             server_request_count: 3,
             peer_eof_observed: true,
             app_server_stdout_eof_observed: false,
-            ..Default::default()
         };
         let observation = ProcessObservation {
             supervisor_trigger: "bridge_error",

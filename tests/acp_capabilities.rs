@@ -3,10 +3,53 @@
 use orbit::acp_capabilities::{
     AgentProtocol, AgentRuntimeCapabilities, CapabilityDiscoverer, CapabilitySource,
     ExecutionIntent, ExecutionResolver, ModelCapability, RuntimeCapabilityCache,
-    RuntimeCapabilityCacheKey,
+    RuntimeCapabilityCacheKey, ToolAuditCorrelationCapability,
 };
 use std::io::Write;
 use tempfile::NamedTempFile;
+
+#[test]
+fn qualified_tool_audit_capability_is_bound_to_image_and_adapter_revision() {
+    use orbit::acp_capabilities::qualified_tool_audit_correlation;
+
+    assert_eq!(
+        qualified_tool_audit_correlation(
+            orbit::codex_credential_enrollment::CODEX_IMAGE_DIGEST,
+            orbit::codex_bridge::REVISION,
+        ),
+        ToolAuditCorrelationCapability::Exact
+    );
+    assert_eq!(
+        qualified_tool_audit_correlation(
+            orbit::credential_enrollment::ANTIGRAVITY_DIGEST,
+            orbit::acp_capabilities::ANTIGRAVITY_ACP_ADAPTER_REVISION,
+        ),
+        ToolAuditCorrelationCapability::Partial
+    );
+    assert_eq!(
+        qualified_tool_audit_correlation(
+            orbit::codex_credential_enrollment::CODEX_IMAGE_DIGEST,
+            "unqualified-bridge-revision",
+        ),
+        ToolAuditCorrelationCapability::Unknown
+    );
+    assert_eq!(
+        qualified_tool_audit_correlation("sha256:unqualified", orbit::codex_bridge::REVISION),
+        ToolAuditCorrelationCapability::Unknown
+    );
+}
+
+#[test]
+fn tool_audit_requirements_fail_closed_on_unknown_capability() {
+    use ToolAuditCorrelationCapability as Capability;
+
+    assert!(Capability::Exact.satisfies(Capability::Exact));
+    assert!(!Capability::Partial.satisfies(Capability::Exact));
+    assert!(!Capability::Unknown.satisfies(Capability::Exact));
+    assert!(Capability::Partial.satisfies(Capability::Partial));
+    assert!(!Capability::Unknown.satisfies(Capability::Partial));
+    assert!(!Capability::Exact.satisfies(Capability::Unknown));
+}
 
 #[test]
 fn test_capability_cache_keying_and_invalidation() {

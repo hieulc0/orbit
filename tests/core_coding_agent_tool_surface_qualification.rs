@@ -735,6 +735,10 @@ async fn load_role_tool_audits(
     .context("failed to read role tool-call audit")
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the bounded fixture report names each durable execution fact"
+)]
 fn render_live_fixture_audit(
     role_execution_id: &str,
     agent_execution_id: &str,

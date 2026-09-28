@@ -33,6 +33,53 @@ pub enum CapabilitySource {
     StaticConfiguration,
 }
 
+/// Strength of the runtime's provider-event to callback identity evidence.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ToolAuditCorrelationCapability {
+    #[default]
+    Unknown,
+    None,
+    Partial,
+    Exact,
+}
+
+pub const ANTIGRAVITY_ACP_ADAPTER_REVISION: &str = "agy_acp_server_1.1.1";
+
+impl ToolAuditCorrelationCapability {
+    pub fn satisfies(self, required: Self) -> bool {
+        self != Self::Unknown && required != Self::Unknown && self >= required
+    }
+
+    pub fn as_evidence(self) -> &'static str {
+        match self {
+            Self::Unknown => "UNKNOWN",
+            Self::None => "NONE",
+            Self::Partial => "PARTIAL",
+            Self::Exact => "EXACT",
+        }
+    }
+}
+
+/// A declaration applies only to the pinned image and ACP adapter revision
+/// that produced the qualifying tool evidence. A changed runtime is unknown.
+pub fn qualified_tool_audit_correlation(
+    image_digest: &str,
+    adapter_revision: &str,
+) -> ToolAuditCorrelationCapability {
+    match (image_digest, adapter_revision) {
+        (
+            "sha256:5e2441ec351e6dc1ce2100111d0e56a08199b4c9d419150fbd236786a1895895",
+            "orbit-codex-acp-bridge-v2",
+        ) => ToolAuditCorrelationCapability::Exact,
+        (
+            "sha256:3e7415f6f732ae4168b98a6fb0e14e0fba965020cf5cc1fc5a3b35867b4cf830",
+            "agy_acp_server_1.1.1",
+        ) => ToolAuditCorrelationCapability::Partial,
+        _ => ToolAuditCorrelationCapability::Unknown,
+    }
+}
+
 /// Capability descriptor for an individual model supported by a runtime.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

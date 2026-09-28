@@ -147,6 +147,9 @@ pub struct RoleCapabilities {
     pub repo_write: bool,
     pub shell: bool,
     pub structured_output: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_tool_audit_correlation:
+        Option<crate::acp_capabilities::ToolAuditCorrelationCapability>,
 }
 
 /// A versioned Role Definition.
@@ -181,6 +184,9 @@ impl RoleDefinition {
                 repo_write: false,
                 shell: true,
                 structured_output: true,
+                required_tool_audit_correlation: Some(
+                    crate::acp_capabilities::ToolAuditCorrelationCapability::Exact,
+                ),
             },
             runtime_preferences: vec!["codex-acp".into(), "antigravity-acp".into()],
         }
@@ -199,6 +205,9 @@ impl RoleDefinition {
                 repo_write: true,
                 shell: true,
                 structured_output: true,
+                required_tool_audit_correlation: Some(
+                    crate::acp_capabilities::ToolAuditCorrelationCapability::Exact,
+                ),
             },
             runtime_preferences: vec!["codex-acp".into(), "antigravity-acp".into()],
         }
@@ -217,6 +226,9 @@ impl RoleDefinition {
                 repo_write: false,
                 shell: true,
                 structured_output: true,
+                required_tool_audit_correlation: Some(
+                    crate::acp_capabilities::ToolAuditCorrelationCapability::Exact,
+                ),
             },
             runtime_preferences: vec!["antigravity-acp".into(), "codex-acp".into()],
         }
@@ -2016,6 +2028,7 @@ struct RuntimeCandidate {
     credential_reference: String,
     credential_id: String,
     quota: RuntimeQuotaFacts,
+    tool_audit_capability: crate::acp_capabilities::ToolAuditCorrelationCapability,
     quota_snapshot_freshness: QuotaSnapshotFreshness,
     availability: crate::availability::AvailabilityState,
 }
@@ -2236,6 +2249,21 @@ fn credential_has_valid_runtime_representation(
         })
 }
 
+fn tool_audit_capability_rejection(
+    required: Option<crate::acp_capabilities::ToolAuditCorrelationCapability>,
+    provided: crate::acp_capabilities::ToolAuditCorrelationCapability,
+) -> Option<String> {
+    required
+        .filter(|required| !provided.satisfies(*required))
+        .map(|required| {
+            format!(
+                "CAPABILITY_MISMATCH(tool_audit_correlation_required={}/provided={})",
+                required.as_evidence(),
+                provided.as_evidence()
+            )
+        })
+}
+
 fn sort_runtime_candidates(candidates: &mut [RuntimeCandidate]) {
     let reset_rank = |candidate: &RuntimeCandidate| match (
         candidate.quota.seven_day_remaining,
@@ -2269,7 +2297,8 @@ fn runtime_candidate_selection_reason(
         "weekly_reset_unknown_or_not_applicable"
     };
     format!(
-        "reset-aware rank={rank}; {weekly_reset_rank}; quota_snapshot_freshness={}; availability={:?}; 5h_remaining={}; 7d_remaining={}; 7d_reset_at_ms={}; provider_preference_rank={}; tie_break=provider_preference_then_stable_account_id; rejected={rejected}",
+        "reset-aware rank={rank}; {weekly_reset_rank}; tool_audit_correlation={}; quota_snapshot_freshness={}; availability={:?}; 5h_remaining={}; 7d_remaining={}; 7d_reset_at_ms={}; provider_preference_rank={}; tie_break=provider_preference_then_stable_account_id; rejected={rejected}",
+        candidate.tool_audit_capability.as_evidence(),
         candidate.quota_snapshot_freshness.as_evidence(),
         candidate.availability,
         format_quota_percent(candidate.quota.five_hour_remaining),
@@ -2358,13 +2387,14 @@ impl RoleRuntimeResolver {
                 continue;
             }
 
-            let (provider, runtime_interface, model, runtime_image_digest) =
+            let (provider, runtime_interface, model, runtime_image_digest, adapter_revision) =
                 if pref.contains("codex") {
                     (
                         "codex",
                         "codex-acp",
                         "gpt-6-luna",
                         crate::codex_credential_enrollment::CODEX_IMAGE_DIGEST,
+                        crate::codex_bridge::REVISION,
                     )
                 } else if pref.contains("antigravity") {
                     (
@@ -2372,6 +2402,7 @@ impl RoleRuntimeResolver {
                         "antigravity-acp",
                         "gemini-3.8-flash",
                         crate::credential_enrollment::ANTIGRAVITY_DIGEST,
+                        crate::acp_capabilities::ANTIGRAVITY_ACP_ADAPTER_REVISION,
                     )
                 } else {
                     continue;
@@ -2398,6 +2429,22 @@ impl RoleRuntimeResolver {
                 if !credential_has_valid_runtime_representation(&inspection) {
                     rejected.push(format!(
                         "{provider}:{}:missing_or_invalid_current_runtime_representation",
+                        credential.reference
+                    ));
+                    continue;
+                }
+
+                let tool_audit_capability =
+                    crate::acp_capabilities::qualified_tool_audit_correlation(
+                        runtime_image_digest,
+                        adapter_revision,
+                    );
+                if let Some(reason) = tool_audit_capability_rejection(
+                    role.allowed_capabilities.required_tool_audit_correlation,
+                    tool_audit_capability,
+                ) {
+                    rejected.push(format!(
+                        "{runtime_interface}:{}:{reason}",
                         credential.reference
                     ));
                     continue;
@@ -2452,6 +2499,7 @@ impl RoleRuntimeResolver {
                     quota,
                     quota_snapshot_freshness: snapshot_freshness,
                     availability,
+                    tool_audit_capability,
                 });
             }
         }
@@ -2715,6 +2763,7 @@ mod tests {
             credential_reference: reference.into(),
             credential_id: account_id.into(),
             quota,
+            tool_audit_capability: crate::acp_capabilities::ToolAuditCorrelationCapability::Exact,
             quota_snapshot_freshness: QuotaSnapshotFreshness::Fresh,
             availability: crate::availability::AvailabilityState::Ready,
         }
@@ -2761,12 +2810,77 @@ mod tests {
         assert!(implementer.allowed_capabilities.repo_write);
         assert_eq!(reviewer.workspace_access, WorkspaceAccess::ReadOnly);
         assert!(!reviewer.allowed_capabilities.repo_write);
+        for role in [&planner, &implementer, &reviewer] {
+            assert_eq!(
+                role.allowed_capabilities.required_tool_audit_correlation,
+                Some(crate::acp_capabilities::ToolAuditCorrelationCapability::Exact)
+            );
+        }
 
         let d1 = planner.digest();
         let d2 = implementer.digest();
         let d3 = reviewer.digest();
         assert_ne!(d1, d2);
         assert_ne!(d2, d3);
+    }
+
+    #[test]
+    fn tool_audit_capability_mismatch_is_explicit() {
+        use crate::acp_capabilities::ToolAuditCorrelationCapability as Capability;
+
+        assert!(
+            tool_audit_capability_rejection(Some(Capability::Exact), Capability::Exact).is_none()
+        );
+        assert!(
+            tool_audit_capability_rejection(Some(Capability::Partial), Capability::Partial)
+                .is_none()
+        );
+        assert!(tool_audit_capability_rejection(None, Capability::Unknown).is_none());
+        for provided in [Capability::Partial, Capability::None, Capability::Unknown] {
+            let reason = tool_audit_capability_rejection(Some(Capability::Exact), provided)
+                .expect("unqualified runtime must be excluded");
+            assert!(reason.contains("CAPABILITY_MISMATCH"));
+            assert!(reason.contains(provided.as_evidence()));
+        }
+    }
+
+    #[test]
+    fn eligible_exact_runtimes_keep_reset_order_and_preference_tie_break() {
+        use crate::acp_capabilities::ToolAuditCorrelationCapability as Capability;
+
+        let quota = RuntimeQuotaFacts {
+            seven_day_remaining: Some(60.0),
+            seven_day_reset_at_ms: Some(4_000),
+            ..RuntimeQuotaFacts::default()
+        };
+        let mut early = candidate("runtime-a", "account-a", "id-a", 1, quota);
+        early.quota.seven_day_reset_at_ms = Some(2_000);
+        let late = candidate("runtime-b", "account-b", "id-b", 0, quota);
+        let mut candidates = vec![late.clone(), early];
+        candidates.retain(|candidate| {
+            tool_audit_capability_rejection(
+                Some(Capability::Exact),
+                candidate.tool_audit_capability,
+            )
+            .is_none()
+        });
+        sort_runtime_candidates(&mut candidates);
+        assert_eq!(candidates[0].credential_reference, "account-a");
+
+        let mut tied = vec![late, candidate("runtime-c", "account-c", "id-c", 1, quota)];
+        sort_runtime_candidates(&mut tied);
+        assert_eq!(tied[0].credential_reference, "account-b");
+
+        tied[0].tool_audit_capability = Capability::Partial;
+        tied.retain(|candidate| {
+            tool_audit_capability_rejection(
+                Some(Capability::Exact),
+                candidate.tool_audit_capability,
+            )
+            .is_none()
+        });
+        assert_eq!(tied.len(), 1);
+        assert_eq!(tied[0].credential_reference, "account-c");
     }
 
     #[test]

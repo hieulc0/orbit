@@ -324,9 +324,29 @@ async fn reset_aware_resolver_prefers_earlier_weekly_reset() -> Result<()> {
 
     // Planner ordinarily prefers Codex. A safe, earlier Antigravity weekly
     // reset must move that account ahead in the actual resolver result.
-    let ranked = RoleRuntimeResolver::resolve_ranked_targets_live(
+    let exact = RoleRuntimeResolver::resolve_ranked_targets_live(
         &ctx.engine.pool,
         &RoleDefinition::planner_v1(),
+        None,
+        RuntimeQuotaSelectionPolicy::default(),
+    )
+    .await?;
+    assert_eq!(exact.len(), 1);
+    assert_eq!(exact[0].provider, "codex");
+    assert!(
+        exact[0]
+            .resolution_reason
+            .contains("tool_audit_correlation=EXACT")
+    );
+    assert!(exact[0].resolution_reason.contains("CAPABILITY_MISMATCH"));
+    assert!(exact[0].resolution_reason.contains("provided=PARTIAL"));
+
+    let mut role = RoleDefinition::planner_v1();
+    role.allowed_capabilities.required_tool_audit_correlation =
+        Some(orbit::acp_capabilities::ToolAuditCorrelationCapability::Partial);
+    let ranked = RoleRuntimeResolver::resolve_ranked_targets_live(
+        &ctx.engine.pool,
+        &role,
         None,
         RuntimeQuotaSelectionPolicy::default(),
     )
@@ -339,6 +359,31 @@ async fn reset_aware_resolver_prefers_earlier_weekly_reset() -> Result<()> {
     assert_eq!(ranked[1].provider, "codex");
     assert!(ranked[0].resolution_reason.contains("known_weekly_reset"));
     assert!(ranked[0].resolution_reason.contains("7d_remaining=70.0%"));
+
+    role.runtime_preferences = vec!["antigravity-acp".into()];
+    role.allowed_capabilities.required_tool_audit_correlation =
+        Some(orbit::acp_capabilities::ToolAuditCorrelationCapability::Exact);
+    let error = RoleRuntimeResolver::resolve_ranked_targets_live(
+        &ctx.engine.pool,
+        &role,
+        None,
+        RuntimeQuotaSelectionPolicy::default(),
+    )
+    .await
+    .expect_err("no exact-capable account must fail closed");
+    assert!(error.to_string().contains("CAPABILITY_MISMATCH"));
+
+    let mut exact_role = RoleDefinition::planner_v1();
+    exact_role.runtime_preferences = vec!["codex-acp".into(), "antigravity-acp".into()];
+    let fallback_error = RoleRuntimeResolver::resolve_ranked_targets_live(
+        &ctx.engine.pool,
+        &exact_role,
+        Some("codex-acp"),
+        RuntimeQuotaSelectionPolicy::default(),
+    )
+    .await
+    .expect_err("operational fallback cannot use a partial-audit runtime");
+    assert!(fallback_error.to_string().contains("CAPABILITY_MISMATCH"));
 
     teardown_test(ctx).await
 }

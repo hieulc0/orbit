@@ -2567,6 +2567,10 @@ impl ToolCallAudit {
         )
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "audit identity and counter inputs stay explicit at dispatch"
+    )]
     fn begin_call_with_context(
         &mut self,
         sequence: u64,
@@ -2618,22 +2622,21 @@ impl ToolCallAudit {
             && !duplicate_callback
             && !callback_tracking_overflow
             && callback_request_id.is_some()
+            && let Some(invocation) = self.provider_tool_invocations.get_mut(&meta.invocation_id)
         {
-            if let Some(invocation) = self.provider_tool_invocations.get_mut(&meta.invocation_id) {
-                if invocation.invalidated {
-                    provider_update_correlation = "INVALIDATED_INVOCATION";
-                } else if invocation.observation.provider_tool_call_id.as_deref()
-                    != Some(meta.provider_tool_call_id.as_str())
-                {
-                    provider_update_correlation = "PROVIDER_ID_MISMATCH";
-                } else if invocation.callback_count > 0 {
-                    provider_update_correlation = "DUPLICATE_INVOCATION_CALLBACK";
-                } else {
-                    invocation.callback_count = 1;
-                    matched_update = Some(invocation.observation.clone());
-                    provider_update_correlation = "CORRELATED";
-                    self.correlation_supported = true;
-                }
+            if invocation.invalidated {
+                provider_update_correlation = "INVALIDATED_INVOCATION";
+            } else if invocation.observation.provider_tool_call_id.as_deref()
+                != Some(meta.provider_tool_call_id.as_str())
+            {
+                provider_update_correlation = "PROVIDER_ID_MISMATCH";
+            } else if invocation.callback_count > 0 {
+                provider_update_correlation = "DUPLICATE_INVOCATION_CALLBACK";
+            } else {
+                invocation.callback_count = 1;
+                matched_update = Some(invocation.observation.clone());
+                provider_update_correlation = "CORRELATED";
+                self.correlation_supported = true;
             }
         }
         if provider_update_correlation != "CORRELATED" {
@@ -5052,7 +5055,7 @@ fn classify_supervisor_evidence(
 
 #[cfg(test)]
 fn validate_role_turn_completion(output: &str, evidence: &SupervisorEvidence) -> Result<()> {
-    if let Some(reason) = evidence.failure.as_deref() {
+    if let Some(reason) = evidence.failure {
         bail!("{reason}");
     }
     ensure!(evidence.cleanup_confirmed, "CLEANUP_RECEIPT_UNCONFIRMED");
@@ -5543,7 +5546,7 @@ async fn execute_real_acp_turn_body(
                 .unwrap_or_else(|| ANTIGRAVITY_IMAGE.into()),
             command: vec![ACP_EXECUTABLE.into()],
             agent_name: "antigravity-acp".into(),
-            agent_version: "agy_acp_server_1.1.1".into(),
+            agent_version: crate::acp_capabilities::ANTIGRAVITY_ACP_ADAPTER_REVISION.into(),
             binary_revision: "1.1.1".into(),
             cpu_millis: 1000,
             memory_mib: 512,
@@ -6038,7 +6041,7 @@ async fn execute_real_acp_turn_body(
     lifecycle.note_terminal_persistence_attempt();
     if store
         .finish_agent_execution(
-            &agent_exec_id,
+            agent_exec_id,
             &role_exec.id,
             finished_at_ms,
             status_text,

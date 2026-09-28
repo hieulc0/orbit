@@ -1036,6 +1036,9 @@ fn reset_aware_selection_evidence(reason: &str) -> serde_json::Value {
     let tie_break = fields
         .get("tie_break")
         .filter(|value| **value == "provider_preference_then_stable_account_id");
+    let tool_audit_correlation = fields
+        .get("tool_audit_correlation")
+        .filter(|value| matches!(**value, "EXACT" | "PARTIAL" | "NONE" | "UNKNOWN"));
     let rejected_summary_items = reason
         .split_once("; rejected=")
         .and_then(|(_, summary)| summary.strip_prefix('['))
@@ -1047,7 +1050,9 @@ fn reset_aware_selection_evidence(reason: &str) -> serde_json::Value {
                 summary
                     .matches("codex:")
                     .count()
+                    .saturating_add(summary.matches("codex-acp:").count())
                     .saturating_add(summary.matches("antigravity:").count())
+                    .saturating_add(summary.matches("antigravity-acp:").count())
                     .min(16)
             }
         });
@@ -1063,6 +1068,8 @@ fn reset_aware_selection_evidence(reason: &str) -> serde_json::Value {
         "five_hour_reset_at_ms": null,
         "provider_preference_rank": provider_preference_rank,
         "tie_break": tie_break,
+        "tool_audit_correlation": tool_audit_correlation,
+        "capability_exclusions": capability_exclusions(reason),
         "rejected_candidate_summary_items": rejected_summary_items,
         "selection_reason": {
             "ranking": if reason.starts_with("reset-aware rank=") { "reset-aware" } else { "other_or_unknown" },
@@ -1077,6 +1084,40 @@ fn reset_aware_selection_evidence(reason: &str) -> serde_json::Value {
             "tie_break": tie_break
         }
     })
+}
+
+fn capability_exclusions(reason: &str) -> Vec<serde_json::Value> {
+    let Some((_, rejected)) = reason.split_once("; rejected=[") else {
+        return Vec::new();
+    };
+    let Some(rejected) = rejected.strip_suffix(']') else {
+        return Vec::new();
+    };
+    rejected
+        .split(',')
+        .take(8)
+        .filter_map(|item| {
+            let (runtime, rest) = item.split_once(':')?;
+            let (account, capability) = rest.split_once(":CAPABILITY_MISMATCH(")?;
+            let capability = capability.strip_suffix(')')?;
+            let (required, provided) = capability.split_once("/provided=")?;
+            let required = required.strip_prefix("tool_audit_correlation_required=")?;
+            if !qualification_safe_id(runtime, 64)
+                || !qualification_safe_id(account, 128)
+                || !matches!(required, "EXACT" | "PARTIAL" | "NONE")
+                || !matches!(provided, "EXACT" | "PARTIAL" | "NONE" | "UNKNOWN")
+            {
+                return None;
+            }
+            Some(serde_json::json!({
+                "runtime": runtime,
+                "account": account,
+                "reason": "CAPABILITY_MISMATCH",
+                "required": required,
+                "provided": provided
+            }))
+        })
+        .collect()
 }
 
 fn is_safe_quota_percent(value: &str) -> bool {
@@ -1980,9 +2021,19 @@ async fn run_live_cli_qualification(
                 serde_json::json!({"state":"unknown", "quota_windows":[]}),
             )
         };
+        let required_tool_audit_correlation = match role.role_id.as_str() {
+            "planner" => orbit::workflow::RoleDefinition::planner_v1(),
+            "implementer" => orbit::workflow::RoleDefinition::implementer_v1(),
+            "reviewer" => orbit::workflow::RoleDefinition::reviewer_v1(),
+            _ => anyhow::bail!("unknown qualification role"),
+        }
+        .allowed_capabilities
+        .required_tool_audit_correlation
+        .map(|capability| capability.as_evidence());
         role_evidence.push(serde_json::json!({
             "role_execution_id": role.id,
             "role": role.role_id,
+            "required_tool_audit_correlation": required_tool_audit_correlation,
             "stage": role.stage,
             "status": role.status.as_str(),
             "input_workspace_state_id": role.input_workspace_state_id,
@@ -2109,6 +2160,13 @@ async fn run_live_cli_qualification(
                     .is_some_and(|target| target.resolution_reason.starts_with("reset-aware rank="))
             })
     });
+    let exact_tool_audit_targets_selected = role_executions.iter().all(|role| {
+        role.resolved_target.as_ref().is_some_and(|target| {
+            target
+                .resolution_reason
+                .contains("; tool_audit_correlation=EXACT;")
+        })
+    });
     let cleanup_confirmed = all_agent_executions_terminal
         && all_agent_cleanup_confirmed
         && all_supervisor_exits_checked
@@ -2121,6 +2179,7 @@ async fn run_live_cli_qualification(
         && review_approved
         && candidate_contract_passed
         && reset_aware_targets_recorded
+        && exact_tool_audit_targets_selected
         && fast_passed
         && standard_passed
         && full_passed
@@ -2175,6 +2234,7 @@ async fn run_live_cli_qualification(
         "coordinator_error": coordinator_error,
         "role_executions": role_evidence,
         "reset_aware_targets_recorded": reset_aware_targets_recorded,
+        "exact_tool_audit_targets_selected": exact_tool_audit_targets_selected,
         "fallback_events": [],
         "fallback_behavior": "The current coordinator resolves one target per role and has no execution-time fallback loop; failed agent attempts are listed separately.",
         "failed_agent_attempts": failed_agent_attempts,
@@ -5183,6 +5243,28 @@ mod live_workflow_qualification_tests {
         let projected = serde_json::to_string(&facts).unwrap();
         assert!(!projected.contains("private-account"));
         assert!(!projected.contains("another-private-account"));
+    }
+
+    #[test]
+    fn live_selection_report_identifies_capability_exclusions() {
+        let evidence = reset_aware_selection_evidence(
+            "reset-aware rank=1; weekly_reset_unknown_or_not_applicable; tool_audit_correlation=EXACT; quota_snapshot_freshness=STALE; availability=Unknown; 5h_remaining=unknown; 7d_remaining=unknown; 7d_reset_at_ms=unknown; provider_preference_rank=1; tie_break=provider_preference_then_stable_account_id; rejected=[antigravity-acp:fixture-account:CAPABILITY_MISMATCH(tool_audit_correlation_required=EXACT/provided=PARTIAL)]",
+        );
+        assert_eq!(evidence["tool_audit_correlation"], "EXACT");
+        assert_eq!(
+            evidence["capability_exclusions"][0]["runtime"],
+            "antigravity-acp"
+        );
+        assert_eq!(
+            evidence["capability_exclusions"][0]["account"],
+            "fixture-account"
+        );
+        assert_eq!(
+            evidence["capability_exclusions"][0]["reason"],
+            "CAPABILITY_MISMATCH"
+        );
+        assert_eq!(evidence["capability_exclusions"][0]["required"], "EXACT");
+        assert_eq!(evidence["capability_exclusions"][0]["provided"], "PARTIAL");
     }
 
     #[test]
