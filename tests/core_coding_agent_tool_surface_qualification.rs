@@ -2897,6 +2897,22 @@ async fn real_codex_coding_fixture() -> Result<()> {
             .store
             .create_role_execution(&wf.id, &role, "IMPLEMENTING", 0, None, None)
             .await?;
+        ctx.store
+            .set_role_execution_resolved(&role_exec.id, &target)
+            .await?;
+        let role_exec = ctx
+            .store
+            .get_role_execution(&role_exec.id)
+            .await?
+            .context("Codex fixture RoleExecution was not persisted")?;
+        ensure!(
+            role_exec.status == RoleExecutionStatus::Running,
+            "Codex fixture RoleExecution is not RUNNING after target resolution"
+        );
+        ensure!(
+            role_exec.resolved_target.as_ref() == Some(&target),
+            "Codex fixture RoleExecution did not persist the selected target"
+        );
         audit_role_execution_id = Some(role_exec.id.clone());
 
         ctx.store
