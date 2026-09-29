@@ -542,3 +542,48 @@ fn acp_antigravity_example_registry_pins_launch_scope_and_combined_resources() -
     worker.authorize(&assignment)?;
     Ok(())
 }
+
+#[test]
+fn runtime_timeout_and_cleanup_classification_survives_context() -> Result<()> {
+    use orbit::acp_runtime::{AcpCleanupUnconfirmed, Adapter, TurnTimeout};
+    use orbit::continuation::TerminationReason;
+    let root = tempfile::tempdir()?;
+    let mut runtime = runtime(root.path())?;
+    for adapter in [Adapter::Acp, Adapter::Codex, Adapter::Antigravity] {
+        runtime.launch.adapter = adapter;
+        let timeout = anyhow::Error::from(TurnTimeout {
+            diagnostic: "bounded runtime evidence".into(),
+            pending_model_call: Some(true),
+        })
+        .context("outer diagnostic");
+        assert_eq!(
+            runtime.classify_error(&timeout).termination_reason,
+            TerminationReason::TurnLimit
+        );
+        let cleanup =
+            anyhow::Error::from(AcpCleanupUnconfirmed).context("turn timeout during local cleanup");
+        assert_eq!(
+            runtime.classify_error(&cleanup).termination_reason,
+            TerminationReason::AgentError
+        );
+        let uncertain_cleanup = anyhow::Error::from(TurnTimeout {
+            diagnostic: "bounded runtime evidence".into(),
+            pending_model_call: Some(true),
+        })
+        .context(AcpCleanupUnconfirmed);
+        assert_eq!(
+            runtime
+                .classify_error(&uncertain_cleanup)
+                .termination_reason,
+            TerminationReason::AgentError
+        );
+    }
+    runtime.launch.adapter = Adapter::Acp;
+    assert_eq!(
+        runtime
+            .classify_error(&anyhow::anyhow!("turn timeout in an unrelated diagnostic"))
+            .termination_reason,
+        TerminationReason::AgentError
+    );
+    Ok(())
+}

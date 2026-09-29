@@ -7,7 +7,7 @@
 //! - Invalidates verification freshness when the workspace is mutated.
 //! - Bounded command execution with timeout, process-group cleanup, and output limits.
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool, Row};
 use std::{collections::BTreeMap, path::Path, time::Duration};
@@ -702,25 +702,84 @@ impl Drop for ScopedProcessGroup {
     }
 }
 
-async fn confirm_verification_container_removed(name: &str) -> Result<()> {
-    let output = tokio::time::timeout(
-        Duration::from_secs(20),
-        tokio::process::Command::new("podman")
-            .args(["--remote=false", "container", "exists", name])
-            .output(),
-    )
-    .await
-    .context("verification container cleanup check timed out")??;
-    ensure!(
-        output.status.code() == Some(1),
-        "VERIFICATION_CLEANUP_UNCONFIRMED: container still exists or runtime check failed"
-    );
-    Ok(())
+/// Failures whose policy meaning must survive diagnostic context.
+#[derive(Debug, PartialEq, Eq)]
+pub enum VerificationCommandFailure {
+    Cancelled,
+    CleanupUnconfirmed,
+}
+
+impl std::fmt::Display for VerificationCommandFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Cancelled => "verification command cancelled",
+            Self::CleanupUnconfirmed => "VERIFICATION_CLEANUP_UNCONFIRMED",
+        })
+    }
+}
+
+impl std::error::Error for VerificationCommandFailure {}
+
+/// The observed process result, independent of diagnostic output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandOutcome {
+    Exited(i32),
+    Signaled(i32),
+    TimedOut,
+    Unknown,
+}
+
+impl CommandOutcome {
+    fn from_status(status: std::process::ExitStatus) -> Self {
+        if let Some(code) = status.code() {
+            return Self::Exited(code);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            if let Some(signal) = status.signal() {
+                return Self::Signaled(signal);
+            }
+        }
+        Self::Unknown
+    }
+}
+
+pub(crate) fn confirm_podman_resource_absent(
+    status: std::process::ExitStatus,
+) -> std::result::Result<(), VerificationCommandFailure> {
+    // Podman exists returns 1 only for absence; runtime failures cannot confirm cleanup.
+    if status.code() == Some(1) {
+        Ok(())
+    } else {
+        Err(VerificationCommandFailure::CleanupUnconfirmed)
+    }
+}
+
+pub(crate) async fn confirm_verification_container_removed(name: &str) -> Result<()> {
+    let result = async {
+        let output = tokio::time::timeout(
+            Duration::from_secs(20),
+            tokio::process::Command::new("podman")
+                .args(["--remote=false", "container", "exists", name])
+                .output(),
+        )
+        .await
+        .context("verification container cleanup check timed out")??;
+        confirm_podman_resource_absent(output.status)?;
+        Ok(())
+    }
+    .await;
+    result.map_err(|error: anyhow::Error| {
+        error.context(VerificationCommandFailure::CleanupUnconfirmed)
+    })
 }
 
 /// Bounded output capture result.
 #[derive(Debug)]
 pub struct CommandOutputCapture {
+    pub outcome: CommandOutcome,
+    /// Retained for callers that inspect numeric exits; policy uses `outcome`.
     pub exit_code: Option<i32>,
     pub stdout_bytes: Vec<u8>,
     pub stdout_total_len: u64,
@@ -944,7 +1003,7 @@ pub async fn execute_verification_command_isolated_with_network(
 
     let mut stdout_done = false;
     let mut stderr_done = false;
-    let mut child_exit_code = None;
+    let mut child_status = None;
 
     let deadline = Instant::now() + timeout_duration;
     let mut timed_out = false;
@@ -977,9 +1036,9 @@ pub async fn execute_verification_command_isolated_with_network(
                 timed_out = true;
                 break;
             }
-            res = child.wait(), if child_exit_code.is_none() => {
+            res = child.wait(), if child_status.is_none() => {
                 let status = res?;
-                child_exit_code = status.code();
+                child_status = Some(status);
                 if stdout_done && stderr_done {
                     break;
                 }
@@ -1010,7 +1069,7 @@ pub async fn execute_verification_command_isolated_with_network(
             }
         }
 
-        if child_exit_code.is_some() && stdout_done && stderr_done {
+        if child_status.is_some() && stdout_done && stderr_done {
             break;
         }
     }
@@ -1020,25 +1079,30 @@ pub async fn execute_verification_command_isolated_with_network(
         unsafe {
             libc::kill(-(child_pid as i32), libc::SIGKILL);
         }
-        if let Some(ref cname) = container_name {
-            let mut stop_cmd = tokio::process::Command::new("podman");
-            stop_cmd.args([
-                "--remote=false",
-                "--cgroup-manager=cgroupfs",
-                "rm",
-                "-f",
-                cname,
-            ]);
-            tokio::time::timeout(Duration::from_secs(30), stop_cmd.output())
+        let cleanup = async {
+            if let Some(ref cname) = container_name {
+                let mut stop_cmd = tokio::process::Command::new("podman");
+                stop_cmd.args([
+                    "--remote=false",
+                    "--cgroup-manager=cgroupfs",
+                    "rm",
+                    "-f",
+                    cname,
+                ]);
+                tokio::time::timeout(Duration::from_secs(30), stop_cmd.output())
+                    .await
+                    .context("VERIFICATION_CLEANUP_UNCONFIRMED: container removal timed out")??;
+            }
+            tokio::time::timeout(Duration::from_secs(10), child.wait())
                 .await
-                .context("VERIFICATION_CLEANUP_UNCONFIRMED: container removal timed out")??;
+                .context("VERIFICATION_CLEANUP_UNCONFIRMED: verification process did not exit")??;
+            confirm_verification_container_removed(container_name.as_deref().unwrap()).await?;
+            Ok::<_, anyhow::Error>(())
         }
-        tokio::time::timeout(Duration::from_secs(10), child.wait())
-            .await
-            .context("VERIFICATION_CLEANUP_UNCONFIRMED: verification process did not exit")??;
-        confirm_verification_container_removed(container_name.as_deref().unwrap()).await?;
+        .await;
+        cleanup.map_err(|error| error.context(VerificationCommandFailure::CleanupUnconfirmed))?;
         if cancelled {
-            bail!("verification command cancelled");
+            return Err(VerificationCommandFailure::Cancelled.into());
         }
     } else {
         confirm_verification_container_removed(container_name.as_deref().unwrap()).await?;
@@ -1049,7 +1113,14 @@ pub async fn execute_verification_command_isolated_with_network(
     let stderr_truncated = stderr_total > MAX_STREAM_OUTPUT_BYTES as u64;
 
     Ok(CommandOutputCapture {
-        exit_code: child_exit_code,
+        outcome: if timed_out {
+            CommandOutcome::TimedOut
+        } else {
+            child_status
+                .map(CommandOutcome::from_status)
+                .unwrap_or(CommandOutcome::Unknown)
+        },
+        exit_code: child_status.and_then(|status| status.code()),
         stdout_bytes: stdout_buf,
         stdout_total_len: stdout_total,
         stdout_truncated,
@@ -2073,12 +2144,12 @@ pub async fn execute_run_contents(
                         error_msg,
                     ) = match capture_res {
                         Ok(capture) => {
-                            let st = if capture.timed_out {
-                                VerificationStepStatus::TimedOut
-                            } else if capture.exit_code == Some(0) {
-                                VerificationStepStatus::Passed
-                            } else {
-                                VerificationStepStatus::Failed
+                            let st = match capture.outcome {
+                                CommandOutcome::TimedOut => VerificationStepStatus::TimedOut,
+                                CommandOutcome::Exited(0) => VerificationStepStatus::Passed,
+                                CommandOutcome::Exited(_)
+                                | CommandOutcome::Signaled(_)
+                                | CommandOutcome::Unknown => VerificationStepStatus::Failed,
                             };
 
                             let out_preview = String::from_utf8_lossy(
@@ -2108,7 +2179,8 @@ pub async fn execute_run_contents(
                             )
                         }
                         Err(err) => {
-                            let is_cancel = err.to_string().contains("cancelled");
+                            let is_cancel = err.downcast_ref::<VerificationCommandFailure>()
+                                == Some(&VerificationCommandFailure::Cancelled);
                             let st = if is_cancel {
                                 VerificationStepStatus::Cancelled
                             } else {
@@ -2684,6 +2756,75 @@ mod tests {
 
         assert_eq!(ws_a1, ws_a2);
         assert_ne!(ws_a1.state_id, ws_b.state_id);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn command_exit_and_signal_have_distinct_outcomes() {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            CommandOutcome::from_status(std::process::ExitStatus::from_raw(0)),
+            CommandOutcome::Exited(0)
+        );
+        assert_eq!(
+            CommandOutcome::from_status(std::process::ExitStatus::from_raw(42 << 8)),
+            CommandOutcome::Exited(42)
+        );
+        assert_eq!(
+            CommandOutcome::from_status(std::process::ExitStatus::from_raw(libc::SIGTERM)),
+            CommandOutcome::Signaled(libc::SIGTERM)
+        );
+        assert_ne!(CommandOutcome::TimedOut, CommandOutcome::Exited(1));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn actual_signaled_process_is_not_a_timeout() -> Result<()> {
+        let status = std::process::Command::new("sh")
+            .args(["-c", "kill -TERM $$"])
+            .status()?;
+        assert_eq!(
+            CommandOutcome::from_status(status),
+            CommandOutcome::Signaled(libc::SIGTERM)
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cleanup_confirmation_requires_observed_resource_absence() {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            confirm_podman_resource_absent(std::process::ExitStatus::from_raw(1 << 8)),
+            Ok(())
+        );
+        for status in [0, 125 << 8, 127 << 8, libc::SIGKILL] {
+            assert_eq!(
+                confirm_podman_resource_absent(std::process::ExitStatus::from_raw(status)),
+                Err(VerificationCommandFailure::CleanupUnconfirmed)
+            );
+        }
+    }
+
+    #[test]
+    fn cancellation_classification_survives_context_without_trusting_messages() {
+        let cancelled =
+            anyhow::Error::from(VerificationCommandFailure::Cancelled).context("outer diagnostic");
+        assert_eq!(
+            cancelled.downcast_ref::<VerificationCommandFailure>(),
+            Some(&VerificationCommandFailure::Cancelled)
+        );
+        let cleanup = anyhow::Error::from(VerificationCommandFailure::CleanupUnconfirmed)
+            .context("cancelled while removing resources");
+        assert_eq!(
+            cleanup.downcast_ref::<VerificationCommandFailure>(),
+            Some(&VerificationCommandFailure::CleanupUnconfirmed)
+        );
+        assert!(
+            anyhow::anyhow!("cancelled")
+                .downcast_ref::<VerificationCommandFailure>()
+                .is_none()
+        );
     }
 
     #[test]

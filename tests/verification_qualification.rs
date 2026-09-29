@@ -154,7 +154,11 @@ async fn cancellation_stops_isolated_verification_and_confirms_cleanup() -> Resu
     tx.send(true)?;
     let result = tokio::time::timeout(Duration::from_secs(15), execution).await??;
     let error = result.unwrap_err();
-    assert!(error.to_string().contains("cancelled"), "{error:#}");
+    assert_eq!(
+        error.downcast_ref::<orbit::verification::VerificationCommandFailure>(),
+        Some(&orbit::verification::VerificationCommandFailure::Cancelled),
+        "{error:#}"
+    );
     Ok(())
 }
 

@@ -42,6 +42,17 @@ impl std::fmt::Display for ServiceKind {
     }
 }
 
+#[derive(Debug)]
+pub struct ReadinessTimeout(String);
+
+impl std::fmt::Display for ReadinessTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ReadinessTimeout {}
+
 /// Readiness probe specification.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -807,12 +818,11 @@ impl EnvironmentManager {
                     }
 
                     if Instant::now() > deadline {
-                        bail!(
+                        return Err(ReadinessTimeout(format!(
                             "readiness timeout: TCP probe to {}:{} did not succeed within {}s",
-                            host,
-                            port,
-                            timeout_seconds
-                        );
+                            host, port, timeout_seconds
+                        ))
+                        .into());
                     }
 
                     // Attempt connection
@@ -920,11 +930,11 @@ impl EnvironmentManager {
                     }
 
                     if Instant::now() > deadline {
-                        bail!(
+                        return Err(ReadinessTimeout(format!(
                             "readiness timeout: HTTP probe to {} did not succeed within {}s",
-                            url,
-                            timeout_seconds
-                        );
+                            url, timeout_seconds
+                        ))
+                        .into());
                     }
 
                     if let Some(net) = network_name {
@@ -1190,7 +1200,7 @@ impl EnvironmentManager {
                                 .await
                             {
                                 let err_str = e.to_string();
-                                let is_timeout = err_str.contains("timeout");
+                                let is_timeout = e.is::<ReadinessTimeout>();
                                 let status = if is_timeout {
                                     EnvironmentServiceStatus::TimedOut
                                 } else {
@@ -1450,7 +1460,7 @@ impl EnvironmentManager {
                                 .await
                             {
                                 let err_str = e.to_string();
-                                let is_timeout = err_str.contains("timeout");
+                                let is_timeout = e.is::<ReadinessTimeout>();
                                 let status = if is_timeout {
                                     EnvironmentServiceStatus::TimedOut
                                 } else {
@@ -1580,7 +1590,16 @@ impl EnvironmentManager {
 
         // 4. If environment services failed to start, cleanup and return environment error
         if let Some((err_status, err_msg)) = environment_err {
-            Self::teardown_services(&self.store, active_services, network_name.as_deref()).await;
+            let (err_status, err_msg) = match Self::teardown_services(
+                &self.store,
+                active_services,
+                network_name.as_deref(),
+            )
+            .await
+            {
+                Ok(()) => (err_status, err_msg),
+                Err(error) => (EnvironmentRunStatus::Error, error.to_string()),
+            };
             self.store
                 .finalize_environment_run(&env_run.id, err_status, Some(&err_msg))
                 .await?;
@@ -1605,7 +1624,7 @@ impl EnvironmentManager {
             )
             .await;
             match cap_res {
-                Ok(cap) if cap.exit_code == Some(0) => {}
+                Ok(cap) if cap.outcome == crate::verification::CommandOutcome::Exited(0) => {}
                 Ok(cap) => {
                     setup_failed = true;
                     setup_err = format!(
@@ -1623,26 +1642,37 @@ impl EnvironmentManager {
         }
 
         if setup_failed {
-            Self::teardown_services(&self.store, active_services, network_name.as_deref()).await;
+            let setup_status = match Self::teardown_services(
+                &self.store,
+                active_services,
+                network_name.as_deref(),
+            )
+            .await
+            {
+                Ok(()) => EnvironmentRunStatus::Failed,
+                Err(error) => {
+                    setup_err = error.to_string();
+                    EnvironmentRunStatus::Error
+                }
+            };
             self.store
-                .finalize_environment_run(
-                    &env_run.id,
-                    EnvironmentRunStatus::Failed,
-                    Some(&setup_err),
-                )
+                .finalize_environment_run(&env_run.id, setup_status, Some(&setup_err))
                 .await?;
             let completed_env = self.store.get_environment_run(&env_run.id).await?.unwrap();
-            return Ok((
-                completed_env,
-                Err((EnvironmentRunStatus::Failed, setup_err)),
-            ));
+            return Ok((completed_env, Err((setup_status, setup_err))));
         }
 
         // 7. Execute tests via caller's callback (passing network_name so test containers join network)
         let test_result = test_execution_fn(network_name.clone()).await;
 
         // 8. Teardown active services in reverse dependency order
-        Self::teardown_services(&self.store, active_services, network_name.as_deref()).await;
+        let test_result =
+            match Self::teardown_services(&self.store, active_services, network_name.as_deref())
+                .await
+            {
+                Ok(()) => test_result,
+                Err(error) => Err((EnvironmentRunStatus::Error, error.to_string())),
+            };
 
         // 9. Finalize environment run record
         let final_env_status = match &test_result {
@@ -1666,7 +1696,8 @@ impl EnvironmentManager {
         store: &EnvironmentStore,
         mut active_services: Vec<ActiveServiceHandle>,
         network_name: Option<&str>,
-    ) {
+    ) -> Result<()> {
+        let mut cleanup_error = None;
         while let Some(mut handle) = active_services.pop() {
             if let Some(ref cname) = handle.container_name {
                 let mut logs_cmd = tokio::process::Command::new("podman");
@@ -1712,18 +1743,38 @@ impl EnvironmentManager {
                     "-f",
                     cname,
                 ]);
-                let _ = rm_cmd.output().await;
+                let _ = tokio::time::timeout(Duration::from_secs(30), rm_cmd.output()).await;
+                if let Err(error) =
+                    crate::verification::confirm_verification_container_removed(cname).await
+                {
+                    cleanup_error.get_or_insert(error);
+                }
             }
 
-            if let Some(ref mut child) = handle.child {
-                let _ = child.kill().await;
+            if let Some(ref mut child) = handle.child
+                && let Err(error) = tokio::time::timeout(Duration::from_secs(10), child.kill())
+                    .await
+                    .context("service process cleanup timed out")
+                    .and_then(|result| result.map_err(Into::into))
+            {
+                cleanup_error.get_or_insert(error);
             }
             drop(handle.pid_guard);
-            if let Some(task) = handle.stdout_task {
-                let _ = task.await;
+            if let Some(task) = handle.stdout_task
+                && let Err(error) = tokio::time::timeout(Duration::from_secs(10), task)
+                    .await
+                    .context("service stdout cleanup timed out")
+                    .and_then(|result| result.map_err(Into::into))
+            {
+                cleanup_error.get_or_insert(error);
             }
-            if let Some(task) = handle.stderr_task {
-                let _ = task.await;
+            if let Some(task) = handle.stderr_task
+                && let Err(error) = tokio::time::timeout(Duration::from_secs(10), task)
+                    .await
+                    .context("service stderr cleanup timed out")
+                    .and_then(|result| result.map_err(Into::into))
+            {
+                cleanup_error.get_or_insert(error);
             }
         }
 
@@ -1736,7 +1787,61 @@ impl EnvironmentManager {
                 "rm",
                 net,
             ]);
-            let _ = net_rm.output().await;
+            let _ = tokio::time::timeout(Duration::from_secs(30), net_rm.output()).await;
+            let check = async {
+                let output = tokio::time::timeout(
+                    Duration::from_secs(20),
+                    tokio::process::Command::new("podman")
+                        .args(["--remote=false", "network", "exists", net])
+                        .output(),
+                )
+                .await
+                .context("environment network cleanup check timed out")??;
+                crate::verification::confirm_podman_resource_absent(output.status)?;
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            if let Err(error) = check {
+                cleanup_error.get_or_insert(error);
+            }
         }
+        match cleanup_error {
+            Some(error) => {
+                Err(error
+                    .context(crate::verification::VerificationCommandFailure::CleanupUnconfirmed))
+            }
+            None => Ok(()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn readiness_deadlines_produce_typed_timeout_evidence() -> Result<()> {
+        for probe in [
+            ReadinessProbe::Tcp {
+                host: "127.0.0.1".into(),
+                port: 0,
+                timeout_seconds: 0,
+                interval_ms: 1,
+            },
+            ReadinessProbe::Http {
+                url: "http://127.0.0.1:0".into(),
+                expected_status: 200,
+                timeout_seconds: 0,
+                interval_ms: 1,
+            },
+        ] {
+            let error = EnvironmentManager::poll_readiness(&probe, None, None)
+                .await
+                .unwrap_err();
+            assert!(error.is::<ReadinessTimeout>(), "{error:#}");
+            assert!(error.context("outer diagnostic").is::<ReadinessTimeout>());
+        }
+        assert!(!anyhow::anyhow!("an unrelated timeout in a diagnostic").is::<ReadinessTimeout>());
+        Ok(())
     }
 }

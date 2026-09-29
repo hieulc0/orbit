@@ -144,6 +144,20 @@ The coordinator checks the selected credential generation again before launch;
 `actual_model` remains unset unless the runtime reports an observed model. A
 missing cleanup receipt leaves the mutation lock fenced for reconciliation.
 
+Verification command policy uses the observed process outcome: numeric exit,
+signal, timeout or unknown. Cancellation and cleanup uncertainty carry typed
+errors through diagnostic context; an unrelated diagnostic containing “timeout”
+or “cancelled” does not determine the result. Managed readiness deadlines and
+ACP turn deadlines likewise retain their types. Browser crash classification
+uses the process status when no structured harness report is available.
+
+Container and integration network teardown confirm resource absence before
+publishing successful cleanup. Only the Podman existence check's absence exit
+code confirms removal; a failed or timed out check leaves cleanup unconfirmed.
+Cleanup uncertainty takes precedence over cancellation or a successful command
+and is recorded as an error. These checks preserve workflow fencing, role
+permissions and candidate-bound verification.
+
 Role runtime resolution applies reset-aware account selection over fresh,
 credential-scoped availability evidence. The default safety thresholds are 15%
 for a known 5-hour window and 5% for a known 7-day window; exact-threshold

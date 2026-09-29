@@ -31,6 +31,17 @@ impl std::fmt::Display for TurnTimeout {
 }
 impl std::error::Error for TurnTimeout {}
 
+#[derive(Debug)]
+pub struct AcpCleanupUnconfirmed;
+
+impl std::fmt::Display for AcpCleanupUnconfirmed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ACP process/auth cleanup unconfirmed; auth store may be quarantined")
+    }
+}
+
+impl std::error::Error for AcpCleanupUnconfirmed {}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Adapter {
@@ -235,14 +246,18 @@ impl Runtime {
         error: &anyhow::Error,
     ) -> crate::continuation::NormalizedAgentResult {
         let err_str = error.to_string();
+        if error.is::<AcpCleanupUnconfirmed>() {
+            return crate::continuation::NormalizedAgentResult::agent_error(err_str);
+        }
+        if error.is::<TurnTimeout>() {
+            return crate::continuation::NormalizedAgentResult::turn_limit(err_str);
+        }
         match self.launch.adapter {
             Adapter::Antigravity => crate::continuation::normalize_antigravity_error(&err_str),
             Adapter::Codex => crate::continuation::normalize_codex_error(&err_str),
             Adapter::Acp => {
                 let lower = err_str.to_ascii_lowercase();
-                if lower.contains("turn timeout") {
-                    crate::continuation::NormalizedAgentResult::turn_limit(err_str)
-                } else if lower.contains("429") {
+                if lower.contains("429") {
                     crate::continuation::classify_http_429(&err_str, None)
                 } else {
                     crate::continuation::NormalizedAgentResult::agent_error(err_str)
@@ -501,15 +516,11 @@ impl Runtime {
             .ok()
             .and_then(Result::ok)
             .and_then(|s| s.code());
-        ensure!(
-            cleanup.is_some_and(|code| crate::acp_process::read_cleanup(
-                &request_path,
-                Some(&a.attempt_id)
-            )
-            .ok()
-                == Some(code)),
-            "ACP process/auth cleanup unconfirmed; auth store may be quarantined"
-        );
+        if !cleanup.is_some_and(|code| {
+            crate::acp_process::read_cleanup(&request_path, Some(&a.attempt_id)).ok() == Some(code)
+        }) {
+            return Err(AcpCleanupUnconfirmed.into());
+        }
         let launch_diagnostic =
             crate::acp_process::read_cleanup_diagnostic(&request_path, Some(&a.attempt_id))
                 .ok()

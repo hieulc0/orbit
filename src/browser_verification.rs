@@ -7,6 +7,26 @@ pub const DEFAULT_BROWSER_IMAGE: &str = "localhost/orbit-browser:playwright-chro
 pub const MAX_INLINE_CONSOLE_ENTRIES: usize = 100;
 pub const MAX_INLINE_ERRORS: usize = 50;
 
+#[derive(Debug)]
+enum BrowserProcessOutcome {
+    Completed(std::process::Output),
+    Failed(std::io::Error),
+    TimedOut,
+    Cancelled,
+}
+
+fn browser_process_crashed(status: std::process::ExitStatus) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if status.signal().is_some() {
+            return true;
+        }
+    }
+    // Container launchers encode SIGKILL as the shell exit code 128 + 9.
+    status.code() == Some(137)
+}
+
 fn default_true() -> bool {
     true
 }
@@ -1319,18 +1339,17 @@ impl BrowserVerificationManager {
             let mut cancel_rx = cancellation_token.clone();
 
             let cmd_fut = run_cmd.output();
-            let mut timed_out = false;
-            let mut cancelled = false;
-
-            let output_result = tokio::select! {
-                res = cmd_fut => res,
+            let process_outcome = tokio::select! {
+                res = cmd_fut => match res {
+                    Ok(output) => BrowserProcessOutcome::Completed(output),
+                    Err(error) => BrowserProcessOutcome::Failed(error),
+                },
                 _ = tokio::time::sleep(timeout_duration) => {
-                    timed_out = true;
                     // Force terminate container
                     let mut kill_cmd = tokio::process::Command::new("podman");
                     kill_cmd.args(["--remote=false", "--cgroup-manager=cgroupfs", "kill", &container_name]);
                     kill_cmd.output().await.ok();
-                    Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "test timed out"))
+                    BrowserProcessOutcome::TimedOut
                 }
                 _ = async {
                     if let Some(ref mut rx) = cancel_rx {
@@ -1341,12 +1360,19 @@ impl BrowserVerificationManager {
                         futures_util::future::pending::<()>().await;
                     }
                 } => {
-                    cancelled = true;
                     let mut kill_cmd = tokio::process::Command::new("podman");
                     kill_cmd.args(["--remote=false", "--cgroup-manager=cgroupfs", "kill", &container_name]);
                     kill_cmd.output().await.ok();
-                    Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "execution cancelled"))
+                    BrowserProcessOutcome::Cancelled
                 }
+            };
+            let timed_out = matches!(process_outcome, BrowserProcessOutcome::TimedOut);
+            let cancelled = matches!(process_outcome, BrowserProcessOutcome::Cancelled);
+            let output_result = match process_outcome {
+                BrowserProcessOutcome::Completed(output) => Ok(output),
+                BrowserProcessOutcome::Failed(error) => Err(error),
+                BrowserProcessOutcome::TimedOut => Err(std::io::ErrorKind::TimedOut.into()),
+                BrowserProcessOutcome::Cancelled => Err(std::io::ErrorKind::Interrupted.into()),
             };
 
             let test_finished_at_ms = crate::verification::now_millis();
@@ -1361,7 +1387,20 @@ impl BrowserVerificationManager {
                 "-f",
                 &container_name,
             ]);
-            rm_cmd.output().await.ok();
+            let _ = tokio::time::timeout(Duration::from_secs(30), rm_cmd.output()).await;
+            if let Err(error) =
+                crate::verification::confirm_verification_container_removed(&container_name).await
+            {
+                self.store
+                    .finalize_browser_verification_run(
+                        &b_run_id,
+                        BrowserVerificationStatus::Error,
+                        Some(BrowserFailureReason::EnvironmentError),
+                        crate::verification::now_millis(),
+                    )
+                    .await?;
+                return Err(error);
+            }
 
             // Read JSON result written by harness
             let result_file = host_results_dir.join(format!("test-{}-result.json", test.id));
@@ -1505,10 +1544,7 @@ impl BrowserVerificationManager {
                 let (st, reason, msg) = match output_result {
                     Ok(out) => {
                         let err_str = String::from_utf8_lossy(&out.stderr);
-                        if err_str.contains("signal: 9")
-                            || err_str.contains("killed")
-                            || err_str.contains("exit code: 137")
-                        {
+                        if browser_process_crashed(out.status) {
                             (
                                 BrowserTestStatus::Error,
                                 Some(BrowserFailureReason::BrowserCrashed),
@@ -1601,5 +1637,29 @@ impl BrowserVerificationManager {
         v_run.artifacts = accumulated_artifacts;
 
         Ok(v_run)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn browser_crash_classification_uses_process_status() {
+        for code in [0, 1, 42, 125] {
+            assert!(!browser_process_crashed(
+                std::process::ExitStatus::from_raw(code << 8)
+            ));
+        }
+        assert!(browser_process_crashed(std::process::ExitStatus::from_raw(
+            137 << 8
+        )));
+        assert!(browser_process_crashed(std::process::ExitStatus::from_raw(
+            libc::SIGKILL
+        )));
+        assert!(browser_process_crashed(std::process::ExitStatus::from_raw(
+            libc::SIGSEGV
+        )));
     }
 }
