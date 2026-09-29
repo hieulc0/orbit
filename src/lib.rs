@@ -40,6 +40,7 @@ pub mod provider_status;
 pub mod registry;
 pub mod regression_strategy;
 pub mod repository;
+mod role_prompt;
 pub mod run_export;
 pub mod sdk;
 pub mod secret_backend;

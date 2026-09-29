@@ -58,7 +58,20 @@ independent boundaries, not interchangeable permission strings.
 | `src/registry.rs` | Signed immutable package metadata; no code loading |
 | `src/ops.rs`, `src/main.rs` | Lifecycle, probes, metrics, executable commands |
 | `src/mcp.rs`, `src/sdk.rs`, `sdk/python/`, `ui/` | Peer interfaces over the same server |
+| `src/workflow.rs` | Role definitions, structured handoffs, durable workflow state and fenced mutation ownership |
+| `src/workflow_coordinator.rs` | Workflow stage, progression, repair and completion decisions; repository callbacks and exact tool auditing |
+| `src/role_prompt.rs` | Private role prompt construction and advertised repository tool lists |
+| `src/workflow_role_execution.rs` | Private coordinator child module for live ACP role execution, lifecycle evidence and supervisor cleanup |
+| `src/verification.rs`, `src/regression_strategy.rs` | Authoritative verification, immutable check selection and candidate-bound evidence |
 | `tests/kernel/`, `scripts/` | Disposable qualification and repeatable operational checks |
+
+The role workflow coordinator delegates prompt construction and live execution
+while retaining workflow decisions. `RoleAgentExecutor`, `RoleExecutionOutcome`
+and `RealAcpRoleExecutor` remain available through `workflow_coordinator`; the
+extracted implementation modules are private. Structured handoff parsing and
+verification selection retain their existing owners. This boundary does not
+change role permissions, mutation locks, exact tool auditing, WorkspaceState
+binding or cleanup requirements.
 
 ## Invariants to preserve
 
