@@ -1,6 +1,8 @@
 use agent_client_protocol as acp;
 use anyhow::{Context, Result};
-use orbit::codex_bridge::{CODEX_VERSION, OrbitAcpClient, ToolCall, ToolRouter, thread_start};
+use orbit::codex_bridge::{
+    CODEX_VERSION, OrbitAcpClient, ToolCall, ToolRouter, dynamic_tool_names, thread_start,
+};
 use serde_json::{Value, json};
 use std::{cell::RefCell, path::Path};
 
@@ -324,6 +326,7 @@ fn codex_bridge_tool_instruction_matches_exact_dynamic_tool_aliases() -> Result<
         .iter()
         .map(|name| format!("orbit_{name}"))
         .collect::<Vec<_>>();
+    assert_eq!(dynamic_tool_names(&names)?, expected_names);
     let dynamic_names = request["dynamicTools"]
         .as_array()
         .context("Codex dynamic tool list missing")?

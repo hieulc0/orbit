@@ -40,10 +40,7 @@ pub fn thread_start(
         names.len() <= 32 && names.iter().collect::<BTreeSet<_>>().len() == names.len(),
         "invalid bridge tools"
     );
-    let tools = crate::coding_agent::tool_definitions(names)?.into_iter().map(|tool|
-        json!({"type":"function", "name":format!("orbit_{}", tool["name"].as_str().unwrap()),
-            "description":tool["description"], "inputSchema":tool["parameters"], "deferLoading":false})
-    ).collect::<Vec<_>>();
+    let tools = dynamic_tools(names)?;
     let dynamic_tool_names = tools
         .iter()
         .filter_map(|tool| tool["name"].as_str())
@@ -110,6 +107,29 @@ pub fn thread_start(
         request["config"]["model_reasoning_effort"] = json!(effort);
     }
     Ok(request)
+}
+
+/// Return the provider-facing aliases from the same dynamic tool definitions
+/// sent to Codex, so role instructions cannot drift from the advertised surface.
+pub fn dynamic_tool_names(names: &[String]) -> Result<Vec<String>> {
+    dynamic_tools(names).map(|tools| {
+        tools
+            .iter()
+            .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+            .collect()
+    })
+}
+
+fn dynamic_tools(names: &[String]) -> Result<Vec<Value>> {
+    crate::coding_agent::tool_definitions(names).map(|definitions| {
+        definitions
+            .into_iter()
+            .map(|tool| {
+                json!({"type":"function", "name":format!("orbit_{}", tool["name"].as_str().unwrap()),
+                    "description":tool["description"], "inputSchema":tool["parameters"], "deferLoading":false})
+            })
+            .collect()
+    })
 }
 
 #[derive(Debug, Deserialize)]

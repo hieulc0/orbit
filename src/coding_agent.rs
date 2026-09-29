@@ -49,6 +49,19 @@ pub struct Session<'a> {
 pub fn completion_instructions(workspace: &str, tools: &[String]) -> String {
     let terminal = if tools.iter().any(|tool| tool == "shell") {
         "You can execute repository-local commands through the provided terminal/shell tool. Use it when appropriate to inspect Git changes, build, test, or validate the project."
+    } else if tools.iter().any(|tool| {
+        matches!(
+            tool.as_str(),
+            "write_file"
+                | "edit_file"
+                | "create_directory"
+                | "move"
+                | "copy"
+                | "delete_file"
+                | "delete_directory"
+        )
+    }) {
+        "Terminal execution is unavailable in this assignment. This does not prevent implementation: use the advertised Orbit mutation tools to change repository files. Orbit runs configured authoritative verification separately."
     } else {
         "Terminal execution is unavailable in this assignment; report any validation that cannot be performed."
     };

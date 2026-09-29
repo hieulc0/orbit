@@ -2255,16 +2255,43 @@ fn repository_tools_for_role(role: &RoleDefinition) -> Vec<String> {
         .collect()
 }
 
+struct RolePromptToolContext<'a> {
+    provider: &'a str,
+    role: &'a RoleDefinition,
+    advertised_tools: &'a [String],
+}
+
 fn build_role_prompt(
-    role: &RoleDefinition,
+    tool_context: RolePromptToolContext<'_>,
     task_text: &str,
     repo_path: &Path,
     base_revision: &str,
     input_handoff: Option<&HandoffArtifact>,
     git_diff: Option<&str>,
     available_verification_check_ids: &[String],
-) -> String {
-    let orbit_acp_tool_names = repository_tools_for_role(role).join(", ");
+) -> Result<String> {
+    let RolePromptToolContext {
+        provider,
+        role,
+        advertised_tools,
+    } = tool_context;
+    let provider_tool_names = if provider == "codex" {
+        crate::codex_bridge::dynamic_tool_names(advertised_tools)?
+    } else {
+        advertised_tools.to_vec()
+    };
+    let tool_list = provider_tool_names.join(", ");
+    let mutation_tool_list = advertised_tools
+        .iter()
+        .zip(provider_tool_names.iter())
+        .filter_map(|(canonical_name, provider_name)| {
+            crate::tool_surface::CanonicalToolName::from_wire(canonical_name)
+                .map(crate::tool_surface::ToolMetadata::for_tool)
+                .filter(|metadata| metadata.mutating)
+                .map(|_| provider_name.as_str())
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     let workspace_path = crate::acp_runtime::WORKSPACE;
     let mut doc_files = Vec::new();
     let docs_dir = repo_path.join("docs");
@@ -2282,23 +2309,26 @@ fn build_role_prompt(
 
     let prompt = match role.role_id.as_str() {
         "planner" => format!(
-            "You are the PLANNER role in an Orbit automated software change workflow.\n            Your responsibility is to analyze the task, inspect the repository using read-only tools, and produce a clear, structured implementation plan.\n\n            TASK OBJECTIVE:\n{task_text}\n\n            REPOSITORY CONTEXT:\n            Repository Workspace: {workspace_path}\n            Repository tool paths are relative to this workspace.\n            Base Revision: {base_revision}{docs_manifest}\n            WORKSPACE PERMISSIONS:\n            You have READ-ONLY workspace access. You can inspect the repository using:\n            - fs/read_text_file (or read_file): read file content\n            - fs/list_directory: inspect workspace directory entries\n            - fs/find_path: search for files matching patterns\n            - search/grep: regex or text search across files\n            - git/status, git/diff, git/show: inspect git working tree and commit history\n            You CANNOT write or edit files, and CANNOT create terminals.\n\n            INSTRUCTIONS:\n            1. Inspect existing files, search patterns, and repository structure using the read-only tools.\n            2. Formulate a concrete step-by-step implementation plan.\n            3. You MUST end your response with a structured JSON plan handoff block inside the exact delimiters:\n            <<<ORBIT_HANDOFF_START>>>\n            {{\n              \"summary\": \"Concise summary of the plan\",\n              \"affected_areas\": [\"area1\", \"area2\"],\n              \"implementation_steps\": [\"step 1\", \"step 2\"],\n              \"expected_files\": [\"docs/file1.md\"],\n              \"risks\": [],\n              \"verification_notes\": [\"verification instructions\"],\n              \"open_questions\": []\n            }}\n            <<<ORBIT_HANDOFF_END>>>\n",
+            "You are the PLANNER role in an Orbit automated software change workflow.\n            Your responsibility is to analyze the task, inspect the repository using read-only tools, and produce a clear, structured implementation plan.\n\n            TASK OBJECTIVE:\n{task_text}\n\n            REPOSITORY CONTEXT:\n            Repository Workspace: {workspace_path}\n            Repository tool paths are relative to this workspace.\n            Base Revision: {base_revision}{docs_manifest}\n            WORKSPACE PERMISSIONS:\n            You have READ-ONLY workspace access. The Orbit tools advertised to this role are: {tool_list}\n            You CANNOT write or edit files, and CANNOT create terminals.\n\n            INSTRUCTIONS:\n            1. Inspect existing files, search patterns, and repository structure using the read-only tools.\n            2. Formulate a concrete step-by-step implementation plan.\n            3. You MUST end your response with a structured JSON plan handoff block inside the exact delimiters:\n            <<<ORBIT_HANDOFF_START>>>\n            {{\n              \"summary\": \"Concise summary of the plan\",\n              \"affected_areas\": [\"area1\", \"area2\"],\n              \"implementation_steps\": [\"step 1\", \"step 2\"],\n              \"expected_files\": [\"docs/file1.md\"],\n              \"risks\": [],\n              \"verification_notes\": [\"verification instructions\"],\n              \"open_questions\": []\n            }}\n            <<<ORBIT_HANDOFF_END>>>\n",
             workspace_path = workspace_path,
             base_revision = base_revision,
             task_text = task_text,
             docs_manifest = docs_manifest,
+            tool_list = tool_list,
         ),
         "implementer" => {
             let plan_summary = input_handoff
                 .map(|h| h.structured_payload.to_string())
                 .unwrap_or_else(|| "No prior plan provided.".to_string());
             format!(
-                "You are the IMPLEMENTER role in an Orbit automated software change workflow.\n                Your responsibility is to execute the implementation plan by modifying project files and verifying your work.\n\n                TASK OBJECTIVE:\n{task_text}\n\n                PLANNER SPECIFICATION:\n{plan_summary}\n\n                REPOSITORY CONTEXT:\n                Repository Workspace: {workspace_path}\n                Repository tool paths are relative to this workspace.\n                Base Revision: {base_revision}{docs_manifest}\n                WORKSPACE PERMISSIONS:\n                You have FULL READ-WRITE coding agent workspace access. Tools available to you:\n                - fs/read_text_file: read file contents\n                - fs/write_text_file: write complete file contents\n                - fs/edit_file: perform targeted text replacements (old_text -> new_text, replace_all)\n                - fs/list_directory: list directory contents\n                - fs/find_path: search workspace file paths by pattern\n                - fs/create_directory: create a new directory\n                - fs/move: move or rename files/directories\n                - fs/copy: copy files or directories\n                - fs/delete_file: remove a single file\n                - fs/delete_directory: remove a directory\n                - search/grep: ripgrep workspace code\n                - git/status, git/diff, git/show: inspect git status, diffs, and commits\n                - terminal/create, terminal/output, terminal/wait_for_exit, terminal/kill, terminal/release: run tests or commands\n\n                INSTRUCTIONS:\n                1. Implement all required changes and directory reorganization per the planner specification.\n                2. Use fs/edit_file for surgical modifications and fs/write_text_file for new files.\n                3. You MUST end your response with a structured JSON implementation handoff block inside the exact delimiters:\n                <<<ORBIT_HANDOFF_START>>>\n                {{\n                  \"summary\": \"Concise summary of changes implemented\",\n                  \"changed_files\": [\"docs/file1.md\"],\n                  \"tests_added_or_modified\": [],\n                  \"exploratory_commands\": [],\n                  \"known_limitations\": [],\n                  \"verification_notes\": [\"self-verification details\"]\n                }}\n                <<<ORBIT_HANDOFF_END>>>\n",
+                "You are the IMPLEMENTER role in an Orbit automated software change workflow.\n                Your responsibility is to execute the implementation plan by modifying project files and verifying your work.\n\n                TASK OBJECTIVE:\n{task_text}\n\n                PLANNER SPECIFICATION:\n{plan_summary}\n\n                REPOSITORY CONTEXT:\n                Repository Workspace: {workspace_path}\n                Repository tool paths are relative to this workspace.\n                Base Revision: {base_revision}{docs_manifest}\n                WORKSPACE PERMISSIONS:\n                The native filesystem sandbox is read-only by design. This does not make the assigned repository immutable. Repository changes are authorized only through the Orbit mutation callbacks advertised to this role: {mutation_tool_list}. Use these exact provider-facing names to make the requested changes. The callback boundary continues to enforce role authorization, workspace confinement, and mutation locking; this prompt grants no authority.\n                Orbit tools advertised to this role: {tool_list}\n                Terminal execution is unavailable in this assignment. That does not prevent implementation: use the advertised Orbit mutation callbacks. Orbit runs configured authoritative verification separately after implementation.\n\n                INSTRUCTIONS:\n                1. Implement all required changes and directory reorganization per the planner specification.\n                2. Inspect the repository structure, then use the advertised Orbit mutation callbacks for edits and new files.\n                3. You MUST end your response with a structured JSON implementation handoff block inside the exact delimiters:\n                <<<ORBIT_HANDOFF_START>>>\n                {{\n                  \"summary\": \"Concise summary of changes implemented\",\n                  \"changed_files\": [\"docs/file1.md\"],\n                  \"tests_added_or_modified\": [],\n                  \"exploratory_commands\": [],\n                  \"known_limitations\": [],\n                  \"verification_notes\": [\"self-verification details\"]\n                }}\n                <<<ORBIT_HANDOFF_END>>>\n",
                 workspace_path = workspace_path,
                 base_revision = base_revision,
                 task_text = task_text,
                 plan_summary = plan_summary,
                 docs_manifest = docs_manifest,
+                mutation_tool_list = mutation_tool_list,
+                tool_list = tool_list,
             )
         }
         "reviewer" => {
@@ -2307,10 +2337,11 @@ fn build_role_prompt(
                 .unwrap_or_else(|| "No prior implementation handoff provided.".to_string());
             let diff_text = git_diff.unwrap_or("No diff recorded.");
             format!(
-                "You are the REVIEWER role in an Orbit automated software change workflow.\n                Your responsibility is to review the code changes against the task objective and implementation handoff.\n\n                TASK OBJECTIVE:\n{task_text}\n\n                IMPLEMENTATION HANDOFF:\n{handoff_summary}\n\n                GIT DIFF:\n{diff_text}\n\n                WORKSPACE PERMISSIONS:\n                You have READ-ONLY workspace access. You can inspect files using fs/read_text_file.\n                You CANNOT write files.\n\n                INSTRUCTIONS:\n                1. Carefully review the git diff and verify that the changes satisfy the task without regressions.\n                2. Decide whether to APPROVE or request CHANGES_REQUESTED.\n                3. You MUST end your response with a structured JSON review decision block inside the exact delimiters:\n                <<<ORBIT_HANDOFF_START>>>\n                {{\n                  \"decision\": \"APPROVE\",\n                  \"summary\": \"Review rationale and summary\",\n                  \"findings\": [\n                    {{\n                      \"category\": \"documentation\",\n                      \"severity\": \"medium\",\n                      \"path\": \"docs/README.md\",\n                      \"explanation\": \"Clear description of finding\",\n                      \"requested_change\": \"Specific change required\"\n                    }}\n                  ],\n                  \"requested_changes\": [\"specific change 1\"],\n                  \"suggested_additional_checks\": []\n                }}\n                <<<ORBIT_HANDOFF_END>>>\n                Note: decision must be either APPROVE, CHANGES_REQUESTED, or BLOCKED.\n",
+                "You are the REVIEWER role in an Orbit automated software change workflow.\n                Your responsibility is to review the code changes against the task objective and implementation handoff.\n\n                TASK OBJECTIVE:\n{task_text}\n\n                IMPLEMENTATION HANDOFF:\n{handoff_summary}\n\n                GIT DIFF:\n{diff_text}\n\n                WORKSPACE PERMISSIONS:\n                You have READ-ONLY workspace access. The Orbit tools advertised to this role are: {tool_list}\n                You CANNOT write files or create terminals.\n\n                INSTRUCTIONS:\n                1. Carefully review the git diff and verify that the changes satisfy the task without regressions.\n                2. Decide whether to APPROVE or request CHANGES_REQUESTED.\n                3. You MUST end your response with a structured JSON review decision block inside the exact delimiters:\n                <<<ORBIT_HANDOFF_START>>>\n                {{\n                  \"decision\": \"APPROVE\",\n                  \"summary\": \"Review rationale and summary\",\n                  \"findings\": [\n                    {{\n                      \"category\": \"documentation\",\n                      \"severity\": \"medium\",\n                      \"path\": \"docs/README.md\",\n                      \"explanation\": \"Clear description of finding\",\n                      \"requested_change\": \"Specific change required\"\n                    }}\n                  ],\n                  \"requested_changes\": [\"specific change 1\"],\n                  \"suggested_additional_checks\": []\n                }}\n                <<<ORBIT_HANDOFF_END>>>\n                Note: decision must be either APPROVE, CHANGES_REQUESTED, or BLOCKED.\n",
                 task_text = task_text,
                 handoff_summary = handoff_summary,
                 diff_text = diff_text,
+                tool_list = tool_list,
             )
         }
         _ => format!(
@@ -2320,7 +2351,7 @@ fn build_role_prompt(
         ),
     };
     let prompt = format!(
-        "{prompt}\n\nORBIT/ACP TOOL NAMES: {orbit_acp_tool_names}\n\nFile reads are bounded pages. Read result metadata is under `_meta.orbit` and includes `truncated`, `total_bytes`, and `next_line`; when truncated, repeat the same read with `line` set to `next_line`. The `line` argument is a 1-based line number and `limit`, when supplied, is a maximum line count."
+        "{prompt}\n\nORBIT TOOLS ADVERTISED TO THIS ROLE: {tool_list}\n\nFile reads are bounded pages. Read result metadata is under `_meta.orbit` and includes `truncated`, `total_bytes`, and `next_line`; when truncated, repeat the same read with `line` set to `next_line`. The `line` argument is a 1-based line number and `limit`, when supplied, is a maximum line count."
     );
     let prompt = if role.role_id == "reviewer" {
         format!(
@@ -2337,14 +2368,7 @@ fn build_role_prompt(
     } else {
         prompt
     };
-    let prompt = prompt.replace(
-        "You can inspect files using fs/read_text_file.",
-        "You can inspect files using the listed read-only repository tools.",
-    );
-    prompt.replace(
-        "- terminal/create, terminal/output, terminal/wait_for_exit, terminal/kill, terminal/release: run tests or commands",
-        "- CLI workflow terminal execution is unavailable until a confined terminal owner is qualified",
-    )
+    Ok(prompt)
 }
 
 pub struct AcpTurnState<'a> {
@@ -6228,14 +6252,18 @@ async fn execute_real_acp_turn_body(
         Vec::new()
     };
     let prompt_text = build_role_prompt(
-        role,
+        RolePromptToolContext {
+            provider: &target.provider,
+            role,
+            advertised_tools: &allowed_tools,
+        },
         task_text,
         repo_path,
         base_rev,
         input_handoff,
         git_diff.as_deref(),
         &available_verification_check_ids,
-    );
+    )?;
 
     persist_agent_lifecycle_phase(
         &store,
@@ -7015,22 +7043,43 @@ mod tests {
             }
 
             let prompt = build_role_prompt(
-                role,
+                RolePromptToolContext {
+                    provider: "codex",
+                    role,
+                    advertised_tools: &tools,
+                },
                 "Inspect and update the repository",
                 Path::new("/workspace"),
                 "HEAD",
                 None,
                 None,
                 &[],
-            );
-            assert!(prompt.contains(&format!("ORBIT/ACP TOOL NAMES: {}", tools.join(", "))));
+            )?;
+            let provider_tool_names = crate::codex_bridge::dynamic_tool_names(&tools)?;
+            assert!(prompt.contains(&format!(
+                "ORBIT TOOLS ADVERTISED TO THIS ROLE: {}",
+                provider_tool_names.join(", ")
+            )));
             if role.role_id == "implementer" {
+                assert!(prompt.contains("sandbox is read-only by design"));
+                assert!(prompt.contains("does not make the assigned repository immutable"));
+                assert!(prompt.contains("orbit_write_file, orbit_edit_file"));
+                assert!(!prompt.contains("fs/write_text_file"));
+                assert!(!prompt.contains("fs/edit_file"));
+                assert!(prompt.contains("That does not prevent implementation"));
+                assert!(
+                    prompt.contains("Orbit runs configured authoritative verification separately")
+                );
                 assert!(prompt.contains("Discover paths with list_directory, find_path, or grep"));
                 assert!(prompt.contains("PATH_NOT_FOUND"));
                 assert!(prompt.contains(
                     "complete candidate path set changed relative to the workflow base revision"
                 ));
                 assert!(prompt.contains("During repair this includes earlier candidate changes"));
+            } else {
+                assert!(prompt.contains("orbit_read_file"));
+                assert!(!prompt.contains("orbit_write_file"));
+                assert!(prompt.contains("READ-ONLY workspace access"));
             }
         }
 
@@ -7047,14 +7096,18 @@ mod tests {
             RoleDefinition::implementer_v1(),
         ] {
             let prompt = build_role_prompt(
-                &role,
+                RolePromptToolContext {
+                    provider: "codex",
+                    role: &role,
+                    advertised_tools: &repository_tools_for_role(&role),
+                },
                 "Inspect and update the repository",
                 host_repository.path(),
                 "HEAD",
                 None,
                 None,
                 &[],
-            );
+            )?;
 
             assert!(prompt.contains(&format!(
                 "Repository Workspace: {}",
@@ -7068,19 +7121,60 @@ mod tests {
     }
 
     #[test]
-    fn reviewer_prompt_names_only_configured_verification_check_ids() {
+    fn reviewer_prompt_names_only_configured_verification_check_ids() -> Result<()> {
+        let role = RoleDefinition::reviewer_v1();
         let prompt = build_role_prompt(
-            &RoleDefinition::reviewer_v1(),
+            RolePromptToolContext {
+                provider: "codex",
+                role: &role,
+                advertised_tools: &repository_tools_for_role(&role),
+            },
             "Review the candidate",
             Path::new("/workspace"),
             "HEAD",
             None,
             Some("diff --git a/README.md b/README.md"),
             &["candidate-contract".into()],
-        );
+        )?;
         assert!(prompt.contains("CONFIGURED VERIFICATION CHECK IDS: [\"candidate-contract\"]"));
         assert!(prompt.contains("suggested_additional_checks field accepts only exact IDs"));
         assert!(prompt.contains("Use [] when no additional configured check is needed"));
+        assert!(!prompt.contains("orbit_write_file"));
+        Ok(())
+    }
+
+    #[test]
+    fn repair_implementer_prompt_retains_the_callback_mutation_contract() -> Result<()> {
+        let role = RoleDefinition::implementer_v1();
+        let tools = repository_tools_for_role(&role);
+        let repair_handoff = HandoffArtifact {
+            id: "handoff-repair-context".into(),
+            workflow_run_id: "workflow-run".into(),
+            role_execution_id: Some("reviewer-role".into()),
+            handoff_type: HandoffType::FailureEvidence,
+            version: 1,
+            workspace_state_id: Some("candidate-state".into()),
+            structured_payload: serde_json::json!({"summary":"Address review findings"}),
+        };
+        let prompt = build_role_prompt(
+            RolePromptToolContext {
+                provider: "codex",
+                role: &role,
+                advertised_tools: &tools,
+            },
+            "Repair the reviewed candidate",
+            Path::new("/workspace"),
+            "HEAD",
+            Some(&repair_handoff),
+            None,
+            &[],
+        )?;
+        assert!(prompt.contains("orbit_write_file, orbit_edit_file"));
+        assert!(prompt.contains("Terminal execution is unavailable in this assignment"));
+        assert!(prompt.contains("That does not prevent implementation"));
+        assert!(prompt.contains("Orbit runs configured authoritative verification separately"));
+        assert!(prompt.contains("Address review findings"));
+        Ok(())
     }
 
     fn git_fixture(repo: &Path, args: &[&str]) -> Result<String> {

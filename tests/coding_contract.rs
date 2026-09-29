@@ -29,6 +29,18 @@ fn coding_contract_does_not_advertise_ungranted_terminal() {
 }
 
 #[test]
+fn coding_contract_separates_mutation_callbacks_from_terminal_execution() {
+    let contract = completion_instructions(
+        "/workspace",
+        &["read_file".into(), "write_file".into(), "edit_file".into()],
+    );
+    assert!(contract.contains("Terminal execution is unavailable"));
+    assert!(contract.contains("This does not prevent implementation"));
+    assert!(contract.contains("advertised Orbit mutation tools"));
+    assert!(contract.contains("Orbit runs configured authoritative verification separately"));
+}
+
+#[test]
 fn codex_base_instructions_use_the_shared_completion_contract() {
     let tools = vec!["read_file".into(), "write_file".into(), "shell".into()];
     let thread = orbit::codex_bridge::thread_start(
