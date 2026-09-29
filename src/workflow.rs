@@ -1740,6 +1740,121 @@ impl WorkflowStore {
             .context("role execution not found")
     }
 
+    /// Fail a mutating role and its workflow while revoking all active authority.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fail_mutating_role_and_workflow(
+        &self,
+        re_id: &str,
+        workflow_run_id: &str,
+        attempt_id: &str,
+        output_workspace_state_id: &str,
+        reason: &str,
+        message: &str,
+        handoff_output_id: &str,
+    ) -> Result<RoleExecution> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis() as i64;
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query(
+            r#"
+            UPDATE orbit_role_executions
+            SET status = $1,
+                finished_at_ms = $2,
+                termination_reason = $3,
+                failure_message = $4,
+                handoff_output_id = $5
+            WHERE id = $6 AND status IN ('PENDING', 'RESOLVING', 'RUNNING')
+              AND EXISTS (SELECT 1 FROM orbit_workflow_runs wf
+                  WHERE wf.id = workflow_run_id
+                    AND wf.attempt_id = $7
+                    AND wf.status NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'EXHAUSTED')
+                    AND (($8::text IS NULL AND wf.step_owner_id IS NULL)
+                         OR (wf.step_owner_id = $8 AND wf.step_generation = $9)))
+            "#,
+        )
+        .bind(RoleExecutionStatus::Failed.as_str())
+        .bind(now_ms)
+        .bind(reason)
+        .bind(message)
+        .bind(handoff_output_id)
+        .bind(re_id)
+        .bind(attempt_id)
+        .bind(
+            self.step_claim
+                .as_ref()
+                .map(|claim| claim.owner_id.as_str()),
+        )
+        .bind(self.step_claim.as_ref().map(|claim| claim.generation))
+        .execute(&mut *tx)
+        .await
+        .context("complete mutating orbit_role_executions failure")?;
+        ensure!(result.rows_affected() == 1, "ROLE_EXECUTION_FENCE_REJECTED");
+
+        let released = sqlx::query(
+            "DELETE FROM orbit_attempt_workspace_locks WHERE attempt_id = $1 AND holder_role_execution_id = $2",
+        )
+        .bind(attempt_id)
+        .bind(re_id)
+        .execute(&mut *tx)
+        .await
+        .context("release failed mutating role workspace lock")?;
+        ensure!(
+            released.rows_affected() == 1,
+            "failed mutating role has no matching workspace lock"
+        );
+
+        let failed_workflow = sqlx::query(
+            r#"
+            UPDATE orbit_workflow_runs wf
+            SET status = 'FAILED',
+                current_stage = 'FAILED',
+                current_workspace_state_id = $1,
+                failure_reason = $2,
+                finished_at_ms = $3,
+                step_owner_id = NULL,
+                step_owner_pid = NULL,
+                step_owner_started_at_ms = NULL,
+                step_generation = step_generation + 1
+            WHERE wf.id = $4 AND wf.attempt_id = $5
+              AND wf.status IN ('IMPLEMENTING', 'REPAIRING')
+              AND (($6::text IS NULL AND wf.step_owner_id IS NULL)
+                   OR (wf.step_owner_id = $6 AND wf.step_generation = $7))
+              AND EXISTS (
+                  SELECT 1 FROM orbit_role_executions re
+                  WHERE re.id = $8 AND re.workflow_run_id = wf.id
+                    AND re.status = 'FAILED'
+                    AND ((wf.status = 'IMPLEMENTING' AND re.stage = 'IMPLEMENTING')
+                         OR (wf.status = 'REPAIRING' AND re.stage = 'REPAIRING'))
+              )
+            "#,
+        )
+        .bind(output_workspace_state_id)
+        .bind(message)
+        .bind(now_ms)
+        .bind(workflow_run_id)
+        .bind(attempt_id)
+        .bind(
+            self.step_claim
+                .as_ref()
+                .map(|claim| claim.owner_id.as_str()),
+        )
+        .bind(self.step_claim.as_ref().map(|claim| claim.generation))
+        .bind(re_id)
+        .execute(&mut *tx)
+        .await
+        .context("fail workflow after invalid implementation candidate")?;
+        ensure!(
+            failed_workflow.rows_affected() == 1,
+            "WORKFLOW_STAGE_FENCE_REJECTED"
+        );
+        tx.commit().await?;
+
+        self.get_role_execution(re_id)
+            .await?
+            .context("role execution not found")
+    }
+
     /// Save a structured handoff artifact.
     pub async fn save_handoff_artifact(
         &self,

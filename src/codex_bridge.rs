@@ -48,11 +48,31 @@ pub fn thread_start(
         .iter()
         .filter_map(|tool| tool["name"].as_str())
         .collect::<Vec<_>>()
-        .join(", ");
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
     let available_tools = if dynamic_tool_names.is_empty() {
         "No Orbit tools are available.".to_owned()
     } else {
-        format!("Use only {dynamic_tool_names} when provided.")
+        format!("Use only {} when provided.", dynamic_tool_names.join(", "))
+    };
+    let mutation_tool_names = names
+        .iter()
+        .zip(dynamic_tool_names.iter())
+        .filter_map(|(canonical_name, provider_name)| {
+            crate::tool_surface::CanonicalToolName::from_wire(canonical_name)
+                .map(crate::tool_surface::ToolMetadata::for_tool)
+                .filter(|metadata| metadata.mutating)
+                .map(|_| provider_name.as_str())
+        })
+        .collect::<Vec<_>>();
+    let filesystem_contract = if mutation_tool_names.is_empty() {
+        "Your native filesystem environment and assigned repository access are read-only. No Orbit mutation callbacks are advertised or authorized for this assignment.".to_owned()
+    } else {
+        format!(
+            "Your native filesystem environment is intentionally read-only, so native filesystem writes are unavailable by design. The assigned repository is writable through these advertised Orbit mutation callbacks: {}. For implementation work, use these callbacks to make the required repository changes. They are Orbit's authorized write path and remain subject to workspace confinement, role authorization, and mutation locking. This instruction explains the capabilities already advertised to this session; it does not grant additional authority.",
+            mutation_tool_names.join(", ")
+        )
     };
     let mut request = json!({
         "model":model, "allowProviderModelFallback":false,
@@ -60,7 +80,7 @@ pub fn thread_start(
         "selectedCapabilityRoots":[], "dynamicTools":tools,
         "approvalPolicy":"never", "approvalsReviewer":"user", "sandbox":"read-only",
         "ephemeral":true, "experimentalRawEvents":false,
-        "baseInstructions":format!("{} {available_tools} File paths may be workspace-relative or absolute beneath {}; other absolute paths and traversal are rejected.",
+        "baseInstructions":format!("{} {filesystem_contract} {available_tools} File paths may be workspace-relative or absolute beneath {}; other absolute paths and traversal are rejected.",
             crate::coding_agent::completion_instructions(crate::acp_runtime::WORKSPACE, names),
             crate::acp_runtime::WORKSPACE),
         "config":{

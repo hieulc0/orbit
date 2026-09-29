@@ -64,6 +64,78 @@ pub enum WorkflowStepResult {
     Waiting,
 }
 
+/// Whether a role is required to produce a new repository candidate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImplementationMutationRequirement {
+    Required,
+    NoChangeAllowed,
+}
+
+/// Authoritative result of comparing an implementation handoff with the candidate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ImplementationCandidateOutcome {
+    Valid,
+    NoChange,
+    ChangedFilesMismatch {
+        claimed: Vec<String>,
+        actual: Vec<String>,
+    },
+}
+
+impl ImplementationCandidateOutcome {
+    fn failure_code(&self) -> Option<&'static str> {
+        match self {
+            Self::Valid => None,
+            Self::NoChange => Some("IMPLEMENTATION_NO_CHANGE"),
+            Self::ChangedFilesMismatch { .. } => Some("IMPLEMENTATION_CHANGED_FILES_INVALID"),
+        }
+    }
+
+    fn failure_message(&self) -> Option<String> {
+        match self {
+            Self::Valid => None,
+            Self::NoChange => Some(
+                "implementation completed without producing the required candidate mutation".into(),
+            ),
+            Self::ChangedFilesMismatch { claimed, actual } => Some(format!(
+                "ImplementationHandoff.changed_files does not match the authoritative candidate; claimed={claimed:?}, actual={actual:?}"
+            )),
+        }
+    }
+}
+
+pub fn validate_implementation_candidate(
+    requirement: ImplementationMutationRequirement,
+    input: &WorkspaceState,
+    output: &WorkspaceState,
+    handoff: &ImplementationHandoff,
+    actual_changed_files: &[String],
+) -> ImplementationCandidateOutcome {
+    let claimed = handoff
+        .changed_files
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let actual = actual_changed_files
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if claimed != actual || claimed.len() != handoff.changed_files.len() {
+        return ImplementationCandidateOutcome::ChangedFilesMismatch {
+            claimed: handoff.changed_files.clone(),
+            actual: actual_changed_files.to_vec(),
+        };
+    }
+
+    if requirement == ImplementationMutationRequirement::Required
+        && (input.state_id == output.state_id || actual_changed_files.is_empty())
+    {
+        return ImplementationCandidateOutcome::NoChange;
+    }
+
+    ImplementationCandidateOutcome::Valid
+}
+
 struct ResolvedWorkflowPolicies {
     verification: Option<VerificationPolicy>,
     regression: Option<RegressionPolicy>,
@@ -479,6 +551,9 @@ impl WorkflowCoordinator {
                     .store
                     .get_latest_handoff_of_type(wf_id, HandoffType::Plan)
                     .await?;
+                let repo_path = workflow_repo_path(&wf)?;
+                let baseline = wf.base_revision.as_deref().unwrap_or("HEAD");
+                let input_ws_state = compute_workspace_state(repo_path, baseline).await?;
 
                 let role_exec = self
                     .store
@@ -487,7 +562,7 @@ impl WorkflowCoordinator {
                         &role,
                         "IMPLEMENTING",
                         wf.iteration,
-                        wf.current_workspace_state_id.as_deref(),
+                        Some(&input_ws_state.state_id),
                         plan_handoff.as_ref().map(|h| h.id.as_str()),
                     )
                     .await?;
@@ -607,9 +682,15 @@ impl WorkflowCoordinator {
                     }
                 };
 
-                let repo_path = workflow_repo_path(&wf)?;
-                let baseline = wf.base_revision.as_deref().unwrap_or("HEAD");
                 let new_ws_state = compute_workspace_state(repo_path, baseline).await?;
+                let actual_changed_files = candidate_changed_files(repo_path, baseline).await?;
+                let candidate_outcome = validate_implementation_candidate(
+                    ImplementationMutationRequirement::Required,
+                    &input_ws_state,
+                    &new_ws_state,
+                    &impl_handoff,
+                    &actual_changed_files,
+                );
 
                 let handoff = self
                     .store
@@ -621,6 +702,24 @@ impl WorkflowCoordinator {
                         serde_json::to_value(&impl_handoff)?,
                     )
                     .await?;
+
+                if let Some(failure_code) = candidate_outcome.failure_code() {
+                    let failure_message = candidate_outcome
+                        .failure_message()
+                        .expect("failed candidate outcome has a message");
+                    self.store
+                        .fail_mutating_role_and_workflow(
+                            &role_exec.id,
+                            wf_id,
+                            &wf.attempt_id,
+                            &new_ws_state.state_id,
+                            failure_code,
+                            &failure_message,
+                            &handoff.id,
+                        )
+                        .await?;
+                    return Ok(WorkflowStepResult::Terminal(WorkflowStage::Failed));
+                }
 
                 self.store
                     .complete_role_execution_success(
@@ -783,6 +882,14 @@ impl WorkflowCoordinator {
                     .store
                     .get_latest_handoff_of_type(wf_id, HandoffType::FailureEvidence)
                     .await?;
+                let repo_path = workflow_repo_path(&wf)?;
+                let baseline = wf.base_revision.as_deref().unwrap_or("HEAD");
+                let input_ws_state =
+                    if let Some(state_id) = wf.current_workspace_state_id.as_deref() {
+                        require_candidate_state(&wf, state_id).await?
+                    } else {
+                        compute_workspace_state(repo_path, baseline).await?
+                    };
 
                 let role_exec = self
                     .store
@@ -791,7 +898,7 @@ impl WorkflowCoordinator {
                         &role,
                         "REPAIRING",
                         next_iteration,
-                        wf.current_workspace_state_id.as_deref(),
+                        Some(&input_ws_state.state_id),
                         failure_handoff.as_ref().map(|h| h.id.as_str()),
                     )
                     .await?;
@@ -911,9 +1018,15 @@ impl WorkflowCoordinator {
                     }
                 };
 
-                let repo_path = workflow_repo_path(&wf)?;
-                let baseline = wf.base_revision.as_deref().unwrap_or("HEAD");
                 let new_ws_state = compute_workspace_state(repo_path, baseline).await?;
+                let actual_changed_files = candidate_changed_files(repo_path, baseline).await?;
+                let candidate_outcome = validate_implementation_candidate(
+                    ImplementationMutationRequirement::Required,
+                    &input_ws_state,
+                    &new_ws_state,
+                    &impl_handoff,
+                    &actual_changed_files,
+                );
 
                 let handoff = self
                     .store
@@ -925,6 +1038,24 @@ impl WorkflowCoordinator {
                         serde_json::to_value(&impl_handoff)?,
                     )
                     .await?;
+
+                if let Some(failure_code) = candidate_outcome.failure_code() {
+                    let failure_message = candidate_outcome
+                        .failure_message()
+                        .expect("failed candidate outcome has a message");
+                    self.store
+                        .fail_mutating_role_and_workflow(
+                            &role_exec.id,
+                            wf_id,
+                            &wf.attempt_id,
+                            &new_ws_state.state_id,
+                            failure_code,
+                            &failure_message,
+                            &handoff.id,
+                        )
+                        .await?;
+                    return Ok(WorkflowStepResult::Terminal(WorkflowStage::Failed));
+                }
 
                 self.store
                     .complete_role_execution_success(
@@ -1587,11 +1718,9 @@ impl WorkflowCoordinator {
         crate::verification::validate_pinned_verification_profile(&env)?;
 
         if let Some(sp) = sel_policy {
-            let changed_files = changed_files_for_selection(
-                repo_path,
-                wf.base_revision.as_deref().unwrap_or("HEAD"),
-            )
-            .await?;
+            let changed_files =
+                candidate_changed_files(repo_path, wf.base_revision.as_deref().unwrap_or("HEAD"))
+                    .await?;
             let previous_failed_checks = self.previous_failed_checks(&wf.id).await?;
             let reviewer_escalations = self.reviewer_escalations(&wf.id).await?;
             let selected_plan = select_verification(
@@ -1652,7 +1781,17 @@ impl WorkflowCoordinator {
     }
 }
 
-async fn changed_files_for_selection(repo_path: &Path, baseline: &str) -> Result<Vec<String>> {
+async fn candidate_changed_files(repo_path: &Path, baseline: &str) -> Result<Vec<String>> {
+    if !repo_path.join(".git").exists() {
+        return non_git_candidate_paths(repo_path)?
+            .into_iter()
+            .map(|path| {
+                path.to_str()
+                    .context("candidate path is not UTF-8")
+                    .map(str::to_owned)
+            })
+            .collect();
+    }
     let mut changed = std::collections::BTreeSet::new();
     for args in [
         vec!["diff", "--name-only", "-z", "--no-renames", baseline, "--"],
@@ -1932,21 +2071,6 @@ impl SimulatedRoleExecutor {
             ORBIT_HANDOFF_END
         ));
 
-        *exec.impl_response.lock().unwrap() = Some(format!(
-            "{}\n{}\n{}",
-            ORBIT_HANDOFF_START,
-            serde_json::to_string_pretty(&ImplementationHandoff {
-                summary: "Implemented planned changes".into(),
-                changed_files: vec!["test.rs".into()],
-                tests_added_or_modified: vec!["test_main".into()],
-                exploratory_commands: vec![],
-                known_limitations: vec![],
-                verification_notes: vec![],
-            })
-            .unwrap(),
-            ORBIT_HANDOFF_END
-        ));
-
         *exec.review_response.lock().unwrap() = Some(format!(
             "{}\n{}\n{}",
             ORBIT_HANDOFF_START,
@@ -1961,21 +2085,6 @@ impl SimulatedRoleExecutor {
             ORBIT_HANDOFF_END
         ));
 
-        *exec.repair_response.lock().unwrap() = Some(format!(
-            "{}\n{}\n{}",
-            ORBIT_HANDOFF_START,
-            serde_json::to_string_pretty(&ImplementationHandoff {
-                summary: "Repaired per review / failure feedback".into(),
-                changed_files: vec!["test.rs".into()],
-                tests_added_or_modified: vec![],
-                exploratory_commands: vec![],
-                known_limitations: vec![],
-                verification_notes: vec![],
-            })
-            .unwrap(),
-            ORBIT_HANDOFF_END
-        ));
-
         exec
     }
 }
@@ -1985,8 +2094,8 @@ impl RoleAgentExecutor for SimulatedRoleExecutor {
     async fn execute_role(
         &self,
         _pool: &PgPool,
-        _wf_run: &WorkflowRun,
-        _role_exec: &RoleExecution,
+        wf_run: &WorkflowRun,
+        role_exec: &RoleExecution,
         role: &RoleDefinition,
         _target: &ResolvedExecutionTarget,
         _task_text: &str,
@@ -2036,27 +2145,29 @@ impl RoleAgentExecutor for SimulatedRoleExecutor {
                     );
                 }
 
-                let is_repair = self.repair_response.lock().unwrap().is_some()
-                    && self
-                        .recorded_roles
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .filter(|r| *r == "implementer")
-                        .count()
-                        > 1;
-                if is_repair {
-                    let guard = self.repair_response.lock().unwrap();
-                    guard.clone().unwrap_or_default()
+                let response = if role_exec.stage == "REPAIRING" {
+                    self.repair_response.lock().unwrap().clone()
                 } else {
-                    let guard = self.impl_response.lock().unwrap();
-                    guard.clone().unwrap_or_else(|| {
+                    self.impl_response.lock().unwrap().clone()
+                };
+                match response {
+                    Some(response) => response,
+                    None => {
+                        let changed_files = candidate_changed_files(
+                            repo_path,
+                            wf_run.base_revision.as_deref().unwrap_or("HEAD"),
+                        )
+                        .await?;
                         format!(
                             "{}\n{}\n{}",
                             ORBIT_HANDOFF_START,
                             serde_json::to_string(&ImplementationHandoff {
-                                summary: "Default implementation".into(),
-                                changed_files: vec!["orbit_change.txt".into()],
+                                summary: if role_exec.stage == "REPAIRING" {
+                                    "Default repair implementation".into()
+                                } else {
+                                    "Default implementation".into()
+                                },
+                                changed_files,
                                 tests_added_or_modified: vec![],
                                 exploratory_commands: vec![],
                                 known_limitations: vec![],
@@ -2065,7 +2176,7 @@ impl RoleAgentExecutor for SimulatedRoleExecutor {
                             .unwrap(),
                             ORBIT_HANDOFF_END
                         )
-                    })
+                    }
                 }
             }
             "reviewer" => {
@@ -2221,7 +2332,7 @@ fn build_role_prompt(
     };
     let prompt = if role.role_id == "implementer" {
         format!(
-            "{prompt}\n\nDiscover paths with list_directory, find_path, or grep before guessing names for files the task does not identify. If a lookup returns PATH_NOT_FOUND, inspect the workspace with those tools and retry using a discovered path."
+            "{prompt}\n\nHANDOFF CHANGED FILES: Report the complete candidate path set changed relative to the workflow base revision. During repair this includes earlier candidate changes as well as files changed by the repair.\n\nDiscover paths with list_directory, find_path, or grep before guessing names for files the task does not identify. If a lookup returns PATH_NOT_FOUND, inspect the workspace with those tools and retry using a discovered path."
         )
     } else {
         prompt
@@ -6418,6 +6529,89 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn implementation_handoff(changed_files: &[&str]) -> ImplementationHandoff {
+        ImplementationHandoff {
+            summary: "implemented candidate".into(),
+            changed_files: changed_files.iter().map(|path| (*path).into()).collect(),
+            tests_added_or_modified: vec![],
+            exploratory_commands: vec![],
+            known_limitations: vec![],
+            verification_notes: vec![],
+        }
+    }
+
+    #[test]
+    fn implementation_candidate_requires_authoritative_mutation_and_exact_claims() {
+        let input = WorkspaceState::compute_candidate_v2("base", "head", "input");
+        let output = WorkspaceState::compute_candidate_v2("base", "head", "output");
+
+        assert_eq!(
+            validate_implementation_candidate(
+                ImplementationMutationRequirement::Required,
+                &input,
+                &output,
+                &implementation_handoff(&["src/a.rs", "src/b.rs"]),
+                &["src/a.rs".into(), "src/b.rs".into()],
+            ),
+            ImplementationCandidateOutcome::Valid
+        );
+        assert_eq!(
+            validate_implementation_candidate(
+                ImplementationMutationRequirement::Required,
+                &input,
+                &input,
+                &implementation_handoff(&[]),
+                &[],
+            ),
+            ImplementationCandidateOutcome::NoChange
+        );
+        assert!(matches!(
+            validate_implementation_candidate(
+                ImplementationMutationRequirement::Required,
+                &input,
+                &input,
+                &implementation_handoff(&["src/a.rs"]),
+                &[],
+            ),
+            ImplementationCandidateOutcome::ChangedFilesMismatch { .. }
+        ));
+        assert!(matches!(
+            validate_implementation_candidate(
+                ImplementationMutationRequirement::Required,
+                &input,
+                &output,
+                &implementation_handoff(&["src/a.rs"]),
+                &["src/a.rs".into(), "src/b.rs".into()],
+            ),
+            ImplementationCandidateOutcome::ChangedFilesMismatch { .. }
+        ));
+        assert!(matches!(
+            validate_implementation_candidate(
+                ImplementationMutationRequirement::Required,
+                &input,
+                &output,
+                &implementation_handoff(&["src/a.rs", "src/a.rs"]),
+                &["src/a.rs".into()],
+            ),
+            ImplementationCandidateOutcome::ChangedFilesMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn implementation_candidate_can_explicitly_allow_no_change() {
+        let state = WorkspaceState::compute_candidate_v2("base", "head", "same");
+        assert_eq!(
+            validate_implementation_candidate(
+                ImplementationMutationRequirement::NoChangeAllowed,
+                &state,
+                &state,
+                &implementation_handoff(&[]),
+                &[],
+            ),
+            ImplementationCandidateOutcome::Valid
+        );
+    }
+
     #[test]
     fn bounded_text_read_searches_the_first_complete_line_boundary() -> Result<()> {
         let short = bounded_text_read_result("a\n", 1, None, 65_280)?;
@@ -6833,6 +7027,10 @@ mod tests {
             if role.role_id == "implementer" {
                 assert!(prompt.contains("Discover paths with list_directory, find_path, or grep"));
                 assert!(prompt.contains("PATH_NOT_FOUND"));
+                assert!(prompt.contains(
+                    "complete candidate path set changed relative to the workflow base revision"
+                ));
+                assert!(prompt.contains("During repair this includes earlier candidate changes"));
             }
         }
 

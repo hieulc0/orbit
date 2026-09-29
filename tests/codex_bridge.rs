@@ -350,6 +350,82 @@ fn codex_bridge_tool_instruction_matches_exact_dynamic_tool_aliases() -> Result<
     )));
     assert!(instructions.contains("other absolute paths and traversal are rejected."));
     assert!(instructions.contains("Terminal execution is unavailable"));
+    assert_eq!(request["sandbox"], "read-only");
+    assert!(instructions.contains("native filesystem environment is intentionally read-only"));
+    assert!(instructions.contains("native filesystem writes are unavailable by design"));
+    assert!(instructions.contains(
+        "assigned repository is writable through these advertised Orbit mutation callbacks"
+    ));
+    for mutation_tool in [
+        "orbit_write_file",
+        "orbit_edit_file",
+        "orbit_create_directory",
+        "orbit_move",
+        "orbit_copy",
+        "orbit_delete_file",
+        "orbit_delete_directory",
+    ] {
+        assert!(instructions.contains(mutation_tool));
+    }
+    assert!(
+        instructions.contains("workspace confinement, role authorization, and mutation locking")
+    );
+    assert!(instructions.contains("does not grant additional authority"));
+    Ok(())
+}
+
+#[test]
+fn codex_bridge_keeps_read_only_assignments_read_only() -> Result<()> {
+    for role in ["planner", "reviewer"] {
+        let request = thread_start(
+            CODEX_VERSION,
+            "fixture-model",
+            None,
+            Path::new("/private/control"),
+            &["read_file".into(), "git_diff".into()],
+        )?;
+        let instructions = request["baseInstructions"].as_str().unwrap();
+        assert_eq!(request["sandbox"], "read-only", "{role}");
+        assert!(
+            instructions.contains("assigned repository access are read-only"),
+            "{role}"
+        );
+        assert!(
+            instructions.contains("No Orbit mutation callbacks are advertised or authorized"),
+            "{role}"
+        );
+        assert!(!instructions.contains("orbit_write_file"), "{role}");
+    }
+    Ok(())
+}
+
+#[test]
+fn codex_bridge_gives_repair_implementers_the_same_callback_contract() -> Result<()> {
+    let tools = vec!["read_file".into(), "write_file".into(), "edit_file".into()];
+    let implementation = thread_start(
+        CODEX_VERSION,
+        "fixture-model",
+        None,
+        Path::new("/private/control"),
+        &tools,
+    )?;
+    let repair = thread_start(
+        CODEX_VERSION,
+        "fixture-model",
+        None,
+        Path::new("/private/control"),
+        &tools,
+    )?;
+    assert_eq!(
+        implementation["baseInstructions"],
+        repair["baseInstructions"]
+    );
+    assert!(
+        repair["baseInstructions"]
+            .as_str()
+            .unwrap()
+            .contains("orbit_write_file, orbit_edit_file")
+    );
     Ok(())
 }
 

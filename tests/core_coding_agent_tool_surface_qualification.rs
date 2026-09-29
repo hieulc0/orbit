@@ -2341,6 +2341,22 @@ async fn cli_terminal_create_is_denied() -> Result<()> {
 async fn attempt_mutation_lock_enforcement() -> Result<()> {
     let ctx = setup_test().await?;
 
+    let codex_thread = orbit::codex_bridge::thread_start(
+        orbit::codex_bridge::CODEX_VERSION,
+        "fixture-model",
+        None,
+        Path::new("/orbit/home"),
+        &["read_file".into(), "write_file".into()],
+    )?;
+    assert_eq!(codex_thread["sandbox"], "read-only");
+    assert_eq!(codex_thread["dynamicTools"][1]["name"], "orbit_write_file");
+    assert!(
+        codex_thread["baseInstructions"]
+            .as_str()
+            .unwrap()
+            .contains("Orbit's authorized write path")
+    );
+
     let repo = tempdir()?;
     let (server_in, client_out) = tokio::io::duplex(65536);
     let (client_in, server_out) = tokio::io::duplex(65536);

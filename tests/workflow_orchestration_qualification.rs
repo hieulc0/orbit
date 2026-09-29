@@ -233,6 +233,60 @@ fn fixture_target() -> ResolvedExecutionTarget {
     }
 }
 
+struct NoOpImplementationExecutor;
+
+#[async_trait::async_trait]
+impl RoleAgentExecutor for NoOpImplementationExecutor {
+    async fn execute_role(
+        &self,
+        _pool: &PgPool,
+        _wf_run: &WorkflowRun,
+        role_exec: &RoleExecution,
+        role: &RoleDefinition,
+        _target: &ResolvedExecutionTarget,
+        _task_text: &str,
+        _repo_path: &std::path::Path,
+        _input_handoff: Option<&HandoffArtifact>,
+        _cancellation: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<RoleExecutionOutcome> {
+        let raw_output = match role.role_id.as_str() {
+            "planner" => format!(
+                "{ORBIT_HANDOFF_START}\n{}\n{ORBIT_HANDOFF_END}",
+                serde_json::to_string(&PlanHandoff {
+                    summary: "inspect and update candidate".into(),
+                    affected_areas: vec!["candidate".into()],
+                    implementation_steps: vec!["update candidate".into()],
+                    expected_files: vec!["candidate.txt".into()],
+                    risks: vec![],
+                    verification_notes: vec![],
+                    open_questions: vec![],
+                })?
+            ),
+            "implementer" => format!(
+                "{ORBIT_HANDOFF_START}\n{}\n{ORBIT_HANDOFF_END}",
+                serde_json::to_string(&ImplementationHandoff {
+                    summary: if role_exec.stage == "REPAIRING" {
+                        "repair reported complete".into()
+                    } else {
+                        "implementation reported complete".into()
+                    },
+                    changed_files: vec!["candidate.txt".into()],
+                    tests_added_or_modified: vec![],
+                    exploratory_commands: vec![],
+                    known_limitations: vec![],
+                    verification_notes: vec![],
+                })?
+            ),
+            other => anyhow::bail!("unexpected no-op role {other}"),
+        };
+        Ok(RoleExecutionOutcome {
+            raw_output,
+            agent_execution_ids: vec![format!("noop-agent-{}", id())],
+            termination_reason: Some("completed".into()),
+        })
+    }
+}
+
 async fn record_later_failure(
     ctx: &TestContext,
     workflow_id: &str,
@@ -949,6 +1003,225 @@ async fn structured_implementation_handoff() -> Result<()> {
     assert!(invalid_impl.validate().is_err());
 
     Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
+async fn required_no_op_implementation_fails_before_verification_and_releases_ownership()
+-> Result<()> {
+    let ctx = setup_test().await?;
+    enroll_sample_credentials(&ctx.engine.pool).await?;
+    let repo = tempfile::tempdir()?;
+    std::fs::write(repo.path().join("candidate.txt"), "unchanged\n")?;
+    let workflow = ctx
+        .store
+        .create_workflow_run_full(
+            "required-no-op",
+            &format!("att-{}", id()),
+            2,
+            None,
+            None,
+            None,
+            Some("change the candidate"),
+            repo.path().to_str(),
+            Some("base"),
+        )
+        .await?;
+    let coordinator = WorkflowCoordinator::new(
+        ctx.engine.pool.clone(),
+        Arc::new(NoOpImplementationExecutor),
+    );
+
+    coordinator.step(&workflow.id).await?;
+    coordinator.step(&workflow.id).await?;
+    assert_eq!(
+        coordinator.step(&workflow.id).await?,
+        WorkflowStepResult::Terminal(WorkflowStage::Failed)
+    );
+
+    let roles = ctx.store.list_role_executions(&workflow.id).await?;
+    let implementation = roles
+        .iter()
+        .find(|role| role.stage == "IMPLEMENTING")
+        .context("implementation role missing")?;
+    assert_eq!(implementation.status, RoleExecutionStatus::Failed);
+    assert_eq!(
+        implementation.termination_reason.as_deref(),
+        Some("IMPLEMENTATION_NO_CHANGE")
+    );
+    assert!(implementation.handoff_output_id.is_some());
+    assert!(
+        ctx.store
+            .get_latest_handoff_of_type(&workflow.id, HandoffType::Implementation)
+            .await?
+            .is_some()
+    );
+    assert!(
+        ctx.store
+            .verification_store()
+            .list_runs(&workflow.attempt_id)
+            .await?
+            .is_empty()
+    );
+    assert!(!roles.iter().any(|role| role.stage == "REVIEWING"));
+    let active_locks: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM orbit_attempt_workspace_locks WHERE attempt_id = $1 AND revoked_at_ms IS NULL",
+    )
+    .bind(&workflow.attempt_id)
+    .fetch_one(&ctx.engine.pool)
+    .await?;
+    assert_eq!(active_locks, 0);
+    let step_owner: Option<String> =
+        sqlx::query_scalar("SELECT step_owner_id FROM orbit_workflow_runs WHERE id = $1")
+            .bind(&workflow.id)
+            .fetch_one(&ctx.engine.pool)
+            .await?;
+    assert!(step_owner.is_none());
+    let role_count = roles.len();
+    assert_eq!(
+        coordinator.step(&workflow.id).await?,
+        WorkflowStepResult::Terminal(WorkflowStage::Failed)
+    );
+    let roles_after_retry = ctx.store.list_role_executions(&workflow.id).await?;
+    assert_eq!(roles_after_retry.len(), role_count);
+    assert!(
+        !roles_after_retry
+            .iter()
+            .any(|role| role.stage == "REVIEWING")
+    );
+    assert!(
+        ctx.store
+            .verification_store()
+            .list_runs(&workflow.attempt_id)
+            .await?
+            .is_empty()
+    );
+
+    teardown_test(ctx).await
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
+async fn required_no_op_repair_fails_without_reverification() -> Result<()> {
+    let ctx = setup_test().await?;
+    enroll_sample_credentials(&ctx.engine.pool).await?;
+    let repo = tempfile::tempdir()?;
+    std::fs::write(repo.path().join("candidate.txt"), "broken candidate\n")?;
+    let workflow = ctx
+        .store
+        .create_workflow_run_full(
+            "required-no-op-repair",
+            &format!("att-{}", id()),
+            3,
+            None,
+            None,
+            None,
+            Some("repair the candidate"),
+            repo.path().to_str(),
+            Some("base"),
+        )
+        .await?;
+    let state = compute_workspace_state(repo.path(), "base").await?;
+    ctx.store
+        .transition_workflow_stage(&workflow.id, WorkflowStage::Planning, None, None, None)
+        .await?;
+    ctx.store
+        .transition_workflow_stage(&workflow.id, WorkflowStage::Implementing, None, None, None)
+        .await?;
+    ctx.store
+        .transition_workflow_stage(
+            &workflow.id,
+            WorkflowStage::Verifying,
+            Some(&state.state_id),
+            None,
+            None,
+        )
+        .await?;
+    ctx.store
+        .save_handoff_artifact(
+            &workflow.id,
+            None,
+            HandoffType::FailureEvidence,
+            Some(&state.state_id),
+            serde_json::to_value(FailureEvidenceHandoff {
+                failed_stage: "VERIFYING_FAST".into(),
+                verification_run_id: None,
+                failed_steps: vec!["candidate-check".into()],
+                error_summary: "candidate remains broken".into(),
+                stdout_previews: BTreeMap::new(),
+                stderr_previews: BTreeMap::new(),
+            })?,
+        )
+        .await?;
+    ctx.store
+        .transition_workflow_stage(
+            &workflow.id,
+            WorkflowStage::Repairing,
+            Some(&state.state_id),
+            None,
+            Some("candidate remains broken"),
+        )
+        .await?;
+    let coordinator = WorkflowCoordinator::new(
+        ctx.engine.pool.clone(),
+        Arc::new(NoOpImplementationExecutor),
+    );
+
+    assert_eq!(
+        coordinator.step(&workflow.id).await?,
+        WorkflowStepResult::Terminal(WorkflowStage::Failed)
+    );
+    let roles = ctx.store.list_role_executions(&workflow.id).await?;
+    let repair = roles
+        .iter()
+        .find(|role| role.stage == "REPAIRING")
+        .context("repair role missing")?;
+    assert_eq!(repair.status, RoleExecutionStatus::Failed);
+    assert_eq!(
+        repair.termination_reason.as_deref(),
+        Some("IMPLEMENTATION_NO_CHANGE")
+    );
+    assert!(
+        ctx.store
+            .verification_store()
+            .list_runs(&workflow.attempt_id)
+            .await?
+            .is_empty()
+    );
+    let active_locks: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM orbit_attempt_workspace_locks WHERE attempt_id = $1 AND revoked_at_ms IS NULL",
+    )
+    .bind(&workflow.attempt_id)
+    .fetch_one(&ctx.engine.pool)
+    .await?;
+    assert_eq!(active_locks, 0);
+    let step_owner: Option<String> =
+        sqlx::query_scalar("SELECT step_owner_id FROM orbit_workflow_runs WHERE id = $1")
+            .bind(&workflow.id)
+            .fetch_one(&ctx.engine.pool)
+            .await?;
+    assert!(step_owner.is_none());
+    let role_count = roles.len();
+    assert_eq!(
+        coordinator.step(&workflow.id).await?,
+        WorkflowStepResult::Terminal(WorkflowStage::Failed)
+    );
+    let roles_after_retry = ctx.store.list_role_executions(&workflow.id).await?;
+    assert_eq!(roles_after_retry.len(), role_count);
+    assert!(
+        !roles_after_retry
+            .iter()
+            .any(|role| role.stage == "REVIEWING")
+    );
+    assert!(
+        ctx.store
+            .verification_store()
+            .list_runs(&workflow.attempt_id)
+            .await?
+            .is_empty()
+    );
+
+    teardown_test(ctx).await
 }
 
 #[tokio::test]
