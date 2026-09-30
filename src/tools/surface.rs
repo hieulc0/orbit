@@ -133,7 +133,7 @@ impl CanonicalToolName {
                 Some(Self::FsDeleteDirectory)
             }
             "search/grep" | "search.grep" | "grep" => Some(Self::SearchGrep),
-            "terminal/create" | "terminal.create" | "shell" | "terminal" => {
+            "orbit/shell" | "terminal/create" | "terminal.create" | "shell" | "terminal" => {
                 Some(Self::TerminalCreate)
             }
             "terminal/output" | "terminal.output" => Some(Self::TerminalOutput),
@@ -1260,8 +1260,23 @@ pub struct AgentTerminal {
 }
 
 impl AgentTerminal {
+    pub fn spawn_confined(
+        profile: &crate::execution::local::RoleExecutionProfile,
+        repository: &Path,
+        cwd: &Path,
+        command: &str,
+        args: &[String],
+        output_limit: usize,
+    ) -> Result<Self> {
+        Self::spawn_command(
+            profile.terminal_command(repository, cwd, command, args)?,
+            output_limit,
+        )
+    }
+
+    /// Used by lifecycle fixtures; production repository terminals use the
+    /// selected confined profile through `spawn_confined`.
     pub fn spawn(cwd: &Path, command: &str, args: &[String], output_limit: usize) -> Result<Self> {
-        let output_limit = output_limit.min(65536);
         let mut cmd = tokio::process::Command::new(command);
         cmd.args(args)
             .current_dir(cwd)
@@ -1275,8 +1290,14 @@ impl AgentTerminal {
                 std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into()),
             )
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .stdin(Stdio::null())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null");
+        Self::spawn_command(cmd, output_limit)
+    }
+
+    fn spawn_command(mut cmd: tokio::process::Command, output_limit: usize) -> Result<Self> {
+        let output_limit = output_limit.min(65536);
+        cmd.process_group(0);
+        cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -1376,6 +1397,16 @@ impl AgentTerminal {
         let child_arc = Arc::clone(&self.child);
         let mut guard = child_arc.lock().await;
         if let Some(child) = guard.as_mut() {
+            if let Some(pid) = child.id() {
+                // The group includes the namespace supervisor. Killing only
+                // its direct child can leave command descendants running.
+                let result = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+                if result != 0
+                    && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+                {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+            }
             let _ = child.start_kill();
             if let Ok(st) = child.wait().await {
                 use std::os::unix::process::ExitStatusExt;

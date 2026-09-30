@@ -304,6 +304,14 @@ enum WorkflowAction {
         /// JSON file containing the pinned rootless Podman verification environment identity
         #[arg(long, value_name = "FILE", required = true)]
         verification_environment: PathBuf,
+        /// JSON role execution profile; omitted profiles retain trusted execution.
+        #[arg(long, value_name = "FILE")]
+        agent_execution_profile: Option<PathBuf>,
+        /// Select a versioned skill flow; omission preserves the legacy workflow.
+        #[arg(long, value_enum)]
+        skill: Option<orbit::workflow::flow::Skill>,
+        #[arg(long, value_enum, default_value = "conservative")]
+        risk: orbit::workflow::flow::Risk,
         /// Create workflow state without executing; resume later with `workflow run`
         #[arg(long)]
         detach: bool,
@@ -344,6 +352,13 @@ enum WorkflowAction {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Serve Orbit workflows and managed candidates to ACP editor clients.
+    AcpServe {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long, env = "ORBIT_DATABASE_URL_FILE", hide_env_values = true)]
+        database_url_file: Option<PathBuf>,
+    },
     /// Operator credential registry and enrollment.
     Credential(CredentialArgs),
     /// Execute or inspect isolated verification evidence.
@@ -2921,6 +2936,37 @@ async fn credential_status_report(
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let mut output_format = cli.output_format;
+    if let Commands::AcpServe {
+        config,
+        database_url_file,
+    } = &cli.command
+    {
+        use tokio::io::AsyncReadExt;
+        let mut bytes = Vec::new();
+        tokio::fs::File::open(config)
+            .await?
+            .take(128 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .await?;
+        anyhow::ensure!(
+            bytes.len() <= 128 * 1024,
+            "ACP configuration exceeds bounds"
+        );
+        let config: orbit::acp::service::ServiceConfig = serde_json::from_slice(&bytes)?;
+        let database_url = read_private_database_url(database_url_file.as_deref()).await?;
+        let (engine, scratch) = connect_durable_catalog_engine(database_url.as_str()).await?;
+        let coordinator = std::sync::Arc::new(workflow_coordinator_with_environment(
+            engine.pool.clone(),
+            config.verification_environment.clone(),
+        )?);
+        let service =
+            orbit::acp::service::EditorService::new(engine.pool.clone(), config, coordinator)?;
+        let result =
+            orbit::acp::editor::serve(service, tokio::io::stdin(), tokio::io::stdout()).await;
+        engine.pool.close().await;
+        drop(scratch);
+        return result;
+    }
     if let Commands::AcpLaunchDigest { config } = &cli.command {
         use tokio::io::AsyncReadExt;
         let mut bytes = Vec::new();
@@ -2993,6 +3039,9 @@ async fn main() -> Result<()> {
                 regression_policy,
                 selection_policy,
                 verification_environment,
+                agent_execution_profile,
+                skill,
+                risk,
                 detach,
                 database_url_file,
             } => {
@@ -3087,6 +3136,28 @@ async fn main() -> Result<()> {
                         Some(&base_rev),
                     )
                     .await?;
+
+                if let Some(path) = agent_execution_profile {
+                    use tokio::io::AsyncReadExt;
+                    let mut bytes = Vec::new();
+                    tokio::fs::File::open(path)
+                        .await?
+                        .take(65537)
+                        .read_to_end(&mut bytes)
+                        .await?;
+                    anyhow::ensure!(bytes.len() <= 65536, "role profile exceeds bounds");
+                    let profile: orbit::execution::local::RoleExecutionProfile =
+                        serde_json::from_slice(&bytes)?;
+                    store.pin_execution_profile(&wf.id, &profile).await?;
+                }
+                if let Some(skill) = skill {
+                    store
+                        .pin_flow(
+                            &wf.id,
+                            &orbit::workflow::flow::FlowDefinition::select(*skill, *risk),
+                        )
+                        .await?;
+                }
 
                 if *detach {
                     match output_format {
@@ -4135,6 +4206,9 @@ async fn main() -> Result<()> {
     let value = match cli.command {
         Commands::Verification(_) => {
             unreachable!("local verification handled before API credential resolution")
+        }
+        Commands::AcpServe { .. } => {
+            unreachable!("local ACP service handled before API credentials")
         }
         Commands::Workflow(_) => {
             unreachable!("local workflow handled before API credential resolution")

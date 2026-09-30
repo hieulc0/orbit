@@ -42,17 +42,23 @@ use orbit::{
     workflow_coordinator::*,
 };
 use serde_json::json;
-use sqlx::{PgPool, Row, postgres::PgPoolOptions};
+use sqlx::PgPool;
+#[cfg(feature = "fault-injection")]
+use sqlx::Row;
+#[cfg(feature = "fault-injection")]
+use sqlx::postgres::PgPoolOptions;
 use std::time::Duration;
 use std::{collections::BTreeMap, ops::Deref};
+use std::{fs, path::Path};
+#[cfg(feature = "fault-injection")]
 use std::{
-    fs,
     io::Read,
     os::unix::fs::{MetadataExt, OpenOptionsExt},
-    path::{Path, PathBuf},
+    path::PathBuf,
     str::FromStr,
 };
 use tempfile::tempdir;
+#[cfg(feature = "fault-injection")]
 use zeroize::Zeroizing;
 
 struct TestContext {
@@ -264,10 +270,14 @@ async fn dispatch_correlated_fixture_callback(
     client_wire.read().await
 }
 
+#[cfg(feature = "fault-injection")]
 const LIVE_PROVIDER_OPT_IN: &str = "I_AUTHORIZE_LIVE_PROVIDER_CALLS";
+#[cfg(feature = "fault-injection")]
 const LIVE_PROVIDER_OPT_IN_ENV: &str = "ORBIT_B34_LIVE_PROVIDER_OPT_IN";
+#[cfg(feature = "fault-injection")]
 const LIVE_CREDENTIAL_URL_FILE_ENV: &str = "ORBIT_B34_LIVE_CREDENTIAL_DATABASE_URL_FILE";
 
+#[cfg(feature = "fault-injection")]
 async fn explicitly_authorized_live_credential_catalog() -> Result<PgPool> {
     ensure!(
         std::env::var(LIVE_PROVIDER_OPT_IN_ENV).as_deref() == Ok(LIVE_PROVIDER_OPT_IN),
@@ -354,6 +364,7 @@ async fn explicitly_authorized_live_credential_catalog() -> Result<PgPool> {
         })
 }
 
+#[cfg(feature = "fault-injection")]
 async fn ensure_live_catalog_is_separate(
     catalog_pool: &PgPool,
     workflow_pool: &PgPool,
@@ -382,6 +393,7 @@ async fn ensure_live_catalog_is_separate(
     Ok(())
 }
 
+#[cfg(feature = "fault-injection")]
 async fn resolve_live_target(
     catalog_pool: &PgPool,
     role: &RoleDefinition,
@@ -406,6 +418,7 @@ async fn resolve_live_target(
         .context("no eligible account matched the requested provider fixture")
 }
 
+#[cfg(feature = "fault-injection")]
 fn sanitized_live_selection_summary(target: &ResolvedExecutionTarget) -> serde_json::Value {
     let fields: BTreeMap<&str, &str> = target
         .resolution_reason
@@ -467,6 +480,7 @@ fn sanitized_live_selection_summary(target: &ResolvedExecutionTarget) -> serde_j
     })
 }
 
+#[cfg(feature = "fault-injection")]
 async fn ensure_disposable_schema_has_no_credentials(pool: &PgPool) -> Result<()> {
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM orbit_credentials")
         .fetch_one(pool)
@@ -482,6 +496,7 @@ async fn teardown_test(ctx: TestContext) -> Result<()> {
     ctx.database.teardown().await
 }
 
+#[cfg(feature = "fault-injection")]
 async fn finish_live_fixture(
     credential_catalog_pool: PgPool,
     ctx: TestContext,
@@ -896,6 +911,7 @@ fn b34_audit_correlation_requires_unique_terminal_rows() {
     assert!(!b34_audit_has_exact_correlations(&duplicate_sequence, 2));
 }
 
+#[cfg(feature = "fault-injection")]
 async fn load_role_tool_audits(
     pool: &PgPool,
     role_execution_id: &str,
@@ -1265,6 +1281,7 @@ fn render_live_fixture_audit(
 
 #[derive(Clone, Copy)]
 enum AgentExecutionLookupFailure {
+    #[cfg(feature = "fault-injection")]
     MissingRoleExecutionId,
     QueryFailed,
     NoRows,
@@ -1272,6 +1289,7 @@ enum AgentExecutionLookupFailure {
 
 fn render_agent_execution_lookup_failure(failure: AgentExecutionLookupFailure) -> &'static str {
     match failure {
+        #[cfg(feature = "fault-injection")]
         AgentExecutionLookupFailure::MissingRoleExecutionId => {
             "AgentExecution query not attempted: role execution ID missing; tool audit: UNAVAILABLE_EVIDENCE_DEFECT."
         }
@@ -1284,6 +1302,7 @@ fn render_agent_execution_lookup_failure(failure: AgentExecutionLookupFailure) -
     }
 }
 
+#[cfg(feature = "fault-injection")]
 async fn print_live_fixture_audit(pool: &PgPool, role_execution_id: Option<&str>) {
     println!("Live fixture execution audit:");
     let Some(role_execution_id) = role_execution_id else {
@@ -3186,6 +3205,7 @@ async fn real_acp_execution_row_survives_credential_resolution_failure() -> Resu
 
 #[tokio::test]
 #[ignore = "requires explicit live-provider opt-in and a private control-plane URL file"]
+#[cfg(feature = "fault-injection")]
 async fn real_codex_coding_fixture() -> Result<()> {
     let credential_catalog_pool = explicitly_authorized_live_credential_catalog().await?;
     let ctx = match setup_test().await {
@@ -3375,6 +3395,7 @@ async fn real_codex_coding_fixture() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires explicit live-provider opt-in and a private control-plane URL file"]
+#[cfg(feature = "fault-injection")]
 async fn real_antigravity_review_fixture() -> Result<()> {
     let credential_catalog_pool = explicitly_authorized_live_credential_catalog().await?;
     let ctx = match setup_test().await {

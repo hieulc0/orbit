@@ -37,6 +37,14 @@ zeroize = "1"
 [dev-dependencies]
 
 [[test]]
+name = "developer_local"
+path = "tests/execution/developer_local.rs"
+
+[[test]]
+name = "role_budget"
+path = "tests/execution/role_budget.rs"
+
+[[test]]
 name = "acp"
 path = "tests/acp/preflight.rs"
 
@@ -155,3 +163,7 @@ path = "tests/control_plane/registry.rs"
 [[test]]
 name = "submission"
 path = "tests/control_plane/submission.rs"
+
+[[test]]
+name = "editor_qualification"
+path = "tests/acp/editor_qualification.rs"

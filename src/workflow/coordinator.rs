@@ -504,6 +504,29 @@ impl WorkflowCoordinator {
                     )
                     .await?;
 
+                if self
+                    .store
+                    .flow(wf_id)
+                    .await?
+                    .is_some_and(|flow| flow.read_only)
+                {
+                    let state_id = wf
+                        .current_workspace_state_id
+                        .as_deref()
+                        .context("read-only flow candidate missing")?;
+                    require_candidate_state(&wf, state_id).await?;
+                    self.store
+                        .transition_workflow_stage(
+                            wf_id,
+                            WorkflowStage::Completed,
+                            Some(state_id),
+                            None,
+                            None,
+                        )
+                        .await?;
+                    return Ok(WorkflowStepResult::Terminal(WorkflowStage::Completed));
+                }
+
                 self.store
                     .transition_workflow_stage(
                         wf_id,
@@ -779,44 +802,60 @@ impl WorkflowCoordinator {
                     });
                 }
 
-                // Run STANDARD tier verification
-                let std_run = self
-                    .run_tier_verification(
-                        &wf,
-                        &ws_state,
-                        VerificationTier::Standard,
-                        policies.verification.as_ref(),
-                        policies.regression.as_ref(),
-                        policies.selection.as_ref(),
+                let review_tier = if let Some(flow) = self.store.flow(wf_id).await? {
+                    let paths = candidate_changed_files(
+                        workflow_repo_path(&wf)?,
+                        wf.base_revision.as_deref().unwrap_or("HEAD"),
                     )
                     .await?;
-                require_candidate_state(&wf, ws_state_id).await?;
-
-                if std_run.overall_result != Some(VerificationRunResult::Passed) {
-                    let fail_reason = "Standard tier verification failed".to_string();
-                    self.record_failure_evidence(
-                        wf_id,
-                        "VERIFYING_STANDARD",
-                        Some(&std_run.id),
-                        &fail_reason,
+                    flow.effective_tiers(&paths).0.max(
+                        policies
+                            .regression
+                            .as_ref()
+                            .map_or(VerificationTier::Fast, |policy| policy.review_gate_tier),
                     )
-                    .await?;
-                    self.store
-                        .transition_workflow_stage(
-                            wf_id,
-                            WorkflowStage::Repairing,
-                            Some(ws_state_id),
-                            None,
-                            Some(&fail_reason),
+                } else {
+                    VerificationTier::Standard
+                };
+                if review_tier > VerificationTier::Fast {
+                    let std_run = self
+                        .run_tier_verification(
+                            &wf,
+                            &ws_state,
+                            review_tier,
+                            policies.verification.as_ref(),
+                            policies.regression.as_ref(),
+                            policies.selection.as_ref(),
                         )
                         .await?;
-                    return Ok(WorkflowStepResult::Advanced {
-                        from: WorkflowStage::Verifying,
-                        to: WorkflowStage::Repairing,
-                    });
+                    require_candidate_state(&wf, ws_state_id).await?;
+
+                    if std_run.overall_result != Some(VerificationRunResult::Passed) {
+                        let fail_reason = "Standard tier verification failed".to_string();
+                        self.record_failure_evidence(
+                            wf_id,
+                            "VERIFYING_STANDARD",
+                            Some(&std_run.id),
+                            &fail_reason,
+                        )
+                        .await?;
+                        self.store
+                            .transition_workflow_stage(
+                                wf_id,
+                                WorkflowStage::Repairing,
+                                Some(ws_state_id),
+                                None,
+                                Some(&fail_reason),
+                            )
+                            .await?;
+                        return Ok(WorkflowStepResult::Advanced {
+                            from: WorkflowStage::Verifying,
+                            to: WorkflowStage::Repairing,
+                        });
+                    }
                 }
 
-                // Both FAST and STANDARD passed -> Advance to REVIEWING
+                // All required feedback gates passed on the current candidate.
                 self.store
                     .transition_workflow_stage(
                         wf_id,
@@ -1299,12 +1338,22 @@ impl WorkflowCoordinator {
 
                 let policies = self.resolve_workflow_policies(&wf).await?;
 
-                // Run FULL tier regression verification
+                let completion_tier = if let Some(flow) = self.store.flow(wf_id).await? {
+                    let paths = candidate_changed_files(repo_path, baseline).await?;
+                    flow.effective_tiers(&paths).1.max(
+                        policies
+                            .regression
+                            .as_ref()
+                            .map_or(VerificationTier::Fast, |policy| policy.completion_tier),
+                    )
+                } else {
+                    VerificationTier::Full
+                };
                 let full_run = self
                     .run_tier_verification(
                         &wf,
                         &ws_state,
-                        VerificationTier::Full,
+                        completion_tier,
                         policies.verification.as_ref(),
                         policies.regression.as_ref(),
                         policies.selection.as_ref(),
@@ -1347,7 +1396,27 @@ impl WorkflowCoordinator {
                 );
 
                 // Assert completion invariant
-                self.store.check_completion_invariant(wf_id).await?;
+                self.store
+                    .check_technical_completion_invariant(wf_id)
+                    .await?;
+                if crate::workflow::reasoning::ReasoningStore::new(self.pool.clone())
+                    .requires_acceptance(wf_id)
+                    .await?
+                {
+                    self.store
+                        .transition_workflow_stage(
+                            wf_id,
+                            WorkflowStage::BusinessAcceptance,
+                            Some(ws_state_id),
+                            None,
+                            None,
+                        )
+                        .await?;
+                    return Ok(WorkflowStepResult::Advanced {
+                        from: WorkflowStage::Regression,
+                        to: WorkflowStage::BusinessAcceptance,
+                    });
+                }
 
                 // Transition to COMPLETED
                 self.store
@@ -1363,6 +1432,46 @@ impl WorkflowCoordinator {
                 Ok(WorkflowStepResult::Terminal(WorkflowStage::Completed))
             }
 
+            WorkflowStage::BusinessAcceptance => {
+                let ws = wf
+                    .current_workspace_state_id
+                    .as_deref()
+                    .context("acceptance candidate missing")?;
+                let repo_path = Path::new(
+                    wf.repository_path
+                        .as_deref()
+                        .context("acceptance repository missing")?,
+                );
+                let baseline = wf
+                    .base_revision
+                    .as_deref()
+                    .context("acceptance baseline missing")?;
+                if let Err(error) =
+                    crate::workflow::reasoning::ReasoningStore::new(self.pool.clone())
+                        .check_acceptance(wf_id, ws)
+                        .await
+                {
+                    if error.is::<crate::workflow::reasoning::BusinessAcceptanceRequired>() {
+                        return Ok(WorkflowStepResult::Waiting);
+                    }
+                    return Err(error);
+                }
+                ensure!(
+                    compute_workspace_state(repo_path, baseline).await?.state_id == ws,
+                    "STALE_ACCEPTANCE_CANDIDATE"
+                );
+                self.store.check_completion_invariant(wf_id).await?;
+                self.store
+                    .transition_workflow_stage(
+                        wf_id,
+                        WorkflowStage::Completed,
+                        Some(ws),
+                        None,
+                        None,
+                    )
+                    .await?;
+                Ok(WorkflowStepResult::Terminal(WorkflowStage::Completed))
+            }
             WorkflowStage::Completed
             | WorkflowStage::Failed
             | WorkflowStage::Cancelled
@@ -1418,7 +1527,23 @@ impl WorkflowCoordinator {
             return Ok(None);
         };
         let next = match wf.status {
-            WorkflowStage::Planning => WorkflowStage::Implementing,
+            WorkflowStage::Planning => {
+                if self
+                    .store
+                    .flow(&wf.id)
+                    .await?
+                    .is_some_and(|flow| flow.read_only)
+                {
+                    let state_id = wf
+                        .current_workspace_state_id
+                        .as_deref()
+                        .context("read-only candidate missing")?;
+                    require_candidate_state(wf, state_id).await?;
+                    WorkflowStage::Completed
+                } else {
+                    WorkflowStage::Implementing
+                }
+            }
             WorkflowStage::Implementing | WorkflowStage::Repairing => {
                 let state_id = role
                     .output_workspace_state_id
@@ -1764,7 +1889,10 @@ impl WorkflowCoordinator {
     }
 }
 
-async fn candidate_changed_files(repo_path: &Path, baseline: &str) -> Result<Vec<String>> {
+pub(crate) async fn candidate_changed_files(
+    repo_path: &Path,
+    baseline: &str,
+) -> Result<Vec<String>> {
     if !repo_path.join(".git").exists() {
         return non_git_candidate_paths(repo_path)?
             .into_iter()
@@ -1853,10 +1981,13 @@ pub async fn compute_workspace_state(
 }
 
 async fn git_output(repo_path: &Path, args: &[&str]) -> Result<Vec<u8>> {
-    let output = crate::tool_surface::safe_git_command(repo_path, args)
-        .output()
-        .await
-        .context("GIT_WORKSPACE_STATE_FAILED: start git")?;
+    let output = crate::execution::process::bounded_output(
+        crate::tool_surface::safe_git_command(repo_path, args),
+        32 * 1024 * 1024,
+        std::time::Duration::from_secs(30),
+    )
+    .await
+    .context("GIT_WORKSPACE_STATE_FAILED: start git")?;
     ensure!(
         output.status.success(),
         "GIT_WORKSPACE_STATE_FAILED: git returned {}: {}",
@@ -1881,7 +2012,10 @@ async fn git_untracked_paths(repo_path: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-async fn review_candidate_diff(repo_path: &Path, baseline_revision: &str) -> Result<String> {
+pub(crate) async fn review_candidate_diff(
+    repo_path: &Path,
+    baseline_revision: &str,
+) -> Result<String> {
     let mut diff = if repo_path.join(".git").exists() {
         let mut diff = git_output(
             repo_path,
@@ -2197,6 +2331,9 @@ pub struct AcpTurnState<'a> {
     pub role_id: Option<String>,
     pub workspace_identity: Option<String>,
     pub tool_call_limit: u64,
+    pub execution_profile: crate::execution::local::RoleExecutionProfile,
+    pub role_budget: Option<crate::tools::budget::RoleBudget>,
+    pub role_usage: crate::tools::budget::RoleUsage,
     pub agent_output: String,
     pub tool_calls: u64,
     pub tool_successes: u64,
@@ -2218,6 +2355,9 @@ impl<'a> AcpTurnState<'a> {
             role_id: None,
             workspace_identity: None,
             tool_call_limit: 64,
+            execution_profile: Default::default(),
+            role_budget: None,
+            role_usage: Default::default(),
             agent_output: String::new(),
             tool_calls: 0,
             tool_successes: 0,
@@ -2233,8 +2373,8 @@ impl<'a> AcpTurnState<'a> {
     }
 }
 
-const TOOL_CALL_AUDIT_LIMIT: usize = 64;
-const PROVIDER_TOOL_NAME_QUEUE_LIMIT: usize = 64;
+const TOOL_CALL_AUDIT_LIMIT: usize = 1024;
+const PROVIDER_TOOL_NAME_QUEUE_LIMIT: usize = 1024;
 const TOOL_PATH_INPUT_LIMIT: usize = 4096;
 const TOOL_PATH_DISPLAY_LIMIT: usize = 192;
 const READ_FILE_CONTINUATION_RESERVE_BYTES: usize = 256;
@@ -3050,11 +3190,13 @@ async fn persist_tool_call_audit(state: &AcpTurnState<'_>) -> Result<()> {
         state.role_exec_id.as_deref(),
     ) {
         (Some(pool), Some(agent_exec_id), Some(role_execution_id)) => {
-            let audit = state.tool_call_audit.metadata(
+            let mut audit = state.tool_call_audit.metadata(
                 state.tool_calls,
                 state.tool_successes,
                 state.tool_failures,
             );
+            audit["role_budget"] =
+                serde_json::json!({"limits":state.role_budget,"usage":state.role_usage});
             WorkflowStore::new(pool.clone())
                 .update_running_agent_tool_audit(agent_exec_id, role_execution_id, &audit)
                 .await
@@ -3091,6 +3233,13 @@ fn provider_tool_method_observation(method: &str) -> Option<ProviderToolMethodOb
     use crate::tool_surface::CanonicalToolName as Tool;
 
     let tool = Tool::from_wire(method)?;
+    if method == "orbit/shell" {
+        return Some(ProviderToolMethodObservation {
+            provider_tool_name: "orbit_shell",
+            request_tool_name: "shell",
+            canonical_tool_name: Tool::TerminalCreate,
+        });
+    }
     let orbit_provider_name = match tool {
         Tool::FsReadTextFile => Some("orbit_read_file"),
         Tool::FsWriteTextFile => Some("orbit_write_file"),
@@ -3169,6 +3318,7 @@ fn known_tool_error_code(message: &str) -> Option<&'static str> {
         crate::tool_surface::ERR_NO_MATCH,
         crate::tool_surface::ERR_MULTIPLE_MATCHES,
         "CLI_WORKFLOW_TERMINAL_DISABLED",
+        "TOOL_BUDGET_EXHAUSTED",
         "INVALID_REQUEST",
         "TOOL_EXECUTION_FAILED",
         "TOOL_RESPONSE_FAILED",
@@ -3367,7 +3517,10 @@ fn bounded_text_read_result(
                 "orbit": {
                     "line": start_line,
                     "total_bytes": content.len(),
+                    "total_size": content.len(),
+                    "bytes_returned": page.len(),
                     "truncated": truncated,
+                    "next_offset": truncated.then_some(next_byte),
                     "next_line": truncated.then_some(next_line),
                 }
             },
@@ -3713,7 +3866,13 @@ pub fn render_tool_call_audit(metadata: &serde_json::Value) -> String {
     );
     report.push_str("seq | ToolInvocationId | provider ToolCall ID | callback JSON-RPC ID | provider callback method | update correlation | title class | provider kind | provider status | toolCallId shape | mapping | canonical | advertised | role allowed | outcome | terminal state | error code | mutation applied | later callback observed | turn complete | paths | detail\n");
 
-    for entry in entries.iter().take(TOOL_CALL_AUDIT_LIMIT) {
+    if entries.len() > 64 {
+        report.push_str(&format!(
+            "Showing the latest 64 of {} retained callback rows.\n",
+            entries.len()
+        ));
+    }
+    for entry in entries.iter().skip(entries.len().saturating_sub(64)) {
         let string = |name| {
             entry
                 .get(name)
@@ -3878,7 +4037,33 @@ pub async fn handle_acp_message(
     } else {
         message.get("id").is_some()
     };
-    let result = handle_acp_message_inner(wire, state, message).await;
+    let output_before = wire.response_payload_bytes();
+    if persist_audit {
+        let remaining = state.role_budget.as_ref().map_or(65536, |budget| {
+            budget
+                .max_output_bytes
+                .saturating_sub(state.role_usage.output_bytes)
+                .saturating_sub(128) as usize
+        });
+        wire.set_response_limit(remaining.min(65536));
+    }
+    let mut result = handle_acp_message_inner(wire, state, message).await;
+    if persist_audit {
+        state.role_usage.output_bytes = state
+            .role_usage
+            .output_bytes
+            .saturating_add(wire.response_payload_bytes().saturating_sub(output_before));
+    }
+    if result
+        .as_ref()
+        .err()
+        .is_some_and(|error| error.is::<crate::tools::budget::ToolBudgetExhausted>())
+    {
+        state.role_usage.exhausted = true;
+    }
+    if state.role_usage.exhausted && result.is_ok() {
+        result = Err(crate::tools::budget::ToolBudgetExhausted.into());
+    }
     if persist_audit {
         let persist_result = persist_tool_call_audit(state).await;
         if result.is_ok() {
@@ -3957,6 +4142,38 @@ async fn handle_acp_message_inner(
         // Persist the DISPATCHED row before any callback authorization or
         // mutation branch. A crash or timeout from here remains unresolved.
         persist_tool_call_audit(state).await?;
+        if let Some(budget) = &state.role_budget {
+            // Denied effects still consume callback capacity, but cannot spend
+            // mutation or terminal allowances that the role does not possess.
+            let mutating = canonical
+                .map(crate::tool_surface::ToolMetadata::for_tool)
+                .is_some_and(|metadata| {
+                    metadata.mutating
+                        && state.workspace_access == WorkspaceAccess::ReadWrite
+                        && state
+                            .role_id
+                            .as_deref()
+                            .is_some_and(|role| metadata.is_role_allowed(role))
+                });
+            if let Err(error) = budget.reserve_call(
+                &mut state.role_usage,
+                mutating,
+                mutating
+                    && canonical == Some(crate::tool_surface::CanonicalToolName::TerminalCreate),
+            ) {
+                state.tool_failures += 1;
+                state.tool_call_audit.finish_call(
+                    audit_sequence,
+                    ToolCallOutcome::ExpectedDenial,
+                    Some("TOOL_BUDGET_EXHAUSTED"),
+                );
+                wire.set_response_limit(128);
+                wire.response_error(req_id, -32603, "TOOL_BUDGET_EXHAUSTED")
+                    .await?;
+                return Err(error);
+            }
+        }
+
         let Some(tool) = canonical else {
             state.tool_failures = state.tool_failures.saturating_add(1);
             *state.tool_counts.entry("unsupported".into()).or_insert(0) += 1;
@@ -3992,6 +4209,9 @@ async fn handle_acp_message_inner(
         persist_tool_call_audit(state).await?;
 
         if matches!(
+            state.execution_profile,
+            crate::execution::local::RoleExecutionProfile::Trusted
+        ) && matches!(
             tool,
             crate::tool_surface::CanonicalToolName::TerminalCreate
                 | crate::tool_surface::CanonicalToolName::TerminalOutput
@@ -4010,7 +4230,7 @@ async fn handle_acp_message_inner(
             return Ok(());
         }
 
-        let meta = match crate::tool_surface::authorize_repository_tool(
+        let mut meta = match crate::tool_surface::authorize_repository_tool(
             tool,
             state.role_id.as_deref(),
             state.workspace_access,
@@ -4033,6 +4253,14 @@ async fn handle_acp_message_inner(
                 return Ok(());
             }
         };
+        if let Some(budget) = &state.role_budget {
+            meta.max_output_bytes = meta.max_output_bytes.min(
+                budget
+                    .max_output_bytes
+                    .saturating_sub(state.role_usage.output_bytes)
+                    .saturating_sub(128) as usize,
+            );
+        }
         wire.set_response_limit(meta.max_output_bytes);
 
         // Mutation lock enforcement for mutating operations
@@ -4099,6 +4327,58 @@ async fn handle_acp_message_inner(
             match tool {
                 crate::tool_surface::CanonicalToolName::FsReadTextFile => {
                     let rel_path_str = params.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                    let remaining_read =
+                        state
+                            .role_budget
+                            .as_ref()
+                            .map_or(64 * 1024 * 1024, |budget| {
+                                budget
+                                    .max_file_read_bytes
+                                    .saturating_sub(state.role_usage.file_read_bytes)
+                            });
+                    if let Some(offset) = params.get("offset") {
+                        let offset = offset
+                            .as_u64()
+                            .context("INVALID_REQUEST: invalid byte offset")?;
+                        ensure!(
+                            params.get("line").is_none() && params.get("limit").is_none(),
+                            "INVALID_REQUEST: mixed line and byte ranges"
+                        );
+                        let max_bytes = params
+                            .get("max_bytes")
+                            .map(|value| {
+                                value.as_u64().context("INVALID_REQUEST: invalid byte size")
+                            })
+                            .transpose()?
+                            .unwrap_or(8192);
+                        ensure!(
+                            (4..=65536).contains(&max_bytes),
+                            "INVALID_REQUEST: invalid byte size"
+                        );
+                        if remaining_read < 4 {
+                            return Err(crate::tools::budget::ToolBudgetExhausted.into());
+                        }
+                        let read_size = max_bytes
+                            .min(remaining_read)
+                            .min(meta.max_output_bytes.saturating_sub(1024) as u64 / 6);
+                        if read_size < 4 {
+                            return Err(crate::tools::budget::ToolBudgetExhausted.into());
+                        }
+                        state.role_usage.file_read_bytes += read_size;
+                        let (content, total_size, bytes_read) =
+                            crate::fs_tools::read_text_byte_range(
+                                state.repo_path,
+                                rel_path_str,
+                                offset,
+                                read_size as usize,
+                            )?;
+                        state.role_usage.file_read_bytes -=
+                            read_size.saturating_sub(bytes_read as u64);
+                        let next_offset = offset + content.len() as u64;
+                        state.tool_successes += 1;
+                        wire.response_ok(req_id, serde_json::json!({"content":content,"_meta":{"orbit":{"bytes_returned":content.len(),"total_size":total_size,"total_bytes":total_size,"truncated":next_offset < total_size,"next_offset":(next_offset < total_size).then_some(next_offset)}}})).await?;
+                        return Ok(());
+                    }
                     let (start_line, line_limit) = match requested_text_read_range(&params) {
                         Ok(range) => range,
                         Err(error) => {
@@ -4111,8 +4391,13 @@ async fn handle_acp_message_inner(
                             return Ok(());
                         }
                     };
-                    match crate::fs_tools::read_text_confined(state.repo_path, rel_path_str) {
+                    match crate::fs_tools::read_text_confined_bounded(
+                        state.repo_path,
+                        rel_path_str,
+                        remaining_read,
+                    ) {
                         Ok(content) => {
+                            state.role_usage.file_read_bytes += content.len() as u64;
                             match bounded_text_read_result(
                                 &content,
                                 start_line,
@@ -4146,6 +4431,12 @@ async fn handle_acp_message_inner(
                             }
                         }
                         Err(e) => {
+                            if e.downcast_ref::<std::string::FromUtf8Error>().is_some() {
+                                state.role_usage.file_read_bytes += remaining_read;
+                            }
+                            if e.is::<crate::tools::budget::ToolBudgetExhausted>() {
+                                return Err(e);
+                            }
                             state
                                 .tool_call_audit
                                 .record_operation_error(audit_sequence, &e);
@@ -4620,13 +4911,39 @@ async fn handle_acp_message_inner(
                         .and_then(|v| v.as_u64())
                         .unwrap_or(65536)
                         .min(65536) as usize;
-                    match crate::tool_surface::AgentTerminal::spawn(
+                    match crate::tool_surface::AgentTerminal::spawn_confined(
+                        &state.execution_profile,
+                        state.repo_path,
                         &cwd,
                         &cmd_bin,
                         &cmd_args,
                         output_byte_limit,
                     ) {
                         Ok(term) => {
+                            if method == "orbit/shell" {
+                                let term = Arc::new(term);
+                                let tid = format!("term-{}", crate::model::id());
+                                state.terminals.insert(tid.clone(), term.clone());
+                                let result = term.wait_for_exit(Duration::from_secs(300)).await;
+                                term.kill().await?;
+                                state.terminals.remove(&tid);
+                                match result {
+                                    Ok(code) => {
+                                        state.tool_successes += 1;
+                                        let output = term.output();
+                                        wire.response_ok(req_id, serde_json::json!({"exit_code": code, "output": output.text(), "truncated": output.truncated})).await?;
+                                    }
+                                    Err(error) => {
+                                        state
+                                            .tool_call_audit
+                                            .record_operation_error(audit_sequence, &error);
+                                        state.tool_failures += 1;
+                                        wire.response_error(req_id, -32603, "COMMAND_TIMEOUT")
+                                            .await?;
+                                    }
+                                }
+                                return Ok(());
+                            }
                             let tid = format!("term-{}", crate::model::id());
                             state
                                 .terminals
@@ -4755,6 +5072,37 @@ async fn handle_acp_message_inner(
         {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
+                if error.is::<crate::tools::budget::ToolBudgetExhausted>() {
+                    state.role_usage.exhausted = true;
+                    state.tool_failures += 1;
+                    state.tool_call_audit.finish_call(
+                        audit_sequence,
+                        ToolCallOutcome::ExpectedDenial,
+                        Some("TOOL_BUDGET_EXHAUSTED"),
+                    );
+                    wire.response_error(timeout_request_id, -32603, "TOOL_BUDGET_EXHAUSTED")
+                        .await?;
+                    return Err(error);
+                }
+                if matches!(
+                    normalized_tool_error_code(&error),
+                    "INVALID_REQUEST" | "PATH_NOT_FOUND" | "PATH_OUTSIDE_WORKSPACE"
+                ) {
+                    let code = normalized_tool_error_code(&error);
+                    state.tool_failures += 1;
+                    state.tool_call_audit.finish_call(
+                        audit_sequence,
+                        if code == "INVALID_REQUEST" {
+                            ToolCallOutcome::InvalidRequest
+                        } else {
+                            ToolCallOutcome::ExecutionFailure
+                        },
+                        Some(code),
+                    );
+                    wire.response_error(timeout_request_id, -32602, code)
+                        .await?;
+                    return Ok(());
+                }
                 state.tool_call_audit.settle_counters(
                     audit_sequence,
                     &mut state.tool_successes,
@@ -6455,7 +6803,8 @@ mod tests {
 
         let allowed = vec!["read_file".to_string()];
         let mut audit = ToolCallAudit::with_context(Some("planner"), Some(&allowed));
-        for sequence in 1..=62 {
+        let read_count = TOOL_CALL_AUDIT_LIMIT as u64 - 2;
+        for sequence in 1..=read_count {
             let call = audit.begin_call(
                 sequence,
                 "fs/read_text_file",
@@ -6468,7 +6817,13 @@ mod tests {
         audit.observe_provider_tool_name(&serde_json::json!({
             "sessionUpdate": "tool_call", "title": "orbit_write_file"
         }));
-        let denied = audit.begin_call(63, "fs/write_text_file", Some(Tool::FsWriteTextFile), 62, 0);
+        let denied = audit.begin_call(
+            read_count + 1,
+            "fs/write_text_file",
+            Some(Tool::FsWriteTextFile),
+            read_count,
+            0,
+        );
         audit.finish_call(
             denied,
             ToolCallOutcome::ExpectedDenial,
@@ -6480,29 +6835,47 @@ mod tests {
         audit.observe_provider_tool_name(&serde_json::json!({
             "sessionUpdate": "tool_call", "title": "synthetic-secret-title"
         }));
-        audit.set_turn_completion(true, 63);
+        audit.set_turn_completion(true, read_count + 1);
 
         let entries = &audit.entries;
         assert_eq!(entries.len(), TOOL_CALL_AUDIT_LIMIT);
-        assert_eq!(entries[62].advertised_to_provider, Some(false));
-        assert_eq!(entries[62].role_allowed, Some(false));
-        assert_eq!(entries[62].mutation_applied, Some(false));
-        assert_eq!(entries[63].provider_tool_name, "unknown");
-        assert_eq!(entries[63].provider_name_mapping, "UNMATCHED");
-        assert_eq!(entries[63].advertised_to_provider, None);
-        assert_eq!(entries[63].role_allowed, None);
-        assert_eq!(entries[63].error_code, Some("PROVIDER_CALLBACK_UNRESOLVED"));
+        assert_eq!(
+            entries[TOOL_CALL_AUDIT_LIMIT - 2].advertised_to_provider,
+            Some(false)
+        );
+        assert_eq!(entries[TOOL_CALL_AUDIT_LIMIT - 2].role_allowed, Some(false));
+        assert_eq!(
+            entries[TOOL_CALL_AUDIT_LIMIT - 2].mutation_applied,
+            Some(false)
+        );
+        assert_eq!(
+            entries[TOOL_CALL_AUDIT_LIMIT - 1].provider_tool_name,
+            "unknown"
+        );
+        assert_eq!(
+            entries[TOOL_CALL_AUDIT_LIMIT - 1].provider_name_mapping,
+            "UNMATCHED"
+        );
+        assert_eq!(
+            entries[TOOL_CALL_AUDIT_LIMIT - 1].advertised_to_provider,
+            None
+        );
+        assert_eq!(entries[TOOL_CALL_AUDIT_LIMIT - 1].role_allowed, None);
+        assert_eq!(
+            entries[TOOL_CALL_AUDIT_LIMIT - 1].error_code,
+            Some("PROVIDER_CALLBACK_UNRESOLVED")
+        );
         assert_eq!(audit.omitted_count, 2);
         assert_eq!(audit.mutating_count, 1);
         assert_eq!(audit.mutating_unknown_count, 3);
         assert_eq!(audit.denied_count, 1);
 
         let metadata = serde_json::json!({
-            "tool_call_audit": audit.metadata(63, 62, 1)
+            "tool_call_audit": audit.metadata(read_count + 1, read_count, 1)
         });
         let summary = &metadata["tool_call_audit"]["summary"];
-        assert_eq!(summary["total"], 66);
-        assert_eq!(summary["successful"], 62);
+        assert_eq!(summary["total"], TOOL_CALL_AUDIT_LIMIT as u64 + 2);
+        assert_eq!(summary["successful"], read_count);
         assert_eq!(summary["unsuccessful"], 4);
         assert_eq!(summary["mutating"], 1);
         assert_eq!(summary["denied"], 1);

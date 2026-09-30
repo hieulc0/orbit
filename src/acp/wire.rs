@@ -102,6 +102,7 @@ pub struct Wire {
     codex: bool,
     response_limit: Option<usize>,
     response_limit_hit: bool,
+    response_payload_bytes: u64,
 }
 impl Wire {
     pub fn new(
@@ -119,6 +120,7 @@ impl Wire {
             codex: false,
             response_limit: None,
             response_limit_hit: false,
+            response_payload_bytes: 0,
         }
     }
     pub fn codex(mut self) -> Self {
@@ -132,6 +134,9 @@ impl Wire {
     }
     pub fn take_response_limit_hit(&mut self) -> bool {
         std::mem::take(&mut self.response_limit_hit)
+    }
+    pub fn response_payload_bytes(&self) -> u64 {
+        self.response_payload_bytes
     }
     pub async fn read(&mut self) -> Result<Value> {
         let mut frame = Vec::new();
@@ -219,6 +224,9 @@ impl Wire {
             self.response_limit_hit = true;
             return self.response_error(id, -32603, "OUTPUT_LIMIT").await;
         }
+        self.response_payload_bytes = self
+            .response_payload_bytes
+            .saturating_add(serde_json::to_vec(&result)?.len() as u64);
         self.send(json!({"jsonrpc":"2.0","id":id,"result":result}))
             .await
     }
@@ -228,7 +236,18 @@ impl Wire {
         while !message.is_char_boundary(end) {
             end -= 1;
         }
+        while serde_json::to_vec(&json!({"code":code,"message":&message[..end]}))?.len() > max
+            && end > 0
+        {
+            end -= 1;
+            while !message.is_char_boundary(end) {
+                end -= 1;
+            }
+        }
         let message = &message[..end];
+        self.response_payload_bytes = self.response_payload_bytes.saturating_add(
+            serde_json::to_vec(&json!({"code":code,"message":message}))?.len() as u64,
+        );
         self.send(json!({
             "jsonrpc": "2.0",
             "id": id,

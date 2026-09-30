@@ -44,6 +44,7 @@ pub enum WorkflowStage {
     Reviewing,
     Repairing,
     Regression,
+    BusinessAcceptance,
     Completed,
     Failed,
     Cancelled,
@@ -60,6 +61,7 @@ impl WorkflowStage {
             Self::Reviewing => "REVIEWING",
             Self::Repairing => "REPAIRING",
             Self::Regression => "REGRESSION",
+            Self::BusinessAcceptance => "BUSINESS_ACCEPTANCE",
             Self::Completed => "COMPLETED",
             Self::Failed => "FAILED",
             Self::Cancelled => "CANCELLED",
@@ -76,6 +78,7 @@ impl WorkflowStage {
             "REVIEWING" => Ok(Self::Reviewing),
             "REPAIRING" => Ok(Self::Repairing),
             "REGRESSION" => Ok(Self::Regression),
+            "BUSINESS_ACCEPTANCE" => Ok(Self::BusinessAcceptance),
             "COMPLETED" => Ok(Self::Completed),
             "FAILED" => Ok(Self::Failed),
             "CANCELLED" => Ok(Self::Cancelled),
@@ -570,6 +573,90 @@ pub struct StepClaim {
 }
 
 impl WorkflowStore {
+    pub async fn pin_flow(
+        &self,
+        workflow_id: &str,
+        flow: &crate::workflow::flow::FlowDefinition,
+    ) -> Result<()> {
+        flow.validate()?;
+        let mut transaction = self.pool.begin().await?;
+        let status: String = sqlx::query_scalar("SELECT status FROM orbit_workflow_runs WHERE id = $1 AND step_owner_id IS NULL FOR UPDATE")
+            .bind(workflow_id).fetch_optional(&mut *transaction).await?.context("workflow already executing or missing")?;
+        ensure!(
+            status == "CREATED",
+            "flow must be pinned before workflow execution"
+        );
+        let definition = serde_json::to_value(flow)?;
+        let digest = crate::model::digest(&serde_json::to_vec(flow)?);
+        let stored: serde_json::Value = sqlx::query_scalar("INSERT INTO orbit_workflow_flows (workflow_run_id, definition, digest) VALUES ($1, $2, $3) ON CONFLICT (workflow_run_id) DO UPDATE SET definition = orbit_workflow_flows.definition RETURNING definition")
+            .bind(workflow_id).bind(&definition).bind(&digest).fetch_one(&mut *transaction).await?;
+        ensure!(stored == definition, "workflow flow is immutable");
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn flow(
+        &self,
+        workflow_id: &str,
+    ) -> Result<Option<crate::workflow::flow::FlowDefinition>> {
+        let row = sqlx::query(
+            "SELECT definition, digest FROM orbit_workflow_flows WHERE workflow_run_id = $1",
+        )
+        .bind(workflow_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let flow: crate::workflow::flow::FlowDefinition =
+            serde_json::from_value(row.get("definition"))?;
+        flow.validate()?;
+        ensure!(
+            row.get::<String, _>("digest") == crate::model::digest(&serde_json::to_vec(&flow)?),
+            "FLOW_DIGEST_MISMATCH"
+        );
+        Ok(Some(flow))
+    }
+
+    pub async fn pin_execution_profile(
+        &self,
+        workflow_id: &str,
+        profile: &crate::execution::local::RoleExecutionProfile,
+    ) -> Result<()> {
+        profile.validate()?;
+        let mut transaction = self.pool.begin().await?;
+        let status: String = sqlx::query_scalar("SELECT status FROM orbit_workflow_runs WHERE id = $1 AND step_owner_id IS NULL FOR UPDATE")
+            .bind(workflow_id).fetch_optional(&mut *transaction).await?.context("workflow already executing or missing")?;
+        ensure!(
+            status == "CREATED",
+            "execution profile must be pinned before workflow execution"
+        );
+        let value = serde_json::to_value(profile)?;
+        let stored: serde_json::Value = sqlx::query_scalar("INSERT INTO orbit_workflow_execution_profiles (workflow_run_id, profile) VALUES ($1, $2) ON CONFLICT (workflow_run_id) DO UPDATE SET profile = orbit_workflow_execution_profiles.profile RETURNING profile")
+            .bind(workflow_id).bind(&value).fetch_one(&mut *transaction).await?;
+        ensure!(stored == value, "workflow execution profile is immutable");
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn execution_profile(
+        &self,
+        workflow_id: &str,
+    ) -> Result<crate::execution::local::RoleExecutionProfile> {
+        let value: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT profile FROM orbit_workflow_execution_profiles WHERE workflow_run_id = $1",
+        )
+        .bind(workflow_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let profile: crate::execution::local::RoleExecutionProfile = value
+            .map(serde_json::from_value)
+            .transpose()?
+            .unwrap_or_default();
+        profile.validate()?;
+        Ok(profile)
+    }
+
     pub fn new(pool: PgPool) -> Self {
         let verification_store = VerificationStore::new(pool.clone());
         Self {
@@ -997,10 +1084,47 @@ impl WorkflowStore {
             );
         }
 
+        if matches!(
+            new_stage,
+            WorkflowStage::Completed | WorkflowStage::BusinessAcceptance
+        ) {
+            ensure!(
+                workspace_state_id.is_none()
+                    || workspace_state_id == current.current_workspace_state_id.as_deref(),
+                "completion cannot replace the accepted candidate identity"
+            );
+        }
+
         // Validate state transitions
         match (&current.status, &new_stage) {
             (WorkflowStage::Created, WorkflowStage::Planning) => {}
             (WorkflowStage::Planning, WorkflowStage::Implementing) => {}
+            (WorkflowStage::Planning, WorkflowStage::Completed) => {
+                ensure!(
+                    self.flow(wf_id).await?.is_some_and(|flow| flow.read_only),
+                    "read-only flow required"
+                );
+                let handoff = self
+                    .get_latest_handoff_of_type(wf_id, HandoffType::Plan)
+                    .await?
+                    .context("read-only plan handoff required")?;
+                ensure!(
+                    handoff.workspace_state_id == current.current_workspace_state_id,
+                    "read-only handoff has a stale candidate"
+                );
+                let role_id = handoff
+                    .role_execution_id
+                    .context("read-only handoff needs a role")?;
+                ensure!(
+                    self.list_role_executions(wf_id)
+                        .await?
+                        .iter()
+                        .any(|role| role.id == role_id
+                            && role.role_id == "planner"
+                            && role.status == RoleExecutionStatus::Succeeded),
+                    "read-only role has not succeeded"
+                );
+            }
             (WorkflowStage::Implementing, WorkflowStage::Verifying) => {}
             (WorkflowStage::Verifying, WorkflowStage::Repairing) => {}
             (WorkflowStage::Verifying, WorkflowStage::Reviewing) => {}
@@ -1008,7 +1132,19 @@ impl WorkflowStore {
             (WorkflowStage::Reviewing, WorkflowStage::Repairing) => {}
             (WorkflowStage::Reviewing, WorkflowStage::Regression) => {}
             (WorkflowStage::Regression, WorkflowStage::Repairing) => {}
-            (WorkflowStage::Regression, WorkflowStage::Completed) => {}
+            (WorkflowStage::Regression, WorkflowStage::BusinessAcceptance) => {
+                ensure!(
+                    crate::workflow::reasoning::ReasoningStore::new(self.pool.clone())
+                        .requires_acceptance(wf_id)
+                        .await?,
+                    "external acceptance contract required"
+                );
+                self.check_technical_completion_invariant(wf_id).await?;
+            }
+            (WorkflowStage::BusinessAcceptance, WorkflowStage::Completed)
+            | (WorkflowStage::Regression, WorkflowStage::Completed) => {
+                self.check_completion_invariant(wf_id).await?;
+            }
             // Terminal failure / cancellation / exhaustion can occur from non-terminal states
             (_, WorkflowStage::Failed | WorkflowStage::Cancelled | WorkflowStage::Exhausted) => {}
             (from, to) => {
@@ -1972,6 +2108,23 @@ impl WorkflowStore {
     ///   - The latest final regression run on ws_id PASSED
     ///   - No subsequent mutation has occurred on the workspace
     pub async fn check_completion_invariant(&self, wf_id: &str) -> Result<()> {
+        self.check_technical_completion_invariant(wf_id).await?;
+        let workflow = self
+            .get_workflow_run(wf_id)
+            .await?
+            .context("workflow missing")?;
+        crate::workflow::reasoning::ReasoningStore::new(self.pool.clone())
+            .check_acceptance(
+                wf_id,
+                workflow
+                    .current_workspace_state_id
+                    .as_deref()
+                    .context("workspace state missing")?,
+            )
+            .await
+    }
+
+    pub async fn check_technical_completion_invariant(&self, wf_id: &str) -> Result<()> {
         let wf = self
             .get_workflow_run(wf_id)
             .await?
@@ -2018,7 +2171,7 @@ impl WorkflowStore {
         );
 
         // Completion requires a successful FULL regression tier.
-        let required_tier = if let Some(ref reg_id) = wf.regression_policy_id {
+        let mut required_tier = if let Some(ref reg_id) = wf.regression_policy_id {
             let reg_store = crate::regression_strategy::RegressionStore::new(self.pool.clone());
             let reg_pol = reg_store
                 .get_regression_policy(reg_id, wf.regression_policy_version.unwrap_or(1))
@@ -2029,6 +2182,18 @@ impl WorkflowStore {
         } else {
             crate::regression_strategy::VerificationTier::Full
         };
+        if let Some(flow) = self.flow(wf_id).await? {
+            let paths = crate::workflow_coordinator::candidate_changed_files(
+                Path::new(
+                    wf.repository_path
+                        .as_deref()
+                        .context("flow repository missing")?,
+                ),
+                wf.base_revision.as_deref().unwrap_or("HEAD"),
+            )
+            .await?;
+            required_tier = required_tier.max(flow.effective_tiers(&paths).1);
+        }
 
         let has_passing_completion_tier = matching_runs.iter().any(|r| match r.tier {
             Some(t) => t >= required_tier,

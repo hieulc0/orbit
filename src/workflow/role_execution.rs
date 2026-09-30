@@ -161,6 +161,9 @@ impl AcpRoleLifecycle {
         if error.is::<RoleHandoffResponseMissing>() {
             return "HANDOFF_RESPONSE_MISSING";
         }
+        if error.is::<crate::tools::budget::ToolBudgetExhausted>() {
+            return "TOOL_BUDGET_EXHAUSTED";
+        }
         if error.is::<RoleTerminalCleanupFailed>() {
             return "TERMINAL_CLEANUP_FAILED";
         }
@@ -830,8 +833,10 @@ async fn execute_real_acp_turn_body(
             accounting: Accounting::ExecutionOnly,
             max_limits: AcpLimits {
                 prompt_turns: 1,
-                broker_calls: 32,
-                reported_tool_calls: 64,
+                broker_calls: crate::tools::budget::RoleBudget::for_role(&role.role_id)
+                    .max_total_calls as u32,
+                reported_tool_calls: crate::tools::budget::RoleBudget::for_role(&role.role_id)
+                    .max_total_calls as u32,
                 turn_timeout_seconds: 300,
                 terminal_timeout_seconds: 30,
                 terminal_runtime_seconds: 0,
@@ -953,8 +958,10 @@ async fn execute_real_acp_turn_body(
             accounting: Accounting::ExecutionOnly,
             max_limits: AcpLimits {
                 prompt_turns: 1,
-                broker_calls: 32,
-                reported_tool_calls: 64,
+                broker_calls: crate::tools::budget::RoleBudget::for_role(&role.role_id)
+                    .max_total_calls as u32,
+                reported_tool_calls: crate::tools::budget::RoleBudget::for_role(&role.role_id)
+                    .max_total_calls as u32,
                 turn_timeout_seconds: 300,
                 terminal_timeout_seconds: 30,
                 terminal_runtime_seconds: 0,
@@ -1005,7 +1012,17 @@ async fn execute_real_acp_turn_body(
         bail!("unsupported role provider: {}", target.provider);
     };
 
-    let allowed_tools = repository_tools_for_role(role);
+    let execution_profile = store.execution_profile(&wf_run.id).await?;
+    let role_budget = crate::tools::budget::RoleBudget::for_role(&role.role_id);
+    role_budget.validate()?;
+    let mut allowed_tools = repository_tools_for_role(role);
+    if matches!(
+        execution_profile,
+        crate::execution::local::RoleExecutionProfile::DevLocal { .. }
+    ) && role.workspace_access == WorkspaceAccess::ReadWrite
+    {
+        allowed_tools.push("shell".into());
+    }
 
     let request_path = scratch_dir.path().join("request.json");
     let current_credential = cred_store
@@ -1120,7 +1137,10 @@ async fn execute_real_acp_turn_body(
         workspace_access: role.workspace_access,
         role_id: Some(role.role_id.clone()),
         workspace_identity: wf_run.repository_path.clone(),
-        tool_call_limit: 64,
+        tool_call_limit: role_budget.max_total_calls,
+        role_budget: Some(role_budget.clone()),
+        role_usage: Default::default(),
+        execution_profile,
         agent_output: String::new(),
         tool_calls: 0,
         tool_successes: 0,
@@ -1134,6 +1154,10 @@ async fn execute_real_acp_turn_body(
         pool: Some(workflow_state_pool),
     };
 
+    let terminal_enabled = matches!(
+        state.execution_profile,
+        crate::execution::local::RoleExecutionProfile::DevLocal { .. }
+    ) && role.workspace_access == WorkspaceAccess::ReadWrite;
     let turn = tokio::select! {
         result = async {
     persist_agent_lifecycle_phase(
@@ -1175,7 +1199,8 @@ async fn execute_real_acp_turn_body(
                     "diff": true,
                     "show": true
                 },
-                "terminal": false
+                "_meta": {"orbit": {"atomicShell": terminal_enabled, "byteReads": true}},
+                "terminal": terminal_enabled
             }
         }),
     )
@@ -1474,6 +1499,8 @@ async fn execute_real_acp_turn_body(
             &tool_counts,
             &serde_json::json!({
                 "provider": target.provider,
+                "execution_profile": state.execution_profile,
+                "role_budget": {"limits":state.role_budget,"usage":state.role_usage},
                 "cleanup_confirmed": evidence.cleanup_confirmed,
                 "observed_model": null,
                 "tool_call_audit": tool_call_audit,

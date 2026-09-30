@@ -129,6 +129,20 @@ impl Engine {
         ))
         .execute(&mut *migration)
         .await?;
+        sqlx::raw_sql(include_str!(
+            "../../migrations/0025_workflow_execution_profiles.sql"
+        ))
+        .execute(&mut *migration)
+        .await?;
+        sqlx::raw_sql(include_str!("../../migrations/0026_workflow_flows.sql"))
+            .execute(&mut *migration)
+            .await?;
+        sqlx::raw_sql(include_str!("../../migrations/0027_editor_sessions.sql"))
+            .execute(&mut *migration)
+            .await?;
+        sqlx::raw_sql(include_str!("../../migrations/0028_external_reasoning.sql"))
+            .execute(&mut *migration)
+            .await?;
         migration.commit().await?;
         Ok(Self {
             pool,

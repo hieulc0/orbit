@@ -214,6 +214,9 @@ pub struct ComponentMapping {
 /// Policy governing path classification, component mapping, and check selection.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SelectionPolicy {
+    /// Legacy encoding remains unchanged for existing immutable policy pins.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub canonical_digest: bool,
     pub id: String,
     pub version: u32,
     pub name: String,
@@ -249,6 +252,7 @@ impl SelectionPolicy {
             id: id.into(),
             version: 1,
             name: name.into(),
+            canonical_digest: false,
             component_mappings: Vec::new(),
             component_dependencies: HashMap::new(),
             broad_impact_paths: vec![
@@ -266,7 +270,14 @@ impl SelectionPolicy {
     }
 
     pub fn digest(&self) -> String {
-        let canonical_json = serde_json::to_string(self).unwrap_or_default();
+        let canonical_json = if self.canonical_digest {
+            serde_json::to_string(
+                &serde_json::to_value(self).expect("selection policy is JSON serializable"),
+            )
+        } else {
+            serde_json::to_string(self)
+        }
+        .expect("selection policy is JSON serializable");
         let mut hasher = Sha256::new();
         hasher.update(canonical_json.as_bytes());
         format!("sha256:{:x}", hasher.finalize())

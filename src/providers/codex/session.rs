@@ -128,6 +128,8 @@ impl SessionDiagnostics {
 struct Client {
     wire: Mutex<Wire>,
     active_invocation: StdMutex<Option<OrbitToolInvocationMeta>>,
+    atomic_shell: std::sync::atomic::AtomicBool,
+    byte_reads: std::sync::atomic::AtomicBool,
 }
 
 struct InvocationScope<'a>(&'a Client);
@@ -250,6 +252,34 @@ impl acp::Client for Client {
 
 #[async_trait::async_trait(?Send)]
 impl crate::codex_bridge::OrbitAcpClient for Client {
+    async fn read_byte_range(&self, path: &Path, offset: u64, max_bytes: u64) -> Result<String> {
+        ensure!(
+            self.byte_reads.load(std::sync::atomic::Ordering::Relaxed),
+            "byte reads not negotiated"
+        );
+        let result: serde_json::Value = self
+            .call(
+                "fs/read_text_file",
+                serde_json::json!({"path":path,"offset":offset,"max_bytes":max_bytes}),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("Orbit byte read failed"))?;
+        Ok(result.to_string())
+    }
+    async fn atomic_shell(&self, command: &str, cwd: &Path) -> Result<Option<String>> {
+        if !self.atomic_shell.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let result: serde_json::Value = self
+            .call(
+                "orbit/shell",
+                serde_json::json!({"command": "sh", "args": ["-c", command], "cwd": cwd}),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("Orbit confined shell failed"))?;
+        Ok(Some(result.to_string()))
+    }
+
     async fn create_directory(&self, path: &Path, recursive: bool) -> Result<String> {
         let res: serde_json::Value = self
             .call(
@@ -531,6 +561,8 @@ pub async fn run(
     let client = Client {
         wire: Mutex::new(client),
         active_invocation: StdMutex::new(None),
+        atomic_shell: std::sync::atomic::AtomicBool::new(false),
+        byte_reads: std::sync::atomic::AtomicBool::new(false),
     };
     let mut initialized = false;
     let mut session: Option<(String, String, std::path::PathBuf)> = None;
@@ -557,6 +589,14 @@ pub async fn run(
         let params = &message["params"];
         let result = match message["method"].as_str() {
             Some("initialize") => {
+                client.byte_reads.store(
+                    params["clientCapabilities"]["_meta"]["orbit"]["byteReads"] == true,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                client.atomic_shell.store(
+                    params["clientCapabilities"]["_meta"]["orbit"]["atomicShell"] == true,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 ensure!(
                     !initialized && params["protocolVersion"] == 1,
                     "unsupported ACP initialize"
@@ -951,6 +991,8 @@ mod tests {
         let client = Client {
             wire: Mutex::new(Wire::new(tokio::io::empty(), writer, 4096)),
             active_invocation: StdMutex::new(None),
+            atomic_shell: std::sync::atomic::AtomicBool::new(false),
+            byte_reads: std::sync::atomic::AtomicBool::new(false),
         };
         let invocation = crate::acp_wire::OrbitToolInvocationMeta::new(
             "oti-cancel-test",

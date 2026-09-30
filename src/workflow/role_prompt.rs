@@ -145,8 +145,13 @@ pub(crate) fn build_role_prompt(
             task_text = task_text,
         ),
     };
+    let prompt = if advertised_tools.iter().any(|tool| tool == "shell") {
+        prompt.replace("Terminal execution is unavailable in this assignment. That does not prevent implementation: use the advertised Orbit mutation callbacks.", "Terminal execution is available through the advertised Orbit shell callback in a confined developer-local workspace without host credentials or network.")
+    } else {
+        prompt
+    };
     let prompt = format!(
-        "{prompt}\n\nORBIT TOOLS ADVERTISED TO THIS ROLE: {tool_list}\n\nFile reads are bounded pages. Read result metadata is under `_meta.orbit` and includes `truncated`, `total_bytes`, and `next_line`; when truncated, repeat the same read with `line` set to `next_line`. The `line` argument is a 1-based line number and `limit`, when supplied, is a maximum line count."
+        "{prompt}\n\nORBIT TOOLS ADVERTISED TO THIS ROLE: {tool_list}\n\nFile reads are bounded pages. Read result metadata is under `_meta.orbit` and includes `bytes_returned`, `total_size`, `truncated`, `next_offset`, and `next_line`; when truncated, repeat the same read with `line` set to `next_line`. The `line` argument is a 1-based line number and `limit`, when supplied, is a maximum line count. For very long lines, use `offset` and `max_bytes` (mutually exclusive with line/limit) and continue from `next_offset`. Prefer search followed by a targeted range read."
     );
     let prompt = if role.role_id == "reviewer" {
         format!(

@@ -124,7 +124,11 @@ fn dynamic_tools(names: &[String]) -> Result<Vec<Value>> {
     crate::coding_agent::tool_definitions(names).map(|definitions| {
         definitions
             .into_iter()
-            .map(|tool| {
+            .map(|mut tool| {
+                if tool["name"] == "read_file" {
+                    tool["parameters"]["properties"]["offset"] = json!({"type":"integer","minimum":0,"description":"Negotiated Orbit byte offset; mutually exclusive with line/limit."});
+                    tool["parameters"]["properties"]["max_bytes"] = json!({"type":"integer","minimum":4,"maximum":65536});
+                }
                 json!({"type":"function", "name":format!("orbit_{}", tool["name"].as_str().unwrap()),
                     "description":tool["description"], "inputSchema":tool["parameters"], "deferLoading":false})
             })
@@ -145,6 +149,17 @@ pub struct ToolCall {
 
 #[async_trait::async_trait(?Send)]
 pub trait OrbitAcpClient: acp::Client {
+    async fn read_byte_range(&self, path: &Path, offset: u64, max_bytes: u64) -> Result<String> {
+        let _ = (path, offset, max_bytes);
+        anyhow::bail!("byte reads unsupported by client")
+    }
+    /// A negotiated single callback keeps a shell invocation correlated with
+    /// exactly one audited repository operation. Older clients retain ACP's
+    /// terminal lifecycle protocol.
+    async fn atomic_shell(&self, command: &str, cwd: &Path) -> Result<Option<String>> {
+        let _ = (command, cwd);
+        Ok(None)
+    }
     async fn create_directory(&self, path: &Path, recursive: bool) -> Result<String> {
         let _ = (path, recursive);
         anyhow::bail!("create_directory unsupported")
@@ -307,10 +322,48 @@ impl ToolRouter {
                 false
             )?);
         }
-        crate::coding_agent::tool_command(tool, &arguments, 1)?;
+        let mut validation_arguments = arguments.clone();
+        if tool == "read_file" && arguments.get("offset").is_some() {
+            ensure!(
+                arguments.get("line").is_none() && arguments.get("limit").is_none(),
+                "mixed file read ranges"
+            );
+            ensure!(
+                arguments["offset"].as_u64().is_some()
+                    && arguments.get("max_bytes").is_none_or(|value| value
+                        .as_u64()
+                        .is_some_and(|size| (4..=65536).contains(&size))),
+                "invalid byte read range"
+            );
+            validation_arguments
+                .as_object_mut()
+                .unwrap()
+                .remove("offset");
+            validation_arguments
+                .as_object_mut()
+                .unwrap()
+                .remove("max_bytes");
+        }
+        crate::coding_agent::tool_command(tool, &validation_arguments, 1)?;
         self.seen.insert(call.call_id);
         let text = match tool {
             "read_file" => {
+                if let Some(offset) = arguments.get("offset").and_then(Value::as_u64) {
+                    let result = client
+                        .read_byte_range(
+                            &self.workspace.join(arguments["path"].as_str().unwrap()),
+                            offset,
+                            arguments
+                                .get("max_bytes")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(8192),
+                        )
+                        .await?;
+                    ensure!(result.len() <= 65536, "file response too large");
+                    return Ok(
+                        json!({"contentItems":[{"type":"inputText","text":result}],"success":true}),
+                    );
+                }
                 let line = optional_positive_u32(&arguments, "line")?;
                 let limit = optional_positive_u32(&arguments, "limit")?;
                 let response = client
@@ -380,8 +433,12 @@ impl ToolRouter {
                 client.delete_directory(&path, recursive).await?
             }
             "shell" => {
-                self.shell(client, arguments["command"].as_str().unwrap())
-                    .await?
+                let command = arguments["command"].as_str().unwrap();
+                if let Some(result) = client.atomic_shell(command, &self.workspace).await? {
+                    result
+                } else {
+                    self.shell(client, command).await?
+                }
             }
             "list_directory" => {
                 let path = self.workspace.join(arguments["path"].as_str().unwrap());

@@ -2,7 +2,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use std::ffi::{CString, OsStr};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
@@ -552,6 +552,71 @@ pub fn read_text_confined(repo_path: &Path, path_str: &str) -> Result<String> {
     let root = RootedRepo::open(repo_path)?;
     let relative = root.relative(path_str)?;
     Ok(String::from_utf8(root.read_file(&relative)?)?)
+}
+
+pub fn read_text_confined_bounded(
+    repo_path: &Path,
+    path_str: &str,
+    max_bytes: u64,
+) -> Result<String> {
+    let root = RootedRepo::open(repo_path)?;
+    let relative = root.relative(path_str)?;
+    let (parent, leaf) = root.open_parent(&relative, false)?;
+    let file = RootedRepo::open_child(&parent, OsStr::from_bytes(leaf.as_bytes()), libc::O_RDONLY)?;
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.is_file(),
+        "repository target is not a regular file"
+    );
+    if metadata.len() > max_bytes {
+        return Err(crate::tools::budget::ToolBudgetExhausted.into());
+    }
+    let mut bytes = Vec::new();
+    file.take(max_bytes).read_to_end(&mut bytes)?;
+    Ok(String::from_utf8(bytes)?)
+}
+
+/// Byte offsets permit progress even when a file contains a very long line.
+/// The descriptor is opened beneath the repository before metadata or reads.
+pub fn read_text_byte_range(
+    repo_path: &Path,
+    path_str: &str,
+    offset: u64,
+    max_bytes: usize,
+) -> Result<(String, u64, usize)> {
+    ensure!(
+        (4..=65536).contains(&max_bytes),
+        "INVALID_REQUEST: invalid byte read size"
+    );
+    let root = RootedRepo::open(repo_path)?;
+    let relative = root.relative(path_str)?;
+    let (parent, leaf) = root.open_parent(&relative, false)?;
+    let mut file =
+        RootedRepo::open_child(&parent, OsStr::from_bytes(leaf.as_bytes()), libc::O_RDONLY)?;
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.is_file() && offset <= metadata.len(),
+        "INVALID_REQUEST: invalid file offset"
+    );
+    file.seek(SeekFrom::Start(offset))?;
+    let mut bytes = Vec::new();
+    file.take(max_bytes as u64).read_to_end(&mut bytes)?;
+    let bytes_read = bytes.len();
+    let length = match std::str::from_utf8(&bytes) {
+        Ok(_) => bytes.len(),
+        Err(error)
+            if error.error_len().is_none() && offset + (bytes.len() as u64) < metadata.len() =>
+        {
+            error.valid_up_to()
+        }
+        Err(_) => anyhow::bail!("INVALID_REQUEST: file offset or content is not UTF-8"),
+    };
+    ensure!(
+        length > 0 || offset == metadata.len(),
+        "INVALID_REQUEST: no UTF-8 progress"
+    );
+    bytes.truncate(length);
+    Ok((String::from_utf8(bytes)?, metadata.len(), bytes_read))
 }
 
 pub fn write_text_confined(repo_path: &Path, path_str: &str, content: &str) -> Result<()> {
