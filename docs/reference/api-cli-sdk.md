@@ -1,9 +1,9 @@
 # API, CLI and SDK contract
 
-Phase 3 adds journal streaming, JSONL and reusable worker transports. It preserves
+The API supports journal streaming, JSONL and reusable worker transports. It preserves
 the existing unprefixed HTTP routes, `orbit/v0` worker protocol and both definition
 versions. YAML and JSON definitions use the same parser and validation rules.
-Phase 4 also supports `container.run` through the same transports. See the
+It also supports `container.run` through the same transports. See the
 [compute contract](compute-artifacts.md) for resources, pools and provider
 metadata. The [private registry](packages.md) now supports signed
 capability descriptors and packaged definitions; worker provisioning remains
@@ -36,7 +36,7 @@ and the optional static `/console/` assets are public. Coarse `/healthz` and
 credentials are distinct. Operator routes are `/runs` (GET/POST), `/runs/{id}` (GET),
 `/runs/{id}/events` (GET), `/runs/{id}/events/stream` (GET),
 `/runs/{id}/cancel` (POST), `/runs/{id}/signals` (POST), and `/limits` (GET/POST).
-Phase 4 adds operator `GET /workers` and `GET /queues` with corresponding CLI
+Operator routes also include `GET /workers` and `GET /queues` with corresponding CLI
 commands. Worker capacity and pool membership come from server configuration.
 Worker routes are `/worker/register`, `/worker/claim`, `/worker/operate`,
 `/worker/upload` (POST) and `/worker/runs/{run}/attempts/{attempt}` (GET).
@@ -225,7 +225,7 @@ committed while the server is down.
 These tests do not establish streaming throughput, browser compatibility, or SDK
 package publication. SDK packages remain local source artifacts.
 
-Phase 3 qualification is complete; the full case mapping, runtime/fixture fixes,
+Historical interface qualification, the full case mapping, runtime/fixture fixes,
 verified evidence export and final concurrent/serial results are recorded in
 [Phase 3 qualification](../archive/phase-3-qualification.md). The built-in Rust runtime uses
 the server's remaining-lease duration receipts as described in the

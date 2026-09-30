@@ -5,7 +5,7 @@ Orbit provides this ACP v1 initialization probe separately from the experimental
 installed agent. The
 [Codex compatibility record](../operations/acp-codex-compatibility.md) explains
 the maintained adapter's tool-routing gap and Orbit's Codex bridge; the
-[implementation plan](../development/acp-implementation-plan.md) tracks next work.
+[adapter qualification](../development/acp-qualification.md) defines adapter acceptance.
 
 `orbit acp-probe` verifies pinned installation files, launches the configured
 command in a fresh private directory, and sends only `initialize`. It advertises

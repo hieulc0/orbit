@@ -10,7 +10,7 @@ the original kernel subset, not the complete current product.
 > Orbit coordinates one real repository change from request to tested patch,
 > survives deliberate interruption, and makes every recovery decision understandable.
 
-This document specifies the milestone subset of the
+This document specifies the `orbit/v0` subset of the
 [architecture vision](../architecture/vision.md). The normative words MUST,
 MUST NOT, and SHOULD describe implementation requirements. Companion contracts:
 [states](state-machines.md), [workers](worker-protocol.md), and
@@ -29,9 +29,8 @@ repository revision + bounded task
 The kernel supports sequential dependencies, immutable plans, leases, attempts,
 bounded retries, deadlines, cancellation, artifacts, and recovery. It does not
 require fan-out, merge integration, agent review, approval workflows, deployment,
-MCP, a web UI, a registry, or general durable workflow code. No Rust implementation
-is prescribed by this specification; the current implementation is tracked in
-[implementation status](../archive/implementation-status-2026-09-12.md).
+MCP, a web UI, a registry, or general durable workflow code. The
+[current architecture](../architecture/README.md) maps these contracts to their owners.
 
 ## Definition and accepted run
 
@@ -49,7 +48,7 @@ logical contract MUST contain:
 | test commands | Explicit argument arrays, working directory relative to workspace, per-command timeout |
 
 The v0 shape is illustrated below. The revision value is a placeholder that MUST
-be replaced before submission. Inputs are literal values in this milestone;
+be replaced before submission. Inputs are literal values in `orbit/v0`;
 there is no expression language or implicit environment-variable interpolation.
 
 ```yaml
@@ -82,7 +81,7 @@ steps:
 ```
 
 All illustrated fields are required except `needs`, which is prohibited on `code`
-and must be exactly `[code]` on `test`. The milestone accepts exactly these two
+and must be exactly `[code]` on `test`. The v0 schema accepts exactly these two
 step IDs and capabilities. Unknown fields are rejected. Attempt and timeout
 values are positive integers; backoff is a nonnegative integer. Commands are a
 nonempty list with nonempty string argument arrays and workspace-relative paths
@@ -127,7 +126,7 @@ creation and execution. Workspace IDs MUST be unique per attempt. A retry MUST
 NOT reuse the mutable workspace of an earlier attempt, even on the same worker.
 The developer's checkout MUST NOT be used as an attempt workspace.
 
-For milestone 1, a coding result is a patch against `base_revision`, with a
+In `orbit/v0`, a coding result is a patch against `base_revision`, with a
 manifest containing its checksum, producing attempt, and changed paths. Binary
 changes MUST be representable; untracked output files intended as changes MUST
 be included. The worker rejects unsupported patch content explicitly. An empty
@@ -185,7 +184,7 @@ automatic restart or resume and requires intervention. Unknown failure categorie
 also require intervention. Deadline or budget exhaustion terminates the task as
 failed, recording any unresolved uncertainty explicitly.
 
-In milestone 1, intervention is resolved by cancelling the run and submitting a
+For this kernel contract, intervention is resolved by cancelling the run and submitting a
 new run with an explicit reference to the interrupted run and corrected inputs
 or configuration. Editing an active plan, adopting a late result, manually
 marking a task successful, and in-place manual retry are out of scope. This
@@ -218,7 +217,7 @@ Already committed successes and their artifacts remain intact.
 Artifact bytes live in durable storage outside PostgreSQL; metadata records their
 checksum, size, type, base revision where relevant, and exact producing attempt.
 An upload MUST become immutable and durable before its reference is accepted.
-The local milestone provider must survive both worker and server replacement;
+The local artifact provider must survive both worker and server replacement;
 worker scratch storage alone is insufficient.
 
 Uploading bytes does not complete a task. If upload succeeds and completion does

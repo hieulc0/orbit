@@ -1,19 +1,25 @@
 # Rust subsystem ownership
 
-This ownership map relates the established library paths at checkpoint
-`14769c6083b0ac47d4ba6c77a773b6040a9d0267` to their subsystem files. Physical
-movement and its [qualification](../operations/r5-modularization-report.md) are complete. Existing
-[architecture invariants](README.md#invariants-to-preserve) continue to apply.
+Each module has a domain owner. Public compatibility paths remain available;
+physical namespaces do not change database, workflow or policy authority.
+[Architecture invariants](README.md#invariants-to-preserve) apply across all owners.
 
-The folders below express responsibility rather than introducing new runtime
-boundaries. State machines, database tables, serialized types and digests,
-provider selection, policy authority, callback fencing, and cleanup retain
-their current semantics. No new crate or generic abstraction is required.
+## Interactive workflows
 
-## Ownership and destination
+| Owner | Modules | Responsibility |
+| --- | --- | --- |
+| ACP | `acp/editor.rs`, `acp/service.rs` | Client protocol/presentation and coordinator-backed sessions |
+| Execution | `execution/local.rs`, `execution/worktree.rs` | Confined exploratory terminals and managed candidate actions |
+| Execution | private `execution/process.rs` | Bounded native coordinator process capture |
+| Tools | `tools/budget.rs` | Role resource admission and usage |
+| Workflow | `workflow/flow.rs`, `workflow/reasoning.rs` | Immutable skill policy and external reasoning/acceptance contracts |
 
-Each existing module has one owner. The destination is a navigation
-change; moving a module does not move authority to a different component.
+Integration targets follow the same ownership: `editor_qualification`,
+`developer_local`, and `role_budget`.
+
+## Modules and compatibility paths
+
+Each library module has one owner. Compatibility exports preserve established callers.
 
 | Owner | Established library path | File and responsibility |
 | --- | --- | --- |
@@ -86,8 +92,7 @@ direction. The generic ACP broker remains separate from the Codex bridge.
 Explicit subsystem `mod.rs` files define the public module surface. Root modules such as
 `orbit::acp_runtime` and `orbit::workflow_coordinator` are already consumed by
 integration tests, the CLI, examples, and SDK clients. Preserve those paths with
-explicit re-exports during physical movement rather than making file layout an
-unannounced API break.
+explicit compatibility re-exports; file layout must not create an unannounced API break.
 
 The current `orbit::acp`, `orbit::workflow`, `orbit::verification`,
 `orbit::execution`, and `orbit::telemetry` paths also expose domain items.
@@ -101,7 +106,7 @@ documented. Removing a supported root path requires a separate compatibility
 decision. Module moves must not rename serialized types, table fields, policy
 identifiers, or persisted evidence values.
 
-## Test ownership and migration
+## Test ownership
 
 | Owner | Existing integration targets |
 | --- | --- |
@@ -119,19 +124,11 @@ Tests mirror production ownership where it improves navigation. Explicit
 retain their meaning. Relative fixture/example includes and shared test support
 paths follow their new locations. The mixed kernel harness remains together: its database,
 worker, deployment and fault cases intentionally qualify shared control-plane
-behavior. Qualification names remain explicit after movement.
+behavior. Qualification names remain explicit for traceability.
 
-## Movement and qualification
+## Qualification obligations
 
-Move ACP, workflow, verification, credentials/providers, then execution/tools.
-Apply the remaining control-plane and telemetry ownership without changing
-behavior. Update test locations, compatibility exports, current architecture
-links and contributor guidance afterward. Historical results remain historical;
-repair source links without upgrading old evidence claims.
-
-Review include paths, source-inspection assertions, fixture paths, image build
-inputs, and test filters as part of each move. The final qualification includes
-formatting, Clippy, all regular tests, documentation links, and the applicable
-explicit disposable B1–B6/ACP cases. Live-provider calls remain separately
-guarded. A compiling namespace or generic ignored-test count alone does not
-close R5 acceptance.
+Changes to shared execution ownership require regular checks and relevant disposable
+PostgreSQL/process qualification. Preserve legacy digest fixtures, compatibility
+exports, fencing, callback correlation and cleanup. Historical reports retain their
+original scope; current results are recorded separately in qualification evidence.

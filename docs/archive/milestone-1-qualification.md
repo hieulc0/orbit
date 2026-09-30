@@ -1,7 +1,7 @@
 # Milestone 1 Qualification: Request to Tested Patch
 
 Status: acceptance specification. A first kernel and executable qualification
-tests now exist; see [implementation status](implementation-status-2026-09-12.md). The full
+tests now exist; see [current architecture](../architecture/README.md). The full
 acceptance gate and Orbit-on-Orbit dogfooding are not yet declared complete.
 
 > Orbit coordinates one real repository change from request to tested patch,

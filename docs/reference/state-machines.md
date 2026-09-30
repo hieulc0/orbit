@@ -1,4 +1,4 @@
-# Milestone 1 State Machines
+# Engine and workflow state machines
 
 Status: implementation specification. Scope and recovery policies are defined in
 [engine semantics](engine-semantics.md). All transitions below are persisted with
@@ -12,7 +12,7 @@ Graph success requires all tasks to succeed. See [graph execution](graphs.md)
 and [durable interaction](timers-signals.md) for v1 transitions and races.
 Child/fan-out tasks also follow `PENDING → WAITING → SUCCEEDED`, with deadline
 failure or child intervention/failure propagation. Empty fan-out can complete in
-the same activation transaction. See [Phase 2 execution](children-limits.md).
+the same activation transaction. See [child-run execution](children-limits.md).
 
 ## Run states
 
@@ -126,3 +126,19 @@ time, not network arrival order or a worker-supplied timestamp.
 
 These invariants are the oracles for the
 [qualification suite](../archive/milestone-1-qualification.md), not merely UI conventions.
+
+## Role workflows and external acceptance
+
+Role workflows use their own fenced coordinator stages, separate from the graph
+run/task states above. Skill flows pin immutable policy; read-only analysis can
+complete from PLANNING only with a matching successful handoff and unchanged
+candidate. Mutation flows retain implementation, verification, review, repair
+and regression. See [interactive execution](../guides/interactive-execution.md).
+
+A frozen external contract changes the final transition to
+`REGRESSION → BUSINESS_ACCEPTANCE → COMPLETED`. Technical evidence is checked
+before entering BUSINESS_ACCEPTANCE. BA attestation must bind the exact frozen
+contract, all criteria and the reviewed/verified WorkspaceState. The coordinator
+rechecks disk identity and completion evidence before COMPLETED. Cancellation
+and failure remain available from nonterminal stages; attestation does not grant
+mutation authority. See [external reasoning](../guides/external-reasoning.md).

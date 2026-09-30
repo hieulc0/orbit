@@ -7,7 +7,7 @@ qualification are complete. Real Codex / generic ACP workflows, the shared fault
 regression and pinned-baseline dogfood have passed. Live acceptance and later
 named adapters are **not complete**. See [setup](../guides/acp-coding.md),
 [architecture](../architecture/acp-agent-integration.md) and
-[delivery gates](../development/acp-implementation-plan.md).
+[delivery gates](../development/acp-qualification.md).
 
 ## Selected components and source evidence
 

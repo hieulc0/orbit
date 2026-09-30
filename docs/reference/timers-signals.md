@@ -112,4 +112,4 @@ The standard PostgreSQL/process suite includes:
 
 Evidence is retained under `target/qualification` when configured. Review it
 before sharing. Dynamic fan-out, child runs, and concurrency/admission limits are
-documented in [Phase 2 execution](children-limits.md).
+documented in [child-run execution](children-limits.md).

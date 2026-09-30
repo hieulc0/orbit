@@ -1,28 +1,34 @@
-# Agent onboarding
+# Contributor and agent onboarding
 
-AGENTS.md is the repository entry point: it links the current architecture,
-priorities and tests. Start there; no previous conversation or full vision read
-is required for ordinary implementation. Follow the reference relevant to the
-requested behavior and inspect the owning module/tests before editing.
+Read [repository instructions](../../AGENTS.md), then the
+[current architecture](../architecture/README.md) and [roadmap](../ROADMAP.md).
+Use the reference for the requested behavior and inspect its owning module and
+tests. Current contracts and qualification scope must be understandable without
+prior conversations or implementation plans.
 
-Two small workflow skills are authored in [skills/](../../skills/):
+## Repository skills
 
-- [orbit-development](../../skills/orbit-development/SKILL.md)
-- [orbit-qualification](../../skills/orbit-qualification/SKILL.md)
+- [orbit-development](../../skills/orbit-development/SKILL.md): implementation and review contracts.
+- [orbit-qualification](../../skills/orbit-qualification/SKILL.md): disposable qualification and evidence review.
 
-They deliberately reference canonical docs and scripts rather than copy them.
-Their names/descriptions identify when they apply; essential invariants remain
-in AGENTS.md and are not conditional on skill selection.
+Skills refer to canonical docs and scripts. They do not introduce a separate
+source of runtime authority. Where the local agent supports repository skill
+discovery, configure the existing skill directories using its documented setup;
+do not overwrite an existing installation.
 
-Codex discovers repository skills under `.agents/skills`. The development
-environment used for this increment protects `.agents` as read-only even after
-a scoped write approval, so automatic installation was not performed. In a normal
-writable checkout, create `.agents/skills`, then link each skill directory, e.g.
-`ln -s ../../skills/orbit-development .agents/skills/orbit-development` and the
-equivalent for `orbit-qualification`. Do not overwrite an existing installation.
-Alternatively invoke the source skill by its explicit path. Keep `.codex/` local.
+## Working notes
 
-See official [repository instructions](https://learn.chatgpt.com/docs/agent-configuration/agents-md)
-and [skill discovery](https://learn.chatgpt.com/docs/build-skills). Test onboarding
-by starting a fresh session and asking it to locate a contract, the relevant
-test command and the current unverified gates; it should not need milestone history.
+Temporary plans, investigations, implementation notes, agent scratch material and
+execution checklists belong in the Git-ignored `.local/` directories:
+
+```text
+.local/
+  plans/
+  investigations/
+  implementation/
+```
+
+After implementation, extract durable architecture, contracts, invariants,
+operating procedures and rationale into `docs/`. Retain task/milestone identifiers
+only for intentional requirements, qualification, migration or compatibility
+traceability. Do not copy a completed plan into documentation as project history.

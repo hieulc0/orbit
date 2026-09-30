@@ -3,7 +3,7 @@
 This document describes implemented, optional governance capabilities. Existing
 scopes, roles, principal types, policies and checks remain supported. Expanding
 tenant hierarchy, identity administration or SSO is outside the current remote
-coding milestone, which must also work with governance disabled.
+repository workflow, which must also work with governance disabled.
 
 ## Ownership and credential scope
 

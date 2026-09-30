@@ -50,7 +50,7 @@ target/debug/orbit server \
   --artifacts /absolute/path/to/durable-artifacts
 ```
 
-The default listener is loopback port 7700. Keep it on loopback for this milestone;
+The default listener is loopback port 7700. Keep it on loopback for the supported local deployment;
 the server does not supply TLS. Workers must be able to read the configured local
 repository path. Artifact bytes are uploaded to the server; its artifact directory
 must survive process replacement and must not be worker scratch storage.
@@ -150,7 +150,7 @@ SHA-256 and size. Original evidence remains untouched.
 Review command arguments, repository content, and artifact bytes before sharing:
 field redaction does not detect arbitrary embedded secrets. The export retains
 the original plan digest for attribution; a redacted plan is not a replacement
-executable plan. This command does not certify milestone acceptance.
+executable plan. This command does not establish workflow acceptance.
 
 This runner is for trusted local commands. It clears inherited environment
 variables, provides an attempt-specific HOME, uses separate Git clones, checks
@@ -251,7 +251,7 @@ orbit set-limits --max-active-roots 128 --max-running-attempts 64 --max-attempts
 Inspect child IDs from the parent's tasks with `orbit inspect CHILD_RUN_ID`.
 Limits are shared across servers and require the operator credential to change.
 At capacity, root submissions return HTTP 429 and can be retried using the same
-request ID. See [Phase 2 execution](../reference/children-limits.md) for exact semantics.
+request ID. See [child-run execution](../reference/children-limits.md) for exact semantics.
 
 Stop old server/worker binaries before starting this version. Startup applies
 `0002_coordination.sql` through `0006_operations.sql` additively and preserves

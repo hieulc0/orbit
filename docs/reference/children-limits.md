@@ -1,6 +1,6 @@
-# Phase 2: child runs, fan-out, and scheduling limits
+# Child runs, fan-out and scheduling limits
 
-Phase 2 completes the bounded durable interaction layer alongside
+Bounded durable interaction includes child runs and fan-out alongside
 [graphs](graphs.md) and [timers/signals](timers-signals.md).
 The executable qualification mapping is in [Phase 2 qualification](../archive/phase-2-qualification.md).
 

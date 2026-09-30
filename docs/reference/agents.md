@@ -92,7 +92,7 @@ bounds are checked after storage verification and again under lease ownership.
 
 The experimental [ACP worker](../guides/acp-coding.md) is implemented alongside
 Responses and command runtimes. The [preflight](../guides/acp-preflight.md),
-[implementation plan](../development/acp-implementation-plan.md) and
+[adapter qualification](../development/acp-qualification.md) and
 [Codex compatibility record](../operations/acp-codex-compatibility.md) distinguish
 implemented behavior, observed offline workflows and remaining live/failure gates.
 
@@ -229,9 +229,10 @@ contracts. It does not provide HTTP MCP, sampling, subscriptions or task extensi
 
 ## Qualification
 
-Five regular tests in `tests/execution/agents.rs` cover binding restrictions, immutable
+Regular tests in `tests/execution/agents.rs` cover binding restrictions, immutable
 digests, reservation bounds/replay, report provenance and MCP lifecycle/input
-validation, including a real stdio process. Four PostgreSQL/process cases in `tests/kernel/phase5.rs` pass:
+validation, including a real stdio process. PostgreSQL/process cases in
+`tests/kernel/phase5.rs` cover these invariants:
 
 | Case | Evidence |
 | --- | --- |
@@ -240,11 +241,8 @@ validation, including a real stdio process. Four PostgreSQL/process cases in `te
 | `approval_authorization_early_denial_deadline_and_cancellation` | Actual HTTP identity checks, approval-only credentials, early denial, expiry and cancellation |
 | `agent_runtime_survives_server_worker_kills_without_resetting_budget` | Real Python SDK runtime and server kills, fresh second workspace, retained 200-token reservation total, report/log publication and MCP API inspection |
 
-All four database cases passed together on 2026-09-12 in 4.25 seconds. The first
-qualification run found a missing scheduler capability allowlist entry; later
-fixture fixes used the documented retryable failure code and recognized human
-steps as worker-free. No production limits were relaxed. Evidence is under
-`target/qualification-phase5`; the complete release suite also passes all 41
-cases. See [release qualification](../archive/release-qualification-2026-09-12.md) for export review.
+Historical results and reviewed exports are in
+[release qualification](../archive/release-qualification-2026-09-12.md). Current checks
+must use the disposable prerequisites; a test's presence is not evidence it passed.
 These tests use a
 deterministic local agent, not a paid model, provider billing or hostile tooling.

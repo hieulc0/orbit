@@ -3,9 +3,7 @@
 Status: experimental worker implementation, 2026-09-14. Codex and generic ACP
 offline workflows and the final local fault regression have passed; live-account /
 separate-host acceptance remains open. See [current evidence](../operations/acp-codex-compatibility.md),
-[setup](../guides/acp-coding.md) and the [delivery gates](../development/acp-implementation-plan.md).
-This design applies the user-provided `acp-orbit-agent-integration.md` to Orbit's
-existing architecture at baseline `f7f9b177a1ff64de6152b738b9913857aa1d2907`.
+[setup](../guides/acp-coding.md) and the [delivery gates](../development/acp-qualification.md).
 Existing Responses/command workflows and immutable legacy plan digests remain intact.
 
 ## Boundaries and ownership
@@ -13,8 +11,7 @@ Existing Responses/command workflows and immutable legacy plan digests remain in
 ACP is a worker-to-agent protocol, not a second workflow engine or authorization
 service. PostgreSQL owns accepted plans, reservations, receipts, session records
 and artifacts. Provider computation is externally uncertain, never implicitly
-exactly-once. Delivery order is Codex, official Antigravity ACP, then maintained
-Claude ACP; each real agent needs independent mediation and account evidence.
+exactly-once. Each real agent needs independent mediation and account evidence.
 
 ```text
 Authenticated API → Engine operations → PostgreSQL accepted state
@@ -114,6 +111,16 @@ file operations. Ownership loss/cancellation is watched by the existing outer
 worker loop and drops the entire ACP future; it does not wait behind a terminal
 callback. A turn timeout sends a bounded cancel notification and closes transport.
 Execution/drain grace and cleanup limits remain separate from a model's response.
+
+## Session ownership and interleaved messages
+
+After `session/new` returns an ID, establish broker ownership before model or mode
+selection. While awaiting a response, accept legitimate updates and callbacks for
+that exact session under normal policy, then continue waiting for the matching
+response ID. A notification cannot complete a request. Foreign sessions and genuine
+response-ID mismatches remain integrity errors. Consuming the correct response keeps
+later requests from seeing stale replies. Exact model activation is verified before
+prompting; initialization or a capability manifest alone cannot establish it.
 
 ## Codex bridge
 

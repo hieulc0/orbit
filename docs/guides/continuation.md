@@ -1,238 +1,83 @@
-# Cross-agent continuation and workspace snapshots
+# Continuation contracts and workspace snapshots
 
-Orbit provides cross-agent continuation and automated fallback to allow multi-agent
-collaboration and recovery within a single execution attempt. When an initial
-agent reaches a turn budget, hits provider rate or quota limits, or leaves an
-implementation that fails external validation, Orbit can seamlessly transition the
-task to a fallback agent without discarding intermediate work.
+Orbit's continuation module provides provider-neutral records and pure decisions for
+bounded execution chains. These helpers do not themselves launch a provider or commit
+workflow transitions. The graph engine does not invoke `next_agent` or
+`continuation_recovery_action`; automatic production role continuation is not implemented.
+The workflow coordinator's bounded review/repair loop and runtime selection are
+separate behaviors. See [workflow authority](../architecture/self-development-control-plane.md)
+and [interactive execution](interactive-execution.md).
 
-Orbit owns the durable execution state and workspace lifecycle, treating individual
-agents (such as Antigravity, Codex, or generic ACP agents) as replaceable execution
-engines.
+## Ownership and identity
 
----
+An Attempt owns its workspace and can record sequential AgentExecutions. A receiving
+execution uses the same candidate only after an authorized handoff, drift check and
+confirmed prior cleanup. At most one mutating execution owns the candidate. Provider
+credentials remain isolated; an auth lease cannot be reused while cleanup is uncertain.
+A new Attempt retry starts from its declared immutable inputs and is distinct from
+continuation within an Attempt.
 
-## Core architecture and concepts
+Workspace snapshots are read-only. They record the immutable baseline, observed HEAD,
+changed/added/deleted/untracked paths and binary diff digest. Snapshotting must not run
+reset, checkout or clean. Legacy snapshot identity encoding is preserved; authoritative
+disk verification additionally uses the [candidate identity contract](../reference/verification.md).
 
-### Attempt workspace ownership
-In Orbit, an **Attempt** owns the workspace for its entire lifetime. An attempt
-sequences one or more `AgentExecution` records (`sequence = 1, 2, …`) across
-different agent types and providers operating within the exact same workspace.
+## Outcomes and triggers
 
-- **Workspace retention**: Files created, modified, or deleted by previous agents
-  are preserved in place in the attempt working directory.
-- **Credential isolation**: Agent credential leases are strictly scoped to the active
-  agent invocation. When an agent terminates, its authentication lease is released
-  before the fallback agent acquires its own isolated credentials.
-- **Bounded execution**: Multi-agent continuation is bounded by `max_executions`
-  (default: 2) to prevent runaway retry loops.
+NormalizedAgentResult separates provider/runtime termination from external validation.
+FallbackPolicy is explicitly opt-in (`enabled: false` by default). Eligible configured
+triggers can include turn limits, rate limits, quota exhaustion, timeout, agent errors
+and validation failure. Cancellation, credential/infrastructure errors, process crashes
+and unresolved external effects retain their safety semantics. Eligibility is a proposal
+for the owner to evaluate, not permission to bypass fencing or redispatch uncertainty.
 
-```
-                  ┌──────────────────────────────────────────────────┐
-                  │                 Orbit Attempt                    │
-                  │  (Owns workspace, lifecycle, and verification)  │
-                  └──────────┬───────────────────────────┬───────────┘
-                             │                           │
-                   Sequence 1│                 Sequence 2│
-                             ▼                           ▼
-                     ┌───────────────┐           ┌───────────────┐
-                     │ Primary Agent │           │Fallback Agent │
-                     │ (Antigravity) │           │    (Codex)    │
-                     └───────┬───────┘           └───────▲───────┘
-                             │                           │
-                    TurnLimit / 429 /                    │ Handoff Record
-                    ValidationFailure                    │ & Prompt
-                             │                           │
-                             ▼                           │
-                     ┌───────────────────────────────────┴───┐
-                     │       Orbit Snapshot & Handoff        │
-                     │  - Non-destructive workspace snapshot │
-                     │  - Failure fingerprinting             │
-                     │  - Provider-neutral prompt synthesis  │
-                     └───────────────────────────────────────┘
-```
+FallbackPolicy bounds execution count and identifies a fallback agent. ContinuationPolicy
+uses ordered AgentCandidates, configured triggers, an execution bound and a same-failure
+repetition bound. Candidate count and execution count are distinct: configured candidates
+do not grant unlimited invocations. Runtime/model/reasoning/credential authorization
+still applies to every proposed execution.
 
----
+## Failure fingerprints
 
-## Fallback triggers and error normalization
+ValidationSummary can retain a deterministic FailureFingerprint (`validation/v1`).
+Normalization removes volatile ANSI, timestamp, path and line/column details while
+preserving failure identity. Fingerprint schema version is part of identity. Changing
+failure content must not collapse into the same fingerprint merely because volatile
+formatting was removed. Repetition can guide candidate progression or stop an exhausted
+chain, but cannot establish success. A passing authoritative check and accepted candidate
+are still required.
 
-### Normalized termination reasons
-When an agent exits or encounters an error, the runtime adapter normalizes the outcome
-into a `NormalizedAgentResult` with a machine-readable `TerminationReason`:
+## Handoffs
 
-| Termination reason | Description | Eligible for fallback? |
-| :--- | :--- | :--- |
-| `turn_limit` | Agent exhausted configured ACP turn timeout or prompt turn limits | **Yes** |
-| `rate_limited` | Temporary HTTP 429 (requests/tokens per minute, retry-after) | **Yes** |
-| `quota_exhausted` | Provider account quota or monthly usage limit exhausted | **Yes** |
-| `resource_exhausted` | Ambiguous backend resource exhaustion (e.g., gRPC code 8) | **Yes** |
-| `timeout` | Session initialization or prompt response timeout | **Yes** |
-| `agent_error` | Internal provider or adapter protocol error | **Yes** (when configured) |
-| `cancelled` | Explicit operator or workflow cancellation | **No** (fail immediately) |
-| `credential_error` | Missing, invalid, expired, or quarantined credentials | **No** (requires intervention) |
-| `infrastructure_error`| Supervisor launch failure or host container errors | **No** (environment fault) |
-| `process_crash` | Container or supervisor process killed by signal/exit code | **No** (fail-closed) |
+HandoffRecord (`handoff/v1`) retains task/attempt/source-execution identity, trigger,
+workspace snapshot, previous execution summary and bounded validation findings.
+`build_handoff_prompt` derives provider-neutral context: original objective, prior outcome,
+changed paths, command/exit findings and instructions to inspect the candidate and preserve
+valid work. It excludes raw full diffs, logs and prior-provider private state.
+Prior output is untrusted context, never a new tool or policy grant.
 
-### External validation triggers
-Agent termination classification is separate from external verification. Orbit runs
-independent test commands (e.g. `cargo test`) after agent termination. If the agent
-exited cleanly (`TerminationReason::Success`) but external verification fails
-(`exit_code != 0`), Orbit captures a `FallbackTrigger::ValidationFailed`.
+A durable owner must persist identity and accepted snapshot before launching a receiving
+execution. Handoff, snapshot and validation replay require stable content/request identity.
+Changed replay or unexpected disk drift cannot authorize launch. Success evidence must
+refer to the final candidate, not an earlier handoff's passing checks.
 
-### Failure fingerprinting
-To detect repetitive errors and prevent infinite cycling between agents, Orbit normalizes
-compiler and test diagnostic output into deterministic `FailureFingerprint` records
-(schema version `validation/v1`).
+## Pure recovery decisions
 
-- **Normalization**: Strips ANSI escape codes, ISO-8601 timestamps, absolute paths
-  (retaining workspace-relative paths), and compiler line/column numbers.
-- **Repetition limits**: If the same failure fingerprint occurs more than
-  `max_same_failure_repetitions` (default: 2), the continuation engine advances past
-  the repeating candidate or halts the attempt to prevent endless retry loops.
+`continuation_recovery_action` derives an action from Attempt state, execution history,
+validation/handoff records, policy and observed workspace digest. Terminal and cancelled
+Attempts do not restart. Proposed actions include validation resumption, handoff preparation,
+claiming a pending execution, reconciling a running execution or finalizing failure.
+An owner executing such an action must add database claims, liveness checks, fencing and
+post-I/O validation. Repeated reconciliation must not create duplicate dispatches.
 
----
+Running/pending records do not prove process liveness. An expired owner or uncertain
+external execution requires reconciliation rather than optimistic fallback. Cancellation
+prevents a later handoff or launch even when prior evidence remains available. Provider
+chat history and leftover workspace files cannot reconstruct missing accepted authority.
 
-## Workspace snapshots and handoff records
+## Qualification scope
 
-### Non-destructive workspace snapshots
-Before invoking a fallback agent, Orbit captures a `WorkspaceSnapshot` without modifying
-the working tree (`Workspace::snapshot_workspace`):
-
-- **Baseline revision**: The pinned immutable Git commit SHA.
-- **Working tree inspection**: Runs `git status --porcelain=v1 --untracked-files=all -z`
-  to accurately parse modified, added, deleted, and untracked files (including paths
-  with spaces or Unicode characters).
-- **Binary diff digest**: Computes a binary diff against the baseline revision and
-  records its SHA-256 hash (`diff_sha256`).
-- **Safety guarantee**: The snapshotting process is strictly read-only. It never runs
-  `git reset`, `git checkout`, or `git clean`.
-
-### Handoff records (`handoff/v1`)
-Orbit structures the handoff context into a versioned `HandoffRecord`:
-
-```json
-{
-  "schema": "handoff/v1",
-  "task_id": "task-42",
-  "attempt_id": "attempt-101",
-  "from_execution_id": "exec-001",
-  "trigger": "turn_limit",
-  "workspace": {
-    "baseline_revision": "78174688aaa37edaee05369988af66334a57454b",
-    "head_revision": "78174688aaa37edaee05369988af66334a57454b",
-    "changed_files": ["src/service.rs"],
-    "added_files": ["src/feature.rs"],
-    "deleted_files": [],
-    "untracked_files": ["tests/feature_test.rs"],
-    "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-  },
-  "previous_execution": {
-    "execution_id": "exec-001",
-    "agent_type": "antigravity",
-    "provider": "google",
-    "model": "gemini-3.7-flash-high",
-    "termination_reason": "turn_limit",
-    "message": "ACP turn timeout; prompt outcome unconfirmed"
-  },
-  "validation": {
-    "command": "cargo test",
-    "exit_code": 101,
-    "summary": "error[E0308]: mismatched types in src/feature.rs:42:5"
-  },
-  "created_at": 1726820150
-}
-```
-
-### Provider-neutral continuation prompt
-Orbit automatically constructs a continuation prompt (`build_handoff_prompt`) for the
-receiving agent. The prompt includes:
-
-1. **Original task description**.
-2. **Previous execution summary**: Agent type, model, termination reason, and diagnostics.
-3. **Repository state summary**: Explicit lists of changed, added, deleted, and untracked files.
-4. **Validation diagnostics**: Failing command, exit code, and bounded compiler/test error summaries.
-5. **Standard instructions**: Instructs the agent to inspect the live workspace and git diff,
-   preserve valid work, correct defects, and verify fixes.
-
-> [!NOTE]
-> Raw diffs and full log files are intentionally excluded from the prompt text.
-> The agent has direct access to the live repository in the workspace and inspects
-> diffs using standard file and terminal tools.
-
----
-
-## Policy configuration
-
-Continuation and fallback behavior is configured via `FallbackPolicy` or `ContinuationPolicy`.
-By default, automatic fallback is **disabled** (`enabled: false`) to preserve backwards compatibility.
-
-### Configuration fields
-
-```json
-{
-  "enabled": true,
-  "fallback_agent": "codex",
-  "max_executions": 2,
-  "on_triggers": [
-    "turn_limit",
-    "rate_limited",
-    "quota_exhausted",
-    "timeout",
-    "validation_failed"
-  ]
-}
-```
-
-- `enabled` (*bool*): Enables multi-agent continuation for the step or runtime.
-- `fallback_agent` (*string*): The binding name or identifier of the fallback agent candidate.
-- `max_executions` (*u32*): Maximum number of agent execution attempts per Attempt (default: `2`).
-- `on_triggers` (*array*): List of triggers that qualify for automatic fallback handoff.
-
-### Chained agent candidates
-For complex pipelines, `ContinuationPolicy` supports ordered multi-agent candidate lists
-(`AgentCandidate`), allowing transitions across multiple specialized agents (e.g. Primary Antigravity
-→ Fallback Codex → Tertiary Claude) with repetition back-off limits.
-
----
-
-## Deterministic crash recovery and drift detection
-
-Orbit's reconciler evaluates continuation state using a pure, deterministic state machine
-(`continuation_recovery_action`):
-
-1. **Terminal state protection**: If an attempt has reached a terminal state (`Succeeded`, `Failed`, `Cancelled`),
-   recovery is a no-op.
-2. **Cancellation priority**: Cancellation requests take immediate precedence and prevent subsequent fallbacks.
-3. **Workspace drift validation**: During recovery, Orbit compares the live workspace diff SHA-256
-   against the persisted `HandoffRecord.workspace.diff_sha256`. If unexpected file alterations or corruption
-   occurred outside the supervisor lifecycle, recovery fails closed.
-4. **Resumption actions**:
-   - `ResumeValidation`: Re-runs external test validation if an agent completed before verification finished.
-   - `PrepareHandoff`: Generates snapshot and handoff record when a fallback trigger is detected.
-   - `StartFallback`: Launches the fallback agent with `sequence = 2`.
-   - `FinalizeFailure`: Halts the attempt if max executions are reached or non-retryable errors occurred.
-
----
-
-## Inspection and verification
-
-Operators can monitor multi-agent execution status through the CLI and API:
-
-### Inspecting an active run
-Use `orbit inspect` to view the continuation state of all tasks and attempts:
-
-```sh
-orbit run inspect --run-id <run-id>
-```
-
-The output contains real-time continuation tracking for each attempt:
-- `continuation.state`: `not_configured`, `fallback_pending`, `fallback_running`, `completed`, or `exhausted`.
-- `continuation.sequence`: Current execution sequence number.
-- `agent_executions`: Full chronological history of agent executions, providers, models, timestamps,
-  and termination reasons.
-
-### Attempt success criteria
-An attempt succeeds if:
-1. At least one agent execution finishes with status `Completed` (either primary or fallback).
-2. The final external validation command passes with exit code `0`.
-3. The final patch and execution report artifacts are successfully uploaded and sealed.
+Pure selector/recovery tests establish deterministic contracts; they do not establish a
+fully wired scheduler path, live-provider acceptance or exactly-once external execution.
+[Testing](../development/testing.md) and [workflow qualification](../development/workflow-qualification.md)
+identify the actual executed paths. Reports must distinguish these scopes explicitly.

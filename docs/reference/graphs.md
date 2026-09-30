@@ -1,9 +1,9 @@
 # Repository graph execution
 
-This Phase 2 increment introduces `orbit/v1`. The v0 contract remains in
+The graph schema is `orbit/v1`. The v0 contract remains in
 [engine semantics](engine-semantics.md). Both versions use the existing run
-aggregate and transactional journal. Phase 2 adds the additive coordination
-migration documented in [Phase 2 execution](children-limits.md). Workers
+aggregate and transactional journal. The additive coordination
+migration is documented in [child-run and scheduling semantics](children-limits.md). Workers
 must be upgraded with the server before submitting v1 definitions because older
 workers assume fixed step names.
 
@@ -35,7 +35,7 @@ have no independent deadline. Commands are prohibited on coding and engine steps
 Testing commands are checked against the server binding for every testing step.
 See [durable interaction](timers-signals.md) for timer durations, wait
 deadlines, signals, early delivery, and cancellation semantics.
-See [Phase 2 execution](children-limits.md) for child templates and shared limits.
+See [child-run and scheduling semantics](children-limits.md) for child templates and shared limits.
 
 Coding dependencies control ordering only: each coding step starts from the
 original base revision, not an upstream patch. Tests may have additional testing

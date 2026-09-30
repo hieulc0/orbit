@@ -2,7 +2,7 @@
 
 ## Durable Execution Control Plane
 
-**Status:** Architecture North Star / Greenfield Project\
+**Status:** Long-term architecture direction; current support is in [the roadmap](../ROADMAP.md)\
 **Project:** Orbit\
 **CLI:** `orbit`\
 **Core implementation:** Rust\
@@ -14,7 +14,7 @@ graph runtime
 
 ------------------------------------------------------------------------
 
-# 1. Executive Summary
+# Executive Summary
 
 Orbit is a standalone durable execution control plane for coordinating
 heterogeneous work across software, compute, agents, humans, and
@@ -56,7 +56,7 @@ The defining architectural principles are:
 
 ------------------------------------------------------------------------
 
-# 2. Why Orbit Exists
+# Why Orbit Exists
 
 Visual workflow products are already mature. Products such as n8n are
 excellent at connecting applications, APIs, SaaS services, triggers, and
@@ -120,9 +120,9 @@ work.
 
 ------------------------------------------------------------------------
 
-# 3. Product Philosophy
+# Product Philosophy
 
-## 3.1 Orbit is execution-first
+## Orbit is execution-first
 
 The architecture is:
 
@@ -158,7 +158,7 @@ Clients sit above the execution platform:
 The canvas is therefore not the architecture. It is an IDE for authoring
 and inspecting Orbit definitions.
 
-## 3.2 Orbit owns coordination, not computation
+## Orbit owns coordination, not computation
 
 Orbit owns:
 
@@ -194,7 +194,7 @@ The rule is:
 > **Orbit decides when and why work executes. Runtimes determine how the
 > work is performed.**
 
-## 3.3 Coordinate existing systems instead of replacing them
+## Coordinate existing systems instead of replacing them
 
 Orbit should not become:
 
@@ -207,7 +207,7 @@ Orbit should not become:
 
 Orbit should be able to coordinate these systems durably.
 
-## 3.4 Standalone and domain-neutral
+## Standalone and domain-neutral
 
 Orbit must not depend on a parent product, company, industry, customer,
 or historical project.
@@ -220,7 +220,7 @@ integrations outside the core.
 
 ------------------------------------------------------------------------
 
-# 4. What Orbit Is Not
+# What Orbit Is Not
 
 Orbit is deliberately **not**:
 
@@ -240,7 +240,7 @@ Orbit may integrate with all of these.
 
 ------------------------------------------------------------------------
 
-# 5. Product Identity
+# Product Identity
 
 **Name:** Orbit
 
@@ -277,7 +277,7 @@ A useful conceptual image is:
 
 ------------------------------------------------------------------------
 
-# 6. Core Vocabulary
+# Core Vocabulary
 
 Orbit should avoid inheriting visual-workflow terminology as its
 internal model.
@@ -335,7 +335,7 @@ The append-only history of meaningful execution transitions.
 
 ------------------------------------------------------------------------
 
-# 7. Definition as a First-Class Executable Artifact
+# Definition as a First-Class Executable Artifact
 
 An Orbit Definition is not merely an export from a database.
 
@@ -399,7 +399,7 @@ orbit cancel <run-id>
 
 ------------------------------------------------------------------------
 
-# 8. Compilation Model
+# Compilation Model
 
 Definitions are not executed directly.
 
@@ -441,7 +441,7 @@ Run.
 
 ------------------------------------------------------------------------
 
-# 9. Why Orbit Has a Native Engine
+# Why Orbit Has a Native Engine
 
 A greenfield Orbit does not need to inherit Temporal.
 
@@ -488,24 +488,24 @@ separate architectural decision.
 
 ------------------------------------------------------------------------
 
-# 10. Engine Invariants
+# Engine Invariants
 
 The native engine should be designed around explicit invariants.
 
-## 10.1 Durable accepted runs
+## Durable accepted runs
 
 Once Orbit acknowledges that a Run has been durably accepted, loss of
 the API process must not erase that Run.
 
-## 10.2 Durable state transitions
+## Durable state transitions
 
 Meaningful execution transitions are committed to PostgreSQL.
 
-## 10.3 Immutable plans
+## Immutable plans
 
 An active Run executes the ExecutionPlan it started with.
 
-## 10.4 At-least-once task execution
+## At-least-once task execution
 
 Orbit should not claim exactly-once execution for arbitrary external
 side effects.
@@ -514,7 +514,7 @@ The baseline guarantee is:
 
 > **Durable at-least-once task execution with idempotency support.**
 
-## 10.5 Idempotency identity
+## Idempotency identity
 
 Every Task should expose a stable idempotency identity where
 appropriate.
@@ -529,27 +529,27 @@ attempt_id
 idempotency_key
 ```
 
-## 10.6 Leased execution
+## Leased execution
 
 Worker ownership of a Task is temporary and renewable.
 
 A dead worker must not permanently own work.
 
-## 10.7 Recovery by reconciliation
+## Recovery by reconciliation
 
 Recovery reads durable state and repairs incomplete or expired execution
 ownership.
 
-## 10.8 No worker is required during a wait
+## No worker is required during a wait
 
 A timer, approval, or external signal may wait for days without holding
 a worker process.
 
-## 10.9 Cancellation is durable intent
+## Cancellation is durable intent
 
 Cancellation is persisted before propagation.
 
-## 10.10 History is inspectable
+## History is inspectable
 
 The system should make it possible to answer:
 
@@ -563,7 +563,7 @@ The system should make it possible to answer:
 
 ------------------------------------------------------------------------
 
-# 11. Execution State Model
+# Execution State Model
 
 A first task state machine can be intentionally small:
 
@@ -604,7 +604,7 @@ implementation.
 
 ------------------------------------------------------------------------
 
-# 12. PostgreSQL as the Durable Source of Truth
+# PostgreSQL as the Durable Source of Truth
 
 Orbit should begin with PostgreSQL as its only mandatory external
 stateful dependency.
@@ -653,7 +653,7 @@ it is not a prerequisite for run ownership or worker authorization.
 
 ------------------------------------------------------------------------
 
-# 13. Journal + Materialized State
+# Journal + Materialized State
 
 Orbit should not begin as a pure event-sourced system.
 
@@ -715,7 +715,7 @@ This supports:
 
 ------------------------------------------------------------------------
 
-# 14. Scheduling and Worker Leases
+# Scheduling and Worker Leases
 
 Workers claim eligible Tasks through durable coordination.
 
@@ -770,7 +770,7 @@ The engine must carefully define behavior around:
 
 ------------------------------------------------------------------------
 
-# 15. Failure Semantics
+# Failure Semantics
 
 Distributed execution cannot promise that arbitrary external side
 effects happen exactly once.
@@ -812,7 +812,7 @@ side effects.
 
 ------------------------------------------------------------------------
 
-# 16. Timers and Waits
+# Timers and Waits
 
 A wait is persisted state, not a sleeping worker.
 
@@ -835,7 +835,7 @@ Timer scalability should be benchmarked explicitly.
 
 ------------------------------------------------------------------------
 
-# 17. Signals and Human Interaction
+# Signals and Human Interaction
 
 External events should be able to resume waiting execution.
 
@@ -870,7 +870,7 @@ sleeping until a user clicks a button.
 
 ------------------------------------------------------------------------
 
-# 18. Fan-Out and Fan-In
+# Fan-Out and Fan-In
 
 Orbit should support dynamic Step instances without abandoning its
 explicit execution model.
@@ -906,7 +906,7 @@ Large fan-out must be designed with:
 
 ------------------------------------------------------------------------
 
-# 19. Capability-Based Runtime Routing
+# Capability-Based Runtime Routing
 
 A Definition should not care about a worker's implementation language.
 
@@ -979,7 +979,7 @@ External Worker
 
 ------------------------------------------------------------------------
 
-# 20. Agents as First-Class Participants
+# Agents as First-Class Participants
 
 Orbit should not reduce agents to a decorative "LLM node."
 
@@ -1029,7 +1029,7 @@ apply accepted patch artifacts to a fresh base workspace before human review.
 
 ------------------------------------------------------------------------
 
-# 21. Agent Fan-Out and Delegation
+# Agent Fan-Out and Delegation
 
 Orbit should distinguish two kinds of orchestration.
 
@@ -1060,7 +1060,7 @@ Otherwise it may remain internal to the agent runtime.
 
 ------------------------------------------------------------------------
 
-# 22. Humans as Execution Participants
+# Humans as Execution Participants
 
 Humans should be modeled explicitly where durable process interaction
 requires them.
@@ -1086,7 +1086,7 @@ These should support:
 
 ------------------------------------------------------------------------
 
-# 23. Containers and Compute
+# Containers and Compute
 
 Container execution is an important generic escape hatch.
 
@@ -1126,7 +1126,7 @@ network, filesystem and resource restrictions as well as the isolation class.
 
 ------------------------------------------------------------------------
 
-# 24. Artifacts
+# Artifacts
 
 Large outputs should not flow through the engine database.
 
@@ -1160,7 +1160,7 @@ temporary.
 
 ------------------------------------------------------------------------
 
-# 25. Rust Technology Foundation
+# Rust Technology Foundation
 
 Orbit's core should be Rust-native because it is infrastructure software
 rather than primarily an application backend.
@@ -1200,7 +1200,7 @@ ecosystem-heavy workloads.
 
 ------------------------------------------------------------------------
 
-# 26. Modular Monolith First
+# Modular Monolith First
 
 Orbit should begin as a modular monolith, not a microservice
 architecture.
@@ -1242,7 +1242,7 @@ being fixed prematurely.
 
 ------------------------------------------------------------------------
 
-# 27. Proposed Repository Layout
+# Proposed Repository Layout
 
 ``` text
 orbit/
@@ -1281,7 +1281,7 @@ than treated as a final structure on day one.
 
 ------------------------------------------------------------------------
 
-# 28. CLI-First Product Surface
+# CLI-First Product Surface
 
 The CLI should exist before the visual editor.
 
@@ -1321,7 +1321,7 @@ The test is:
 
 ------------------------------------------------------------------------
 
-# 29. API and Realtime
+# API and Realtime
 
 The Axum server should expose stable APIs around domain concepts rather
 than engine internals.
@@ -1350,7 +1350,7 @@ semantics materially justify it.
 
 ------------------------------------------------------------------------
 
-# 30. MCP and Agent Operation
+# MCP and Agent Operation
 
 Orbit should be easy for autonomous agents to operate.
 
@@ -1383,7 +1383,7 @@ The same principle applies to REST, CLI, and the web UI.
 
 ------------------------------------------------------------------------
 
-# 31. Web UI Philosophy
+# Web UI Philosophy
 
 The first web UI should be an **operations console**, not a canvas.
 
@@ -1421,7 +1421,7 @@ There must not be a separate "visual workflow format."
 
 ------------------------------------------------------------------------
 
-# 32. Security Direction
+# Security Direction
 
 Orbit should eventually distinguish:
 
@@ -1466,7 +1466,7 @@ tenant identity management are separate concerns with separate acceptance gates.
 
 ------------------------------------------------------------------------
 
-# 33. Scoping and Ownership
+# Scoping and Ownership
 
 Orbit preserves authenticated run attribution, worker admission, credential-use
 authorization and artifact access boundaries. These contracts remain compatible
@@ -1483,7 +1483,7 @@ through arbitrary Step parameters. Attribution alone is not an access grant.
 
 ------------------------------------------------------------------------
 
-# 34. Packages and Extensibility
+# Packages and Extensibility
 
 Orbit should eventually support installable capabilities without making
 the core runtime unsafe.
@@ -1524,9 +1524,9 @@ core Orbit server.
 
 ------------------------------------------------------------------------
 
-# 35. Observability
+# Observability
 
-Orbit should be observable from its first serious engine milestone.
+Orbit should be observable throughout durable execution.
 
 Required dimensions include:
 
@@ -1564,7 +1564,7 @@ Logs alone are insufficient.
 
 ------------------------------------------------------------------------
 
-# 36. Engine Correctness Testing
+# Engine Correctness Testing
 
 The native engine must be developed as infrastructure.
 
@@ -1623,7 +1623,7 @@ engine invariants.
 
 ------------------------------------------------------------------------
 
-# 37. Performance Philosophy
+# Performance Philosophy
 
 Correctness comes before extreme throughput.
 
@@ -1654,7 +1654,7 @@ model.
 
 ------------------------------------------------------------------------
 
-# 38. Built-In Engine Scope Boundary
+# Built-In Engine Scope Boundary
 
 The biggest architectural risk is accidentally building a
 general-purpose Temporal competitor.
@@ -1688,7 +1688,7 @@ This boundary should be defended.
 
 ------------------------------------------------------------------------
 
-# 39. Why Not Temporal
+# Why Not Temporal
 
 Orbit is not rejecting Temporal because Temporal is technically weak.
 
@@ -1711,7 +1711,7 @@ defended ideologically.
 
 ------------------------------------------------------------------------
 
-# 40. Why Not Build on a Basic Queue
+# Why Not Build on a Basic Queue
 
 A task queue alone does not provide the semantics Orbit requires.
 
@@ -1739,7 +1739,7 @@ an accidental evolution from a background-job queue.
 
 ------------------------------------------------------------------------
 
-# 41. Why Rust
+# Why Rust
 
 Rust is not chosen because Python is unsuitable for application APIs.
 
@@ -1766,7 +1766,7 @@ Python remains intentionally supported where its ecosystem is strongest.
 
 ------------------------------------------------------------------------
 
-# 42. Why a New Project
+# Why a New Project
 
 Orbit should not be implemented as a refactor of Pipeline Studio.
 
@@ -1812,223 +1812,7 @@ Orbit is a new project.
 
 ------------------------------------------------------------------------
 
-# 43. Development Roadmap
-
-The phases below describe the original development sequence. Active priorities,
-implemented support and remaining acceptance gates are in [the current roadmap](../ROADMAP.md).
-Historical phase records do not make future tenancy or infrastructure mandatory.
-
-## Phase 0 --- Semantics Before Code
-
-Define formally:
-
--   Definition;
--   Step;
--   ExecutionPlan;
--   Run;
--   Task;
--   Attempt;
--   Worker;
--   lease;
--   Signal;
--   Timer;
--   Artifact;
--   cancellation;
--   retry;
--   terminal states.
-
-Deliverables:
-
-``` text
-VISION.md
-ENGINE_SEMANTICS.md
-STATE_MACHINES.md
-FAILURE_MODEL.md
-DEFINITION_SPEC.md
-```
-
-Do not build a web editor.
-
-## Phase 1 --- Native Engine Kernel
-
-Implement:
-
--   PostgreSQL schema;
--   immutable plans;
--   Run creation;
--   DAG dependencies;
--   ready-task scheduling;
--   task claiming;
--   leases;
--   attempts;
--   retry;
--   timeout;
--   cancellation;
--   journal;
--   recovery.
-
-Success criterion:
-
-> Runs survive repeated server and worker termination without violating
-> documented state invariants.
-
-## Phase 2 --- Durable Interaction
-
-Implement:
-
--   timers;
--   signals;
--   waits;
--   fan-out;
--   join;
--   child Definition execution;
--   concurrency limits;
--   backpressure.
-
-## Phase 3 --- Developer Surface
-
-Implement:
-
--   `orbit` CLI;
--   YAML/JSON Definition format;
--   Axum API;
--   SSE;
--   JSON/JSONL output;
--   Rust worker SDK;
--   Python worker SDK.
-
-At this milestone Orbit should already be useful without a web UI.
-
-## Phase 4 --- Compute and Artifacts
-
-Implement:
-
--   artifact abstraction;
--   local artifact provider;
--   S3-compatible provider;
--   container runner;
--   resource requirements;
--   capability routing;
--   worker pools.
-
-## Phase 5 --- Agent Execution
-
-Implement:
-
--   Agent Step;
--   model/tool bindings;
--   budgets;
--   permissions;
--   MCP;
--   durable agent execution;
--   controlled delegation;
--   human approval.
-
-## Phase 6 --- Operations UI
-
-Implement React operations console:
-
--   Runs;
--   timeline;
--   attempts;
--   artifacts;
--   workers;
--   queues;
--   failure inspection;
--   cancellation/signaling.
-
-## Phase 7 --- Visual Definition IDE
-
-Only now implement:
-
--   graph visualization;
--   visual editing;
--   schema-driven Step panels;
--   Definition source synchronization;
--   diff/validation.
-
-The graph editor edits the canonical Definition.
-
-## Phase 8 --- Ownership and Authorization
-
-Implement:
-
--   authenticated run attribution;
--   worker and artifact authorization;
--   service accounts;
--   secret/binding providers;
--   policies;
--   audit controls.
-
-Existing optional scoped governance is retained for compatibility. Further tenant
-hierarchy, RBAC administration and SSO require a concrete product requirement.
-
-## Phase 9 --- Ecosystem
-
-Implement:
-
--   package registry;
--   capability packages;
--   verified packages;
--   SDK stabilization;
--   marketplace if justified.
-
-------------------------------------------------------------------------
-
-# 44. First Engineering Milestone
-
-The first milestone should intentionally look unimpressive from the
-outside.
-
-Example Definition:
-
-``` yaml
-apiVersion: orbit/v1
-kind: Definition
-
-metadata:
-  name: recovery-test
-
-steps:
-  first:
-    uses: test.sleep
-    with:
-      milliseconds: 500
-
-  second:
-    uses: test.echo
-    needs:
-      - first
-
-  third:
-    uses: test.fail_n_times
-    needs:
-      - second
-    retry:
-      max_attempts: 3
-```
-
-Then:
-
-``` bash
-orbit run recovery-test.yaml
-```
-
-During execution:
-
-1.  kill the Orbit server;
-2.  restart it;
-3.  kill the worker;
-4.  restart the worker;
-5.  verify the failed task retries correctly;
-6.  verify every journal event;
-7.  verify the Run reaches the correct terminal state.
-
-If this is boring and correct, the foundation is good.
-
-------------------------------------------------------------------------
-
-# 45. Architecture Decision Rules
+# Architecture Decision Rules
 
 Every major feature should be tested against these questions.
 
@@ -2073,7 +1857,7 @@ If yes, move it to an extension.
 
 ------------------------------------------------------------------------
 
-# 46. Long-Term Product Shape
+# Long-Term Product Shape
 
 A mature Orbit may look like:
 
@@ -2123,7 +1907,7 @@ The graph editor, if present, remains one view over this architecture.
 
 ------------------------------------------------------------------------
 
-# 47. Success Criteria
+# Success Criteria
 
 Orbit is succeeding if:
 
@@ -2155,7 +1939,7 @@ Orbit is drifting if:
 
 ------------------------------------------------------------------------
 
-# 48. Final Principle
+# Final Principle
 
 Orbit exists because durable coordination across heterogeneous work is a
 distinct infrastructure problem.
@@ -2181,7 +1965,7 @@ recoverable, and operable by both humans and machines.
 
 ------------------------------------------------------------------------
 
-# 49. Open Source Strategy and License
+# Open Source Strategy and License
 
 Orbit should be developed as a **public open-source project from the beginning**, unless there is a concrete short-lived reason to keep an early security-sensitive prototype private.
 
@@ -2193,7 +1977,7 @@ License:               Apache License 2.0
 SPDX identifier:       Apache-2.0
 ```
 
-## 49.1 Why Public
+## Why Public
 
 Orbit's intended identity is infrastructure rather than a proprietary application built around hidden workflow definitions.
 
@@ -2213,7 +1997,7 @@ Orbit must never depend on secrets, private infrastructure names, private endpoi
 
 If an experimental branch temporarily requires private material, keep that material in a separate private repository rather than making Orbit Core depend on it.
 
-## 49.2 Why Apache License 2.0
+## Why Apache License 2.0
 
 Orbit should use the **Apache License, Version 2.0**.
 
@@ -2238,7 +2022,7 @@ The initial philosophy is instead:
 
 > **Make the execution substrate open, auditable, embeddable, and easy to adopt. Build ecosystem value around the open core rather than restricting use of the core.**
 
-## 49.3 Repository License Files
+## Repository License Files
 
 The repository root should contain:
 
@@ -2263,7 +2047,7 @@ SPDX-License-Identifier: Apache-2.0
 The exact copyright holder should be chosen deliberately before adding
 copyright headers throughout the repository.
 
-## 49.4 Contribution Policy
+## Contribution Policy
 
 At the beginning, keep contribution mechanics simple.
 
@@ -2273,7 +2057,7 @@ If Orbit later develops substantial outside corporate contribution, a foundation
 
 Contributor provenance, dependency licenses, generated code, vendored code, and third-party assets must remain traceable.
 
-## 49.5 Open Source Does Not Mean Uncontrolled Core
+## Open Source Does Not Mean Uncontrolled Core
 
 A permissive license does not require Orbit to accept every feature into the engine.
 
@@ -2303,7 +2087,7 @@ Core changes require stronger review because they affect durability and compatib
 
 The open-source model should encourage extension **around** a small trusted core rather than continuously expanding the core itself.
 
-## 49.6 Commercial Future
+## Commercial Future
 
 Apache-2.0 leaves Orbit free to develop a commercial ecosystem later without changing the open-source identity of the core.
 
@@ -2324,7 +2108,7 @@ The foundational commitment should remain clear:
 
 > **Orbit Core is open infrastructure.**
 
-# 50. Timescale Boundary: Fast to Continue, Not Fast to Twitch
+# Timescale Boundary: Fast to Continue, Not Fast to Twitch
 
 Orbit is not a hard-real-time control system and must not become one in pursuit of low latency.
 
@@ -2380,7 +2164,7 @@ store until measurements demonstrate that another component is necessary.
 
 Do not add Redis, Kafka, NATS, or another broker merely to make Orbit appear fast.
 
-## 50.1 The Worker Protocol Is a First-Class Pillar
+## The Worker Protocol Is a First-Class Pillar
 
 Orbit has two foundational execution components:
 

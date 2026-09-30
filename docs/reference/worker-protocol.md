@@ -8,7 +8,7 @@ Worker draining is an additive operational control: existing accepted claims,
 heartbeats and completion remain valid while new claims stop. Registration never
 clears a durable drain flag. See [lifecycle and authorization](../operations/observability.md).
 
-Phase 4 retains the v0 wire protocol and adds `container.run`, optional
+The v0 wire protocol includes `container.run`, optional
 `gpu_devices` in assignments, provider/object-key metadata on artifacts, and
 `data`/`container_report` artifact kinds. Server-authorized capacity and pool
 membership constrain claims; clients cannot supply capacity overrides. See
@@ -17,7 +17,7 @@ membership constrain claims; clients cannot supply capacity overrides. See
 ## Registration and claim
 
 A worker registers an authenticated worker identity, protocol version, supported
-capabilities, recovery policies, and checkpoint formats/versions. For milestone 1,
+capabilities, recovery policies, and checkpoint formats/versions. For the v0 repository contract,
 capabilities are `repository.code` and `repository.test`. The server rejects an
 unsupported protocol version or a policy/capability mismatch before dispatch.
 Worker and operator credentials MUST be distinct; workers cannot cancel arbitrary
@@ -84,14 +84,14 @@ be confirmed before the known lease expires, the worker stops work and attempts
 to terminate its process group. Network isolation MUST NOT justify continued
 authority. Recovery and stale-message rejection remain server responsibilities.
 
-Phase 3 start/heartbeat receipts add `lease_remaining_ms`. A worker anchors this
+Start/heartbeat receipts include `lease_remaining_ms`. A worker anchors this
 duration to its monotonic time immediately before the original request, including
 all retransmission time, never to response receipt. That provides a conservative
 local deadline without assuming synchronized clocks. The heartbeat interval
 schedules renewal; the previous confirmed lease bounds the acknowledgement wait.
 A late start receipt must not start work, and a heartbeat arriving after the
-previous local deadline must not restore authority. The Phase 3 built-in runtime
-requires these duration receipts from a Phase 3 server; older workers ignore the
+previous local deadline must not restore authority. The built-in runtime
+requires these duration receipts from a compatible server; older workers ignore the
 additive fields. Rolling mixed-version runtime upgrades remain unqualified.
 
 ## Workspace lifecycle
@@ -108,7 +108,7 @@ additive fields. Rolling mixed-version runtime upgrades remain unqualified.
 
 Workers MUST NOT infer a successful prior attempt from leftover directories.
 Abandoned workspaces remain distinguishable from active work. They are retained
-for milestone qualification and accessible through a documented manual recovery
+for qualification and accessible through a documented manual recovery
 procedure. A later cleanup feature must account for ownership and retention.
 
 The coding worker may use an agent runtime, but the engine does not interpret its

@@ -9,7 +9,7 @@ This document describes Orbit's **Google Antigravity Agent Client Protocol (ACP)
 > The new image has been built and qualified for credential-free ACP initialize;
 > enrollment and execution qualification for that new image remain open.
 
-## Operator credential enrollment (Phase A)
+## Operator credential enrollment
 
 `orbit credential add antigravity` provides the operator-local
 `oauth-personal` adapter. It requires current catalog migrations in the durable
@@ -219,19 +219,19 @@ Configure the following environment variables when running the adapter container
 
 ## 5. End-to-End Execution Workflow
 
-### Step 1: Prepare the Fixture
+### Prepare the fixture
 Build the container image using the fixture packaging script:
 ```bash
 ./scripts/prepare-antigravity-fixture.sh --base-image debian:bookworm-slim
 ```
 
-### Step 2: Provision the configured private auth store
+### Provision the configured private auth store
 Provision the operator-controlled credential files at the private source
 directory configured by `auth.path`. Orbit stages those files into the runtime
 HOME; it does not create or acquire them. Never put credential contents in a
 Definition, source-controlled example, or command history.
 
-### Step 3: Run the ACP Adapter Server
+### Run the ACP adapter server
 Start `agy_acp_server.par` inside the container:
 ```bash
 export ANTIGRAVITY_AGENT=1
@@ -242,7 +242,7 @@ export NO_BROWSER=1
 /opt/antigravity/agy_acp_server.par
 ```
 
-### Step 4: Dispatch Tasks via Orbit
+### Dispatch tasks via Orbit
 Orbit connects to standard I/O of the ACP process, sending agent requests and handling tool callbacks for file modification and command execution in `/orbit/home/workspace`.
 
 ---

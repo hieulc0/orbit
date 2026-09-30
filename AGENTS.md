@@ -11,3 +11,12 @@ Write code for future maintainers, not for the implementation plan that produced
 - Remove temporary helpers, scaffolding, debug paths, and implementation-plan terminology before handoff. Before handoff, review the final diff as if the implementation plan and agent conversation did not exist. The resulting code should be understandable on its own.
 
 Planning vocabulary must not become implementation vocabulary.
+
+## Documentation and working notes
+
+Keep temporary plans, investigations, implementation notes, agent scratch material,
+execution checklists, and implementation-phase notes under `.local/plans/`,
+`.local/investigations/`, or `.local/implementation/`, not `docs/`. After implementation,
+extract durable architecture, contracts, invariants, rationale, and operating rules
+into `docs/`. Retain historical identifiers only for intentional qualification,
+migration, compatibility, or requirements traceability.

@@ -1,164 +1,68 @@
 # Current roadmap
 
-## Next milestone: developer-local execution
+## Current capabilities
 
-S9 workflow boundary extraction and S10 typed execution/cleanup outcomes are
-complete at checkpoint `14769c6`. The frozen R4 campaign passed, and the final
-live self-hosting documentation workflow is
-[qualified](operations/r4-stabilization-final-report.md), including independent
-review, a real repair, FULL, exact candidate identity, and confirmed cleanup.
+Orbit provides durable graph execution, attempt leases and fencing, immutable
+plans and artifacts, repository workers, managed verification environments,
+credential status discovery, and bounded role workflows. The
+[architecture](architecture/README.md) and [reference contracts](README.md#architecture-and-reference)
+describe supported behavior. Qualification records describe the checks actually run.
 
-R5 physical modularization is [implemented and qualified](operations/r5-modularization-report.md).
-The [ownership map](architecture/subsystem-ownership.md) defines
-its subsystem files, public compatibility exports, and test ownership. R6–R11
-remain pending: developer-local execution, production role budgets, Orbit-ACP,
-editor integration, skills selecting flows, and external BA/SA roles. The
-[detailed roadmap](archive/roadmap.md) retains their contracts and sequence.
+## Workflow requirements and acceptance
 
-The earlier delivery planning below is retained as historical context. Its
-earlier "in progress" and "next" labels do not supersede the current milestone
-status above. Separate-host acceptance and broader production hardening remain
-outside the bounded R4 result.
+Requirement IDs below are retained for roadmap traceability. They are not names
+for runtime components. The [workflow requirements](archive/roadmap.md) define
+acceptance conditions; reports preserve historical results and limitations.
 
-## Milestone: reproducible, deployable alpha
+| Requirement | Current state | Evidence or contract |
+| --- | --- | --- |
+| R4 stabilization and self-hosting | Accepted; workflow boundary extraction and typed outcomes complete at `14769c6` | [Stabilization report](operations/r4-stabilization-final-report.md) |
+| R5 subsystem organization | Implemented and qualified at `7c6ea4f` | [Modularization report](operations/r5-modularization-report.md) |
+| R6 developer-local execution | Implemented; confinement and cleanup qualified | [Execution contract](guides/interactive-execution.md) |
+| R7 production role budgets | Implemented; resource limits and byte paging qualified | [Execution contract](guides/interactive-execution.md) |
+| R8 ACP service | Implemented and qualified offline; bounded real-provider ACP fixture accepted at `8dec490` | [Interactive qualification](operations/interactive-workflows-report.md) |
+| R9 editor integration | Managed candidates and ACP protocol qualified offline; actual Zed acceptance pending | [Editor setup](guides/editor-acp.md) |
+| R10 skill-selected flows | Implemented; immutable flow selection and conservative escalation qualified | [Skill flows](guides/interactive-execution.md#skill-flows) |
+| R11 external BA/SA reasoning | Typed artifacts and authority staged and qualified offline; development bridge integration and live acceptance pending | [External reasoning](guides/external-reasoning.md) |
 
-The bounded Phase 1–9 feature work is committed. Historical acceptance and
-qualification remain in [the archive](archive/README.md); they are not a claim
-that the complete long-term vision or production hardening is finished.
+The roadmap remains incomplete. Live admission requires fresh credential-scoped
+quota evidence: at least 15% for a known five-hour window and 5% for a known
+seven-day window. A queued run, successful initialization, mocked artifact exchange,
+or protocol test does not satisfy a live acceptance gate. Refresh with
+`credential status --all --quota` before execution and review. Previously generated
+local evidence and timers may be absent; inspect their actual state before relying
+on them. Current observed run status belongs in the qualification report.
 
-The alpha increment covers:
+The development BA bridge is `../orbit-ba-bridge`. Integration must preserve its
+existing conversation state and use explicitly identified BA/SA conversations.
+The required acceptance is a frozen contract, real implementation, independent
+review and final verification, followed by BA attestation for that exact candidate.
 
-1. Current docs and a fresh-agent entry point, with preserved historical evidence.
-2. Repeatable Rust/Python/UI checks and CI qualification with disposable services.
-3. A non-root server image, Docker Compose, Podman Quadlet, and host worker units.
-4. Probes, metrics, safe structured logs, SIGTERM handling and durable worker drain.
-5. Backup/restore, coordinated upgrades, credential rotation and operational tests.
-6. A trusted command-agent adapter and Orbit-on-Orbit work against a pinned baseline.
+## Deployment and provider acceptance
 
-See [alpha qualification](operations/qualification.md) for implemented vs verified
-items. A workflow is not qualified by the mere presence of its template or test.
+Local packaging supports a non-root server image, Compose, Quadlet, host workers,
+probes, durable drain, backup/restore and coordinated upgrades. See
+[alpha qualification](operations/qualification.md) for the verified scope.
 
-## Acceptance gates
+Selected live-provider and separately hosted worker acceptance remain distinct
+from local fixtures. The remote repository workflow must demonstrate an actual
+inspect/edit/test/revise cycle, accepted artifacts, independent verification,
+human review, account refresh/expiry behavior, denied unauthorized effects and
+recovery after worker/server failure. Unknown provider outcomes remain unknown.
+See [remote coding qualification](operations/remote-coding-qualification.md) and
+[ACP compatibility](operations/acp-codex-compatibility.md).
 
-- A fresh checkout has one documented build/check path and no secret prerequisites
-  for regular tests.
-- A fresh installation can serve the UI/API, finish a worker-free workflow,
-  restart with retained state, and preserve verified artifacts.
-- Container shutdown and worker drain preserve the existing lease/retry semantics.
-- A stopped deployment can be backed up and restored into an empty isolated
-  destination, with run/journal/artifact agreement independently checked.
-- A fresh agent can locate authoritative docs and run the relevant checks without
-  relying on conversation history.
-- Orbit-on-Orbit produces a reviewed patch and successful independent checks
-  without changing or pushing the developer checkout.
+## Conditional extensions
 
-## Next milestone: remote agent-assisted repository change
+The following require a selected workload or deployment need and their own evidence:
 
-A remote worker completes an agent-assisted repository change, with scoped
-credentials, isolated tools, independent tests, durable recovery, patch artifacts
-and human review.
+- Stronger isolation for hostile code, such as gVisor or Firecracker.
+- Physical GPU execution and additional GPU runtimes.
+- Multi-host capacity, HA, throughput and retention guarantees.
+- Kubernetes or cloud provisioning for demonstrated capacity requirements.
+- SSO, tenant administration or external policy distribution.
+- Additional credential providers, public package distribution and SDK publication.
+- Parallel analysis or isolated implementation branches with explicit integration.
 
-Implementation sequence:
-
-1. Portable private remote Git bindings, pinned commits, logical credential
-   references and fresh worker-local workspaces.
-2. One live multi-turn coding runtime, together with the minimum execution policy,
-   credential authorization and OCI tool containment needed to run it.
-3. End-to-end qualification of independent verification, durable artifacts, human
-   review and failure recovery.
-
-Acceptance requires a separately hosted worker without a shared developer
-checkout; an inspect/edit/test/revise cycle; independent tests on a fresh base
-plus accepted patch; denied unauthorized tools/credentials/artifacts; no isolation
-downgrade; and worker/server failure or lost acknowledgements preserving budgets,
-fencing, artifacts and explicit uncertain provider outcomes. Human review uses the
-existing durable approval boundary. Passing local fixtures is not live-provider
-or remote-host qualification. Transparent conversation checkpoint resume is not
-required.
-
-Rootless Podman/OCI is the first backend. Model calls and Git materialization run
-in trusted worker adapters; repository tools have no network or provider/Orbit
-credentials. Existing governance and legacy plans remain compatible, and the
-workflow must work without enabling organization/project/environment governance.
-
-The implementation now includes these bindings and profiles, a bounded Responses
-coding loop, attempt-scoped credential/tool authorization, tracked invocation
-receipts, isolated workspaces and an independent-test/review example. See the
-[setup guide](guides/remote-coding.md). Qualification is recorded separately;
-implementation is not acceptance. The next acceptance work is a selected live
-provider/model/account and a separately hosted worker, not more worker types.
-See [remote coding qualification](operations/remote-coding-qualification.md) for
-the passing local checks, reviewed artifacts and remaining live acceptance gates.
-
-The immediate product increment is a repeatable
-[submit, inspect and review workflow](guides/repository-review.md). `orbit export-run`
-collects a private, journal-bounded snapshot and verified accepted artifacts using
-existing read APIs. It supports human review without changing engine semantics or
-claiming live acceptance. The actual CLI now passes the local PostgreSQL/rootless
-Podman workflow across a pending-review server restart, with deduplicated approval
-and byte-identical candidate artifacts; see the
-[qualification record](operations/remote-coding-qualification.md#repository-review-export-qualification).
-Repeated real tasks should establish useful outcomes and
-expose onboarding/recovery friction before adding further adapters. A subsequent
-non-repository workload should exercise existing compute/artifact/wait contracts;
-extend the worker contract only when that workload demonstrates a specific gap.
-
-## In progress: ACP agent integration
-
-Add a worker-side ACP adapter alongside the existing Responses and command
-adapters. The [design](architecture/acp-agent-integration.md) maps the external
-proposal to current Orbit contracts; the
-[implementation plan](development/acp-implementation-plan.md) tracks work packages
-and failure/acceptance gates. The probe, pinned worker registry, execution-only
-accounting, durable session batches, private auth supervision, confined file/terminal
-broker, Codex App Server bridge and patch/test/review routing are implemented.
-Real Codex and generic ACP offline workflows and all 60 shared local fault-regression
-cases have passed. Later named agents and live account/host qualification are not
-accepted.
-
-Delivery order is Codex, official Google Antigravity ACP, then Claude. The pinned
-Codex ACP adapter passes initialization but uses native tools. A version-specific
-Codex App Server bridge hands effects to Orbit before execution; see the
-[setup guide](guides/acp-coding.md) and [compatibility record](operations/acp-codex-compatibility.md).
-Prioritize Codex-first live account/host acceptance for the selected workflow.
-The specific terminal handoff gaps in
-[Antigravity/Claude](operations/acp-agent-compatibility.md) remain follow-up work
-when a selected workload requires those agents; they do not gate use of the
-implemented Codex path.
-A prompt may hide multiple model calls; unknown billing stays unknown.
-Unresolved prompts retain intervention semantics, with automatic session resume
-deferred. Agent and repository tools have distinct OCI resource/network policies;
-agent host-network access is not provider-only egress.
-
-This increment does not close or remove the current live-provider and
-separate-worker acceptance gates above. Local fixtures precede a separately
-authorized live account/host qualification; actual adapter compatibility and
-reviewed evidence determine acceptance.
-
-## Conditional follow-up work
-
-The credential foundation now includes the registry, LocalPrivateSecretBackend,
-provider-scope state, and catalog-backed status/availability persistence for
-Codex and Antigravity. Codex device-code enrollment and Antigravity ACP/agy
-enrollment and quota-group normalization are qualified; provider status evidence
-is recorded in [provider status discovery](operations/provider-status-discovery.md).
-The system still does not inventory or select resources, lease provider
-capacity, or dispatch by role. Q7, resource-lease, role, review/repair, and
-self-development qualification gates remain open.
-
-4. Additional isolation backends when a defined threat model requires them:
-   gVisor/runsc for sandboxed execution, Firecracker for untrusted execution.
-5. Physical GPU qualification and additional GPU runtime support.
-6. Kubernetes/elastic capacity when a selected deployment or scaling requirement
-   justifies it. A second worker host alone is not such a requirement.
-7. Tenancy, organization management, SSO or RBAC administration only for a concrete
-   product requirement. This is separate from execution isolation.
-
-Vault/cloud credential providers are optional integrations when selected accounts
-require them. File/environment references suffice for the initial milestone.
-Docker compute qualification, HA/throughput/retention, browser/accessibility,
-public distribution and selected-cloud infrastructure retain their separate
-evidence requirements. Do not add Kubernetes or Terraform speculatively.
-
-Public publishing, deployments outside disposable local fixtures and paid model
-calls require explicit authority and selected destinations/accounts.
+These are not prerequisites for the bounded local workflow. Publishing, pushing,
+merging and deploying use explicit authority and selected destinations.

@@ -48,7 +48,7 @@ database. It verifies that the selected target and early normalized failure are
 durable before any provider credential staging, supervisor, or ACP process
 starts. Run it without the live-provider opt-in, with
 `ORBIT_TEST_DATABASE_URL` pointed at the current disposable workflow database
-(port 55443 in the S8 qualification setup):
+using the disposable endpoint provisioned for this run:
 
 ```sh
 cargo test --locked --features fault-injection --test core_coding_agent_tool_surface_qualification -- --ignored --exact real_acp_execution_row_survives_credential_resolution_failure --nocapture
@@ -74,7 +74,8 @@ for every tool call. Mutations require the persisted role execution's database
 lock, and callback calls, output, and runtime are bounded by tool metadata.
 Filesystem mutations use directory-relative handles to reject traversal and
 symlink replacement. Git status/diff path filters are normalized to repository
-relative pathspecs before host Git runs. CLI workflow terminal calls remain denied.
+relative pathspecs before host Git runs. The trusted CLI profile denies terminal calls; an explicitly pinned developer-local
+profile permits implementer terminals under confinement and mutation ownership.
 Role prompts identify the ACP virtual workspace root and require
 workspace-relative repository tool paths; the host repository path is not
 exposed to the role.

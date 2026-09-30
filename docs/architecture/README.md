@@ -35,8 +35,24 @@ repository tool runs in a disposable host-managed rootless Podman container,
 with Attempt-owned Git metadata, without provider credentials or network. Tasks request a logical isolation
 class; the operator pins its execution profile. Only `trusted` workspace execution
 is implemented. Optional governance stays compatible, but adding a tenant
-hierarchy is not part of this milestone. Authorization and containment are
+hierarchy requires a concrete product requirement. Authorization and containment are
 independent boundaries, not interchangeable permission strings.
+
+## Interactive workflows
+
+The [stdio ACP service](../guides/editor-acp.md) presents durable workflow state
+and managed candidates to an editor. `acp/service.rs` delegates progression to the
+same workflow coordinator; `acp/editor.rs` owns protocol presentation and replay.
+`execution/local.rs` confines developer-local exploratory terminals, while final
+verification retains its independent pinned rootless OCI profile.
+`execution/worktree.rs` manages explicit candidate apply/discard, and
+`tools/budget.rs` accounts for production role resources.
+
+`workflow/flow.rs` maps skills to immutable flow policy.
+`workflow/reasoning.rs` stores external BA/SA artifacts and frozen contracts;
+BUSINESS_ACCEPTANCE is a durable coordinator stage after technical qualification.
+External reasoning connections receive artifact authority without mutation or
+implementation control. See [external reasoning](../guides/external-reasoning.md).
 
 ## Code map
 
@@ -95,5 +111,5 @@ external process or provider stopped. See the [worker contract](../reference/wor
 Trusted Linux operators/workers, bounded graph/agent/artifact sizes, static
 replica-consistent configuration, single-host packaging and coordinated upgrades.
 No hostile multi-tenant isolation, checkpoint resume, remote runtime mounts,
-automatic model selection, provider billing enforcement, rolling mixed-version
+LLM-directed model selection, provider billing enforcement, rolling mixed-version
 upgrades, or HA/performance guarantee. [Security](../../SECURITY.md) expands this boundary.
