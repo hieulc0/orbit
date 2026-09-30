@@ -39,7 +39,7 @@ not the source of current setup instructions.
 
 - [Deployment](operations/deployment.md), [observability and lifecycle](operations/observability.md)
 - [Backup and restore](operations/backup-restore.md), [upgrades and rotation](operations/upgrades.md)
-- [Testing and CI](development/testing.md), [dogfooding](development/dogfooding.md)
+- [Testing and CI](development/testing.md), [Workflow qualification](development/workflow-qualification.md), [dogfooding](development/dogfooding.md)
 - [Agent onboarding and repository skills](development/agents.md)
 - [ACP implementation and acceptance plan](development/acp-implementation-plan.md)
 - [Codex ACP compatibility and implementation record](operations/acp-codex-compatibility.md)

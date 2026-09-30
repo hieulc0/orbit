@@ -113,9 +113,9 @@ substitute for the selected compatibility decision.
 
 ### P1 — Add contracts without changing legacy serialized plans
 
-Primary files: [src/agent.rs](../../src/agent.rs),
-[src/model.rs](../../src/model.rs), [src/execution.rs](../../src/execution.rs),
-[src/api.rs](../../src/api.rs), definition schema consumers and SDK types.
+Primary files: [src/execution/agent.rs](../../src/execution/agent.rs),
+[src/model.rs](../../src/model.rs), [src/execution/profile.rs](../../src/execution/profile.rs),
+[src/control_plane/api.rs](../../src/control_plane/api.rs), definition schema consumers and SDK types.
 
 Implement the proposed optional ACP binding descriptor, worker-local registry,
 definition limits, model attribution and execution-only accounting. Preserve
@@ -136,10 +136,10 @@ definition schema/UI validation and Python/Rust callers for optional accounting.
 
 ### P2 — Extend the ledger and accepted evidence
 
-Primary files: [src/agent.rs](../../src/agent.rs),
-[src/engine.rs](../../src/engine.rs), [src/model.rs](../../src/model.rs),
-[src/sdk.rs](../../src/sdk.rs), [src/artifacts.rs](../../src/artifacts.rs),
-[src/evidence.rs](../../src/evidence.rs) and Python SDK operations.
+Primary files: [src/execution/agent.rs](../../src/execution/agent.rs),
+[src/control_plane/engine.rs](../../src/control_plane/engine.rs), [src/model.rs](../../src/model.rs),
+[src/sdk.rs](../../src/sdk.rs), [src/telemetry/artifacts.rs](../../src/telemetry/artifacts.rs),
+[src/telemetry/evidence.rs](../../src/telemetry/evidence.rs) and Python SDK operations.
 
 Add transactional ACP limit charges and compact usage/session projection. Reuse
 tracked prompt/tool reservations and finish receipts. Add bounded normalized
@@ -163,7 +163,7 @@ inspection retain the new records and artifact checksums.
 ### P3 — Implement the supervised ACP client
 
 Proposed new module: `src/acp_agent.rs` with transport/process helpers as needed.
-Integrate with [src/worker.rs](../../src/worker.rs),
+Integrate with [src/control_plane/worker.rs](../../src/control_plane/worker.rs),
 [src/main.rs](../../src/main.rs) and [src/lib.rs](../../src/lib.rs).
 The reviewed SDK was added during P0 to exercise real initialization; retain its
 locked version until serialization and wire compatibility are requalified.
@@ -189,9 +189,9 @@ prompt retransmission.
 
 ### P4 — Implement brokered files and asynchronous terminals
 
-Primary files: [src/workspace.rs](../../src/workspace.rs),
-[src/container.rs](../../src/container.rs), ACP broker helpers and
-[src/coding_agent.rs](../../src/coding_agent.rs) only where a shared interface is
+Primary files: [src/execution/workspace.rs](../../src/execution/workspace.rs),
+[src/execution/container.rs](../../src/execution/container.rs), ACP broker helpers and
+[src/execution/coding_agent.rs](../../src/execution/coding_agent.rs) only where a shared interface is
 needed. Retain the current synchronous workspace execution wrapper for Responses
 and independent test callers.
 
@@ -216,7 +216,7 @@ to confirm removal is visible, not accepted as success.
 
 ### P5 — Complete the repository workflow
 
-Primary files: [src/workspace.rs](../../src/workspace.rs), worker runtime routing,
+Primary files: [src/execution/workspace.rs](../../src/execution/workspace.rs), worker runtime routing,
 agent report validation, examples, CLI/API inspection and existing review UI.
 
 Route only the agent phase through ACP; reuse private Git materialization,

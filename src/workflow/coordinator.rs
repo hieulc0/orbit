@@ -180,7 +180,7 @@ async fn require_candidate_state(
     Ok(state)
 }
 
-#[path = "workflow_role_execution.rs"]
+#[path = "role_execution.rs"]
 mod live_role_execution;
 
 pub use live_role_execution::{RealAcpRoleExecutor, RoleAgentExecutor, RoleExecutionOutcome};
@@ -6803,7 +6803,7 @@ mod tests {
 
     #[test]
     fn workflow_verification_has_no_weak_authoritative_fallbacks() {
-        let source = include_str!("workflow_coordinator.rs")
+        let source = include_str!("coordinator.rs")
             .split("#[cfg(test)]")
             .next()
             .unwrap();

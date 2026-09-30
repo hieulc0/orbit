@@ -623,7 +623,7 @@ mod tests {
             .trim()
             .to_string();
 
-        let mut definition = Definition::parse(include_str!("../examples/agent.yaml"))?;
+        let mut definition = Definition::parse(include_str!("../../examples/agent.yaml"))?;
         definition.inputs.base_revision = baseline.clone();
         let plan = Plan {
             definition,

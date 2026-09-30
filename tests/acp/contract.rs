@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
 fn fixture() -> (Value, Binding, AgentSpec) {
-    let raw: Value = serde_json::from_str(include_str!("fixtures/acp-contract.json")).unwrap();
+    let raw: Value = serde_json::from_str(include_str!("../fixtures/acp-contract.json")).unwrap();
     let binding = serde_json::from_value(raw["binding"].clone()).unwrap();
     let agent = serde_json::from_value(raw["agent"].clone()).unwrap();
     (raw, binding, agent)
@@ -81,12 +81,12 @@ fn acp_contracts_reject_unenforceable_accounting_permissions_and_policies() -> R
 fn acp_referenced_and_nested_bindings_pin_policy_without_changing_legacy_bytes() -> Result<()> {
     let (_, binding, spec) = fixture();
     let mut definition = Definition::parse(
-        &include_str!("../examples/remote-coding.yaml")
+        &include_str!("../../examples/remote-coding.yaml")
             .replace("REPLACE_WITH_FULL_COMMIT_ID", &"a".repeat(40)),
     )?;
     definition.steps.get_mut("code").unwrap().agent = Some(spec);
     let server: orbit::api::Config =
-        serde_json::from_str(include_str!("../examples/server-remote-coding.json"))?;
+        serde_json::from_str(include_str!("../../examples/server-remote-coding.json"))?;
     let bindings = BTreeMap::from([("codex-fixture".into(), binding.clone())]);
     let compile = |def, bindings: &BTreeMap<String, Binding>| {
         Plan::compile_with_execution(

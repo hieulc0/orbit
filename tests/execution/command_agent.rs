@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 #[test]
 fn command_runtime_restricts_environment_tools_and_reservations() {
     let original: Value =
-        serde_json::from_str(include_str!("../examples/command-agent-runtime.json")).unwrap();
+        serde_json::from_str(include_str!("../../examples/command-agent-runtime.json")).unwrap();
     serde_json::from_value::<CommandAgent>(original.clone())
         .unwrap()
         .validate()

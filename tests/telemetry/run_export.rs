@@ -28,7 +28,7 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Result<Self> {
-        let mut definition = Definition::parse(include_str!("../examples/container.yaml"))?;
+        let mut definition = Definition::parse(include_str!("../../examples/container.yaml"))?;
         definition.steps.insert(
             "review".into(),
             serde_json::from_value(json!({

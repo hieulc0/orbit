@@ -27,95 +27,105 @@ impl Engine {
         let mut migration = pool.begin().await?;
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended(current_schema() || ':orbit:migrations',0))")
             .execute(&mut *migration).await?;
-        sqlx::raw_sql(include_str!("../migrations/0001_kernel.sql"))
+        sqlx::raw_sql(include_str!("../../migrations/0001_kernel.sql"))
             .execute(&mut *migration)
             .await?;
-        sqlx::raw_sql(include_str!("../migrations/0002_coordination.sql"))
+        sqlx::raw_sql(include_str!("../../migrations/0002_coordination.sql"))
             .execute(&mut *migration)
             .await?;
-        sqlx::raw_sql(include_str!("../migrations/0003_workers.sql"))
+        sqlx::raw_sql(include_str!("../../migrations/0003_workers.sql"))
             .execute(&mut *migration)
             .await?;
-        sqlx::raw_sql(include_str!("../migrations/0004_governance.sql"))
+        sqlx::raw_sql(include_str!("../../migrations/0004_governance.sql"))
             .execute(&mut *migration)
             .await?;
-        sqlx::raw_sql(include_str!("../migrations/0005_registry.sql"))
+        sqlx::raw_sql(include_str!("../../migrations/0005_registry.sql"))
             .execute(&mut *migration)
             .await?;
-        sqlx::raw_sql(include_str!("../migrations/0006_operations.sql"))
+        sqlx::raw_sql(include_str!("../../migrations/0006_operations.sql"))
             .execute(&mut *migration)
             .await?;
-        sqlx::raw_sql(include_str!("../migrations/0007_availability.sql"))
+        sqlx::raw_sql(include_str!("../../migrations/0007_availability.sql"))
             .execute(&mut *migration)
             .await?;
         sqlx::raw_sql(include_str!(
-            "../migrations/0008_provider_scope_bindings.sql"
+            "../../migrations/0008_provider_scope_bindings.sql"
         ))
         .execute(&mut *migration)
         .await?;
-        sqlx::raw_sql(include_str!("../migrations/0009_credentials.sql"))
+        sqlx::raw_sql(include_str!("../../migrations/0009_credentials.sql"))
             .execute(&mut *migration)
             .await?;
         sqlx::raw_sql(include_str!(
-            "../migrations/0010_credential_representation_provenance.sql"
-        ))
-        .execute(&mut *migration)
-        .await?;
-        sqlx::raw_sql(include_str!(
-            "../migrations/0011_credential_identity_bindings.sql"
+            "../../migrations/0010_credential_representation_provenance.sql"
         ))
         .execute(&mut *migration)
         .await?;
         sqlx::raw_sql(include_str!(
-            "../migrations/0012_credential_reference_rename.sql"
+            "../../migrations/0011_credential_identity_bindings.sql"
         ))
         .execute(&mut *migration)
         .await?;
         sqlx::raw_sql(include_str!(
-            "../migrations/0013_credential_runtime_provenance_compat.sql"
+            "../../migrations/0012_credential_reference_rename.sql"
         ))
         .execute(&mut *migration)
         .await?;
         sqlx::raw_sql(include_str!(
-            "../migrations/0014_agy_representation_enrollment_stage.sql"
+            "../../migrations/0013_credential_runtime_provenance_compat.sql"
         ))
         .execute(&mut *migration)
         .await?;
         sqlx::raw_sql(include_str!(
-            "../migrations/0015_credential_cascade_delete.sql"
+            "../../migrations/0014_agy_representation_enrollment_stage.sql"
         ))
         .execute(&mut *migration)
         .await?;
-        sqlx::raw_sql(include_str!("../migrations/0016_verification_evidence.sql"))
-            .execute(&mut *migration)
-            .await?;
-        sqlx::raw_sql(include_str!("../migrations/0017_verification_policy.sql"))
-            .execute(&mut *migration)
-            .await?;
-        sqlx::raw_sql(include_str!("../migrations/0018_role_agents_workflow.sql"))
-            .execute(&mut *migration)
-            .await?;
         sqlx::raw_sql(include_str!(
-            "../migrations/0019_integration_environments.sql"
+            "../../migrations/0015_credential_cascade_delete.sql"
         ))
         .execute(&mut *migration)
         .await?;
-        sqlx::raw_sql(include_str!("../migrations/0020_browser_verification.sql"))
-            .execute(&mut *migration)
-            .await?;
-        sqlx::raw_sql(include_str!("../migrations/0021_regression_strategy.sql"))
-            .execute(&mut *migration)
-            .await?;
         sqlx::raw_sql(include_str!(
-            "../migrations/0022_workflow_orchestration.sql"
+            "../../migrations/0016_verification_evidence.sql"
         ))
         .execute(&mut *migration)
         .await?;
-        sqlx::raw_sql(include_str!("../migrations/0023_agent_executions.sql"))
+        sqlx::raw_sql(include_str!(
+            "../../migrations/0017_verification_policy.sql"
+        ))
+        .execute(&mut *migration)
+        .await?;
+        sqlx::raw_sql(include_str!(
+            "../../migrations/0018_role_agents_workflow.sql"
+        ))
+        .execute(&mut *migration)
+        .await?;
+        sqlx::raw_sql(include_str!(
+            "../../migrations/0019_integration_environments.sql"
+        ))
+        .execute(&mut *migration)
+        .await?;
+        sqlx::raw_sql(include_str!(
+            "../../migrations/0020_browser_verification.sql"
+        ))
+        .execute(&mut *migration)
+        .await?;
+        sqlx::raw_sql(include_str!(
+            "../../migrations/0021_regression_strategy.sql"
+        ))
+        .execute(&mut *migration)
+        .await?;
+        sqlx::raw_sql(include_str!(
+            "../../migrations/0022_workflow_orchestration.sql"
+        ))
+        .execute(&mut *migration)
+        .await?;
+        sqlx::raw_sql(include_str!("../../migrations/0023_agent_executions.sql"))
             .execute(&mut *migration)
             .await?;
         sqlx::raw_sql(include_str!(
-            "../migrations/0024_workflow_step_ownership.sql"
+            "../../migrations/0024_workflow_step_ownership.sql"
         ))
         .execute(&mut *migration)
         .await?;

@@ -1039,7 +1039,7 @@ Before provisioning, the active rootless store at
 `/home/hieulc/.local/share/containers/storage` had no Alpine image. The reference
 was not stale or mutable, and Podman was using the expected UID-1000 rootless
 store. The test setup had omitted the documented `podman pull <exact digest>`
-prerequisite. `--pull=never` is enforced by `src/workspace.rs`; no implicit pull
+prerequisite. `--pull=never` is enforced by `src/execution/workspace.rs`; no implicit pull
 or tag fallback was added. The test harness now checks the exact profile image
 using `podman --remote=false image exists` before creating a Run or dispatching
 the coding interaction, with a specific `validator runtime unavailable` error

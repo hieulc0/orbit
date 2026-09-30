@@ -1,5 +1,25 @@
 # Current roadmap
 
+## Next milestone: developer-local execution
+
+S9 workflow boundary extraction and S10 typed execution/cleanup outcomes are
+complete at checkpoint `14769c6`. The frozen R4 campaign passed, and the final
+live self-hosting documentation workflow is
+[qualified](operations/r4-stabilization-final-report.md), including independent
+review, a real repair, FULL, exact candidate identity, and confirmed cleanup.
+
+R5 physical modularization is [implemented and qualified](operations/r5-modularization-report.md).
+The [ownership map](architecture/subsystem-ownership.md) defines
+its subsystem files, public compatibility exports, and test ownership. R6–R11
+remain pending: developer-local execution, production role budgets, Orbit-ACP,
+editor integration, skills selecting flows, and external BA/SA roles. The
+[detailed roadmap](archive/roadmap.md) retains their contracts and sequence.
+
+The earlier delivery planning below is retained as historical context. Its
+earlier "in progress" and "next" labels do not supersede the current milestone
+status above. Separate-host acceptance and broader production hardening remain
+outside the bounded R4 result.
+
 ## Milestone: reproducible, deployable alpha
 
 The bounded Phase 1–9 feature work is committed. Historical acceptance and

@@ -14,7 +14,7 @@ fn signed() -> (Package, BTreeMap<String, TrustedPublisher>) {
         capabilities: BTreeMap::new(),
         definitions: BTreeMap::from([(
             "compute".into(),
-            Definition::parse(include_str!("../examples/container.yaml")).unwrap(),
+            Definition::parse(include_str!("../../examples/container.yaml")).unwrap(),
         )]),
     };
     let signature = hex::encode(key.sign(&manifest.signing_message().unwrap()).to_bytes());

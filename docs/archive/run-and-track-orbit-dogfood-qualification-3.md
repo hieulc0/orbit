@@ -224,11 +224,11 @@ Do not add:
 
 In particular, do NOT tell the coding agent that Q2 inspected:
 
-    src/continuation.rs
-    src/telemetry.rs
+    src/workflow/continuation.rs
+    src/telemetry/agent.rs
     src/model.rs
     src/main.rs
-    src/run_export.rs
+    src/telemetry/run_export.rs
 
 The coding agent must rediscover the repository itself.
 

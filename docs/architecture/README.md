@@ -40,34 +40,37 @@ independent boundaries, not interchangeable permission strings.
 
 ## Code map
 
+The [subsystem ownership map](subsystem-ownership.md) covers every library module
+and the compatibility exports retained by the subsystem namespaces.
+
 | Module | Responsibility |
 | --- | --- |
 | `src/model.rs` | Strict definitions, immutable plans, durable run/task/attempt types |
-| `src/credential_registry.rs`, `src/secret_backend.rs` | Operator credential metadata/lifecycle and owner-only local secret storage; see [credential registry](credential-registry.md) |
-| `src/engine.rs`, `migrations/` | PostgreSQL transitions, coordination, deduplication, reconciliation |
-| `src/api.rs`, `src/governance.rs` | Authentication, scoped authorization, admission policy |
-| `src/worker.rs`, `src/container.rs` | Lease-bound execution, workspaces, process supervision |
-| `src/execution.rs`, `src/workspace.rs`, `src/repository.rs` | Logical requirements, pinned OCI profiles, isolated tools and private Git materialization |
-| `src/agent.rs`, `src/command_agent.rs` | Agent contracts and trusted command-runtime adapter |
-| `src/coding_agent.rs` | Bounded Responses loop, per-call dispatch intent/receipts and tool authorization |
-| `src/acp.rs`, `src/acp_contract.rs` | Credential-free ACP preflight, pinned policy, execution-only limits/charges |
-| `src/acp_runtime.rs`, `src/acp_process.rs`, `src/acp_wire.rs` | Pinned registry, auth quarantine, agent supervision and bounded protocol sessions |
-| `src/acp_broker.rs`, `src/acp_files.rs`, `src/acp_terminal.rs` | Lease-fenced client callbacks, confined files and asynchronous supervised terminals |
-| `src/codex_bridge.rs`, `src/codex_session.rs`, `src/codex_credential_enrollment.rs`, `src/codex_status_probe.rs` | Version-specific Codex App Server bridge, isolated device-code enrollment, catalog-backed status probing, and dynamic-tool-to-ACP routing |
-| `src/artifacts.rs` | Local/S3 immutable publication and verified reads |
-| `src/registry.rs` | Signed immutable package metadata; no code loading |
-| `src/ops.rs`, `src/main.rs` | Lifecycle, probes, metrics, executable commands |
+| `src/credentials/registry.rs`, `src/credentials/secret_backend.rs` | Operator credential metadata/lifecycle and owner-only local secret storage; see [credential registry](credential-registry.md) |
+| `src/control_plane/engine.rs`, `migrations/` | PostgreSQL transitions, coordination, deduplication, reconciliation |
+| `src/control_plane/api.rs`, `src/control_plane/governance.rs` | Authentication, scoped authorization, admission policy |
+| `src/control_plane/worker.rs`, `src/execution/container.rs` | Lease-bound execution, workspaces, process supervision |
+| `src/execution/profile.rs`, `src/execution/workspace.rs`, `src/execution/repository.rs` | Logical requirements, pinned OCI profiles, isolated tools and private Git materialization |
+| `src/execution/agent.rs`, `src/execution/command_agent.rs` | Agent contracts and trusted command-runtime adapter |
+| `src/execution/coding_agent.rs` | Bounded Responses loop, per-call dispatch intent/receipts and tool authorization |
+| `src/acp/preflight.rs`, `src/acp/contract.rs` | Credential-free ACP preflight, pinned policy, execution-only limits/charges |
+| `src/acp/runtime.rs`, `src/acp/process.rs`, `src/acp/wire.rs` | Pinned registry, auth quarantine, agent supervision and bounded protocol sessions |
+| `src/acp/broker.rs`, `src/acp/files.rs`, `src/acp/terminal.rs` | Lease-fenced client callbacks, confined files and asynchronous supervised terminals |
+| `src/providers/codex/bridge.rs`, `src/providers/codex/session.rs`, `src/providers/codex/enrollment.rs`, `src/providers/codex/status_probe.rs` | Version-specific Codex App Server bridge, isolated device-code enrollment, catalog-backed status probing, and dynamic-tool-to-ACP routing |
+| `src/telemetry/artifacts.rs` | Local/S3 immutable publication and verified reads |
+| `src/control_plane/registry.rs` | Signed immutable package metadata; no code loading |
+| `src/control_plane/operations.rs`, `src/main.rs` | Lifecycle, probes, metrics, executable commands |
 | `src/mcp.rs`, `src/sdk.rs`, `sdk/python/`, `ui/` | Peer interfaces over the same server |
-| `src/workflow.rs` | Role definitions, structured handoffs, durable workflow state and fenced mutation ownership |
-| `src/workflow_coordinator.rs` | Workflow stage, progression, repair and completion decisions; repository callbacks and exact tool auditing |
-| `src/role_prompt.rs` | Private role prompt construction and advertised repository tool lists |
-| `src/workflow_role_execution.rs` | Private coordinator child module for live ACP role execution, lifecycle evidence and supervisor cleanup |
-| `src/verification.rs`, `src/regression_strategy.rs` | Authoritative verification, immutable check selection and candidate-bound evidence |
+| `src/workflow/domain.rs` | Role definitions, structured handoffs, durable workflow state and fenced mutation ownership |
+| `src/workflow/coordinator.rs` | Workflow stage, progression, repair and completion decisions; repository callbacks and exact tool auditing |
+| `src/workflow/role_prompt.rs` | Private role prompt construction and advertised repository tool lists |
+| `src/workflow/role_execution.rs` | Private coordinator child module for live ACP role execution, lifecycle evidence and supervisor cleanup |
+| `src/verification/engine.rs`, `src/verification/regression.rs` | Authoritative verification, immutable check selection and candidate-bound evidence |
 | `tests/kernel/`, `scripts/` | Disposable qualification and repeatable operational checks |
 
 The role workflow coordinator delegates prompt construction and live execution
 while retaining workflow decisions. `RoleAgentExecutor`, `RoleExecutionOutcome`
-and `RealAcpRoleExecutor` remain available through `workflow_coordinator`; the
+and `RealAcpRoleExecutor` remain available through `workflow::coordinator` and the compatibility path `workflow_coordinator`; the
 extracted implementation modules are private. Structured handoff parsing and
 verification selection retain their existing owners. This boundary does not
 change role permissions, mutation locks, exact tool auditing, WorkspaceState

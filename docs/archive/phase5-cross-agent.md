@@ -148,11 +148,11 @@ orphan process cleanup
 At minimum inspect relevant code in:
 
 ```text
-src/engine.rs
-src/workspace.rs
+src/control_plane/engine.rs
+src/execution/workspace.rs
 src/model.rs
-src/evidence.rs
-src/continuation.rs
+src/telemetry/evidence.rs
+src/workflow/continuation.rs
 ```
 
 plus existing worker/lease/scheduler modules.

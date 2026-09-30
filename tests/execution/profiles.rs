@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 fn fixture() -> Result<(Definition, RepositoryBinding, WorkerConfig)> {
     let definition = Definition::parse(
-        &include_str!("../examples/remote-coding.yaml")
+        &include_str!("../../examples/remote-coding.yaml")
             .replace("REPLACE_WITH_FULL_COMMIT_ID", &"a".repeat(40)),
     )?;
     let mut repository = RepositoryBinding::none();
@@ -21,7 +21,7 @@ fn fixture() -> Result<(Definition, RepositoryBinding, WorkerConfig)> {
         timeout_seconds: 30,
     };
     repository.allowed_test_executables = vec!["sh".into()];
-    let worker = serde_json::from_str(include_str!("../examples/remote-worker.json"))?;
+    let worker = serde_json::from_str(include_str!("../../examples/remote-worker.json"))?;
     Ok((definition, repository, worker))
 }
 
@@ -29,9 +29,10 @@ fn fixture() -> Result<(Definition, RepositoryBinding, WorkerConfig)> {
 fn validator_requirements_are_optional_local_and_bounded() -> Result<()> {
     let (_, _, legacy) = fixture()?;
     assert!(legacy.validator_requirements.is_empty());
-    let mut raw: Value = serde_json::from_str(include_str!("../examples/remote-worker.json"))?;
-    let requirements: Value =
-        serde_json::from_str(include_str!("../examples/rust-validator-requirements.json"))?;
+    let mut raw: Value = serde_json::from_str(include_str!("../../examples/remote-worker.json"))?;
+    let requirements: Value = serde_json::from_str(include_str!(
+        "../../examples/rust-validator-requirements.json"
+    ))?;
     raw["validator_requirements"] = requirements["validator_requirements"].clone();
     let configured: WorkerConfig = serde_json::from_value(raw.clone())?;
     configured.validate()?;
@@ -51,7 +52,7 @@ fn execution_requirements_pin_profiles_preserve_legacy_and_reject_downgrades() -
     worker.validate()?;
     let agent = worker.coding_agent.as_ref().unwrap();
     let server: orbit::api::Config =
-        serde_json::from_str(include_str!("../examples/server-remote-coding.json"))?;
+        serde_json::from_str(include_str!("../../examples/server-remote-coding.json"))?;
     assert_eq!(
         serde_json::to_value(&server.agent_bindings[&agent.binding_name])?,
         serde_json::to_value(&agent.binding)?
@@ -98,7 +99,7 @@ fn execution_requirements_pin_profiles_preserve_legacy_and_reject_downgrades() -
     let mut raw = serde_json::to_value(&definition)?;
     raw["steps"]["code"]["execution"]["runtime"] = json!("firecracker");
     assert!(serde_json::from_value::<Definition>(raw).is_err());
-    let legacy = Definition::parse(include_str!("../examples/container.yaml"))?;
+    let legacy = Definition::parse(include_str!("../../examples/container.yaml"))?;
     let legacy_repository = RepositoryBinding::none();
     let expected = digest(&serde_json::to_vec(&(&legacy, &legacy_repository))?);
     let plan =
@@ -258,7 +259,7 @@ fn coding_tools_are_bounded_and_tracked_dispatch_is_not_replay_permission() -> R
     conflict.result_digest = digest(b"different");
     assert!(usage.finish(&conflict).is_err());
     assert_eq!(usage.tokens, Some(73728));
-    let mut raw: Value = serde_json::from_str(include_str!("../examples/remote-worker.json"))?;
+    let mut raw: Value = serde_json::from_str(include_str!("../../examples/remote-worker.json"))?;
     raw["coding_agent"]["tokens_per_call"] = json!(1);
     assert!(
         serde_json::from_value::<WorkerConfig>(raw)?

@@ -1,4 +1,3 @@
-// src/regression_strategy.rs
 // Regression tier selection and policy evaluation.
 
 use anyhow::{Context, Result, bail, ensure};

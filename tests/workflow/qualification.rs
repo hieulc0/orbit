@@ -22,7 +22,7 @@ struct TestContext {
 }
 
 #[allow(dead_code)] // shared test helpers are used by different qualification binaries
-#[path = "common/mod.rs"]
+#[path = "../common/mod.rs"]
 mod common;
 
 impl Deref for TestContext {

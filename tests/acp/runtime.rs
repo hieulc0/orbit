@@ -11,7 +11,7 @@ use std::os::unix::fs::PermissionsExt;
 #[tokio::test]
 #[ignore = "requires exact pinned Codex image in rootless Podman store"]
 async fn codex_declared_launch_preflight_rejects_stale_executable() -> Result<()> {
-    let raw: Value = serde_json::from_str(include_str!("../examples/acp-worker.json"))?;
+    let raw: Value = serde_json::from_str(include_str!("../../examples/acp-worker.json"))?;
     let mut launch: orbit::acp_runtime::Launch =
         serde_json::from_value(raw["acp_agents"][0]["launch"].clone())?;
     launch.image = std::env::var("ORBIT_TEST_ACP_IMAGE")?;
@@ -25,7 +25,7 @@ async fn codex_declared_launch_preflight_rejects_stale_executable() -> Result<()
 }
 
 fn runtime(path: &std::path::Path) -> Result<Runtime> {
-    let raw: Value = serde_json::from_str(include_str!("fixtures/acp-contract.json"))?;
+    let raw: Value = serde_json::from_str(include_str!("../fixtures/acp-contract.json"))?;
     let mut value = json!({"binding_name":"codex-fixture","binding":raw["binding"],
         "launch":{"adapter":"acp","image":format!("sha256:{}","b".repeat(64)),"command":["/bin/true"],
             "agent_name":"fixture","agent_version":"1","binary_revision":"1","cpu_millis":1000,"memory_mib":128,"network":"none"},
@@ -118,7 +118,7 @@ fn status_auth_staging_uses_probe_marker_and_existing_quarantine() -> Result<()>
 }
 #[test]
 fn acp_records_are_bounded_ordered_idempotent_and_cumulative() -> Result<()> {
-    let raw: Value = serde_json::from_str(include_str!("fixtures/acp-contract.json"))?;
+    let raw: Value = serde_json::from_str(include_str!("../fixtures/acp-contract.json"))?;
     let limits = serde_json::from_value(raw["agent"]["acp_limits"].clone())?;
     let mut usage = Usage::default();
     let mut batch = RecordBatch {
@@ -291,7 +291,7 @@ fn legacy_cleanup_receipts_remain_readable_without_being_rewritten() -> Result<(
 
 #[test]
 fn acp_transcript_and_report_reject_unaccepted_or_misattributed_evidence() -> Result<()> {
-    let raw: Value = serde_json::from_str(include_str!("fixtures/acp-contract.json"))?;
+    let raw: Value = serde_json::from_str(include_str!("../fixtures/acp-contract.json"))?;
     let spec: orbit::agent::AgentSpec = serde_json::from_value(raw["agent"].clone())?;
     let binding: orbit::agent::Binding = serde_json::from_value(raw["binding"].clone())?;
     let mut report = orbit::agent::AgentReport {
@@ -354,7 +354,7 @@ fn acp_launch_digest_cli_uses_canonical_policy_without_api_credentials() -> Resu
 fn acp_example_registry_pins_launch_scope_and_combined_resources() -> Result<()> {
     use orbit::model::*;
     use std::collections::BTreeMap;
-    let mut raw: Value = serde_json::from_str(include_str!("../examples/acp-worker.json"))?;
+    let mut raw: Value = serde_json::from_str(include_str!("../../examples/acp-worker.json"))?;
     raw["acp_agents"][0]["launch"]["image"] = json!(format!("sha256:{}", "b".repeat(64)));
     let launch: orbit::acp_runtime::Launch =
         serde_json::from_value(raw["acp_agents"][0]["launch"].clone())?;
@@ -363,11 +363,11 @@ fn acp_example_registry_pins_launch_scope_and_combined_resources() -> Result<()>
     worker.validate()?;
     let runtime = &worker.acp_agents[0];
     let definition = Definition::parse(
-        &include_str!("../examples/acp-coding.yaml")
+        &include_str!("../../examples/acp-coding.yaml")
             .replace("REPLACE_WITH_FULL_COMMIT_ID", &"a".repeat(40)),
     )?;
     let server: orbit::api::Config =
-        serde_json::from_str(include_str!("../examples/server-remote-coding.json"))?;
+        serde_json::from_str(include_str!("../../examples/server-remote-coding.json"))?;
     let plan = Plan::compile_with_execution(
         definition,
         server.repositories["approved-repository"].clone(),
@@ -440,7 +440,7 @@ fn acp_antigravity_launch_and_isolated_gemini_auth_validate() -> Result<()> {
     std::fs::write(auth.join("acp_token.json"), "{}")?;
     std::fs::write(auth.join("settings.json"), "{}")?;
 
-    let mut raw: Value = serde_json::from_str(include_str!("fixtures/acp-contract.json"))?;
+    let mut raw: Value = serde_json::from_str(include_str!("../fixtures/acp-contract.json"))?;
     raw["binding"]["acp"]["agent_id"] = json!("antigravity-acp");
     raw["binding"]["acp"]["agent_revision"] = json!("agy_acp_server_1.1.1");
     raw["binding"]["model"] = json!("gemini-3.7-flash-high");
@@ -500,7 +500,8 @@ fn acp_antigravity_launch_and_isolated_gemini_auth_validate() -> Result<()> {
 fn acp_antigravity_example_registry_pins_launch_scope_and_combined_resources() -> Result<()> {
     use orbit::model::*;
     use std::collections::BTreeMap;
-    let mut raw: Value = serde_json::from_str(include_str!("../examples/antigravity-worker.json"))?;
+    let mut raw: Value =
+        serde_json::from_str(include_str!("../../examples/antigravity-worker.json"))?;
     raw["acp_agents"][0]["launch"]["image"] = json!(format!("sha256:{}", "b".repeat(64)));
     let launch: orbit::acp_runtime::Launch =
         serde_json::from_value(raw["acp_agents"][0]["launch"].clone())?;
@@ -509,11 +510,11 @@ fn acp_antigravity_example_registry_pins_launch_scope_and_combined_resources() -
     worker.validate()?;
     let runtime = &worker.acp_agents[0];
     let definition = Definition::parse(
-        &include_str!("../examples/antigravity-coding.yaml")
+        &include_str!("../../examples/antigravity-coding.yaml")
             .replace("REPLACE_WITH_FULL_COMMIT_ID", &"a".repeat(40)),
     )?;
     let server: orbit::api::Config =
-        serde_json::from_str(include_str!("../examples/server-remote-coding.json"))?;
+        serde_json::from_str(include_str!("../../examples/server-remote-coding.json"))?;
     let plan = Plan::compile_with_execution(
         definition,
         server.repositories["approved-repository"].clone(),

@@ -53,16 +53,16 @@ upgrade the established `trusted` isolation class or prove safety for hostile ag
 
 | Component | Responsibility |
 | --- | --- |
-| [acp_contract.rs](../../src/acp_contract.rs), [agent.rs](../../src/agent.rs) | Immutable policy, nullable execution-only accounting, bounded session batches |
-| [acp_runtime.rs](../../src/acp_runtime.rs), [execution.rs](../../src/execution.rs), [worker.rs](../../src/worker.rs) | Operator registry, exact assignment authorization, capability advertisement and session lifecycle |
-| [acp_wire.rs](../../src/acp_wire.rs) | Bounded JSON-RPC framing and correlation, without background queues or payload logging |
-| [acp_process.rs](../../src/acp_process.rs) | Independent agent OCI supervision, auth lock/refresh/quarantine and cleanup receipts |
-| [codex_session.rs](../../src/codex_session.rs), [codex_bridge.rs](../../src/codex_bridge.rs) | Codex 0.156.0 App Server translation and dynamic tools routed through ACP callbacks; the latest offline broker compatibility gate is documented in the operations report |
-| [acp_broker.rs](../../src/acp_broker.rs) | Session-bound callbacks, reserve-before-effect, terminal ownership, record/receipt submission |
-| [acp_files.rs](../../src/acp_files.rs) | Linux directory-fd confinement, file bounds and atomic private auth replacement |
-| [acp_terminal.rs](../../src/acp_terminal.rs), [workspace.rs](../../src/workspace.rs), [container.rs](../../src/container.rs) | Asynchronous terminal handles over the existing workspace supervisor; repository lifecycle |
-| [engine.rs](../../src/engine.rs) | Fenced operations, retained budgets, accepted transcript/report validation and uncertainty |
-| [acp.rs](../../src/acp.rs) | Separate initialize-only installation probe; never authorizes execution |
+| [acp_contract.rs](../../src/acp/contract.rs), [agent.rs](../../src/execution/agent.rs) | Immutable policy, nullable execution-only accounting, bounded session batches |
+| [acp_runtime.rs](../../src/acp/runtime.rs), [execution.rs](../../src/execution/profile.rs), [worker.rs](../../src/control_plane/worker.rs) | Operator registry, exact assignment authorization, capability advertisement and session lifecycle |
+| [acp_wire.rs](../../src/acp/wire.rs) | Bounded JSON-RPC framing and correlation, without background queues or payload logging |
+| [acp_process.rs](../../src/acp/process.rs) | Independent agent OCI supervision, auth lock/refresh/quarantine and cleanup receipts |
+| [codex_session.rs](../../src/providers/codex/session.rs), [codex_bridge.rs](../../src/providers/codex/bridge.rs) | Codex 0.156.0 App Server translation and dynamic tools routed through ACP callbacks; the latest offline broker compatibility gate is documented in the operations report |
+| [acp_broker.rs](../../src/acp/broker.rs) | Session-bound callbacks, reserve-before-effect, terminal ownership, record/receipt submission |
+| [acp_files.rs](../../src/acp/files.rs) | Linux directory-fd confinement, file bounds and atomic private auth replacement |
+| [acp_terminal.rs](../../src/acp/terminal.rs), [workspace.rs](../../src/execution/workspace.rs), [container.rs](../../src/execution/container.rs) | Asynchronous terminal handles over the existing workspace supervisor; repository lifecycle |
+| [engine.rs](../../src/control_plane/engine.rs) | Fenced operations, retained budgets, accepted transcript/report validation and uncertainty |
+| [acp.rs](../../src/acp/preflight.rs) | Separate initialize-only installation probe; never authorizes execution |
 
 ## Contracts and installation
 

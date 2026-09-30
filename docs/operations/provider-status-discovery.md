@@ -101,7 +101,7 @@ UNKNOWN, never READY.
 
 ### Personal-account provider-scope enrollment
 
-`src/provider_scope.rs` derives a domain-separated `ps1:` SHA-256 fingerprint
+`src/providers/scope.rs` derives a domain-separated `ps1:` SHA-256 fingerprint
 from the provider label and bounded provider-reported `accountId`. Migration
 `0008_provider_scope_bindings.sql` stores one current binding per provider,
 logical credential reference and credential generation, plus append-only
@@ -171,7 +171,7 @@ docker exec orbit-postgres dropdb -U orbit orbit_status_gate_a
 
 ## Implemented offline normalization
 
-`src/provider_status.rs` accepts only a bounded `account/rateLimits/read`
+`src/providers/status.rs` accepts only a bounded `account/rateLimits/read`
 *result* for the exact Codex bridge revision. It never invokes Codex itself.
 The production adapter compares the reviewed account IDs in memory, then
 discards them; no raw ID is passed into persisted status metadata. Malformed
@@ -338,7 +338,7 @@ fields block any future raw-document retention, but their bounded schema
 diagnostics retain only path, field name, JSON type, rejection reason, and
 limited structural counts/lengths. Safe sibling structure remains visible.
 The input, nesting, node, key, array, string, diagnostic, and serialized-schema
-budgets are bounded in `src/agy_usage_schema.rs`. Values are scrubbed after
+budgets are bounded in `src/providers/antigravity/usage_schema.rs`. Values are scrubbed after
 schema generation; raw status JSON is not retained. At that checkpoint,
 provider values were not available to the normalizer, so availability remained
 UNKNOWN and ACP↔agy identity remained UNVERIFIED.

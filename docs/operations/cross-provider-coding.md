@@ -275,7 +275,7 @@ the test. The uniquely named database container and volume were removed. Existin
 
 The missing-host diagnostic did not recur. App Server logged a dynamic-tool
 request rejection with `tool path must be workspace-relative`. The shared guard
-is in `src/coding_agent.rs`; rejection happened before broker reservation/effect.
+is in `src/execution/coding_agent.rs`; rejection happened before broker reservation/effect.
 The raw tool arguments were intentionally not persisted, so the requested path
 value is unknown. No filesystem or terminal callback reached the workspace
 supervisor and the preflight's harmless nonzero command was not reached. Work

@@ -22,7 +22,7 @@ fn resource_roles_are_scoped_and_global_grants_are_explicit() {
 }
 #[test]
 fn execution_scope_is_pinned_without_changing_legacy_digests() {
-    let definition = Definition::parse(include_str!("../examples/container.yaml")).unwrap();
+    let definition = Definition::parse(include_str!("../../examples/container.yaml")).unwrap();
     let plan = Plan::compile(definition, RepositoryBinding::none()).unwrap();
     assert_eq!(plan.digest, plan.clone().in_scope(None).unwrap().digest);
     let a = plan.clone().in_scope(Some(scope("a"))).unwrap();
@@ -51,7 +51,7 @@ fn credential_files_are_private_bounded_and_not_symlinks() {
 }
 #[test]
 fn environment_policy_restricts_nested_capabilities_and_resources() {
-    let definition = Definition::parse(include_str!("../examples/container.yaml")).unwrap();
+    let definition = Definition::parse(include_str!("../../examples/container.yaml")).unwrap();
     let mut policy = Policy {
         capabilities: vec!["container.run".into()],
         repository_ids: vec![],

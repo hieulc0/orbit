@@ -129,11 +129,11 @@ Current two-agent assumption
 Especially inspect:
 
 ```text id="0h5c7h"
-src/continuation.rs
-src/workspace.rs
-src/engine.rs
+src/workflow/continuation.rs
+src/execution/workspace.rs
+src/control_plane/engine.rs
 src/model.rs
-tests/continuation.rs
+tests/workflow/continuation.rs
 ```
 
 Do not layer an N-agent abstraction on top of hidden two-agent assumptions.

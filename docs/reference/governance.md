@@ -54,7 +54,7 @@ across replicas. Use a new worker identity when changing that profile.
 identity to a `kind`, credential reference and grants. A grant has a scope and
 role names; an explicit `scope: null` grants those actions globally. A scoped
 grant never grants global worker, queue, scheduler-limit or audit access.
-Supported actions are enumerated in `src/governance.rs` and include
+Supported actions are enumerated in `src/control_plane/governance.rs` and include
 `run.read/submit/cancel/signal/approve`, `artifact.read`,
 `definition.read/validate`, `worker.read`, `queue.read`, `limits.read/write`,
 `audit.read` and `package.read/publish`.

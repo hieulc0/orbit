@@ -229,7 +229,7 @@ contracts. It does not provide HTTP MCP, sampling, subscriptions or task extensi
 
 ## Qualification
 
-Five regular tests in `tests/agents.rs` cover binding restrictions, immutable
+Five regular tests in `tests/execution/agents.rs` cover binding restrictions, immutable
 digests, reservation bounds/replay, report provenance and MCP lifecycle/input
 validation, including a real stdio process. Four PostgreSQL/process cases in `tests/kernel/phase5.rs` pass:
 

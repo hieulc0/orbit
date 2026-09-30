@@ -35,3 +35,123 @@ uuid = { version = "1", features = ["v4", "serde"] }
 zeroize = "1"
 
 [dev-dependencies]
+
+[[test]]
+name = "acp"
+path = "tests/acp/preflight.rs"
+
+[[test]]
+name = "acp_broker"
+path = "tests/acp/broker.rs"
+
+[[test]]
+name = "acp_capabilities"
+path = "tests/acp/capabilities.rs"
+
+[[test]]
+name = "acp_contract"
+path = "tests/acp/contract.rs"
+
+[[test]]
+name = "acp_runtime"
+path = "tests/acp/runtime.rs"
+
+[[test]]
+name = "workflow_qualification"
+path = "tests/workflow/qualification.rs"
+
+[[test]]
+name = "workflow_orchestration_qualification"
+path = "tests/workflow/orchestration_qualification.rs"
+
+[[test]]
+name = "real_acp_role_execution_qualification"
+path = "tests/workflow/real_acp_qualification.rs"
+
+[[test]]
+name = "continuation"
+path = "tests/workflow/continuation.rs"
+
+[[test]]
+name = "verification_qualification"
+path = "tests/verification/qualification.rs"
+
+[[test]]
+name = "regression_strategy_qualification"
+path = "tests/verification/regression_qualification.rs"
+
+[[test]]
+name = "integration_environment_qualification"
+path = "tests/verification/integration_environment_qualification.rs"
+
+[[test]]
+name = "browser_verification_qualification"
+path = "tests/verification/browser_qualification.rs"
+
+[[test]]
+name = "credential_registry_pg"
+path = "tests/credentials/registry_pg.rs"
+
+[[test]]
+name = "codex_enrollment_pg"
+path = "tests/credentials/codex_enrollment_pg.rs"
+
+[[test]]
+name = "secret_backend"
+path = "tests/credentials/secret_backend.rs"
+
+[[test]]
+name = "availability"
+path = "tests/providers/availability.rs"
+
+[[test]]
+name = "provider_scope"
+path = "tests/providers/scope.rs"
+
+[[test]]
+name = "codex_bridge"
+path = "tests/providers/codex_bridge.rs"
+
+[[test]]
+name = "agents"
+path = "tests/execution/agents.rs"
+
+[[test]]
+name = "command_agent"
+path = "tests/execution/command_agent.rs"
+
+[[test]]
+name = "execution"
+path = "tests/execution/profiles.rs"
+
+[[test]]
+name = "repository_filesystem_mutation_qualification"
+path = "tests/execution/filesystem_mutation_qualification.rs"
+
+[[test]]
+name = "core_coding_agent_tool_surface_qualification"
+path = "tests/execution/tool_surface_qualification.rs"
+
+[[test]]
+name = "agent_telemetry"
+path = "tests/telemetry/agent.rs"
+
+[[test]]
+name = "evidence"
+path = "tests/telemetry/evidence.rs"
+
+[[test]]
+name = "run_export"
+path = "tests/telemetry/run_export.rs"
+
+[[test]]
+name = "governance"
+path = "tests/control_plane/governance.rs"
+
+[[test]]
+name = "registry"
+path = "tests/control_plane/registry.rs"
+
+[[test]]
+name = "submission"
+path = "tests/control_plane/submission.rs"

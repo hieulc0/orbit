@@ -42,7 +42,7 @@ async fn start_mock_server() -> (String, tokio::sync::oneshot::Sender<()>) {
 }
 
 fn create_assignment(acp_limits: Limits) -> Result<Assignment> {
-    let mut def = Definition::parse(include_str!("../examples/agent.yaml"))?;
+    let mut def = Definition::parse(include_str!("../../examples/agent.yaml"))?;
     def.steps.retain(|name, _| name == "planner");
     let step = def.steps.get_mut("planner").unwrap();
     let mut agent = step.agent.clone().unwrap();

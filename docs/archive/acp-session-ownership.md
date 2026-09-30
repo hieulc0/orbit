@@ -122,7 +122,7 @@ NOT:
 1. ESTABLISH SESSION OWNERSHIP IMMEDIATELY
 ============================================================
 
-Inspect src/acp_runtime.rs and related session initialization code.
+Inspect src/acp/runtime.rs and related session initialization code.
 
 After session/new successfully returns and its session ID has been
 validated, establish:

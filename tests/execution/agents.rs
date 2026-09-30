@@ -18,11 +18,11 @@ fn coding_runtime_exposes_bounded_shell_capability() {
 }
 
 fn bindings() -> BTreeMap<String, Binding> {
-    serde_json::from_str(include_str!("../examples/agent-bindings.json")).unwrap()
+    serde_json::from_str(include_str!("../../examples/agent-bindings.json")).unwrap()
 }
 #[test]
 fn agents_pin_authorized_bindings_and_restrict_delegation() {
-    let def = Definition::parse(include_str!("../examples/agent.yaml")).unwrap();
+    let def = Definition::parse(include_str!("../../examples/agent.yaml")).unwrap();
     assert!(Plan::compile(def.clone(), RepositoryBinding::none()).is_err());
     let binding = bindings();
     let plan = Plan::compile_with_agents(def.clone(), RepositoryBinding::none(), &binding).unwrap();
@@ -68,7 +68,7 @@ fn agents_pin_authorized_bindings_and_restrict_delegation() {
 }
 #[test]
 fn budget_reservations_are_bounded_and_replay_safe() {
-    let def = Definition::parse(include_str!("../examples/agent.yaml")).unwrap();
+    let def = Definition::parse(include_str!("../../examples/agent.yaml")).unwrap();
     let spec = def.steps["planner"].agent.as_ref().unwrap();
     let mut usage = Usage::default();
     let mut call = CallReservation {
@@ -101,7 +101,7 @@ fn budget_reservations_are_bounded_and_replay_safe() {
 }
 #[test]
 fn agent_reports_enforce_output_provenance_and_bounds() {
-    let def = Definition::parse(include_str!("../examples/agent.yaml")).unwrap();
+    let def = Definition::parse(include_str!("../../examples/agent.yaml")).unwrap();
     let spec = def.steps["planner"].agent.as_ref().unwrap();
     let bindings = bindings();
     let binding = &bindings["local-agent"];
@@ -137,7 +137,7 @@ fn mcp_stdio_emits_only_protocol_messages_and_exits_on_eof() {
         json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}}),
         json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
         json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
-        json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"validate_definition","arguments":{"yaml":include_str!("../examples/agent.yaml")}}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"validate_definition","arguments":{"yaml":include_str!("../../examples/agent.yaml")}}}),
     ] {
         writeln!(input, "{message}").unwrap();
     }
@@ -203,7 +203,7 @@ async fn mcp_lifecycle_validation_and_no_approval_tool() {
             .len(),
         10
     );
-    let result = session.handle(&client,request(4,"tools/call",json!({"name":"validate_definition","arguments":{"yaml":include_str!("../examples/agent.yaml")}}))).await.unwrap();
+    let result = session.handle(&client,request(4,"tools/call",json!({"name":"validate_definition","arguments":{"yaml":include_str!("../../examples/agent.yaml")}}))).await.unwrap();
     assert_eq!(result["result"]["isError"], false);
     let result = session
         .handle(
