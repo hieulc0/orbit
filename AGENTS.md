@@ -10,13 +10,14 @@ Write code for future maintainers, not for the implementation plan that produced
 - Match the naming and documentation conventions already used in the surrounding code instead of introducing a new local convention.
 - Remove temporary helpers, scaffolding, debug paths, and implementation-plan terminology before handoff. Before handoff, review the final diff as if the implementation plan and agent conversation did not exist. The resulting code should be understandable on its own.
 
-Planning vocabulary must not become implementation vocabulary.
-
 ## Documentation and working notes
 
-Keep temporary plans, investigations, implementation notes, agent scratch material,
-execution checklists, and implementation-phase notes under `.local/plans/`,
-`.local/investigations/`, or `.local/implementation/`, not `docs/`. After implementation,
-extract durable architecture, contracts, invariants, rationale, and operating rules
-into `docs/`. Retain historical identifiers only for intentional qualification,
-migration, compatibility, or requirements traceability.
+Planning vocabulary must not become implementation vocabulary.
+Implementation history must not become architecture documentation.
+
+Temporary plans, investigations, implementation notes, qualification execution
+notes, and agent scratch material belong under `.local/`: use `plans/`,
+`investigations/`, `implementation/`, `qualification/`, and `scratch/` according
+to purpose. Only durable conclusions are promoted into `docs/`. Use domain
+names for documentation files and headings; keep run-specific evidence out of
+normal documentation.

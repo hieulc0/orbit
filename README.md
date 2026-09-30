@@ -11,8 +11,8 @@ gates](docs/ROADMAP.md).
 ## Start here
 
 - [Documentation index](docs/README.md)
-- [Local development and first workflow](docs/guides/local-development.md)
-- [Single-host deployment](docs/operations/deployment.md)
+- [Local development and first workflow](docs/operations/installation.md#local-server-and-first-repository-workflow)
+- [Single-host deployment](docs/operations/deployment.md#server-images-services-and-host-workers)
 - [Architecture](docs/architecture/README.md)
 - [Contributing](CONTRIBUTING.md) and [security boundaries](SECURITY.md)
 
@@ -50,7 +50,7 @@ The timer needs no worker or repository. For compute, agents, repository changes
 and approvals, follow the [workflow guides](docs/README.md#workflows). Keep the
 same request ID after an uncertain submission; use a new ID for independent work.
 
-For a repository change, follow [submit → inspect → review](docs/guides/repository-review.md).
+For a repository change, follow [submit → inspect → review](docs/operations/installation.md#submit-inspect-and-review-a-candidate).
 `orbit export-run RUN_ID --output /absolute/private/review` saves a private run
 snapshot, journal and verified accepted artifacts for human review.
 
@@ -61,16 +61,17 @@ stop at their last confirmed lease/deadline. Retries are at-least-once, not
 exactly-once external effects. Cancellation and approvals are durable decisions;
 artifacts are immutable and checksum-verified. Waits consume no workers.
 
-API/CLI/worker wire compatibility and SDK responsibilities are documented in the
-[reference](docs/reference/api-cli-sdk.md). PostgreSQL and artifact bytes both
-need durable storage and tested backups.
+API/worker wire compatibility and SDK responsibilities are documented in the
+[API reference](docs/reference/api.md); command behavior is in the
+[CLI reference](docs/reference/cli.md). PostgreSQL and artifact bytes both need
+durable storage and tested backups.
 
 ## Qualification
 
 `bash scripts/qualify.sh` runs the full disposable PostgreSQL/S3/OCI/browser
 suite after its prerequisites are provisioned. It never silently starts services
-or pulls images. See [testing](docs/development/testing.md) and the
-[alpha qualification record](docs/operations/qualification.md).
+or pulls images. See [testing](docs/operations/troubleshooting.md#qualification-prerequisites-and-ci) and the
+[acceptance requirements](docs/requirements/verification.md).
 
-Historical milestone decisions and evidence remain in [the archive](docs/archive/README.md).
+Pending acceptance is listed in [the roadmap](docs/ROADMAP.md).
 Passing tests do not establish production readiness or owner acceptance.

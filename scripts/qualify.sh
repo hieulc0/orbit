@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
-: "${ORBIT_TEST_DATABASE_URL:?Set a disposable PostgreSQL database; see docs/development/testing.md}"
-: "${ORBIT_TEST_S3_ACCESS_KEY:?Provision the local qualification S3 bucket; see docs/development/testing.md}"
-: "${ORBIT_TEST_S3_SECRET_KEY:?Provision the local qualification S3 bucket; see docs/development/testing.md}"
-: "${ORBIT_TEST_ACP_IMAGE:?Build the offline pinned ACP fixture image; see docs/development/testing.md}"
+: "${ORBIT_TEST_DATABASE_URL:?Set a disposable PostgreSQL database; see docs/operations/troubleshooting.md}"
+: "${ORBIT_TEST_S3_ACCESS_KEY:?Provision the local qualification S3 bucket; see docs/operations/troubleshooting.md}"
+: "${ORBIT_TEST_S3_SECRET_KEY:?Provision the local qualification S3 bucket; see docs/operations/troubleshooting.md}"
+: "${ORBIT_TEST_ACP_IMAGE:?Build the offline pinned ACP fixture image; see docs/operations/troubleshooting.md}"
 export ORBIT_CONTAINER_RUNTIME=${ORBIT_CONTAINER_RUNTIME:-podman}
 case "$ORBIT_CONTAINER_RUNTIME" in docker|podman) ;; *) echo 'Select docker or podman' >&2; exit 2;; esac
 command -v "$ORBIT_CONTAINER_RUNTIME" >/dev/null

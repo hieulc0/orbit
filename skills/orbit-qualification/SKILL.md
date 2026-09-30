@@ -3,8 +3,9 @@ name: orbit-qualification
 description: Run and review Orbit's disposable database, worker, OCI, browser or deployment qualification and its evidence without touching live systems.
 ---
 
-Read docs/development/testing.md for prerequisites and docs/operations/qualification.md
-for the current evidence map. Pick the smallest relevant case, then the complete
+Read docs/operations/troubleshooting.md for prerequisites and docs/ROADMAP.md
+for pending acceptance. Record temporary run results under `.local/qualification/`.
+Pick the smallest relevant case, then the complete
 suite when the change affects shared execution semantics. scripts/qualify.sh
 does not provision services or pull images implicitly.
 
@@ -17,4 +18,4 @@ Export evidence into a new destination using orbit export-evidence. Check its
 manifest and accepted artifacts, then review raw artifact content and command
 arguments for secrets before any sharing. A passing suite or checksum review is
 not owner acceptance. Report failed/skipped cases, backend differences and retained
-local resources. Use docs/development/dogfooding.md for pinned Orbit-on-Orbit work.
+local resources. Use docs/operations/troubleshooting.md for pinned Orbit-on-Orbit work.

@@ -4,7 +4,7 @@ The supported worker transport is `orbit/v0`, with additive optional fields for
 `orbit/v1` graph, compute and agent execution. This is a wire compatibility
 contract, not a claim that Rust struct literals or every SDK language API have
 reached a frozen 1.0 release. The crate/package version remains 0.1.0 and no SDK
-has been published externally as part of this implementation.
+has been published externally.
 
 - Existing registration, claim, operation, upload, attempt inspection and artifact
   endpoints retain their meaning. New capabilities are opt-in and authorized by
@@ -34,7 +34,7 @@ has been published externally as part of this implementation.
   server-authorized `execution.podman-v1`. Legacy workers cannot claim those steps.
   Private Git bindings use logical credential names, not embedded secrets. Legacy
   plans without the new fields keep their serialized digests. See the
-  [remote coding guide](../docs/guides/remote-coding.md) for the narrow first backend.
+  [worker isolation contract](../docs/architecture/workers.md#trusted-worker-isolation) for the supported execution boundary.
 - Treat model/provider credentials as runtime configuration. Assignments contain
   scoped contracts and lease tokens, not provider credentials. Never log/export
   lease tokens or include them in agent/container environment payloads.

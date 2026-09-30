@@ -5,12 +5,13 @@ for the behavior you are changing. [AGENTS.md](AGENTS.md) applies to coding agen
 
 Use `bash scripts/check.sh` for regular Rust/Python/UI checks. The full ignored
 suite needs deliberately provisioned disposable services; follow
-[testing](docs/development/testing.md). Do not make a production system a fixture.
+[testing](docs/operations/troubleshooting.md#qualification-prerequisites-and-ci). Do not make a production system a fixture.
 
 Keep patches focused. Add regression tests for changes to scheduling, leases,
 authorization, storage, protocol compatibility or lifecycle. Preserve old plan
 digests and explicit wire versions. Update the relevant reference and operational
-instructions when behavior changes, rather than rewriting archived evidence.
+instructions when behavior changes. Promote durable conclusions rather than
+execution history.
 
 Before review, report checks run/skipped and known limits. Never commit runtime
 configuration, credentials, developer agent settings, generated workspaces or

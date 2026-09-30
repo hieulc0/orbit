@@ -132,7 +132,7 @@ async fn advance_to_verifying(store: &WorkflowStore, workflow_id: &str) -> Resul
 }
 
 #[tokio::test]
-#[ignore = "requires disposable PostgreSQL; see docs/development/testing.md"]
+#[ignore = "requires disposable PostgreSQL; see docs/operations/troubleshooting.md"]
 async fn workflow_rejects_missing_or_changed_pinned_policy() -> Result<()> {
     let ctx = setup_workflow_test().await?;
     let missing_policy = sample_policy();
@@ -187,7 +187,7 @@ async fn workflow_rejects_missing_or_changed_pinned_policy() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires disposable PostgreSQL and pinned rootless Podman Alpine image; see docs/development/testing.md"]
+#[ignore = "requires disposable PostgreSQL and pinned rootless Podman Alpine image; see docs/operations/troubleshooting.md"]
 async fn happy_path() -> Result<()> {
     let ctx = setup_workflow_test().await?;
     let policy = sample_policy();
@@ -402,7 +402,7 @@ async fn happy_path() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires disposable PostgreSQL and pinned rootless Podman Alpine image; see docs/development/testing.md"]
+#[ignore = "requires disposable PostgreSQL and pinned rootless Podman Alpine image; see docs/operations/troubleshooting.md"]
 async fn verification_failure_and_repair() -> Result<()> {
     let ctx = setup_workflow_test().await?;
     let policy = sample_policy();
@@ -553,7 +553,7 @@ async fn verification_failure_and_repair() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires disposable PostgreSQL and pinned rootless Podman Alpine image; see docs/development/testing.md"]
+#[ignore = "requires disposable PostgreSQL and pinned rootless Podman Alpine image; see docs/operations/troubleshooting.md"]
 async fn review_changes_requested_and_repair() -> Result<()> {
     let ctx = setup_workflow_test().await?;
     let policy = sample_policy();
@@ -736,7 +736,7 @@ async fn review_changes_requested_and_repair() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires disposable PostgreSQL and pinned rootless Podman Alpine image; see docs/development/testing.md"]
+#[ignore = "requires disposable PostgreSQL and pinned rootless Podman Alpine image; see docs/operations/troubleshooting.md"]
 async fn final_regression_failure() -> Result<()> {
     let ctx = setup_workflow_test().await?;
     let policy = sample_policy();
@@ -861,7 +861,7 @@ async fn final_regression_failure() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires disposable PostgreSQL; see docs/development/testing.md"]
+#[ignore = "requires disposable PostgreSQL; see docs/operations/troubleshooting.md"]
 async fn provider_fallback_preserves_role_identity() -> Result<()> {
     let ctx = setup_workflow_test().await?;
     let reviewer = RoleDefinition::reviewer_v1();
@@ -924,7 +924,7 @@ async fn provider_fallback_preserves_role_identity() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires disposable PostgreSQL; see docs/development/testing.md"]
+#[ignore = "requires disposable PostgreSQL; see docs/operations/troubleshooting.md"]
 async fn session_independence() -> Result<()> {
     let ctx = setup_workflow_test().await?;
     let wf = ctx
@@ -987,7 +987,7 @@ async fn read_only_reviewer() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires disposable PostgreSQL; see docs/development/testing.md"]
+#[ignore = "requires disposable PostgreSQL; see docs/operations/troubleshooting.md"]
 async fn single_mutator_lock() -> Result<()> {
     let ctx = setup_workflow_test().await?;
     let attempt_id = format!("att-{}", id());
@@ -1047,7 +1047,7 @@ async fn single_mutator_lock() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires disposable PostgreSQL; see docs/development/testing.md"]
+#[ignore = "requires disposable PostgreSQL; see docs/operations/troubleshooting.md"]
 async fn iteration_exhaustion() -> Result<()> {
     let ctx = setup_workflow_test().await?;
     let mut wf = ctx
@@ -1099,7 +1099,7 @@ async fn iteration_exhaustion() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires disposable PostgreSQL; see docs/development/testing.md"]
+#[ignore = "requires disposable PostgreSQL; see docs/operations/troubleshooting.md"]
 async fn stale_review_invalidation() -> Result<()> {
     let ctx = setup_workflow_test().await?;
     let task_id = format!("task-{}", id());
@@ -1157,7 +1157,7 @@ async fn stale_review_invalidation() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires disposable PostgreSQL; see docs/development/testing.md"]
+#[ignore = "requires disposable PostgreSQL; see docs/operations/troubleshooting.md"]
 async fn restart_durability() -> Result<()> {
     let ctx = setup_workflow_test().await?;
     let task_id = format!("task-{}", id());

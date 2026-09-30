@@ -1,14 +1,18 @@
-# Single-host deployment
+# Deployment
+
+- [Server images, services and host workers](#server-images-services-and-host-workers)
+
+## Server images, services and host workers
 
 The alpha packaging is a Linux API/UI server image with PostgreSQL and local
 artifacts. Workers run separately on trusted hosts. This is not an HA,
 hostile-code sandbox or public-internet production configuration. Read the exact
-[qualification boundary](qualification.md) before rollout.
+[qualification boundary](../ROADMAP.md) before rollout.
 
 The root `docker-compose.yml` provisions disposable test services. `deploy/` uses
 separate names, volumes and credentials. Never reuse test data in a deployment.
 
-## Build and initialize
+### Build and initialize
 
 Build from the repository root with either runtime. Base images are digest-pinned
 in [the Containerfile](../../deploy/Containerfile); no image is published.
@@ -37,7 +41,7 @@ private `server.json`, `.env`, `secrets/` and an empty `artifacts/`; it does not
 start services or print credentials. `.env` contains paths/UID/port, not tokens.
 Keep the installation private and outside Git.
 
-## Docker Compose
+### Docker Compose
 
 ```sh
 docker compose --env-file /srv/orbit/.env -f deploy/docker/compose.yaml config --quiet
@@ -56,7 +60,7 @@ Bindings are loopback-only. Remote access needs an explicitly selected TLS/auth
 boundary and network policy; these templates do not install a public proxy.
 Adjust resource capacity and backup policy before real workloads.
 
-## Rootless Podman / Quadlet
+### Rootless Podman / Quadlet
 
 Use a dedicated login user, subordinate UID/GID ranges, cgroup v2 and a working
 systemd user manager. Initialize that user's absolute `.local/share/orbit` path
@@ -76,7 +80,7 @@ uses `keep-id:uid=10001,gid=10001`; SELinux labels distinguish private mounts fr
 shared secrets. PostgreSQL's named volume survives service removal: never remove
 it as routine cleanup. See [official Quadlet documentation](https://docs.podman.io/en/latest/markdown/podman-systemd.unit.5.html).
 
-## Trusted host workers
+### Trusted host workers
 
 Each worker needs a matching host binary and a distinct server-authorized identity.
 The generated deployment has one `compute` identity with `container.run` and a
@@ -102,9 +106,9 @@ Provision the binary, `/etc/orbit/workers/INSTANCE.env`, private `INSTANCE.token
 and workspace ownership before installation. The [environment example](../../deploy/systemd/compute.env.example)
 contains no credential. User creation, runtime directory/session setup and Docker
 access are host-specific, not automatic. Command agents additionally require
-`--agent-runtime`; see [their guide](../guides/command-agent.md).
+`--agent-runtime`; see [their guide](installation.md#command-agent-setup).
 
-## Verify before use
+### Verify before use
 
 ```sh
 python3 scripts/backup-drill.py --runtime podman --image localhost/orbit:alpha
@@ -114,5 +118,5 @@ The pinned PostgreSQL image must already exist in the selected runtime. This
 drill creates randomly named labelled fixtures, tests restart/rotation/restore,
 then removes only its owned containers and anonymous database volumes. Private
 files/results remain under `target/deployment-smoke`. It does not touch the
-installation above. Continue with [observability](observability.md),
-[backups](backup-restore.md) and [upgrades](upgrades.md).
+installation above. Continue with [observability](../architecture/workers.md#drain-and-shutdown),
+[backups](backup-recovery.md#offline-backup-and-restore) and [upgrades](upgrades.md#coordinated-upgrades-and-credential-rotation).

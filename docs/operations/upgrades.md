@@ -1,16 +1,19 @@
-# Coordinated upgrades and credential rotation
+# Upgrades and rotation
 
-Alpha uses a maintenance window, not a rolling mixed-version guarantee. Startup
-applies additive migrations under PostgreSQL coordination. This increment adds
-`0006_operations.sql` (`orbit_workers.draining`); old plan digests/outcomes remain
-immutable. Migrations are not automatic down-migration or rollback.
+- [Coordinated upgrades and credential rotation](#coordinated-upgrades-and-credential-rotation)
 
-## Upgrade sequence
+## Coordinated upgrades and credential rotation
+
+Orbit uses a maintenance window, not a rolling mixed-version guarantee. Startup
+applies additive migrations under PostgreSQL coordination. Accepted plan digests
+and outcomes remain immutable. Migrations are not automatic down-migration or rollback.
+
+### Upgrade sequence
 
 1. Record source revision, immutable image ID, PostgreSQL major version and private
    config location. Build/check the candidate before downtime; read schema changes.
 2. Stop submissions; drain workers and resolve outstanding leases/external effects.
-   Stop workers and all servers; take a verified [offline backup](backup-restore.md).
+   Stop workers and all servers; take a verified [offline backup](backup-recovery.md#offline-backup-and-restore).
 3. Restore a copy into an isolated replacement and start the candidate there.
    Check readiness, old runs/journals/artifacts, a new timer and relevant worker
    capabilities on disposable workspaces.
@@ -26,7 +29,7 @@ separate replacement using its compatible old image/config. Do not run an old
 binary against an unqualified newer schema, remove columns or overwrite the only
 backup. Same-image restart/restore does not prove every future upgrade safe.
 
-## Credentials
+### Credentials
 
 Server credential references resolve at startup, with no hot reload. Clients also
 resolve `ORBIT_TOKEN_FILE` at startup; inline `--token`/`ORBIT_TOKEN` remains

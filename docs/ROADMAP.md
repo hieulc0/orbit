@@ -1,68 +1,44 @@
-# Current roadmap
+# Current and future work
 
-## Current capabilities
+Current behavior belongs in [architecture](architecture/README.md), interfaces in
+[reference](reference/README.md), and acceptance constraints in
+[requirements](requirements/README.md). This roadmap lists unfinished work only.
 
-Orbit provides durable graph execution, attempt leases and fencing, immutable
-plans and artifacts, repository workers, managed verification environments,
-credential status discovery, and bounded role workflows. The
-[architecture](architecture/README.md) and [reference contracts](README.md#architecture-and-reference)
-describe supported behavior. Qualification records describe the checks actually run.
+## Pending acceptance
 
-## Workflow requirements and acceptance
+- **Zed GUI integration:** exercise progress, replay, cancellation, diff navigation,
+  apply/discard and interrupted-action recovery in an actual disposable editor session.
+  ACP protocol or fixture acceptance cannot substitute for GUI evidence.
+- **External BA/SA integration:** use the development bridge at `../orbit-ba-bridge`
+  with an identified authenticated conversation, typed requirements/proposal artifacts,
+  challenge resolution, a frozen acceptance contract, real implementation/review/verification,
+  and BA attestation for the exact accepted candidate. Preserve existing bridge conversations.
+- **Selected provider and worker deployments:** establish account-class eligibility,
+  refresh/expiry, actual model semantics, quota behavior, repository-data/egress policy,
+  separately hosted workers and recovery after worker/server failure. Qualification must
+  use selected resources and explicit authority.
+- **Backend and operational acceptance:** establish Docker compute parity where needed,
+  coordinated object-store backup/recovery, physical GPU behavior and installation lifecycle
+  on the selected deployment. Template validity and local fixtures are insufficient.
 
-Requirement IDs below are retained for roadmap traceability. They are not names
-for runtime components. The [workflow requirements](reference/workflow-requirements.md) define
-acceptance conditions; reports preserve historical results and limitations.
-
-| Requirement | Current state | Evidence or contract |
-| --- | --- | --- |
-| R4 stabilization and self-hosting | Accepted; workflow boundary extraction and typed outcomes complete at `14769c6` | [Stabilization report](operations/r4-stabilization-final-report.md) |
-| R5 subsystem organization | Implemented and qualified at `7c6ea4f` | [Modularization report](operations/r5-modularization-report.md) |
-| R6 developer-local execution | Implemented; confinement and cleanup qualified | [Execution contract](guides/interactive-execution.md) |
-| R7 production role budgets | Implemented; resource limits and byte paging qualified | [Execution contract](guides/interactive-execution.md) |
-| R8 ACP service | Implemented and qualified offline; bounded real-provider ACP fixture accepted at `8dec490` | [Interactive qualification](operations/interactive-workflows-report.md) |
-| R9 editor integration | Managed candidates and ACP protocol qualified offline; actual Zed acceptance pending | [Editor setup](guides/editor-acp.md) |
-| R10 skill-selected flows | Implemented; immutable flow selection and conservative escalation qualified | [Skill flows](guides/interactive-execution.md#skill-flows) |
-| R11 external BA/SA reasoning | Typed artifacts and authority staged and qualified offline; development bridge integration and live acceptance pending | [External reasoning](guides/external-reasoning.md) |
-
-The roadmap remains incomplete. Live admission requires fresh credential-scoped
-quota evidence: at least 15% for a known five-hour window and 5% for a known
-seven-day window. A queued run, successful initialization, mocked artifact exchange,
-or protocol test does not satisfy a live acceptance gate. Refresh with
-`credential status --all --quota` before execution and review. Previously generated
-local evidence and timers may be absent; inspect their actual state before relying
-on them. Current observed run status belongs in the qualification report.
-
-The development BA bridge is `../orbit-ba-bridge`. Integration must preserve its
-existing conversation state and use explicitly identified BA/SA conversations.
-The required acceptance is a frozen contract, real implementation, independent
-review and final verification, followed by BA attestation for that exact candidate.
-
-## Deployment and provider acceptance
-
-Local packaging supports a non-root server image, Compose, Quadlet, host workers,
-probes, durable drain, backup/restore and coordinated upgrades. See
-[alpha qualification](operations/qualification.md) for the verified scope.
-
-Selected live-provider and separately hosted worker acceptance remain distinct
-from local fixtures. The remote repository workflow must demonstrate an actual
-inspect/edit/test/revise cycle, accepted artifacts, independent verification,
-human review, account refresh/expiry behavior, denied unauthorized effects and
-recovery after worker/server failure. Unknown provider outcomes remain unknown.
-See [remote coding qualification](operations/remote-coding-qualification.md) and
-[ACP compatibility](operations/acp-codex-compatibility.md).
+Live provider admission requires fresh credential-scoped quota evidence and the
+[selection policy](requirements/scheduling.md). Refresh with
+`credential status --all --quota` before execution and review. A queued run,
+stale observation or initialization result cannot satisfy acceptance.
 
 ## Conditional extensions
 
-The following require a selected workload or deployment need and their own evidence:
+Require a concrete workload or deployment need and separate qualification:
 
-- Stronger isolation for hostile code, such as gVisor or Firecracker.
-- Physical GPU execution and additional GPU runtimes.
-- Multi-host capacity, HA, throughput and retention guarantees.
+- Hostile-workload isolation, such as gVisor or Firecracker.
+- Physical GPU execution and additional runtimes.
+- Multi-host capacity, provider-capacity leases, HA, throughput and retention guarantees.
 - Kubernetes or cloud provisioning for demonstrated capacity requirements.
-- SSO, tenant administration or external policy distribution.
-- Additional credential providers, public package distribution and SDK publication.
+- SSO, tenant administration, external policy distribution and additional secret backends.
+- Additional credential/provider adapters and public package/SDK distribution.
+- Automatic cross-agent continuation or provider re-resolution with explicit uncertainty policy.
 - Parallel analysis or isolated implementation branches with explicit integration.
 
-These are not prerequisites for the bounded local workflow. Publishing, pushing,
-merging and deploying use explicit authority and selected destinations.
+Commit, merge, push, publication and deployment require explicit authority and a
+selected destination. Future work cannot silently change accepted digests, grant
+new effects to old bindings or downgrade isolation.
