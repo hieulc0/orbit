@@ -11,7 +11,7 @@ describe supported behavior. Qualification records describe the checks actually 
 ## Workflow requirements and acceptance
 
 Requirement IDs below are retained for roadmap traceability. They are not names
-for runtime components. The [workflow requirements](archive/roadmap.md) define
+for runtime components. The [workflow requirements](reference/workflow-requirements.md) define
 acceptance conditions; reports preserve historical results and limitations.
 
 | Requirement | Current state | Evidence or contract |

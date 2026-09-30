@@ -1,18 +1,18 @@
 # Deployable alpha qualification
 
-For the later remote coding increment, see
-[remote coding qualification](remote-coding-qualification.md). The alpha evidence
-and backend gaps below are preserved, not replaced by that increment.
-
-This is the current implementation record for 2026-09-12, following the committed
-Phase 1–9 baseline `9b9e3d252615589104067d2d272124fc795b3f2b`. Historical counts and
-owner decisions remain in [the archive](../archive/README.md). This increment does
-not assert that the complete long-term vision or production hardening is finished.
+Historical qualification record: 2026-09-12, for the committed Phase 1–9
+baseline `9b9e3d252615589104067d2d272124fc795b3f2b`. Later
+[remote coding qualification](remote-coding-qualification.md) preserves a distinct
+boundary. The counts and backend gaps below apply to this baseline; they do not
+assert current support or completion of the long-term vision. Use the
+[current roadmap](../ROADMAP.md) and [deployment guide](deployment.md) for current
+state and procedures. Earlier owner decisions remain in
+[the archive](../archive/README.md).
 
 ## Evidence map
 
 | Gate | Implementation and observed evidence |
-| --- | --- |\
+| --- | --- |
 | Current docs / fresh-agent entry | Indexed architecture/reference/guides/operations; historical records preserved; root AGENTS.md and two validated skills |
 | Repeatable checks | 24 regular Rust tests, formatting, Clippy all targets/features with warnings denied; 2 Python SDK + 3 operations tests; strict TypeScript/UI build and 5 mocked Chromium cases |
 | Durable regressions | 46 PostgreSQL/process/Podman/S3/real-browser cases passed together in 19.26s; the separate dogfood case also passed |

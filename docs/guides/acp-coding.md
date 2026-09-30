@@ -1,21 +1,22 @@
 # ACP repository workers
 
-Orbit implements an experimental ACP v1 worker and a version-pinned Codex bridge.
-The historical Codex 0.153.4 binary passed a disposable, loopback-provider
-workflow. The current pinned package is Codex 0.156.0, selected after the
-dedicated account's model catalog advertised GPT-6 Luna and high reasoning.
-However, the current 0.156.0 offline broker regression failed after prompt
-reservation and before any dynamic-tool callback; do not treat the Codex runtime
-as ready for live coding. See the
-[post-Q6 runtime report](../operations/post-q6-hardening.md#gpt-6-luna-runtime-requirement--2026-09-23)
-for the exact evidence and stop decision, and the
-[historical compatibility record](../operations/acp-codex-compatibility.md) for
-earlier checks.
+Orbit provides an experimental ACP v1 repository worker and a version-pinned
+Codex bridge. The pinned Codex package is 0.156.0. A bounded live GPT-6 Luna High
+worker preflight produced accepted file and terminal effects, confirmed cleanup,
+and a passing independent validator. The
+[qualification record](../operations/post-q6-hardening.md#final-gpt-6-luna-high-capability-preflight-and-offline-harness-review)
+preserves its exact identities, harness limits and observed scope.
 
-Delivery order remains Codex, official Google Antigravity ACP, then Claude.
-The generic `adapter: acp` registry supports client-brokered agents, but does not
-turn native tools into client callbacks. Neither later named adapter is currently
-qualified; see [their compatibility findings](../operations/acp-agent-compatibility.md).
+The CLI/editor service uses the same ACP transport through a separate role
+workflow interface; its [bounded live acceptance](../operations/interactive-workflows-report.md)
+does not establish actual Zed GUI or separate-host worker acceptance.
+
+The generic `adapter: acp` registry supports client-brokered agents. Each named
+runtime needs independent evidence for its effects. The unmodified Antigravity
+release does not broker native terminal commands; Orbit's pinned variant adds a
+client-terminal overlay. Use [Antigravity setup](antigravity-acp.md) and
+[adapter compatibility](../operations/acp-agent-compatibility.md) for its qualified
+scope and Claude's remaining gaps.
 
 ## Operator setup
 
@@ -30,8 +31,8 @@ the tester and approval step are unchanged. Regular tests need no provider accou
    the official Codex 0.156.0 package and matching Code Mode host before building
    the local digest-addressed image. Use only the printed immutable image digest
    and `--pull=never`. Do not use `npx`, floating tags, a host executable or a
-   mixed-version helper in an assignment. Note that package/smoke verification
-   has passed but the current offline Orbit broker compatibility gate has not.
+   mixed-version helper in an assignment. A package build does not qualify a
+   runtime/account/effect combination; use the recorded qualification evidence.
    The older [offline fixture builder](../../scripts/prepare-acp-fixture.sh)
    remains test infrastructure only.
 2. Select and provision the account **outside Orbit tasks**. Create a private
@@ -78,10 +79,10 @@ The server still authorizes each registration, claim, operation and artifact.
 ## What the agent and tools can access
 
 The agent runs in a separate read-only OCI image, with only a fresh private
-control HOME mounted. It receives the selected auth files and an isolated Attempt
-repository, not the developer checkout, provider API tokens from Orbit's credential
-registry, worker tokens, container socket or developer HOME. The Attempt repository
-contains normal Git metadata and starts detached at the pinned baseline; the ACP-visible
+control HOME mounted. It receives only the selected auth files in that HOME; no repository, worker
+token, container socket or developer HOME is mounted. The broker accesses an
+isolated Attempt repository with normal Git metadata, detached at the pinned
+baseline. The ACP-visible
 cwd is the virtual path `/orbit/home/workspace`. Client file/terminal requests under
 that virtual root map only to the actual Attempt repository; host paths are not
 exposed as a second namespace.
@@ -128,8 +129,10 @@ not supported. A denied callback fails the turn; it never authorizes native effe
 
 An existing Attempt directory is reclaimable after a worker restart only when its
 persisted identity marker and Git `HEAD` still match the assignment. A mismatch
-fails closed. Continuation reuses that Attempt repository, including its uncommitted
-changes; it does not create a fresh repository for each AgentExecution.
+fails closed. Reclaiming an assignment preserves its Attempt repository and
+uncommitted changes. The [continuation contracts](continuation.md) describe stored
+handoffs and pure recovery decisions; automatic continuation into another coding
+execution is not implemented.
 Each Attempt uses a `--no-local --no-hardlinks` clone, so cleanup removes the
 Attempt directory and its private `.git` together; it does not create shared
 `.git/worktrees` entries in the operator checkout. Retention remains governed by
@@ -142,7 +145,9 @@ The [submit, inspect and review workflow](repository-review.md) applies to ACP t
 the operator API. The export keeps unknown accounting values as `null` and does
 not copy worker auth stores or workspaces.
 
-Reserve one prompt before dispatch and every broker effect before execution.
+The [accounting reference](../reference/agent-accounting.md) distinguishes
+reservations, callbacks, reported tool IDs and provider usage. Reserve one prompt
+before dispatch and every broker effect before execution.
 Calls, prompt count, broker count and worst-case terminal duration remain charged
 across retries. One ACP prompt may contain many provider exchanges. Token and
 monetary values are explicitly `null`; stable-v1 usage extensions are not enabled,
@@ -189,8 +194,8 @@ and `acp_workflow` qualification. Use [preflight](acp-preflight.md) only for
 credential-free ACP initialization: a probe's `workflow_execution_supported: false`
 means that the probe does not establish workflow support.
 
-Current implementation deliberately runs one new session and one prompt per
-attempt. Definition prompt limits allow retained accounting across retries; they
-do not enable conversation continuation. GUI streaming, interactive tool approval,
-usage extensions, stronger isolation and new provider bridges are separate work.
+The worker runs one new session and one prompt per attempt. Definition prompt limits allow retained accounting across retries; they
+do not enable conversation continuation. The [editor service](editor-acp.md) provides a separate interactive interface.
+Worker-side interactive tool approval, provider usage extensions and stronger
+isolation are not implemented.
 Read the compatibility record before treating any named adapter as qualified.

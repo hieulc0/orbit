@@ -44,6 +44,9 @@ developer-local terminal results are exploratory evidence.
 
 ## Role resources
 
+See [accounting and resource evidence](../reference/agent-accounting.md) for the
+difference between role ceilings, graph-worker reservations and provider usage.
+
 Production CLI workflow executions use these independent resource ceilings:
 
 | Resource | Planner | Implementer | Reviewer |

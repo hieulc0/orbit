@@ -1,7 +1,9 @@
-# Remote coding implementation and qualification
+# Remote coding qualification
 
-Record: 2026-09-13. This increment implements the focused
-[remote coding milestone](../ROADMAP.md#next-milestone-remote-agent-assisted-repository-change).
+Historical qualification record: 2026-09-13, for agent-assisted repository changes.
+Use the [current roadmap](../ROADMAP.md#deployment-and-provider-acceptance) for
+remaining deployment/provider gates and [worker setup](../guides/remote-coding.md)
+for current procedures.
 The [alpha record](qualification.md) and its Docker compute qualification gap
 remain unchanged. Implementation and fixture success are not owner acceptance.
 

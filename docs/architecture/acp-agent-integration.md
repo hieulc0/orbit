@@ -1,9 +1,12 @@
 # ACP agent integration architecture
 
-Status: experimental worker implementation, 2026-09-14. Codex and generic ACP
-offline workflows and the final local fault regression have passed; live-account /
-separate-host acceptance remains open. See [current evidence](../operations/acp-codex-compatibility.md),
-[setup](../guides/acp-coding.md) and the [delivery gates](../development/acp-qualification.md).
+The experimental worker implementation supports Codex and generic ACP runtimes
+through pinned launch policy and brokered effects. Local offline workflows,
+fault regressions and a bounded live Codex worker preflight have recorded
+evidence; separately hosted worker and broader account acceptance remain gates.
+Use [worker setup](../guides/acp-coding.md),
+[adapter qualification](../development/acp-qualification.md) and
+[the current roadmap](../ROADMAP.md) for scope and pending acceptance.
 Existing Responses/command workflows and immutable legacy plan digests remain intact.
 
 ## Boundaries and ownership

@@ -12,6 +12,7 @@ and [the current roadmap](../ROADMAP.md) for current behavior and remaining gate
 - [Release qualification, 2026-09-12](release-qualification-2026-09-12.md)
 - [Autonomous report qualification specification](run-and-track-orbit-dogfood-qualification-3.md)
 
-The [workflow roadmap requirements](roadmap.md) retain stable requirement IDs.
+Current [workflow requirements](../reference/workflow-requirements.md) retain stable
+requirement IDs outside the historical records.
 Local generated evidence may be absent from a checkout. Owner acceptance is a
 recorded decision, not a conclusion inferred from automated checks.

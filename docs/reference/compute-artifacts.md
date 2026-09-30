@@ -17,7 +17,7 @@ repository allowlists. Missing profiles and unsupported `sandboxed`/`untrusted`
 classes fail closed, without fallback. Structural definition validation alone
 does not establish operator profile availability; submission compiles the binding.
 
-The first implementation runs tools in disposable OCI containers on the host's
+Orbit runs tools in disposable OCI containers on the host's
 rootless Podman, not Docker-in-Docker. The trusted worker handles Git/model network
 access outside the tool container. It publishes an attempt/plan/profile/resource
 bound `execution_report`; successful completion checks its provenance. See the

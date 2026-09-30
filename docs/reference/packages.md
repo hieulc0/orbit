@@ -65,7 +65,7 @@ is idempotent; a different envelope for the same version conflicts. Every packag
 read rechecks its requested digest, current key trust and signature. Removing a
 publisher blocks future reads/submissions via `run-package`; listings mark the
 package unverified. Already accepted plans remain immutable and are not silently
-cancelled by key revocation. No delete/yank API is provided in this increment.
+cancelled by key revocation. No delete/yank API is provided.
 
 `run-package` fetches a verified digest, extracts a named definition and submits
 it through the ordinary API. The accepted plan pins the actual definition,

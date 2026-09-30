@@ -1,13 +1,53 @@
-# Google Antigravity ACP Adapter Guide
+# Antigravity ACP runtime
 
-This document describes Orbit's **Google Antigravity Agent Client Protocol (ACP) adapter**, packaging, environment configuration, and credential staging. Operator-local personal OAuth enrollment and fresh-runtime ACP reuse are live-qualified. The same catalog credential also has a file-backed `agy-cli` representation and one qualified `/usage` status observation; see [provider status discovery](../operations/provider-status-discovery.md). The ACP↔agy provider-account binding remains UNVERIFIED.
+Orbit runs a pinned Antigravity ACP server in a supervised rootless Podman
+container. Repository effects use Orbit's client broker; the provider process
+has a private control HOME and no repository mount. See
+[ACP worker setup](acp-coding.md) for worker authorization, resource allocation,
+network policy, repository confinement and cleanup.
 
-> Runtime packaging note (2026-09-24): the fixture instructions below describe
-> historical packaging and are not a reproducible build path. The new pinned
-> 1.1.1 runtime recipe is defined in
-> [Antigravity compatibility](../operations/acp-agent-compatibility.md#automated-packaging-pipeline).
-> The new image has been built and qualified for credential-free ACP initialize;
-> enrollment and execution qualification for that new image remain open.
+The supported image is Orbit's `agy_acp_server_1.1.1-orbit-terminal-v2` variant.
+The unmodified Google distribution routes native commands inside its harness;
+client terminal capabilities alone do not mediate those commands. Orbit's
+versioned overlay removes native command execution and local file fallback and
+exposes client-terminal calls. Keep the original distribution and this variant
+as separate runtime identities.
+
+Credential-free initialization and catalog-owned OAuth enrollment with fresh
+runtime reuse have been qualified for the pinned image below. Model execution,
+account scope and separately hosted worker acceptance require their own evidence.
+[Adapter compatibility](../operations/acp-agent-compatibility.md) and
+[provider status qualification](../operations/provider-status-discovery.md)
+preserve observed results; enrollment success is not model readiness.
+
+## Build and pin the runtime
+
+Use the tracked [runtime builder](../../scripts/build-antigravity-runtime.sh).
+It takes exactly one directory containing regular, non-symlink
+`agy_acp_server.par` and `localharness_external` files from the reviewed 1.1.1
+release. It verifies their hashes, the tracked patcher, terminal client,
+Containerfile and group overlay, and the deterministic patched output. Exact
+Python 3.14.7 is required on the build host to generate the pinned bytecode.
+Input hashes are recorded in the
+[compatibility record](../operations/acp-agent-compatibility.md#automated-packaging-pipeline).
+
+Provision the exact base separately, then build from the repository root:
+
+```sh
+podman --remote=false --cgroup-manager=cgroupfs pull --arch amd64 \
+  gcr.io/distroless/base-nossl-debian13@sha256:792f51c506fc67f7eaa38093f6d4937a053cebb79ec0e7c3b7746f6bbba85606
+
+bash scripts/build-antigravity-runtime.sh /path/to/reviewed/antigravity-acp-artifacts
+```
+
+The build uses `--pull=never`, `--network=none`, OCI format and epoch timestamps.
+It refuses an existing output tag and never overwrites local runtime evidence.
+The image contains the pinned server and external harness under
+`/opt/antigravity/`; it does not import host CA files or install packages during
+build. Review the printed immutable image digest. A build reports `UNQUALIFIED`;
+reusing qualification requires the exact reviewed image identity and scope.
+A different digest needs separate qualification. The legacy
+`prepare-antigravity-fixture.sh` is not the current reproducible setup path.
 
 ## Operator credential enrollment
 
@@ -42,8 +82,10 @@ removal and disposable-HOME cleanup path as other enrollment failures.
 After provider authentication, the adapter captures only
 `.gemini/antigravity-acp/acp_token.json` and `settings.json` from the disposable
 HOME. Their bytes form one versioned opaque bundle under one
-`LocalPrivateSecretBackend` locator. No token, URL, locator, or physical path
-goes into PostgreSQL or user-facing output. A fresh runtime stages only those
+`LocalPrivateSecretBackend` locator. PostgreSQL retains that logical locator,
+not the token bytes or physical path. Runtime output and authentication URLs
+are excluded from stored diagnostics; the enrollment URL is shown only in the
+operator terminal. A fresh runtime stages only those
 files and calls ACP `authenticate(oauth-personal)` again. A new login URL fails
 reuse validation; only successful noninteractive reuse lets the catalog move
 from pending to enrolled. This check may contact provider OAuth/onboarding
@@ -59,112 +101,44 @@ be eligible for future explicit GC. Enrollment does not promote availability
 to READY. The registry catalog ID keeps new identity evidence distinct from
 pre-catalog credentials, even when provider/reference/generation coincide.
 
-Existing manual `~/.orbit/credentials/...` and worker AuthLease are unchanged
-and are not migrated. Gemini Enterprise, API key, Agent Platform, interactive
-agy OAuth enrollment/capture automation, and provider-specific logout are not
-implemented here. The `agy-cli` representation and one bounded `/usage`
-observation are qualified separately; its credential-scoped snapshot is
+Existing manual `~/.orbit/credentials/...` and worker AuthLease are not migrated
+to the catalog. Gemini Enterprise, API-key and Agent Platform enrollment and
+provider-specific logout are not implemented by this adapter. For agy login or
+import through `credential add-representation`, use the
+[credential registry contract](../architecture/credential-registry.md).
+The `agy-cli` representation and one bounded `/usage` observation are qualified separately; its credential-scoped snapshot is
 UNKNOWN because no readiness threshold or exact-model scope is justified. The
 agy 1.2.9 artifact remains operator-supplied and is not officially
 artifact-verified. The Antigravity ACP↔agy account binding remains UNVERIFIED.
 
----
+## Runtime environment and storage
 
-## 1. Overview and Architecture
+The pinned image supplies these defaults:
 
-The Google Antigravity ACP adapter enables Orbit to run Google Antigravity agent harnesses within isolated execution environments (such as Podman or Docker sandboxes) via the Agent Client Protocol (ACP).
+| Variable | Value and purpose |
+| --- | --- |
+| `ANTIGRAVITY_HARNESS_PATH` | `/opt/antigravity/localharness_external`, the pinned executable |
+| `GEMINI_HOME` | `/orbit/home/.gemini`, private provider state |
+| `AGY_ACP_FORCE_FILE_STORAGE` | `1`, file-backed conversation storage |
+| `NO_BROWSER` | `1`, suppress automatic browser launch; not authentication |
+| `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE` | `/etc/ssl/certs/ca-certificates.crt`, image CA bundle |
 
-### Architectural Components
+Orbit supplies the fresh HOME under `/orbit/home`. ACP-visible repository paths
+under `/orbit/home/workspace` map through the client broker to the actual Attempt
+workspace; they do not grant the provider direct filesystem access. Provider
+conversation databases under `$GEMINI_HOME/antigravity-acp/conversations/` are
+private runtime state, not authoritative Orbit workflow state or accepted
+transcripts. Do not export the control HOME.
 
-```
-+-------------------------------------------------------------------------+
-|                              Orbit Runner                               |
-|  - Task Dispatcher & Trajectory Coordinator                             |
-|  - Private Auth-File Lease (lock, stage, write-back)                    |
-|  - Client Tool Handlers (File system, Terminal Execution)              |
-+-------------------------------------------------------------------------+
-                                   |
-                          Agent Client Protocol
-                       (Standard I/O RPC / JSON)
-                                   |
-                                   v
-+-------------------------------------------------------------------------+
-|                     Containerized Sandbox Environment                   |
-|                                                                         |
-|  +-------------------------------------------------------------------+  |
-|  |                   Google Antigravity ACP Adapter                  |  |
-|  |                     (/opt/antigravity/agy_acp_server.par)         |  |
-|  |                                                                   |  |
-|  |  +-------------------------------------------------------------+  |  |
-|  |  |                   Antigravity Local Harness                 |  |  |
-|  |  |             (/opt/antigravity/localharness_external)        |  |  |
-|  |  +-------------------------------------------------------------+  |  |
-|  +-------------------------------------------------------------------+  |
-|                                  |                                      |
-|    - Settings: /orbit/home/.gemini/antigravity-acp/settings.json        |
-|    - Auth Token: /orbit/home/.gemini/antigravity-acp/acp_token.json     |
-|    - Workspace Root: /orbit/home/workspace                              |
-+-------------------------------------------------------------------------+
-```
+Changing launch environment, resources or network policy requires a new launch
+pin. Normal coding uses the worker's reviewed provider network policy; host
+networking does not restrict egress to the provider. Repository commands follow
+the separately authorized tool profile and have no network.
 
-### Key Responsibilities
-1. **Orchestration**: Orbit acts as the host runner, initializing the container runtime and launching the ACP server.
-2. **Standard Protocol**: The adapter (`agy_acp_server.par`) communicates with Orbit over ACP standard streams, translating higher-level agent actions into tool invocations.
-3. **Client Callbacks**: File operations (`client_view_file`, `client_edit_file`, `client_create_file`) and terminal executions (`run_command`) execute within the target workspace via client callbacks.
-4. **Trajectory & Session Tracking**: Conversation state and trajectories are captured in SQLite databases located at `$GEMINI_HOME/antigravity-acp/conversations/` with conversation UUID identifiers.
-
----
-
-## 2. Container Packaging with `prepare-antigravity-fixture.sh`
-
-The `scripts/prepare-antigravity-fixture.sh` script automates the creation and staging of reproducible container fixtures containing the necessary Antigravity binaries, runtime configurations, and workspace scaffolding.
-
-### Purpose of the Packaging Script
-- Assembles binary dependencies into `/opt/antigravity/`.
-- Sets up non-root execution users (`hieulc` or standard workspace user) and permissions.
-- Prepares CA certificate stores for secure gRPC and HTTPS outbound connections.
-- Generates base configuration schemas for ACP settings and authentication templates.
-
-### Script Execution and Usage
-
-```bash
-# Run fixture preparation script from the repository root
-./scripts/prepare-antigravity-fixture.sh [OPTIONS]
-```
-
-#### Common Options and Environment Variables
-- `--output-dir <DIR>`: Specifies the target fixture output directory (default: `build/fixtures/antigravity-acp`).
-- `--base-image <IMAGE>`: Defines the base OCI/container image (e.g., Ubuntu/Debian minimal base).
-- `--binaries-path <PATH>`: Directory containing `agy_acp_server.par` and `localharness_external`.
-- `PINNED_BASE`: Specifies the Git commit base revision (e.g., `1bf4fd8fbe558b9d1bbacead0d03b997480ad4b4`) to anchor fixture builds to a known deterministic state.
-
-### Fixture Directory Layout
-When packaged, the container root filesystem contains the following layout:
-
-```
-/
-├── opt/
-│   └── antigravity/
-│       ├── agy_acp_server.par           # Main ACP entry point server
-│       └── localharness_external        # Underlying agent execution harness
-└── orbit/
-    └── home/
-        ├── .gemini/
-        │   ├── antigravity/
-        │   │   └── bin/
-        │   └── antigravity-acp/
-        │       ├── settings.json        # Adapter configuration
-        │       ├── acp_token.json       # Operator-provisioned auth state, staged by Orbit
-        │       └── conversations/       # SQLite session storage
-        └── workspace/                   # Active user workspace mount
-```
-
----
-
-## 3. Legacy manual authentication files and Orbit's local lease
+## Legacy manual authentication compatibility
 
 This section describes the pre-catalog `AuthLease` path only; it is not the
-production `orbit credential add antigravity` enrollment path above.
+production `orbit credential add antigravity` enrollment path described above.
 
 `NO_BROWSER=1` disables interactive browser launch; it does not authenticate
 the ACP process or obtain provider credentials. The legacy manual worker
@@ -173,7 +147,7 @@ credential conversion, or provider refresh. Its operator must provision the
 private source files configured in the worker's `auth.path` and `auth.files`
 mapping.
 
-For the current example, Orbit treats `acp_token.json` and `settings.json` as
+For the manual configuration, Orbit treats `acp_token.json` and `settings.json` as
 opaque files. `settings.json` is not validated as an authentication schema by
 Orbit. This repository does not establish whether the source token file was
 created by Antigravity desktop, `agy`, the ACP runtime, or another login
@@ -196,60 +170,19 @@ Google account for both enrollments, but no machine-verifiable common provider
 identity is available; provisioning either representation does not prove that
 the other uses the same account.
 
----
+## Troubleshooting
 
-## 4. Runtime Environment Variables
-
-Configure the following environment variables when running the adapter container:
-
-| Variable | Description | Example Value |
-| :--- | :--- | :--- |
-| `ANTIGRAVITY_AGENT` | Flags the environment as an Antigravity agent process | `1` |
-| `ANTIGRAVITY_HARNESS_PATH` | Absolute path to the external harness binary | `/opt/antigravity/localharness_external` |
-| `ANTIGRAVITY_CONVERSATION_ID` | UUID for the active conversation session | `a553f2b2-aff2-4630-8530-66cc0b58948b` |
-| `ANTIGRAVITY_TRAJECTORY_ID` | Trajectory tracking identifier | `a553f2b2-aff2-4630-8530-66cc0b58948b` |
-| `AGY_ACP_FORCE_FILE_STORAGE` | Enforces SQLite file-backed conversation persistence | `1` |
-| `GEMINI_HOME` | Base path for Gemini and Antigravity user configurations | `/orbit/home/.gemini` |
-| `HOME` | Home directory of the container execution user | `/orbit/home` |
-| `NO_BROWSER` | Disables interactive web browser triggers | `1` |
-| `SSL_CERT_FILE` | Path to the CA certificates bundle for TLS verification | `/etc/ssl/certs/ca-certificates.crt` |
-| `REQUESTS_CA_BUNDLE` | CA bundle path for HTTP client requests | `/etc/ssl/certs/ca-certificates.crt` |
-
----
-
-## 5. End-to-End Execution Workflow
-
-### Prepare the fixture
-Build the container image using the fixture packaging script:
-```bash
-./scripts/prepare-antigravity-fixture.sh --base-image debian:bookworm-slim
-```
-
-### Provision the configured private auth store
-Provision the operator-controlled credential files at the private source
-directory configured by `auth.path`. Orbit stages those files into the runtime
-HOME; it does not create or acquire them. Never put credential contents in a
-Definition, source-controlled example, or command history.
-
-### Run the ACP adapter server
-Start `agy_acp_server.par` inside the container:
-```bash
-export ANTIGRAVITY_AGENT=1
-export ANTIGRAVITY_HARNESS_PATH=/opt/antigravity/localharness_external
-export AGY_ACP_FORCE_FILE_STORAGE=1
-export NO_BROWSER=1
-
-/opt/antigravity/agy_acp_server.par
-```
-
-### Dispatch tasks via Orbit
-Orbit connects to standard I/O of the ACP process, sending agent requests and handling tool callbacks for file modification and command execution in `/orbit/home/workspace`.
-
----
-
-## 6. Troubleshooting and Verification
-
-- **Legacy manual credential authentication error**: Verify the operator-provisioned `acp_token.json` exists and is readable. This applies only to the unchanged manual AuthLease path; the new registry enrollment validates a fresh ACP representation before marking it enrolled.
-- **Harness Path Not Found**: Ensure `ANTIGRAVITY_HARNESS_PATH` points directly to the executable binary at `/opt/antigravity/localharness_external`.
-- **Database Locks / Storage Issues**: Ensure `AGY_ACP_FORCE_FILE_STORAGE=1` is set and the directory `/orbit/home/.gemini/antigravity-acp/conversations/` has write permissions.
-- **TLS Handshake Failures**: Confirm `SSL_CERT_FILE` and `REQUESTS_CA_BUNDLE` correctly point to the system CA certificate bundle.
+- **Enrollment or reuse failure:** keep the credential pending and inspect the
+  bounded failure and cleanup result. A runtime requesting another login URL has
+  not demonstrated noninteractive reuse; do not mark it enrolled manually.
+- **Manual authentication failure:** verify only the mapped private source files
+  are readable. `NO_BROWSER=1` does not acquire credentials, and filenames do not
+  prove their provider-account origin.
+- **Harness missing:** verify the pinned image and
+  `ANTIGRAVITY_HARNESS_PATH`; do not substitute a host executable.
+- **Conversation storage failure:** verify the private staged HOME is writable
+  and file-backed storage is enabled. Reconcile uncertain cleanup before reuse;
+  do not share one active auth store among runtimes.
+- **TLS failure:** verify the image CA bundle and its configured paths. A host CA
+  copy would change the packaging boundary and requires an explicitly reviewed
+  runtime identity.

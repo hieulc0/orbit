@@ -7,9 +7,10 @@ the scheduler. The [vision](vision.md) describes the long-term direction. The
 
 The [ACP integration design](acp-agent-integration.md) describes the experimental
 worker registry, supervised agent process, file/terminal broker and Codex bridge.
-Offline workflows and the final local fault regression have passed; live acceptance
-remains a separate gate. Existing Responses/command runtimes and trusted isolation
-stay intact.
+Local qualification includes offline workflows, fault regressions and bounded
+live Codex execution. Account-specific and separate-host acceptance remain gates;
+see [worker setup and evidence](../guides/acp-coding.md). Existing
+Responses/command runtimes and trusted isolation stay intact.
 
 ```text
 CLI / MCP / React UI / SDK

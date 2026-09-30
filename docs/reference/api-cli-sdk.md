@@ -5,7 +5,7 @@ the existing unprefixed HTTP routes, `orbit/v0` worker protocol and both definit
 versions. YAML and JSON definitions use the same parser and validation rules.
 It also supports `container.run` through the same transports. See the
 [compute contract](compute-artifacts.md) for resources, pools and provider
-metadata. The [private registry](packages.md) now supports signed
+metadata. The [private registry](packages.md) supports signed
 capability descriptors and packaged definitions; worker provisioning remains
 external to the server.
 

@@ -1,16 +1,19 @@
-# Credential registry foundation
+# Credential registry and secret boundary
 
-Orbit now has an additive, operator-scoped credential catalog. PostgreSQL knows
-**that** a credential and its representations exist, their lifecycle and logical
-identity. A `SecretBackend` knows **the secret**. A trusted worker will eventually
-receive only a temporary, leased representation. This foundation does not yet
-issue such leases or change existing worker `AuthLease` behavior.
+Orbit has an operator-scoped credential catalog. PostgreSQL records credential
+identity, generations, representations, lifecycle and logical secret locators.
+A `SecretBackend` stores the secret bytes and resolves their private physical
+paths. Catalog-backed CLI role execution selects an eligible credential,
+rechecks its generation and stages the selected representation through the local
+backend. The graph worker's configured `AuthLease` remains a separate manual
+staging path; the catalog does not issue a general worker credential-lease API.
 
-An `AgentRuntime` remains separate: it identifies provider, protocol, image
-digest, adapter revision and capabilities. A `Credential` identifies provider,
-operator reference, generation, endpoint, auth type and secret backend. Future
-candidates may combine runtime, credential, model and reasoning effort; the
-scheduler is unchanged.
+An `AgentRuntime` identifies provider, protocol, image digest, adapter revision
+and capabilities. A `Credential` identifies provider, operator reference,
+generation, endpoint, auth type and secret backend. Role resolution combines
+runtime, credential, model and reasoning effort under the
+[workflow selection contract](../reference/workflow-execution.md#credential-selection).
+The graph scheduler does not become a provider-selection or secret service.
 
 ```text
 Provider login/import
@@ -105,8 +108,7 @@ Other backends may implement the same trait later.
 
 ## Crash consistency and authority
 
-The first provider enrollment adapter is Antigravity ACP personal OAuth. Its
-safe sequence is:
+Antigravity ACP personal OAuth enrollment uses this crash-safe sequence:
 
 1. Operator creates pending metadata and prepares a pending representation with
    an opaque locator in PostgreSQL.
@@ -132,7 +134,7 @@ A concurrent rotation prevents stale finalization. This is not a distributed
 transaction. The generic service exposes these operations to trusted
 control-plane code only; there are no credential mutation API endpoints or
 agent/workflow parameters that select physical secret paths.
-The reconciliation path is deliberately manual for now: enumerate pending
+Reconciliation is manual: enumerate pending
 representations and their recorded opaque locators in the operator catalog,
 check backend existence, compare the credential's *current* generation and
 representation state, then either finish a separately validated current
@@ -141,7 +143,7 @@ Only an operator-approved cleanup after a reviewed retention period may delete
 such a candidate through `SecretBackend::delete`; no enrollment failure
 automatically removes it. Never garbage-collect a locator referenced by a
 stored/current representation, and keep the catalog history for audit. There
-is no automatic GC or retry command in this checkpoint.
+is no automatic GC or retry command.
 An error from atomic replacement after rename but before directory fsync has
 an uncertain publication outcome; a future refresh adapter must re-read and
 validate the stored representation before deciding whether to retry.
@@ -267,8 +269,8 @@ account flow described by [Codex authentication](https://developers.openai.com/c
 API-key and unstable raw-token methods are not selected. The
 device flow needs outbound provider network but no localhost callback. The
 runtime also exposes `account/login/cancel`, `account/logout`, and
-`account/read`; logout and refresh persistence are intentionally outside this
-checkpoint.
+`account/read`; Orbit does not implement provider logout or refresh persistence for
+this enrollment path.
 
 Enrollment runs in the immutable local image
 `localhost/orbit-codex@sha256:5e2441ec351e6dc1ce2100111d0e56a08199b4c9d419150fbd236786a1895895`.

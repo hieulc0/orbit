@@ -4,9 +4,12 @@ This engineering review starts at `94ef99d74c188dbcf36737faf64b9f2a6b283f50`.
 It does not repair the Q6 candidate or perform another qualification. Q6 evidence
 remains in `target/q6-run/export` and its Attempt repository.
 
-Latest cross-provider status is in [Codex CLI vs Orbit Codex architecture and
+Related cross-provider evidence is in [Codex CLI vs Orbit Codex architecture and
 corrected runtime](cross-provider-coding.md#codex-cli-vs-orbit-codex-architecture-and-corrected-runtime).
-The credential-recheck and missing-host results below remain historical evidence.
+This review preserves historical results, including superseded stop conditions.
+Use [current ACP setup](../guides/acp-coding.md),
+[accounting contracts](../reference/agent-accounting.md) and
+[the roadmap](../ROADMAP.md) for current behavior and remaining gates.
 
 ## Corrected Q6 accounting
 

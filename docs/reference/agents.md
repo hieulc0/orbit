@@ -33,6 +33,9 @@ checked runtime contract, not an OS sandbox or a provider-side spending limit.
 
 ## Budget reservation protocol
 
+[Accounting and resource evidence](agent-accounting.md) distinguishes reservations,
+receipts, callback telemetry, role limits and unknown provider billing.
+
 After starting an attempt and before a model/tool invocation, persist and send:
 
 ```json

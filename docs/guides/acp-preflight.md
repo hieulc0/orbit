@@ -84,9 +84,9 @@ The JSON/JSONL result has format `orbit-acp-probe/v1`. A successful report inclu
 Exit 0 means that initialization and direct-child cleanup passed. It does not
 mean the agent is logged in, that native tools are brokered, that all descendants
 were contained, or that a coding workflow is qualified. An identity/version/hash
-mismatch, malformed/oversized input, EOF or timeout fails the probe. The generic
-probe can inspect later agents, but their actual execution support follows the
-requested order: Codex, official Antigravity ACP, then Claude.
+mismatch, malformed/oversized input, EOF or timeout fails the probe. Each adapter needs its own
+[effect-boundary qualification](../development/acp-qualification.md) before
+workflow execution.
 
 Private directories created by the agent are retained under the supplied parent;
 inspect and apply local retention policy. The probe does not upload evidence or
