@@ -4362,7 +4362,10 @@ async fn real_zed_gui_managed_candidate_lifecycle() -> Result<()> {
         for args in [vec!["add","."],vec!["commit","-m","synthetic editor baseline"]] {
             ensure!(std::process::Command::new("git").args(args).current_dir(repository.path()).output()?.status.success(),"fixture baseline failed");
         }
-        let baseline=compute_workspace_state(repository.path(),"HEAD").await?;
+        let head=std::process::Command::new("git").args(["rev-parse","--verify","HEAD"]).current_dir(repository.path()).output()?;
+        ensure!(head.status.success(),"fixture baseline revision unavailable");
+        let baseline_revision=String::from_utf8(head.stdout)?.trim().to_owned();
+        let baseline=compute_workspace_state(repository.path(),&baseline_revision).await?;
         let root=orbit::codex_status_probe::private_control_tempdir()?;
         let managed=root.path().join("managed"); fs::create_dir(&managed)?; fs::set_permissions(&managed,fs::Permissions::from_mode(0o700))?;
         let private=tempfile::Builder::new().prefix("editor-qualification-").permissions(fs::Permissions::from_mode(0o700)).tempdir_in(orbit::secret_backend::operator_home()?.join(".orbit/private"))?;
