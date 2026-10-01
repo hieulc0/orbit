@@ -886,6 +886,12 @@ Use an absolute executable and configuration path. Select Orbit in the agent
 panel; its modes choose skills before the task is pinned. Repository/provider
 credentials stay in the operator catalog and supervised runtime.
 
+The new-thread menu also selects custom agents. For a direct keyboard action,
+bind `agent::NewExternalAgentThread` with `{"agent":"orbit"}` in Zed's keymap.
+When launching Zed with `--user-data-dir`, put its settings and keymap in that
+directory's `config/` subdirectory. This permits a separate editor profile
+without changing the regular editor configuration.
+
 ACP initialization, new session, load/replay, prompt, cancel and mode selection
 are supported. Reload replays the durable notifications before its response, as
 required by [ACP session setup](https://agentclientprotocol.com/protocol/v1/session-setup).
@@ -900,6 +906,13 @@ inspect that durable work. Use explicit cancel to revoke it. Forced server death
 can leave uncertain external effects: existing fenced recovery requires
 reconciliation, and never replays an uncertain provider turn automatically.
 Completed gates and managed candidate state survive a normal server restart.
+Restore the existing Orbit thread from Zed's thread history after reconnecting;
+creating a new thread creates a distinct managed candidate. At a review gate,
+use `/diff` to inspect changes and `/review` to run the independent reviewer and
+final authoritative verification. `/open` displays the attempt path; open that
+directory in the editor for inspection. The original project changes only after
+an explicit `/apply` with the accepted candidate identity. `/discard` releases
+the retained attempt workspace, including after application.
 
 Choose `investigate` for bounded read-only repository reasoning, or an explicit
 change mode for implementation. The existing read-only planner supplies the

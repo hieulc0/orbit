@@ -363,7 +363,6 @@ pub async fn serve(
                             ensure!(params.get("mcpServers").is_none_or(|servers| servers == &json!([])), "external MCP authority is not admitted");
                             let session = service.new_session(Path::new(params["cwd"].as_str().context("cwd required")?)).await?;
                             let mode = if let Some(skill) = service.config().skill { let mode = serde_json::to_value(skill)?.as_str().unwrap().to_owned(); service.set_mode(&session.id, &mode).await?; mode } else {"auto".into()};
-                            update(&service, &mut output, &session.id, commands()).await?;
                             return Ok(Some(json!({"sessionId":session.id,"modes":modes(&service,&mode)})));
                         }
                         let session_id = session_id(params)?.to_owned();
@@ -392,6 +391,10 @@ pub async fn serve(
                             "_orbit/candidate/recover_application" => { service.recover_application(&session_id, params["workspaceStateId"].as_str().context("candidate identity required")?).await?; Ok(Some(json!({}))) }
                             "_orbit/candidate/apply" | "_orbit/candidate/discard" => { service.candidate_action(&session_id, params["workspaceStateId"].as_str().context("candidate identity required")?, method.ends_with("apply")).await?; Ok(Some(json!({}))) }
                             "session/prompt" => {
+                                // Clients may register a new session only after
+                                // handling its response. Refresh the command
+                                // view before the first ordinary turn as well.
+                                update(&service, &mut output, &session_id, commands()).await?;
                                 let prompt = prompt_text(params)?;
                                 if service.config().external_role.is_some() { ensure!(!prompt.starts_with('/') || matches!(prompt.trim(), "/status" | "/diff"), "EXTERNAL_ROLE_AUTHORITY_DENIED"); }
                                 if service.config().external_role == Some(crate::workflow::reasoning::ExternalRole::BusinessAnalyst) { ensure!(prompt.starts_with('/'), "BA submits typed artifacts through the external-role interface"); }
@@ -426,7 +429,21 @@ pub async fn serve(
                             _ => anyhow::bail!("unsupported Orbit ACP method"),
                         }
                     }.await;
-                    match response { Ok(Some(value)) => output.response_ok(request_id,value).await?, Ok(None) => {}, Err(_) => output.response_error(request_id,-32603,"EDITOR_REQUEST_FAILED").await? }
+                    match response {
+                        Ok(Some(value)) => {
+                            let command_session = match method {
+                                "session/new" => value["sessionId"].as_str().map(str::to_owned),
+                                "session/load" => params["sessionId"].as_str().map(str::to_owned),
+                                _ => None,
+                            };
+                            output.response_ok(request_id,value).await?;
+                            if let Some(session_id) = command_session {
+                                update(&service, &mut output, &session_id, commands()).await?;
+                            }
+                        }
+                        Ok(None) => {},
+                        Err(_) => output.response_error(request_id,-32603,"EDITOR_REQUEST_FAILED").await?
+                    }
                 }
                 completed = jobs.join_next(), if !jobs.is_empty() => {
                     let (session_id, result) = completed.context("editor worker disappeared")?.context("editor worker panicked")?;

@@ -589,8 +589,12 @@ async fn acp_v1_stdio_is_typed_bounded_and_replays_session_notifications() -> Re
         let _:agent_client_protocol::InitializeResponse=serde_json::from_value(initialized["result"].clone())?;
         let (created,notes)=exchange(&mut client,2,"session/new",json!({"cwd":repo.path(),"mcpServers":[]})).await?;
         let _:agent_client_protocol::NewSessionResponse=serde_json::from_value(created["result"].clone())?;
-        ensure!(notes.len()==1,"command menu missing");
+        ensure!(notes.is_empty(),"new-session notification preceded client registration");
         let session=created["result"]["sessionId"].as_str().unwrap();
+        let declared=client.read().await?;
+        let _:agent_client_protocol::SessionNotification=serde_json::from_value(declared["params"].clone())?;
+        ensure!(declared["params"]["sessionId"]==session && declared["params"]["update"]["sessionUpdate"]=="available_commands_update","post-response command menu missing");
+        ensure!(declared["params"]["update"]["availableCommands"].as_array().is_some_and(|commands|commands.iter().any(|command|command["name"]=="diff")),"candidate diff command missing");
         let (status,notes)=exchange(&mut client,3,"session/prompt",json!({"sessionId":session,"prompt":[{"type":"text","text":"/status"}]})).await?;
         let _:agent_client_protocol::PromptResponse=serde_json::from_value(status["result"].clone())?;
         ensure!(notes.len()>=3,"progress panel missing");
@@ -598,6 +602,9 @@ async fn acp_v1_stdio_is_typed_bounded_and_replays_session_notifications() -> Re
         let (loaded,replayed)=exchange(&mut client,4,"session/load",json!({"sessionId":session,"cwd":repo.path(),"mcpServers":[]})).await?;
         let _:agent_client_protocol::LoadSessionResponse=serde_json::from_value(loaded["result"].clone())?;
         ensure!(replayed.starts_with(&stored) && replayed.len()>stored.len(),"session replay or fresh durable view missing");
+        let refreshed=client.read().await?;
+        let _:agent_client_protocol::SessionNotification=serde_json::from_value(refreshed["params"].clone())?;
+        ensure!(refreshed["params"]["update"]["sessionUpdate"]=="available_commands_update","restored command menu missing");
         let (denied,_)=exchange(&mut client,5,"fs/write_text_file",json!({"sessionId":session,"path":"README.md","content":"denied"})).await?;
         ensure!(denied.get("error").is_some(),"editor granted direct filesystem authority");
         let expected=service.dashboard(session).await?["candidate"]["state_id"].as_str().unwrap().to_owned();
