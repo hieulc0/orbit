@@ -3868,6 +3868,8 @@ async fn real_developer_local_managed_candidate_and_trusted_verification() -> Re
         }
         let baseline = compute_workspace_state(repo.path(), "HEAD").await?;
         let root = tempfile::tempdir()?;
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))?;
         let mut selection = SelectionPolicy::new("arithmetic", "C arithmetic checks");
         selection.canonical_digest = true;
         selection.checks.push(VerificationCheck::new_command("arithmetic", "Compile and run C tests", vec![VerificationTier::Fast,VerificationTier::Standard,VerificationTier::Full], vec!["sh".into(), "test.sh".into()]));
