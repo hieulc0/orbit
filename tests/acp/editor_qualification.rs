@@ -721,3 +721,47 @@ async fn read_only_flow_completes_only_with_matching_successful_handoff() -> Res
     database.teardown().await?;
     result
 }
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL; uses no providers or secrets"]
+async fn read_only_session_pins_candidate_before_role_dispatch() -> Result<()> {
+    let database = common::DisposablePgTestContext::create("interactive_readonly", 3).await?;
+    let result = async {
+        let repo = common::TemporaryGitRepo::create()?;
+        let root = tempfile::tempdir()?;
+        let coordinator = Arc::new(WorkflowCoordinator::new(
+            database.engine.pool.clone(),
+            Arc::new(SimulatedRoleExecutor::new()),
+        ));
+        let mut admitted = config(&repo, &root)?;
+        admitted.skill = Some(Skill::Investigate);
+        let service = orbit::interactive::InteractiveService::new(
+            database.engine.pool.clone(),
+            admitted,
+            coordinator.clone(),
+        )?;
+        let session = service.new_session(repo.path()).await?;
+        let workflow = service.start(&session.id, "Explain the repository").await?;
+        let candidate = state(session.worktree.as_ref().unwrap()).await?;
+        coordinator.step(&workflow).await?;
+        let store = WorkflowStore::new(database.engine.pool.clone());
+        let planning = store.get_workflow_run(&workflow).await?.unwrap();
+        ensure!(
+            planning.status == orbit::workflow::WorkflowStage::Planning
+                && planning.current_workspace_state_id.as_deref() == Some(candidate.as_str()),
+            "read-only candidate not durably bound before reasoning"
+        );
+        ensure!(
+            store.list_role_executions(&workflow).await?.is_empty(),
+            "baseline binding dispatched a provider"
+        );
+        service.cancel(&session.id).await?;
+        service
+            .candidate_action(&session.id, &candidate, false)
+            .await?;
+        Ok(())
+    }
+    .await;
+    database.teardown().await?;
+    result
+}

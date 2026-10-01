@@ -4298,7 +4298,10 @@ async fn real_acp_sdk_client_recovers_disconnected_coding_and_read_only_roles() 
             second.connection.set_session_mode(SetSessionModeRequest::new(question.clone(),"investigate")).await?;
             second.connection.prompt(PromptRequest::new(question.clone(),vec![ContentBlock::from("Read calc.c and explain original(). Do not edit files. Return a structured PlanHandoff with the explanation and no implementation request.")])).await?;
             let answer=second.request("_orbit/session/status",json!({"sessionId":question})).await?;
-            ensure!(answer["workflow"]["status"]=="completed" && answer["flow"]["read_only"]==true && answer["changed_files"]["total"]==0,"bounded interactive reasoning gained mutation authority");
+            println!("REAL_ORBIT_ACP_READ_ONLY_STATUS {}",answer);
+            ensure!(answer["flow"]["read_only"]==true,"interactive reasoning selected a mutating flow");
+            ensure!(answer["changed_files"]["total"]==0,"interactive reasoning changed the candidate");
+            ensure!(answer["workflow"]["status"]=="completed","read-only workflow did not complete: {}",answer["workflow"]["failure_reason"]);
             let readonly_id=answer["workflow"]["id"].as_str().unwrap();
             for role in ctx.store.list_role_executions(readonly_id).await? {
                 print_live_fixture_audit(&ctx.engine.pool,Some(&role.id)).await;

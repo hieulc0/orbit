@@ -495,8 +495,38 @@ impl WorkflowCoordinator {
 
         match wf.status {
             WorkflowStage::Created => {
+                // Read-only completion must bind its handoff to the candidate
+                // observed before reasoning, then prove that candidate unchanged.
+                let initial_state = if self
+                    .store
+                    .flow(wf_id)
+                    .await?
+                    .is_some_and(|flow| flow.read_only)
+                {
+                    Some(
+                        compute_workspace_state(
+                            workflow_repo_path(&wf)?,
+                            wf.base_revision.as_deref().unwrap_or("HEAD"),
+                        )
+                        .await?,
+                    )
+                } else {
+                    None
+                };
+                if let (Some(expected), Some(observed)) = (
+                    wf.current_workspace_state_id.as_deref(),
+                    initial_state.as_ref(),
+                ) {
+                    ensure!(expected == observed.state_id, "STALE_CANDIDATE");
+                }
                 self.store
-                    .transition_workflow_stage(wf_id, WorkflowStage::Planning, None, None, None)
+                    .transition_workflow_stage(
+                        wf_id,
+                        WorkflowStage::Planning,
+                        initial_state.as_ref().map(|state| state.state_id.as_str()),
+                        None,
+                        None,
+                    )
                     .await?;
                 Ok(WorkflowStepResult::Advanced {
                     from: WorkflowStage::Created,
