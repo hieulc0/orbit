@@ -1789,7 +1789,7 @@ impl WorkflowStore {
         &self,
         id: &str,
         role_execution_id: &str,
-        attempt_id: &str,
+        workflow_attempt_id: &str,
         finished_at_ms: i64,
         receipt: &crate::acp_process::CleanupReceiptEvidence,
         exit_code: Option<i32>,
@@ -1827,7 +1827,7 @@ impl WorkflowStore {
         )
         .bind(id)
         .bind(role_execution_id)
-        .bind(attempt_id)
+        .bind(workflow_attempt_id)
         .bind(finished_at_ms)
         .bind(observation)
         .execute(&self.pool)
@@ -3010,7 +3010,7 @@ mod tests {
             assert!(store.record_cancelled_agent_cleanup("cleanup-agent", &role.id, "cleanup-attempt", 1, &receipt, Some(0), None).await.is_err());
             let coordinator = super::super::coordinator::WorkflowCoordinator::new(engine.pool.clone(), std::sync::Arc::new(super::super::coordinator::SimulatedRoleExecutor::with_approval()));
             coordinator.cancel_workflow(&workflow.id, "test cancellation").await?;
-            for (agent, owner, attempt) in [("other-agent",role.id.as_str(),"cleanup-attempt"),("cleanup-agent","other-role","cleanup-attempt"),("cleanup-agent",role.id.as_str(),"other-attempt")] {
+            for (agent, owner, attempt) in [("other-agent",role.id.as_str(),"cleanup-attempt"),("cleanup-agent","other-role","cleanup-attempt"),("cleanup-agent",role.id.as_str(),"runtime-launch-attempt")] {
                 assert!(store.record_cancelled_agent_cleanup(agent,owner,attempt,1,&receipt,Some(0),None).await.is_err());
             }
             let mut mismatch = receipt.clone();

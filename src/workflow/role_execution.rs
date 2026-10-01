@@ -1730,13 +1730,15 @@ async fn execute_real_acp_turn_body(
         // Cancellation revokes result authority before the supervisor can reap
         // the provider. Only a matching receipt and drained terminals permit
         // recording cleanup after that revocation; the late turn stays rejected.
+        // Receipt validation uses the supervisor request identity; publication
+        // uses the distinct durable workflow attempt that owns this role.
         if lifecycle.cleanup_state == "CONFIRMED"
             && let Some(receipt) = evidence.receipt.as_ref()
             && store
                 .record_cancelled_agent_cleanup(
                     agent_exec_id,
                     &role_exec.id,
-                    &req.attempt_id,
+                    &wf_run.attempt_id,
                     finished_at_ms,
                     receipt,
                     evidence.exit_code,
