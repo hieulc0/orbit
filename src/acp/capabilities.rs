@@ -72,7 +72,7 @@ pub fn qualified_tool_audit_correlation(
 ) -> ToolAuditCorrelationCapability {
     match (image_digest, adapter_revision) {
         (
-            "sha256:5e2441ec351e6dc1ce2100111d0e56a08199b4c9d419150fbd236786a1895895",
+            "sha256:080fa7422dc69cb5367b0b0488f7c08326844f1812831273d298a3fa587f41c2",
             "orbit-codex-acp-bridge-v2",
         ) => ToolAuditCorrelationCapability::Exact,
         (ANTIGRAVITY_CORRELATED_IMAGE_DIGEST, ANTIGRAVITY_ACP_ADAPTER_REVISION) => {

@@ -14,14 +14,21 @@ async fn confined_terminal_cannot_observe_host_state() -> Result<()> {
     let workspace = tempfile::tempdir()?;
     let host = tempfile::tempdir()?;
     std::fs::write(host.path().join("secret"), "host-only")?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    // Positive control: the host endpoint exists before testing that the
+    // terminal cannot reach it from its separate network namespace.
+    let connection = tokio::net::TcpStream::connect(address).await?;
+    drop(connection);
     std::fs::write(workspace.path().join(".git"), "protected metadata")?;
     std::os::unix::fs::symlink(host.path(), workspace.path().join("escape"))?;
     let profile = RoleExecutionProfile::DevLocal {
         bubblewrap: PathBuf::from("/usr/bin/bwrap"),
     };
     let command = format!(
-        "test ! -e '{}' && test ! -e escape/secret && test ! -e /home/orbit/.ssh && test ! -e /home/orbit/.aws && test ! -e /home/orbit/.orbit/private && test ! -e /run/podman/podman.sock && test ! -e /var/run/docker.sock && test -z \"${{ORBIT_TERMINAL_SECRET:-}}\" && test \"$(ls /sys/class/net 2>/dev/null | wc -l)\" -eq 0 && ! printf changed > .git && printf local > candidate.txt",
-        host.path().display()
+        "test ! -e '{}' && test ! -e escape/secret && test ! -e /home/orbit/.ssh && test ! -e /home/orbit/.aws && test ! -e /home/orbit/.orbit/private && test ! -e /run/podman/podman.sock && test ! -e /var/run/docker.sock && test -z \"${{ORBIT_TERMINAL_SECRET:-}}\" && test \"$(ls /sys/class/net 2>/dev/null | wc -l)\" -eq 0 && ! printf changed > .git && ! rm .git && command -v timeout >/dev/null && command -v bash >/dev/null && ! timeout 2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/{}' && printf local > candidate.txt",
+        host.path().display(),
+        address.port()
     );
     let terminal = AgentTerminal::spawn_confined(
         &profile,
@@ -161,4 +168,200 @@ async fn atomic_shell_has_one_fenced_callback_and_confirms_cleanup() -> Result<(
     }.await;
     database.teardown().await?;
     result
+}
+
+/// Compare only command isolation overhead. Provider runtimes remain OCI in
+/// both profiles, and repository callbacks are already native in both.
+#[tokio::test]
+#[ignore = "requires bubblewrap and an explicitly provisioned pinned OCI compiler image"]
+async fn confined_command_latency_against_rootless_oci() -> Result<()> {
+    use anyhow::Context;
+    use serde_json::json;
+    use std::time::Instant;
+    let image = std::env::var("ORBIT_TEST_COMMAND_IMAGE")
+        .context("select a provisioned image by digest")?;
+    let (_, digest) = image
+        .rsplit_once("@sha256:")
+        .context("image must be pinned")?;
+    ensure!(
+        digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "invalid image digest"
+    );
+    let workspace = tempfile::tempdir()?;
+    std::fs::write(
+        workspace.path().join("calc.c"),
+        "int main(void) { return 3 * 4 == 12 ? 0 : 1; }\n",
+    )?;
+    let profile = RoleExecutionProfile::DevLocal {
+        bubblewrap: PathBuf::from("/usr/bin/bwrap"),
+    };
+    for (label, script) in [
+        ("startup", "true"),
+        ("compile_and_run", "cc calc.c -o /tmp/calc && /tmp/calc"),
+    ] {
+        let mut local = Vec::new();
+        let mut oci = Vec::new();
+        // Alternate order to reduce the influence of host warming. Keep the
+        // warm-up separate; every measured command starts a fresh boundary.
+        for sample in 0..8 {
+            for native in if sample % 2 == 0 {
+                [true, false]
+            } else {
+                [false, true]
+            } {
+                let started = Instant::now();
+                if native {
+                    let terminal = AgentTerminal::spawn_confined(
+                        &profile,
+                        workspace.path(),
+                        workspace.path(),
+                        "sh",
+                        &["-c".into(), script.into()],
+                        4096,
+                    )?;
+                    ensure!(
+                        terminal.wait_for_exit(Duration::from_secs(30)).await? == 0,
+                        "local workload failed: {}",
+                        terminal.output().text()
+                    );
+                    terminal.kill().await?;
+                } else {
+                    let name = format!("orbit-command-comparison-{}", orbit::model::id());
+                    let mut command = tokio::process::Command::new("podman");
+                    command
+                        .args([
+                            "--remote=false",
+                            "--cgroup-manager=cgroupfs",
+                            "run",
+                            "--rm",
+                            "--pull=never",
+                            "--name",
+                            &name,
+                            "--network=none",
+                            "--read-only",
+                            "--cap-drop=ALL",
+                            "--security-opt=no-new-privileges",
+                            "--pids-limit=64",
+                            "--memory=512m",
+                            "--cpus=1",
+                            "--userns=keep-id",
+                            "--tmpfs=/tmp:rw,nosuid,nodev,size=64m",
+                            "--workdir=/workspace",
+                            "--volume",
+                        ])
+                        .arg(format!("{}:/workspace:rw", workspace.path().display()))
+                        .args([&image, "sh", "-c", script]);
+                    command.kill_on_drop(true);
+                    let output =
+                        tokio::time::timeout(Duration::from_secs(30), command.output()).await;
+                    if output.is_err() {
+                        let _ = tokio::process::Command::new("podman")
+                            .args(["--remote=false", "rm", "--force", &name])
+                            .output()
+                            .await;
+                    }
+                    let output = output??;
+                    ensure!(
+                        output.status.success(),
+                        "OCI workload failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                if sample > 0 {
+                    if native {
+                        local.push(started.elapsed().as_secs_f64() * 1000.0);
+                    } else {
+                        oci.push(started.elapsed().as_secs_f64() * 1000.0);
+                    }
+                }
+            }
+        }
+        local.sort_by(f64::total_cmp);
+        oci.sort_by(f64::total_cmp);
+        println!(
+            "COMMAND_LATENCY {}",
+            json!({"workload":label,"samples":7,"dev_local_ms":local,"rootless_oci_ms":oci,"dev_local_median_ms":local[3],"rootless_oci_median_ms":oci[3],"oci_image":image})
+        );
+        ensure!(
+            local[3] < oci[3],
+            "no measured local latency improvement for {label}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_repository_operations_preserve_candidate_confinement() -> Result<()> {
+    use orbit::{
+        execution::worktree::ManagedWorktree,
+        fs_tools::read_text_confined,
+        tool_surface::{git_diff, git_status, search_grep},
+        workflow_coordinator::compute_workspace_state,
+    };
+    use std::time::Instant;
+    let source = common::TemporaryGitRepo::create()?;
+    let root = tempfile::tempdir()?;
+    let candidate = ManagedWorktree::create(source.path(), &root.path().join("candidate")).await?;
+    let outside = tempfile::tempdir()?;
+    std::fs::write(outside.path().join("secret"), "host secret")?;
+    std::os::unix::fs::symlink(outside.path(), candidate.workspace.join("outside"))?;
+    let started = Instant::now();
+    ensure!(
+        read_text_confined(&candidate.workspace, "README.md")?.contains("offline fixture"),
+        "native read failed"
+    );
+    ensure!(
+        read_text_confined(&candidate.workspace, "outside/secret").is_err(),
+        "native read escaped candidate"
+    );
+    let read_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let started = Instant::now();
+    ensure!(
+        !search_grep(
+            &candidate.workspace,
+            Some("README.md"),
+            "offline",
+            true,
+            false,
+            &[],
+            &[],
+            10,
+            0
+        )?
+        .matches
+        .is_empty(),
+        "native search failed"
+    );
+    let search_ms = started.elapsed().as_secs_f64() * 1000.0;
+    std::fs::write(candidate.workspace.join("README.md"), "changed candidate\n")?;
+    let started = Instant::now();
+    ensure!(
+        git_status(&candidate.workspace, None)
+            .await?
+            .modified
+            .contains(&"README.md".into()),
+        "native Git status failed on linked worktree"
+    );
+    ensure!(
+        git_diff(&candidate.workspace, None, None, None, false, 4096)
+            .await?
+            .diff
+            .contains("changed candidate"),
+        "native Git diff failed"
+    );
+    let git_ms = started.elapsed().as_secs_f64() * 1000.0;
+    std::fs::remove_file(candidate.workspace.join("outside"))?;
+    let started = Instant::now();
+    let state = compute_workspace_state(&candidate.workspace, &candidate.base_revision).await?;
+    let state_ms = started.elapsed().as_secs_f64() * 1000.0;
+    println!(
+        "NATIVE_REPOSITORY_LATENCY {}",
+        serde_json::json!({"read_ms":read_ms,"search_ms":search_ms,"git_status_diff_ms":git_ms,"workspace_state_ms":state_ms})
+    );
+    ensure!(
+        std::fs::read_to_string(source.path().join("README.md"))? == "offline fixture baseline\n",
+        "main checkout changed"
+    );
+    candidate.discard(&state.state_id).await?;
+    Ok(())
 }

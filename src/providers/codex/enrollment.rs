@@ -25,9 +25,9 @@ pub const CODEX_INTERFACE: &str = "codex";
 pub const CODEX_AUTH_TYPE: &str = "chatgpt-device-code";
 pub const CODEX_VERSION: &str = "0.156.0";
 pub const CODEX_IMAGE_DIGEST: &str =
-    "sha256:5e2441ec351e6dc1ce2100111d0e56a08199b4c9d419150fbd236786a1895895";
+    "sha256:080fa7422dc69cb5367b0b0488f7c08326844f1812831273d298a3fa587f41c2";
 pub const CODEX_IMAGE: &str =
-    "localhost/orbit-codex@sha256:5e2441ec351e6dc1ce2100111d0e56a08199b4c9d419150fbd236786a1895895";
+    "localhost/orbit-codex@sha256:080fa7422dc69cb5367b0b0488f7c08326844f1812831273d298a3fa587f41c2";
 pub const CODEX_BINARY: &str = "/opt/codex/bin/codex";
 pub const CODEX_ARTIFACT: &str = "codex-app-server";
 pub const CODEX_BINARY_SHA256: &str =

@@ -316,7 +316,14 @@ role cleanup can be confirmed.
 Git metadata in a linked worktree points outside the terminal mount. Use Orbit's
 native Git callbacks for inspection. Repository tools still have no network;
 dependency installation requires operator-provisioned tools or separate policy.
+The terminal sees system tools under `/usr`, `/bin`, `/sbin`, `/lib` and
+`/lib64`. A compiler installed only in the operator home is unavailable; provision
+required system tools before selecting this profile. Exploratory checks must not
+add home-directory mounts to make a build pass.
+
 This profile is for trusted interactive repositories, not hostile workloads.
+CPU time, open files, output and file sizes are bounded; the local terminal does
+not provide the OCI verifier's memory or process-count cgroup limits.
 Untrusted execution remains unsupported.
 
 The provider process remains in its existing supervised OCI runtime. Codex

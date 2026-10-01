@@ -689,7 +689,7 @@ runtime also exposes `account/login/cancel`, `account/logout`, and
 this enrollment path.
 
 Enrollment runs in the immutable local image
-`localhost/orbit-codex@sha256:5e2441ec351e6dc1ce2100111d0e56a08199b4c9d419150fbd236786a1895895`.
+`localhost/orbit-codex@sha256:080fa7422dc69cb5367b0b0488f7c08326844f1812831273d298a3fa587f41c2`.
 That image was built from the checksum-pinned official 0.156.0 package; its
 Codex executable SHA-256 is
 `78a11f06e0a2dda42d13fba1d50dc62e8cbdb2d5f69789722f4d4d99b5cdbe30`.

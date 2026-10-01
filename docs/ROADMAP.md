@@ -6,6 +6,10 @@ Current behavior belongs in [architecture](architecture/README.md), interfaces i
 
 ## Pending acceptance
 
+- **Developer-local acceptance:** finish a guarded real coding workflow in a
+  managed worktree, with confined exploratory terminal feedback and independent
+  trusted verification. Complete the security and architecture review before
+  accepting the profile for interactive use.
 - **Zed GUI integration:** exercise progress, replay, cancellation, diff navigation,
   apply/discard and interrupted-action recovery in an actual disposable editor session.
   ACP protocol or fixture acceptance cannot substitute for GUI evidence.

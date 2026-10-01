@@ -506,6 +506,7 @@ async fn guard_live_codex_quota(catalog: &PgPool) -> Result<()> {
 struct LiveCatalogRoleExecutor {
     catalog: PgPool,
     injected: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    inject_pre_prompt_failures: bool,
 }
 
 #[cfg(feature = "fault-injection")]
@@ -523,10 +524,12 @@ impl RoleAgentExecutor for LiveCatalogRoleExecutor {
         handoff: Option<&HandoffArtifact>,
         cancellation: tokio::sync::watch::Receiver<bool>,
     ) -> Result<RoleExecutionOutcome> {
-        let inject = matches!(
-            (role.role_id.as_str(), target.provider.as_str()),
-            ("planner", "codex") | ("reviewer", "antigravity")
-        ) && self.injected.lock().unwrap().insert(role.role_id.clone());
+        let inject = self.inject_pre_prompt_failures
+            && matches!(
+                (role.role_id.as_str(), target.provider.as_str()),
+                ("planner", "codex") | ("reviewer", "antigravity")
+            )
+            && self.injected.lock().unwrap().insert(role.role_id.clone());
         if inject {
             return RealAcpRoleExecutor
                 .simulate_pre_prompt_runtime_failure(pool, execution, target)
@@ -3779,7 +3782,7 @@ async fn real_mixed_provider_workflow_and_operational_fallback() -> Result<()> {
         orbit::regression_strategy::RegressionStore::new(ctx.engine.pool.clone()).insert_selection_policy(&selection).await?;
         let task = "Inspect src.rs, add public multiply(a:i32,b:i32)->i32 using a*b and a unit test multiply(3,4)==12, and document multiply in README.md. Keep test.sh unchanged. Use advertised read and mutation callbacks. Each role must read src.rs. Produce structured role handoffs. This is a synthetic arithmetic qualification repository.";
         let workflow = ctx.store.create_workflow_run_full("arithmetic", &format!("attempt-{}", id()), 1, Some(&policy), None, Some(&selection), Some(task), repo.path().to_str(), Some("HEAD")).await?;
-        let executor = std::sync::Arc::new(LiveCatalogRoleExecutor {catalog:catalog.clone(),injected:std::sync::Mutex::new(Default::default())});
+        let executor = std::sync::Arc::new(LiveCatalogRoleExecutor {catalog:catalog.clone(),injected:std::sync::Mutex::new(Default::default()),inject_pre_prompt_failures:true});
         let coordinator = WorkflowCoordinator::new(ctx.engine.pool.clone(), executor).with_credential_catalog(catalog.clone()).with_verification_environment(EnvironmentIdentity {
             execution_profile:"sandboxed-container".into(),isolation:"rootless-podman".into(),oci_runtime:Some("podman".into()),runtime_image:Some("localhost/orbit-s9-verification@sha256:73fa989caa01cba6c284e53005aefd3f40a6be85f0f6a1612a7360b8e6342692".into()),runtime_image_digest:Some("sha256:8326e0c4dcd2dec8101272e317856a4608d8fb4c42ced2f8ab71e3068b96b047".into()),..Default::default()
         })?;
@@ -3817,6 +3820,101 @@ async fn real_mixed_provider_workflow_and_operational_fallback() -> Result<()> {
         ensure!(workflow.current_workspace_state_id.as_deref() == Some(&state.state_id), "completed candidate lost workspace identity");
         let runs = ctx.store.verification_store().list_runs(&workflow.attempt_id).await?;
         ensure!(!runs.is_empty() && runs.iter().all(|run| run.workspace_state_id == state.state_id && run.overall_result == Some(VerificationRunResult::Passed)), "independent verification lost exact candidate binding");
+        ensure_disposable_schema_has_no_credentials(&ctx.engine.pool).await?;
+        Ok(())
+    }.await;
+    finish_live_fixture(catalog, ctx, result).await
+}
+
+#[tokio::test]
+#[ignore = "requires guarded live providers, disposable PostgreSQL, bubblewrap and a pinned verification environment"]
+#[cfg(feature = "fault-injection")]
+async fn real_developer_local_managed_candidate_and_trusted_verification() -> Result<()> {
+    use orbit::{
+        acp::service::{EditorService, ServiceConfig},
+        execution::local::RoleExecutionProfile,
+        regression_strategy::{SelectionPolicy, VerificationCheck, VerificationTier},
+        verification::{EnvironmentIdentity, VerificationRunResult},
+        workflow::flow::{Risk, Skill},
+    };
+    let path = std::env::var("ORBIT_TEST_VERIFICATION_ENVIRONMENT_FILE")
+        .context("select an operator-provisioned verification environment")?;
+    let bytes = fs::read(path)?;
+    ensure!(
+        bytes.len() <= 65536,
+        "verification environment exceeds bounds"
+    );
+    let environment: EnvironmentIdentity = serde_json::from_slice(&bytes)?;
+    let catalog = explicitly_authorized_live_credential_catalog().await?;
+    if let Err(error) = guard_live_codex_quota(&catalog).await {
+        catalog.close().await;
+        return Err(error);
+    }
+    let ctx = match setup_test().await {
+        Ok(ctx) => ctx,
+        Err(error) => {
+            catalog.close().await;
+            return Err(error);
+        }
+    };
+    let result = async {
+        ensure_live_catalog_is_separate(&catalog, &ctx.engine.pool, &ctx.database.schema).await?;
+        ensure_disposable_schema_has_no_credentials(&ctx.engine.pool).await?;
+        let repo = common::TemporaryGitRepo::create()?;
+        fs::write(repo.path().join("calc.c"), "int original(void) { return 0; }\n")?;
+        fs::write(repo.path().join("test.sh"), "#!/bin/sh\nset -eu\ncc -Wall -Wextra -Werror calc.c -o /tmp/arithmetic-test\n/tmp/arithmetic-test\n")?;
+        for args in [vec!["add", "."], vec!["commit", "-m", "synthetic C baseline"]] {
+            ensure!(std::process::Command::new("git").args(args).current_dir(repo.path()).output()?.status.success(), "fixture commit failed");
+        }
+        let baseline = compute_workspace_state(repo.path(), "HEAD").await?;
+        let root = tempfile::tempdir()?;
+        let mut selection = SelectionPolicy::new("arithmetic", "C arithmetic checks");
+        selection.canonical_digest = true;
+        selection.checks.push(VerificationCheck::new_command("arithmetic", "Compile and run C tests", vec![VerificationTier::Fast,VerificationTier::Standard,VerificationTier::Full], vec!["sh".into(), "test.sh".into()]));
+        let executor = std::sync::Arc::new(LiveCatalogRoleExecutor { catalog:catalog.clone(), injected:std::sync::Mutex::new(Default::default()), inject_pre_prompt_failures:false });
+        let coordinator = std::sync::Arc::new(WorkflowCoordinator::new(ctx.engine.pool.clone(), executor).with_credential_catalog(catalog.clone()).with_verification_environment(environment.clone())?);
+        let config = ServiceConfig { repository:repo.path().canonicalize()?, workspaces:root.path().canonicalize()?, agent_execution_profile:RoleExecutionProfile::DevLocal { bubblewrap:PathBuf::from("/usr/bin/bwrap") }, verification_environment:environment.clone(), selection_policy:selection, risk:Risk::Conservative, skill:Some(Skill::ImplementFeature), external_role:None };
+        let service = EditorService::new(ctx.engine.pool.clone(), config.clone(), coordinator.clone())?;
+        let session = service.new_session(repo.path()).await?;
+        let worktree = session.worktree.as_ref().context("managed worktree missing")?;
+        let task = "This is a fresh synthetic C qualification repository. Inspect calc.c. Add int multiply(int a,int b) returning a*b, and a main that tests multiply(3,4)==12 and returns zero on success. Document multiply in README.md. Keep test.sh unchanged. Implementer MUST use an advertised confined terminal callback to run sh test.sh after editing; the system cc is available. Every role must read calc.c. Use Orbit repository read/search/git callbacks for inspection and Git metadata; shell Git metadata outside the managed worktree is intentionally inaccessible. Produce structured role handoffs. Do not stage or commit the candidate.";
+        let workflow_id = service.start(&session.id, task).await?;
+        let started = std::time::Instant::now();
+        service.run(&session.id, false).await?;
+        ensure!(ctx.store.get_workflow_run(&workflow_id).await?.context("workflow missing")?.status == WorkflowStage::Reviewing, "candidate did not reach review");
+        ensure!(compute_workspace_state(repo.path(), "HEAD").await?.state_id == baseline.state_id, "source checkout mutated during coding");
+        // Reconstruct the client service from durable session state before review.
+        let service = EditorService::new(ctx.engine.pool.clone(), config, coordinator)?;
+        let dashboard = service.dashboard(&session.id).await?;
+        println!("MANAGED_CANDIDATE_BEFORE_REVIEW {}", dashboard);
+        service.run(&session.id, true).await?;
+        let workflow = ctx.store.get_workflow_run(&workflow_id).await?.context("workflow missing")?;
+        let roles = ctx.store.list_role_executions(&workflow_id).await?;
+        for role in &roles { print_live_fixture_audit(&ctx.engine.pool, Some(&role.id)).await; }
+        ensure!(workflow.status == WorkflowStage::Completed, "managed coding workflow did not complete: {:?}", workflow.status);
+        let mut shell = false;
+        for role in roles {
+            ensure!(role.status == RoleExecutionStatus::Succeeded, "role failed");
+            for execution in role.agent_execution_ids {
+                let (status,calls,successes,failures,_,metadata) = load_agent_tool_audit(&ctx.engine.pool, &execution).await?;
+                ensure!(status == "SUCCEEDED" && calls > 0 && successes == calls && failures == 0 && b34_audit_has_exact_correlations(&metadata["tool_call_audit"], usize::try_from(calls)?) && metadata["cleanup_confirmed"] == true, "role lacks exact successful tool/cleanup evidence");
+                if role.role_id == "implementer" {
+                    shell |= metadata["tool_call_audit"]["entries"].as_array().is_some_and(|entries| entries.iter().any(|entry| entry["canonical_tool_name"] == "terminal.create"));
+                }
+            }
+        }
+        ensure!(shell, "real implementer did not use confined terminal feedback");
+        let candidate = compute_workspace_state(&worktree.workspace, &worktree.base_revision).await?;
+        ensure!(workflow.current_workspace_state_id.as_deref() == Some(&candidate.state_id), "completed workspace binding lost");
+        let runs = ctx.store.verification_store().list_runs(&workflow.attempt_id).await?;
+        ensure!(runs.len() >= 3 && runs.iter().all(|run| run.workspace_state_id == candidate.state_id && run.overall_result == Some(VerificationRunResult::Passed) && run.environment_identity.isolation == "rootless-podman" && run.environment_identity.runtime_image_digest == environment.runtime_image_digest), "independent trusted verification missing exact candidate/environment binding");
+        ensure!(compute_workspace_state(repo.path(), "HEAD").await?.state_id == baseline.state_id, "main changed without explicit apply");
+        ensure!(service.candidate_action(&session.id, "stale", true).await.is_err(), "stale candidate applied");
+        service.candidate_action(&session.id, &candidate.state_id, true).await?;
+        ensure!(compute_workspace_state(repo.path(), &worktree.base_revision).await?.state_id == candidate.state_id, "applied state differs from accepted candidate");
+        service.candidate_action(&session.id, &candidate.state_id, false).await?;
+        ensure!(!worktree.workspace.exists(), "candidate retained after discard");
+        println!("MANAGED_CODING_ACCEPTANCE {}", json!({"workflow":workflow_id,"candidate":candidate.state_id,"elapsed_ms":started.elapsed().as_millis(),"trusted_verification_runs":runs.len(),"source_protected":true,"explicit_apply":true,"explicit_discard":true}));
         ensure_disposable_schema_has_no_credentials(&ctx.engine.pool).await?;
         Ok(())
     }.await;
