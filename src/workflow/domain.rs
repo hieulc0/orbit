@@ -1781,6 +1781,62 @@ impl WorkflowStore {
         Ok(())
     }
 
+    /// A revoked execution may report independently confirmed cleanup, but may
+    /// not publish its output, tool results, model choice, or success. This is
+    /// deliberately separate from the active-owner finalization fence.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn record_cancelled_agent_cleanup(
+        &self,
+        id: &str,
+        role_execution_id: &str,
+        attempt_id: &str,
+        finished_at_ms: i64,
+        receipt: &crate::acp_process::CleanupReceiptEvidence,
+        exit_code: Option<i32>,
+        signal: Option<i32>,
+    ) -> Result<()> {
+        ensure!(
+            receipt.runtime == "podman"
+                && receipt.expected_image_matches
+                && (exit_code == Some(receipt.exit_code) || signal.is_some()),
+            "CLEANUP_RECEIPT_MISMATCH"
+        );
+        let observation = serde_json::json!({
+            "receipt": receipt,
+            "process_exit_code": exit_code,
+            "process_signal": signal,
+        });
+        let updated = sqlx::query(
+            r#"
+            UPDATE orbit_agent_executions ae
+            SET status = 'CANCELLED', finished_at_ms = $4,
+                termination_reason = 'ROLE_EXECUTION_CANCELLED',
+                metadata = ae.metadata || jsonb_build_object(
+                    'cleanup_confirmed', true, 'cleanup_observation', $5::jsonb,
+                    'lifecycle', COALESCE(ae.metadata->'lifecycle', '{}'::jsonb)
+                        || jsonb_build_object('phase', 'TERMINAL',
+                            'cleanup_state', 'CONFIRMED', 'outcome', 'CANCELLED',
+                            'normalized_reason', 'ROLE_EXECUTION_CANCELLED'))
+            WHERE ae.id = $1 AND ae.role_execution_id = $2 AND ae.status = 'RUNNING'
+              AND EXISTS (SELECT 1 FROM orbit_role_executions re
+                          JOIN orbit_workflow_runs wf ON wf.id = re.workflow_run_id
+                          WHERE re.id = $2 AND re.status = 'CANCELLED'
+                            AND re.agent_execution_ids @> jsonb_build_array($1::text)
+                            AND wf.attempt_id = $3 AND wf.status = 'CANCELLED')
+            "#,
+        )
+        .bind(id)
+        .bind(role_execution_id)
+        .bind(attempt_id)
+        .bind(finished_at_ms)
+        .bind(observation)
+        .execute(&self.pool)
+        .await
+        .context("record cancelled agent cleanup")?;
+        ensure!(updated.rows_affected() == 1, "AGENT_CLEANUP_FENCE_REJECTED");
+        Ok(())
+    }
+
     /// Complete role execution with success and output handoff.
     pub async fn complete_role_execution_success(
         &self,
@@ -2922,6 +2978,68 @@ pub fn format_workflow_show(wf: &WorkflowRun, roles: &[RoleExecution]) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires disposable PostgreSQL; uses no providers or secrets"]
+    async fn cancelled_cleanup_observation_cannot_publish_late_results() -> Result<()> {
+        let base = std::env::var("ORBIT_TEST_DATABASE_URL")?;
+        let admin = PgPool::connect(&base).await?;
+        let schema = format!("orbit_cleanup_{}", id().replace('-', ""));
+        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+            .execute(&admin)
+            .await?;
+        let separator = if base.contains('?') { '&' } else { '?' };
+        let directory = tempfile::tempdir()?;
+        let engine = crate::engine::Engine::connect(
+            &format!("{base}{separator}options=-csearch_path%3D{schema}"),
+            directory.path().join("artifacts"),
+            3,
+        )
+        .await?;
+        let result: Result<()> = async {
+            let store = WorkflowStore::new(engine.pool.clone());
+            let workflow = store.create_workflow_run("cleanup-test", "cleanup-attempt", 1, None).await?;
+            let role = store.create_role_execution(&workflow.id, &RoleDefinition::planner_v1(), "PLANNING", 1, None, None).await?;
+            sqlx::query("UPDATE orbit_role_executions SET status='RUNNING' WHERE id=$1").bind(&role.id).execute(&engine.pool).await?;
+            let original = serde_json::json!({"cleanup_confirmed":false,"tool_call_audit":{"pre_effect":"retained"},"lifecycle":{"prompt_uncertainty":"IN_FLIGHT","persistence_state":"UNCONFIRMED"}});
+            store.start_agent_execution("cleanup-agent", &role.id, "fixture", None, None, 0, None, None, &original).await?;
+            let receipt = crate::acp_process::CleanupReceiptEvidence {
+                format_version: 1, runtime: "podman", launch_stage: "runtime_started", exit_code: 0,
+                expected_image_matches: true, diagnostic_present: false, diagnostic_truncated: false, codex_session: None,
+            };
+            assert!(store.record_cancelled_agent_cleanup("cleanup-agent", &role.id, "cleanup-attempt", 1, &receipt, Some(0), None).await.is_err());
+            let coordinator = super::super::coordinator::WorkflowCoordinator::new(engine.pool.clone(), std::sync::Arc::new(super::super::coordinator::SimulatedRoleExecutor::with_approval()));
+            coordinator.cancel_workflow(&workflow.id, "test cancellation").await?;
+            for (agent, owner, attempt) in [("other-agent",role.id.as_str(),"cleanup-attempt"),("cleanup-agent","other-role","cleanup-attempt"),("cleanup-agent",role.id.as_str(),"other-attempt")] {
+                assert!(store.record_cancelled_agent_cleanup(agent,owner,attempt,1,&receipt,Some(0),None).await.is_err());
+            }
+            let mut mismatch = receipt.clone();
+            mismatch.expected_image_matches = false;
+            assert!(store.record_cancelled_agent_cleanup("cleanup-agent", &role.id,"cleanup-attempt",1,&mismatch,Some(0),None).await.is_err());
+            assert!(store.record_cancelled_agent_cleanup("cleanup-agent", &role.id,"cleanup-attempt",1,&receipt,Some(1),None).await.is_err());
+            assert!(store.finish_agent_execution("cleanup-agent", &role.id,1,"SUCCEEDED",None,None,None,None,None,None,1,1,1,0,&serde_json::json!({}),&serde_json::json!({"cleanup_confirmed":true})).await.is_err());
+            assert!(store.update_running_agent_execution_lifecycle("cleanup-agent", &role.id,&serde_json::json!({"outcome":"SUCCEEDED"})).await.is_err());
+            assert!(store.complete_role_execution_success(&role.id,None,None).await.is_err());
+            store.record_cancelled_agent_cleanup("cleanup-agent", &role.id,"cleanup-attempt",1,&receipt,Some(0),None).await?;
+            let row = sqlx::query("SELECT status,metadata,tool_call_count FROM orbit_agent_executions WHERE id='cleanup-agent'").fetch_one(&engine.pool).await?;
+            let metadata: serde_json::Value = row.get("metadata");
+            assert_eq!(row.get::<String,_>("status"), "CANCELLED");
+            assert_eq!(row.get::<i64,_>("tool_call_count"),0);
+            assert_eq!(metadata["tool_call_audit"],original["tool_call_audit"]);
+            assert_eq!(metadata["lifecycle"]["persistence_state"],"UNCONFIRMED");
+            assert_eq!(metadata["lifecycle"]["cleanup_state"],"CONFIRMED");
+            assert_eq!(metadata["cleanup_confirmed"],true);
+            assert_eq!(store.get_workflow_run(&workflow.id).await?.unwrap().status,WorkflowStage::Cancelled);
+            assert!(store.record_cancelled_agent_cleanup("cleanup-agent", &role.id,"cleanup-attempt",2,&receipt,Some(0),None).await.is_err());
+            Ok(())
+        }.await;
+        engine.pool.close().await;
+        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+            .execute(&admin)
+            .await?;
+        admin.close().await;
+        result
+    }
 
     fn runtime_credential_inspection(
         provider: &str,

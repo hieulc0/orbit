@@ -4,6 +4,7 @@ pub mod acp;
 pub mod control_plane;
 pub mod credentials;
 pub mod execution;
+pub mod interactive;
 pub mod mcp;
 pub mod model;
 pub mod providers;

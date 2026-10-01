@@ -16,6 +16,7 @@
 | `signal`, `approve` | Deliver durable signals and assigned human decisions |
 | `credential` | Enroll, inspect, rotate, revoke and observe catalog credentials |
 | `workflow` | Start and advance role workflows under pinned policy |
+| `interactive` | Control durable managed-worktree sessions and inspect candidates |
 | `acp-serve`, `acp-probe`, `acp-launch-digest` | Editor interface, credential-free initialization and launch pinning |
 | `identity`, `projects`, `audit` | Scoped operator identity, visible projects and authorization history |
 | `publish-package`, `packages`, `package`, `run-package` | Signed private package publication, inspection and submission |
@@ -25,6 +26,40 @@ Use `orbit --help` and `orbit COMMAND --help` for exact flags. Operator procedur
 are in [installation](../operations/installation.md); wire behavior is in
 [API reference](api.md). Definitions, policies and scopes constrain commands even
 when their syntax is valid.
+
+## Interactive control
+
+All actions take `orbit interactive --config FILE --database-url-file PRIVATE_FILE`.
+The database and repository configuration are operator-selected; this is local
+control over PostgreSQL, not an HTTP client. See [setup and reconnect](../operations/installation.md#interactive-cli).
+
+| Action | Contract |
+| --- | --- |
+| `new` | Create a detached candidate and return its durable session ID |
+| `start SESSION --task-file FILE` | Pin UTF-8 instructions (at most 64 KiB); dispatch no provider |
+| `continue SESSION` | Advance the existing coordinator to the review gate |
+| `review SESSION` | Request review and final authoritative verification |
+| `show SESSION` | Query durable task/stage, roles and selection, profile, candidate and evidence |
+| `watch SESSION --seconds N` | Emit changed status snapshots as flushed JSONL; 1–3600 seconds |
+| `diff SESSION --offset N` | Read up to 32 KiB of UTF-8 candidate diff; follow `nextOffset` |
+| `cancel SESSION` | Persist cancellation and request provider cleanup |
+| `apply SESSION STATE` | Apply the exact completed, verified and reviewed candidate |
+| `discard SESSION STATE` | Remove the exact candidate after confirmed cleanup |
+| `recover-application SESSION STATE` | Reconcile interrupted application by exact checkout identity |
+
+Repeat `start` with identical instructions to recover its existing workflow ID.
+Different objectives require a new session. Frozen external requirements, where
+configured, determine the objective through their existing contract boundary.
+`show` remains usable after reconnect. `watch` polls every 500 ms and may coalesce
+intermediate changes: `snapshot_digest` identifies a view, not a durable event
+cursor. Reconnect by querying the session again. An unavailable candidate or
+unknown quota stays explicitly unavailable.
+
+Interrupting `continue` or `review` requests durable cancellation and waits for
+supervised cleanup. Interrupting `watch` only ends observation. A cancellation
+response can precede cleanup; candidate actions remain denied until cleanup is
+confirmed. Commands never substitute exploratory terminal feedback for trusted
+verification evidence.
 
 ## Output formats, local probes and review exports
 

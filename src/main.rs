@@ -350,8 +350,68 @@ enum WorkflowAction {
     },
 }
 
+#[derive(Args)]
+struct InteractiveArgs {
+    /// Operator-selected repository, managed root, profile and verification policy.
+    #[arg(long)]
+    config: PathBuf,
+    #[arg(long, env = "ORBIT_DATABASE_URL_FILE", hide_env_values = true)]
+    database_url_file: Option<PathBuf>,
+    #[command(subcommand)]
+    action: InteractiveAction,
+}
+
+#[derive(Subcommand)]
+enum InteractiveAction {
+    /// Create a durable session and detached managed candidate.
+    New,
+    /// Pin initial user instructions without dispatching a provider.
+    Start {
+        session_id: String,
+        #[arg(long)]
+        task_file: PathBuf,
+    },
+    /// Continue the workflow to its review gate.
+    Continue { session_id: String },
+    /// Request technical review and final authoritative verification.
+    Review { session_id: String },
+    /// Query durable task, role, candidate and evidence state.
+    Show { session_id: String },
+    /// Emit changed durable status snapshots as flushed JSONL.
+    Watch {
+        session_id: String,
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        seconds: u64,
+    },
+    /// Read a bounded page of candidate changes.
+    Diff {
+        session_id: String,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+    },
+    /// Revoke durable workflow authority and request supervised cleanup.
+    Cancel { session_id: String },
+    /// Apply the exact accepted candidate to the clean source checkout.
+    Apply {
+        session_id: String,
+        workspace_state_id: String,
+    },
+    /// Remove the exact candidate after cleanup.
+    Discard {
+        session_id: String,
+        workspace_state_id: String,
+    },
+    /// Reconcile an interrupted application using its exact candidate identity.
+    RecoverApplication {
+        session_id: String,
+        workspace_state_id: String,
+    },
+}
+
 #[derive(Subcommand)]
 enum Commands {
+    /// Control durable managed-worktree tasks independently of editor protocols.
+    Interactive(InteractiveArgs),
     /// Serve Orbit workflows and managed candidates to ACP editor clients.
     AcpServe {
         #[arg(long)]
@@ -2364,6 +2424,327 @@ async fn connect_durable_catalog_engine(database_url: &str) -> Result<(Engine, t
     Ok((engine, scratch))
 }
 
+/// The operator's private URL file selects the accepted-state authority.
+/// Unlike credential enrollment, interactive control is not tied to one local
+/// catalog deployment. Existing server migrations must be present.
+async fn interactive_service(
+    args: &InteractiveArgs,
+) -> Result<orbit::interactive::InteractiveService> {
+    use tokio::io::AsyncReadExt;
+    let mut bytes = Vec::new();
+    tokio::fs::File::open(&args.config)
+        .await?
+        .take(128 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .await?;
+    anyhow::ensure!(
+        bytes.len() <= 128 * 1024,
+        "interactive configuration exceeds bounds"
+    );
+    let config: orbit::interactive::ServiceConfig = serde_json::from_slice(&bytes)?;
+    config.validate()?;
+    let url = read_private_database_url(args.database_url_file.as_deref()).await?;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(12)
+        .connect(url.as_str())
+        .await
+        .map_err(|_| anyhow::anyhow!("interactive control-plane connection failed"))?;
+    let ready: bool = sqlx::query_scalar("SELECT to_regclass('orbit_editor_sessions') IS NOT NULL AND to_regclass('orbit_workflow_runs') IS NOT NULL").fetch_one(&pool).await?;
+    anyhow::ensure!(
+        ready,
+        "initialize the selected control-plane migrations before interactive use"
+    );
+    let coordinator =
+        interactive_coordinator(pool.clone(), config.verification_environment.clone()).await?;
+    orbit::interactive::InteractiveService::new(pool, config, std::sync::Arc::new(coordinator))
+}
+
+async fn interactive_coordinator(
+    pool: sqlx::PgPool,
+    environment: orbit::verification::EnvironmentIdentity,
+) -> Result<orbit::workflow_coordinator::WorkflowCoordinator> {
+    #[cfg(feature = "fault-injection")]
+    if let Some(path) = std::env::var_os("ORBIT_B34_LIVE_CREDENTIAL_DATABASE_URL_FILE") {
+        anyhow::ensure!(
+            std::env::var("ORBIT_B34_LIVE_PROVIDER_OPT_IN").as_deref()
+                == Ok("I_AUTHORIZE_LIVE_PROVIDER_CALLS"),
+            "live fixture requires explicit opt-in"
+        );
+        let url = read_private_database_url(Some(Path::new(&path))).await?;
+        validate_durable_catalog_url(url.as_str())?;
+        let catalog = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .after_connect(|connection, _| {
+                Box::pin(async move {
+                    sqlx::query("SET default_transaction_read_only = on")
+                        .execute(connection)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect(url.as_str())
+            .await?;
+        let accepted: (String, String) =
+            sqlx::query_as("SELECT current_database(), current_schema()")
+                .fetch_one(&pool)
+                .await?;
+        let credentials: (String, String) =
+            sqlx::query_as("SELECT current_database(), current_schema()")
+                .fetch_one(&catalog)
+                .await?;
+        anyhow::ensure!(
+            accepted.0 != credentials.0
+                && accepted.1.starts_with("orbit_interactive_")
+                && credentials == ("orbit_control_plane".into(), "public".into()),
+            "live qualification requires separate disposable accepted state"
+        );
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM orbit_credentials")
+            .fetch_one(&pool)
+            .await?;
+        anyhow::ensure!(
+            count == 0,
+            "live fixture must not copy credentials into accepted state"
+        );
+        let executor = std::sync::Arc::new(GuardedQualificationExecutor {
+            catalog: catalog.clone(),
+        });
+        return orbit::workflow_coordinator::WorkflowCoordinator::new(pool, executor)
+            .with_credential_catalog(catalog)
+            .with_verification_environment(environment);
+    }
+    workflow_coordinator_with_environment(pool, environment)
+}
+
+fn print_interactive_value(value: &serde_json::Value, output: Output) -> Result<()> {
+    if output == Output::Jsonl {
+        println!("{}", serde_json::to_string(value)?);
+    } else {
+        println!("{}", serde_json::to_string_pretty(value)?);
+    }
+    Ok(())
+}
+
+async fn run_interactive_cli(args: &InteractiveArgs, output: Output) -> Result<()> {
+    use InteractiveAction::*;
+    use tokio::io::AsyncReadExt;
+    let service = interactive_service(args).await?;
+    let value = match &args.action {
+        New => serde_json::to_value(service.new_session(&service.config().repository).await?)?,
+        Start {
+            session_id,
+            task_file,
+        } => {
+            let mut bytes = Vec::new();
+            tokio::fs::File::open(task_file)
+                .await?
+                .take(65537)
+                .read_to_end(&mut bytes)
+                .await?;
+            anyhow::ensure!(bytes.len() <= 65536, "user instructions exceed bounds");
+            let task = std::str::from_utf8(&bytes).context("user instructions must be UTF-8")?;
+            serde_json::json!({"workflow_run_id":service.start(session_id, task).await?})
+        }
+        Continue { session_id } | Review { session_id } => {
+            let id = session_id.clone();
+            let executing = service.clone();
+            let review = matches!(&args.action, Review { .. });
+            let mut run = Box::pin(executing.run(&id, review));
+            tokio::select! {
+                result = &mut run => result?,
+                _ = tokio::signal::ctrl_c() => {
+                    service.cancel(session_id).await?;
+                    // Keep the execution future alive until its supervised cleanup
+                    // completes. Process interruption never grants candidate authority.
+                    let _ = run.await;
+                }
+            }
+            service.dashboard(session_id).await?
+        }
+        Show { session_id } => service.dashboard(session_id).await?,
+        Watch {
+            session_id,
+            seconds,
+        } => {
+            use std::io::Write;
+            let end = tokio::time::Instant::now() + Duration::from_secs(*seconds);
+            let mut previous = None;
+            while tokio::time::Instant::now() < end {
+                let state = service.dashboard(session_id).await?;
+                let digest = orbit::model::digest(&serde_json::to_vec(&state)?);
+                if previous.as_ref() != Some(&digest) {
+                    println!(
+                        "{}",
+                        serde_json::to_string(
+                            &serde_json::json!({"snapshot_digest":digest,"state":state})
+                        )?
+                    );
+                    std::io::stdout().flush()?;
+                    previous = Some(digest);
+                }
+                tokio::select! { _=tokio::time::sleep(Duration::from_millis(500))=>{}, _=tokio::signal::ctrl_c()=>break }
+            }
+            return Ok(());
+        }
+        Diff { session_id, offset } => service.candidate_diff(session_id, *offset).await?,
+        Cancel { session_id } => {
+            service.cancel(session_id).await?;
+            service.dashboard(session_id).await?
+        }
+        Apply {
+            session_id,
+            workspace_state_id,
+        }
+        | Discard {
+            session_id,
+            workspace_state_id,
+        } => {
+            service
+                .candidate_action(
+                    session_id,
+                    workspace_state_id,
+                    matches!(&args.action, Apply { .. }),
+                )
+                .await?;
+            serde_json::to_value(service.session(session_id).await?)?
+        }
+        RecoverApplication {
+            session_id,
+            workspace_state_id,
+        } => {
+            service
+                .recover_application(session_id, workspace_state_id)
+                .await?;
+            serde_json::to_value(service.session(session_id).await?)?
+        }
+    };
+    print_interactive_value(&value, output)
+}
+
+#[cfg(feature = "fault-injection")]
+struct GuardedQualificationExecutor {
+    catalog: sqlx::PgPool,
+}
+
+#[cfg(feature = "fault-injection")]
+#[async_trait::async_trait]
+impl orbit::workflow_coordinator::RoleAgentExecutor for GuardedQualificationExecutor {
+    async fn execute_role(
+        &self,
+        pool: &sqlx::PgPool,
+        workflow: &orbit::workflow::WorkflowRun,
+        execution: &orbit::workflow::RoleExecution,
+        role: &orbit::workflow::RoleDefinition,
+        target: &orbit::workflow::ResolvedExecutionTarget,
+        task: &str,
+        repository: &Path,
+        handoff: Option<&orbit::workflow::HandoffArtifact>,
+        cancellation: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<orbit::workflow_coordinator::RoleExecutionOutcome> {
+        if target.provider == "codex" {
+            guard_qualification_codex_quota(&self.catalog).await?;
+        }
+        orbit::workflow_coordinator::RealAcpRoleExecutor
+            .execute_role_with_credential_catalog(
+                pool,
+                &self.catalog,
+                workflow,
+                execution,
+                role,
+                target,
+                task,
+                repository,
+                handoff,
+                cancellation,
+            )
+            .await
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+async fn guard_qualification_codex_quota(catalog: &sqlx::PgPool) -> Result<()> {
+    use anyhow::ensure;
+    use orbit::codex_status_probe as probe;
+    let credential = orbit::credential_registry::CredentialStore::new(catalog)
+        .get("codex-main")
+        .await?
+        .context("Codex qualification credential missing")?;
+    let binding = orbit::provider_scope::BindingStore::new(catalog)
+        .inspect(&credential.identity())
+        .await?
+        .context("Codex provider scope missing")?;
+    ensure!(
+        binding.state == orbit::provider_scope::BindingState::Confirmed,
+        "live Codex scope is not confirmed"
+    );
+    let backend = orbit::secret_backend::LocalPrivateSecretBackend::default_for_operator()?;
+    let (runtime, resource) = probe::cataloged_codex_runtime(&credential)?;
+    let control = probe::private_control_tempdir()?;
+    let outcome = probe::probe_cataloged_once(
+        probe::CatalogCredentialSource {
+            pool: catalog,
+            backend: &backend,
+            reference: &credential.reference,
+        },
+        &runtime,
+        &resource,
+        probe::ProbeBinding::ConfirmedFingerprint(&binding.fingerprint),
+        control.path(),
+        Duration::from_secs(60),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("live Codex quota probe failed"))?;
+    ensure!(
+        outcome.receipt.cleanup_confirmed
+            && outcome.receipt.authenticated_account_present
+            && outcome.receipt.correlated_status_response
+            && !outcome.receipt.model_turn_started
+            && !outcome.receipt.model_thread_created,
+        "live Codex quota receipt incomplete"
+    );
+    let now = orbit::verification::now_millis();
+    ensure!(
+        outcome.snapshot.observed_at_ms <= now && now < outcome.snapshot.expires_at_ms,
+        "live Codex quota is stale"
+    );
+    let ordinary_bucket = outcome
+        .ordinary_quota_bucket_fingerprint
+        .context("live Codex ordinary quota bucket identity is unknown")?;
+    let windows = outcome
+        .snapshot
+        .quota_buckets
+        .iter()
+        .filter(|bucket| {
+            bucket.scope.is_none() && bucket.provider_bucket_fingerprint == ordinary_bucket
+        })
+        .flat_map(|bucket| bucket.windows.iter())
+        .collect::<Vec<_>>();
+    let remaining = |duration| {
+        windows
+            .iter()
+            .filter(|window| {
+                window.duration_minutes == Some(duration)
+                    && window.resets_at_ms.is_some_and(|reset| reset > now)
+            })
+            .filter_map(|window| {
+                window
+                    .remaining_percent
+                    .or_else(|| window.remaining_fraction.map(|fraction| fraction * 100.0))
+                    .or_else(|| window.used_percent.map(|used| 100.0 - used))
+            })
+            .reduce(f64::min)
+    };
+    let short = remaining(300).context("live Codex 5h quota is unknown")?;
+    let weekly = remaining(10080).context("live Codex weekly quota is unknown")?;
+    ensure!(
+        short >= 15.0 && weekly >= 5.0,
+        "LIVE_CODEX_QUOTA_GUARD: 5h={short:.1}%, weekly={weekly:.1}%; minimum=15%/5%"
+    );
+    eprintln!(
+        "LIVE_CODEX_QUOTA_GUARD: native ordinary meter, confirmed account; 5h={short:.1}%, weekly={weekly:.1}%; minimum=15%/5%"
+    );
+    Ok(())
+}
+
 const CREDENTIAL_STATUS_ALL_MAX: usize = 32;
 const CREDENTIAL_STATUS_TTL: Duration = Duration::from_secs(60);
 
@@ -2936,6 +3317,9 @@ async fn credential_status_report(
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let mut output_format = cli.output_format;
+    if let Commands::Interactive(args) = &cli.command {
+        return run_interactive_cli(args, output_format).await;
+    }
     if let Commands::AcpServe {
         config,
         database_url_file,
@@ -4209,6 +4593,9 @@ async fn main() -> Result<()> {
         }
         Commands::AcpServe { .. } => {
             unreachable!("local ACP service handled before API credentials")
+        }
+        Commands::Interactive(_) => {
+            unreachable!("interactive control handled before API credential resolution")
         }
         Commands::Workflow(_) => {
             unreachable!("local workflow handled before API credential resolution")

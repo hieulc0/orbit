@@ -1727,6 +1727,26 @@ async fn execute_real_acp_turn_body(
         .await
         .is_err()
     {
+        // Cancellation revokes result authority before the supervisor can reap
+        // the provider. Only a matching receipt and drained terminals permit
+        // recording cleanup after that revocation; the late turn stays rejected.
+        if lifecycle.cleanup_state == "CONFIRMED"
+            && let Some(receipt) = evidence.receipt.as_ref()
+            && store
+                .record_cancelled_agent_cleanup(
+                    agent_exec_id,
+                    &role_exec.id,
+                    &req.attempt_id,
+                    finished_at_ms,
+                    receipt,
+                    evidence.exit_code,
+                    evidence.signal,
+                )
+                .await
+                .is_ok()
+        {
+            return Err(RoleExecutionCancelled.into());
+        }
         lifecycle.note_terminal_persistence_failure();
         return Err(RoleTerminalPersistenceUnconfirmed.into());
     }

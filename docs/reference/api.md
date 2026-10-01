@@ -6,6 +6,36 @@
 - [Resource accounting](#resource-accounting)
 - [Protocol and configuration compatibility](#protocol-and-configuration-compatibility)
 - [Signed package registry](#signed-package-registry)
+- [Interactive control surface](#interactive-control-surface)
+
+## Interactive control surface
+
+`orbit::interactive::InteractiveService` is the product control/view layer over
+existing PostgreSQL workflow, execution, verification and managed-candidate
+stores. `InteractiveSession` identifies a durable candidate and its workflow;
+`ServiceConfig` binds repository, workspace root, execution profile and project
+policy. Existing `orbit::acp::service` names remain compatibility re-exports;
+database and configuration encodings are retained.
+
+The service exposes session creation/reload, immutable task start, coordinator
+continuation/review, cancellation, dashboard, bounded diff, exact apply/discard
+and interrupted application recovery. The [interactive CLI](cli.md#interactive-control)
+is a direct client. There is no additional workflow engine or provider-session
+store. Local clients are admitted through operator-selected private database
+configuration, not the graph HTTP bearer interface.
+
+Dashboard state includes task/attempt and stage, role executions with resolved
+provider/model/logical account, execution profile, observed candidate identity,
+changed paths, verification and review artifacts, failure/cancellation reasons,
+execution budgets and cleanup. Candidate inspection is observational and may be
+unavailable; it never grants acceptance. Provider quota can be unknown or stale.
+
+Progress is currently polled durable state. Each watcher notification carries a
+snapshot digest and state; it is not a journal record and does not promise every
+intermediate transition. Role-workflow IDs are not graph Run IDs: the graph SSE
+journal below must not be used as an invented role-workflow event history.
+Reconnect by session ID and requery durable state. Provider history and client
+connection lifetime do not own tasks, candidates or evidence.
 
 ## Transport compatibility and journal streaming
 

@@ -3922,3 +3922,170 @@ async fn real_developer_local_managed_candidate_and_trusted_verification() -> Re
     }.await;
     finish_live_fixture(catalog, ctx, result).await
 }
+
+#[cfg(feature = "fault-injection")]
+fn interactive_cli_command(
+    config: &Path,
+    database_file: &Path,
+    arguments: &[&str],
+) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_orbit"));
+    command
+        .args(["interactive", "--config"])
+        .arg(config)
+        .arg("--database-url-file")
+        .arg(database_file)
+        .args(arguments);
+    command.kill_on_drop(true);
+    command
+}
+
+#[cfg(feature = "fault-injection")]
+async fn interactive_cli_value(
+    config: &Path,
+    database_file: &Path,
+    arguments: &[&str],
+) -> Result<serde_json::Value> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(600),
+        interactive_cli_command(config, database_file, arguments).output(),
+    )
+    .await??;
+    eprintln!(
+        "INTERACTIVE_CLI {:?}: {}",
+        arguments.first(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    ensure!(
+        output.status.success(),
+        "interactive CLI operation failed: {:?}",
+        arguments.first()
+    );
+    serde_json::from_slice(&output.stdout).context("CLI did not return a JSON control result")
+}
+
+#[tokio::test]
+#[ignore = "requires guarded live providers, disposable PostgreSQL, private fixture URL staging and rootless runtimes"]
+#[cfg(feature = "fault-injection")]
+async fn real_interactive_cli_reconnect_candidate_and_active_cancellation() -> Result<()> {
+    use orbit::{
+        execution::local::RoleExecutionProfile,
+        interactive::ServiceConfig,
+        regression_strategy::{SelectionPolicy, VerificationCheck, VerificationTier},
+        verification::{EnvironmentIdentity, VerificationRunResult},
+        workflow::flow::{Risk, Skill},
+    };
+    use std::os::unix::fs::PermissionsExt;
+    let environment: EnvironmentIdentity = serde_json::from_slice(&fs::read(std::env::var(
+        "ORBIT_TEST_VERIFICATION_ENVIRONMENT_FILE",
+    )?)?)?;
+    let catalog = explicitly_authorized_live_credential_catalog().await?;
+    if let Err(error) = guard_live_codex_quota(&catalog).await {
+        catalog.close().await;
+        return Err(error);
+    }
+    let database = common::DisposablePgTestContext::create("interactive_cli", 3).await?;
+    let ctx = TestContext {
+        store: WorkflowStore::new(database.engine.pool.clone()),
+        database,
+    };
+    let result = async {
+        ensure_live_catalog_is_separate(&catalog, &ctx.engine.pool, &ctx.database.schema).await?;
+        ensure_disposable_schema_has_no_credentials(&ctx.engine.pool).await?;
+        let repository = common::TemporaryGitRepo::create()?;
+        fs::write(repository.path().join("calc.c"), "int original(void) { return 0; }\n")?;
+        fs::write(repository.path().join("test.sh"), "#!/bin/sh\nset -eu\ncc -Wall -Wextra -Werror calc.c -o /tmp/candidate-test\n/tmp/candidate-test\n")?;
+        for args in [vec!["add", "."], vec!["commit", "-m", "synthetic interactive baseline"]] {
+            ensure!(std::process::Command::new("git").args(args).current_dir(repository.path()).output()?.status.success(), "fixture commit failed");
+        }
+        let baseline=compute_workspace_state(repository.path(),"HEAD").await?;
+        let root=orbit::codex_status_probe::private_control_tempdir()?;
+        let managed=root.path().join("managed"); fs::create_dir(&managed)?; fs::set_permissions(&managed,fs::Permissions::from_mode(0o700))?;
+        let private = tempfile::Builder::new().prefix("interactive-qualification-").permissions(fs::Permissions::from_mode(0o700)).tempdir_in(orbit::secret_backend::operator_home()?.join(".orbit/private"))?;
+        let database_file=private.path().join("database-url");
+        let mut file=fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&database_file)?;
+        std::io::Write::write_all(&mut file,ctx.database.url.as_bytes())?; drop(file);
+        let mut selection=SelectionPolicy::new("interactive-arithmetic","Interactive arithmetic"); selection.canonical_digest=true;
+        selection.checks.push(VerificationCheck::new_command("arithmetic","C compile/run",vec![VerificationTier::Fast,VerificationTier::Standard,VerificationTier::Full],vec!["sh".into(),"test.sh".into()]));
+        let config=ServiceConfig { repository:repository.path().canonicalize()?,workspaces:managed.canonicalize()?,agent_execution_profile:RoleExecutionProfile::DevLocal {bubblewrap:PathBuf::from("/usr/bin/bwrap")}, verification_environment:environment.clone(),selection_policy:selection,risk:Risk::Conservative,skill:Some(Skill::ImplementFeature),external_role:None };
+        let config_file=root.path().join("interactive.json"); fs::write(&config_file,serde_json::to_vec(&config)?)?;
+        let instructions=root.path().join("instructions.txt"); fs::write(&instructions,"This is a synthetic C repository. Inspect calc.c. Add int multiply(int a,int b) returning a*b, and main testing multiply(3,4)==12. Document multiply in README.md. Keep test.sh unchanged. Implementer must run sh test.sh using the advertised confined terminal after editing. Every role must read calc.c. Use native repository/search/Git callbacks for inspection; shell Git metadata is intentionally outside the managed mount. Return structured role handoffs. Do not stage or commit.")?;
+        let created=interactive_cli_value(&config_file,&database_file,&["new"]).await?;
+        let session=created["id"].as_str().context("session ID missing")?;
+        let restored=interactive_cli_value(&config_file,&database_file,&["show",session]).await?;
+        ensure!(restored["session"]["id"]==created["id"] && restored["session"]["worktree"]==created["worktree"],"CLI reconnect changed managed identity");
+        let started=interactive_cli_value(&config_file,&database_file,&["start",session,"--task-file",instructions.to_str().unwrap()]).await?;
+        let workflow_id=started["workflow_run_id"].as_str().context("workflow ID missing")?;
+        let status=interactive_cli_value(&config_file,&database_file,&["show",session]).await?;
+        ensure!(status["workflow"]["id"]==workflow_id && status["execution_profile"]["profile"]=="dev_local", "durable task/profile missing");
+        let mut running=interactive_cli_command(&config_file,&database_file,&["continue",session]);
+        running.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        let running=running.spawn()?;
+        let updates=interactive_cli_command(&config_file,&database_file,&["watch",session,"--seconds","3"]).output().await?;
+        ensure!(updates.status.success(),"CLI status watch failed");
+        let snapshots=String::from_utf8(updates.stdout)?.lines().map(serde_json::from_str::<serde_json::Value>).collect::<std::result::Result<Vec<_>,_>>()?;
+        ensure!(!snapshots.is_empty() && snapshots.iter().all(|s|s["state"]["session"]["id"]==session),"watch lost durable session state");
+        let completed=tokio::time::timeout(Duration::from_secs(600),running.wait_with_output()).await??;
+        eprintln!("INTERACTIVE_CONTINUE: {}",String::from_utf8_lossy(&completed.stderr));
+        ensure!(completed.status.success(),"CLI coding failed");
+        let candidate=interactive_cli_value(&config_file,&database_file,&["show",session]).await?;
+        ensure!(candidate["workflow"]["status"]=="reviewing" && candidate["verification"].as_array().is_some_and(|runs|runs.len()>=2),"CLI did not expose review/verification state");
+        let diff=interactive_cli_value(&config_file,&database_file,&["diff",session]).await?;
+        ensure!(diff["diff"].as_str().is_some_and(|d|d.contains("multiply")) && diff["diff"].as_str().unwrap().len()<=32768,"candidate diff missing or unbounded");
+        let accepted=interactive_cli_value(&config_file,&database_file,&["review",session]).await?;
+        ensure!(accepted["workflow"]["status"]=="completed", "CLI review did not complete");
+        let candidate_id=accepted["candidate"]["state_id"].as_str().context("accepted candidate identity missing")?;
+        ensure!(compute_workspace_state(repository.path(),"HEAD").await?.state_id==baseline.state_id,"source checkout changed before explicit application");
+        let workflow=ctx.store.get_workflow_run(workflow_id).await?.context("workflow missing")?;
+        let roles=ctx.store.list_role_executions(workflow_id).await?;
+        for role in &roles {
+            print_live_fixture_audit(&ctx.engine.pool,Some(&role.id)).await;
+            ensure!(role.status==RoleExecutionStatus::Succeeded,"interactive role failed");
+            for execution in &role.agent_execution_ids {
+                let (status,calls,successes,failures,_,metadata)=load_agent_tool_audit(&ctx.engine.pool,execution).await?;
+                ensure!(status=="SUCCEEDED" && calls>0 && calls==successes && failures==0 && metadata["cleanup_confirmed"]==true && b34_audit_has_exact_correlations(&metadata["tool_call_audit"],usize::try_from(calls)?),"interactive role lacks exact cleanup/tool evidence");
+            }
+        }
+        let runs=ctx.store.verification_store().list_runs(&workflow.attempt_id).await?;
+        ensure!(runs.len()>=3 && runs.iter().all(|run|run.workspace_state_id==candidate_id && run.overall_result==Some(VerificationRunResult::Passed) && run.environment_identity.runtime_image_digest==environment.runtime_image_digest),"CLI lost exact trusted verification evidence");
+        // Cancel a genuinely executing second task from another CLI process.
+        let other=interactive_cli_value(&config_file,&database_file,&["new"]).await?;
+        let other_session=other["id"].as_str().unwrap();
+        let other_started=interactive_cli_value(&config_file,&database_file,&["start",other_session,"--task-file",instructions.to_str().unwrap()]).await?;
+        let other_workflow=other_started["workflow_run_id"].as_str().unwrap();
+        let mut active=interactive_cli_command(&config_file,&database_file,&["continue",other_session]);
+        active.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        let active=active.spawn()?;
+        tokio::time::timeout(Duration::from_secs(90),async {
+            loop {
+                let prompted: bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM orbit_agent_executions ae JOIN orbit_role_executions re ON re.id=ae.role_execution_id WHERE re.workflow_run_id=$1 AND ae.status='RUNNING' AND ae.metadata->'lifecycle'->>'phase'='PROMPT_IN_FLIGHT')").bind(other_workflow).fetch_one(&ctx.engine.pool).await?;
+                if prompted { break; }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Ok::<_,anyhow::Error>(())
+        }).await??;
+        let cancelled=interactive_cli_value(&config_file,&database_file,&["cancel",other_session]).await?;
+        ensure!(cancelled["workflow"]["status"]=="cancelled","cancellation was not durable");
+        let stopped=tokio::time::timeout(Duration::from_secs(30),active.wait_with_output()).await??;
+        eprintln!("INTERACTIVE_CANCELLED_RUN: {}",String::from_utf8_lossy(&stopped.stderr));
+        let cancelled=interactive_cli_value(&config_file,&database_file,&["show",other_session]).await?;
+        println!("INTERACTIVE_CANCELLED_STATUS {}",cancelled);
+        ensure!(cancelled["workflow"]["status"]=="cancelled" && cancelled["agent_executions"].as_array().is_some_and(|executions|!executions.is_empty() && executions.iter().all(|e|e["cleanup_confirmed"]==true && e["status"]!="RUNNING")),"active cancellation did not retain confirmed cleanup");
+        let other_state=cancelled["candidate"]["state_id"].as_str().unwrap();
+        let denied=interactive_cli_command(&config_file,&database_file,&["apply",other_session,other_state]).output().await?;
+        ensure!(!denied.status.success(),"cancelled task acquired apply authority");
+        ensure!(ctx.store.get_latest_handoff_of_type(other_workflow,HandoffType::Plan).await?.is_none(),"cancelled planner published a late handoff");
+        interactive_cli_value(&config_file,&database_file,&["discard",other_session,other_state]).await?;
+        let stale=interactive_cli_command(&config_file,&database_file,&["apply",session,"stale"]).output().await?;
+        ensure!(!stale.status.success(),"CLI applied a stale candidate");
+        interactive_cli_value(&config_file,&database_file,&["apply",session,candidate_id]).await?;
+        let base=created["worktree"]["base_revision"].as_str().unwrap();
+        ensure!(compute_workspace_state(repository.path(),base).await?.state_id==candidate_id,"CLI application changed accepted identity");
+        interactive_cli_value(&config_file,&database_file,&["discard",session,candidate_id]).await?;
+        ensure!(!Path::new(created["worktree"]["workspace"].as_str().unwrap()).exists(),"CLI discard retained candidate");
+        ensure_disposable_schema_has_no_credentials(&ctx.engine.pool).await?;
+        println!("INTERACTIVE_CLI_ACCEPTANCE {}",json!({"workflow":workflow_id,"candidate":candidate_id,"snapshot_count":snapshots.len(),"trusted_verification_runs":runs.len(),"active_cancel":true,"reconnected_processes":true,"explicit_apply_discard":true}));
+        Ok(())
+    }.await;
+    finish_live_fixture(catalog, ctx, result).await
+}

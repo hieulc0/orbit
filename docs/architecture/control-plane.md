@@ -72,7 +72,8 @@ physical namespaces do not change database, workflow or policy authority.
 
 | Owner | Modules | Responsibility |
 | --- | --- | --- |
-| ACP | `acp/editor.rs`, `acp/service.rs` | Client protocol/presentation and coordinator-backed sessions |
+| Interactive | `interactive.rs` | Durable sessions, coordinator control and candidate views/actions |
+| ACP | `acp/editor.rs`, compatibility `acp/service.rs` | Client protocol/presentation over interactive control |
 | Execution | `execution/local.rs`, `execution/worktree.rs` | Confined exploratory terminals and managed candidate actions |
 | Execution | private `execution/process.rs` | Bounded native coordinator process capture |
 | Tools | `tools/budget.rs` | Role resource admission and usage |
@@ -80,6 +81,17 @@ physical namespaces do not change database, workflow or policy authority.
 
 Integration targets follow the same ownership: `editor_qualification`,
 `developer_local`, and `role_budget`.
+
+CLI and protocol clients share `InteractiveService`; neither owns workflow
+progression, provider selection or verification truth. Sessions bind immutable
+instructions, policy and execution profile to managed candidates in PostgreSQL.
+Clients recover by session ID and query state without provider conversation
+history. Status notifications are observations, not transition authority.
+
+Cancellation revokes workflow and role authority before cleanup completes. A
+matching supervisor receipt may subsequently record cleanup for that exact
+cancelled execution. This observation cannot publish late results or success;
+candidate actions still require confirmed cleanup and released ownership.
 
 ### Modules and compatibility paths
 

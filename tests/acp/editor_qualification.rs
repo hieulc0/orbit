@@ -216,7 +216,17 @@ async fn sessions_replay_modes_and_candidate_actions_are_durable() -> Result<()>
         let store=WorkflowStore::new(database.engine.pool.clone());
         ensure!(store.flow(&workflow).await?.unwrap().skill==Skill::UpdateDocumentation,"skill not pinned");
         let restart=EditorService::new(database.engine.pool.clone(),config,Arc::new(WorkflowCoordinator::new(database.engine.pool.clone(),Arc::new(SimulatedRoleExecutor::new()))))?;
-        ensure!(restart.start(&session.id,"another task").await?==workflow,"restart created a second task");
+        ensure!(restart.start(&session.id,"Repair documentation").await?==workflow,"retry created a second task");
+        ensure!(restart.start(&session.id,"another task").await.is_err(),"different instructions silently ignored");
+        ensure!(restart.dashboard(&session.id).await?["execution_profile"]["profile"]=="trusted","pinned profile missing");
+        let candidate = session.worktree.as_ref().unwrap();
+        std::fs::write(candidate.workspace.join("README.md"),"durable café\n")?;
+        let diff=restart.candidate_diff(&session.id,0).await?;
+        let text=diff["diff"].as_str().unwrap();
+        ensure!(text.contains("café"),"candidate diff missing");
+        let midpoint=text.find("é").unwrap()+1;
+        ensure!(restart.candidate_diff(&session.id,midpoint).await.is_err(),"invalid UTF-8 offset admitted");
+        ensure!(restart.candidate_diff(&session.id,usize::MAX).await.is_err(),"unbounded offset admitted");
         let note=json!({"sessionId":session.id,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"durable"}}});
         restart.record_notification(&session.id,&note).await?;
         ensure!(restart.notifications(&session.id).await?==vec![note],"transcript not replayed");

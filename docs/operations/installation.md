@@ -7,6 +7,7 @@
 - [ACP worker setup](#acp-worker-setup)
 - [Antigravity runtime and OAuth enrollment](#antigravity-runtime-and-oauth-enrollment)
 - [CLI representation and Codex enrollment](#cli-representation-and-codex-enrollment)
+- [Interactive CLI](#interactive-cli)
 - [Editor ACP service and Zed](#editor-acp-service-and-zed)
 - [External requirements and BA acceptance](#external-requirements-and-ba-acceptance)
 - [Console and definition editor](#console-and-definition-editor)
@@ -776,6 +777,52 @@ are not migrated/copied/deleted automatically, and require a later explicit
 operator-controlled migration. Catalog credentials are not used for worker
 selection or lease issuance; the explicit Codex status command is an operator
 qualification path and does not change those execution boundaries.
+
+## Interactive CLI
+
+Use `orbit interactive` for managed-worktree development without an editor.
+Initialize the selected PostgreSQL database with Orbit's existing migrations,
+enroll provider credentials through the normal credential commands, and prepare
+the [operator configuration](#operator-configuration). The independently pinned
+verification image must already be provisioned and qualified for the project.
+
+Store the selected database URL in a regular owner-only file under
+`~/.orbit/private/`, with file mode `0600` and owner-only directories (`0700`)
+from `.orbit` down to its parent. Symlinks and hard-linked credential files are
+rejected. The local operator grants access by selecting this file and repository
+configuration; no URL or credential goes in task instructions.
+
+```sh
+export ORBIT_DATABASE_URL_FILE="$HOME/.orbit/private/database/control-plane-url"
+orbit interactive --config /absolute/path/to/project.json new
+orbit interactive --config /absolute/path/to/project.json start SESSION \
+  --task-file /absolute/path/to/instructions.txt
+orbit interactive --config /absolute/path/to/project.json continue SESSION
+orbit interactive --config /absolute/path/to/project.json show SESSION
+orbit interactive --config /absolute/path/to/project.json diff SESSION
+orbit interactive --config /absolute/path/to/project.json review SESSION
+```
+
+Retain the returned session ID. Separate commands can reconnect using that ID,
+the same database and unchanged configuration. `continue` drives the existing
+workflow and stops at its review gate; `review` requests its remaining review
+and verification. Neither operation requires the provider's previous chat
+history. `watch SESSION --seconds 30` supplies bounded progress snapshots while
+another client drives work.
+
+Inspect the candidate and evidence before `apply SESSION WORKSPACE_STATE_ID`.
+The source checkout stays unchanged until this explicit operation; it must still
+be clean and match the candidate's base revision. Stale candidate identity is
+rejected. `discard SESSION WORKSPACE_STATE_ID` removes the managed worktree after
+cleanup, including an applied candidate once its contents are preserved in the
+source checkout. Cancel from another process with `cancel SESSION`, then inspect
+state and wait for confirmed cleanup before discarding. Apply is unavailable for
+cancelled or unaccepted work.
+
+Use `recover-application` only to reconcile a recorded interrupted application;
+it proves checkout identity and never guesses whether a partial change is safe.
+See the [CLI contract](../reference/cli.md#interactive-control) for output bounds
+and interruption behavior.
 
 ## Editor ACP service and Zed
 
