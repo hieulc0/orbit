@@ -6,6 +6,10 @@ Current behavior belongs in [architecture](architecture/README.md), interfaces i
 
 ## Pending acceptance
 
+- **Independent provider/fallback review:** obtain independent approval of native
+  action correlation and bounded operational continuation before advancing
+  editor-facing acceptance. Individual role checks cannot replace complete
+  workflow qualification and review.
 - **Zed GUI integration:** exercise progress, replay, cancellation, diff navigation,
   apply/discard and interrupted-action recovery in an actual disposable editor session.
   ACP protocol or fixture acceptance cannot substitute for GUI evidence.
@@ -36,7 +40,7 @@ Require a concrete workload or deployment need and separate qualification:
 - Kubernetes or cloud provisioning for demonstrated capacity requirements.
 - SSO, tenant administration, external policy distribution and additional secret backends.
 - Additional credential/provider adapters and public package/SDK distribution.
-- Automatic cross-agent continuation or provider re-resolution with explicit uncertainty policy.
+- Continuation after prompt dispatch with explicit reconciliation of uncertain provider effects.
 - Parallel analysis or isolated implementation branches with explicit integration.
 
 Commit, merge, push, publication and deployment require explicit authority and a

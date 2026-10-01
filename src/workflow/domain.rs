@@ -2668,7 +2668,7 @@ impl RoleRuntimeResolver {
             }
 
             let (provider, runtime_interface, model, runtime_image_digest, adapter_revision) =
-                if pref.contains("codex") {
+                if pref == "codex-acp" {
                     (
                         "codex",
                         "codex-acp",
@@ -2676,12 +2676,23 @@ impl RoleRuntimeResolver {
                         crate::codex_credential_enrollment::CODEX_IMAGE_DIGEST,
                         crate::codex_bridge::REVISION,
                     )
-                } else if pref.contains("antigravity") {
+                } else if pref == "antigravity-terminal-acp" {
                     (
                         "antigravity",
                         "antigravity-acp",
                         "gemini-3.8-flash",
                         crate::credential_enrollment::ANTIGRAVITY_DIGEST,
+                        crate::acp_capabilities::ANTIGRAVITY_ACP_ADAPTER_REVISION,
+                    )
+                } else if matches!(
+                    pref.as_str(),
+                    "antigravity-acp" | "antigravity-correlated-acp"
+                ) {
+                    (
+                        "antigravity",
+                        "antigravity-acp",
+                        "gemini-3.7-flash-high",
+                        crate::acp_capabilities::ANTIGRAVITY_CORRELATED_IMAGE_DIGEST,
                         crate::acp_capabilities::ANTIGRAVITY_ACP_ADAPTER_REVISION,
                     )
                 } else {

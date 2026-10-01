@@ -45,6 +45,89 @@ async fn acp_call(
     }
 }
 
+fn reported_session_model(response: &serde_json::Value) -> Result<Option<String>> {
+    let model = response
+        .pointer("/models/currentModelId")
+        .and_then(|v| v.as_str());
+    if let Some(model) = model {
+        ensure!(
+            crate::agent::valid_name(model),
+            "invalid ACP reported model"
+        );
+    }
+    Ok(model.map(str::to_owned))
+}
+
+async fn activate_role_model(
+    wire: &mut Wire,
+    state: &mut AcpTurnState<'_>,
+    session_id: &str,
+    requested: Option<&str>,
+    observed: &mut Option<String>,
+) -> Result<()> {
+    let Some(model) = requested else {
+        return Ok(());
+    };
+    ensure!(
+        crate::agent::valid_name(model),
+        "invalid requested model name"
+    );
+    if observed.as_deref() == Some(model) {
+        return Ok(());
+    }
+    let config = tokio::time::timeout(
+        Duration::from_secs(10),
+        acp_call(
+            wire,
+            state,
+            "session/set_config_option",
+            serde_json::json!({"sessionId":session_id,"configId":"model","value":model}),
+        ),
+    )
+    .await
+    .context("ACP model selection timeout; protocol outcome unconfirmed")?;
+    let config = match config {
+        Ok(response) => Some(response),
+        Err(error) if error.is::<crate::acp_wire::RequestRejected>() => None,
+        Err(error) => return Err(error),
+    };
+    if let Some(response) = config
+        && let Some(value) = response
+            .get("configOptions")
+            .and_then(|v| v.as_array())
+            .and_then(|options| options.iter().find(|v| v["id"] == "model"))
+            .and_then(|v| v["currentValue"].as_str())
+    {
+        ensure!(
+            crate::agent::valid_name(value),
+            "invalid ACP reported model"
+        );
+        *observed = Some(value.to_owned());
+        if value == model {
+            return Ok(());
+        }
+    }
+    // Only a correlated response permits another request on the same stream.
+    // A timeout or transport failure may leave a late response behind.
+    let response = tokio::time::timeout(
+        Duration::from_secs(10),
+        acp_call(
+            wire,
+            state,
+            "session/set_model",
+            serde_json::json!({"sessionId":session_id,"modelId":model}),
+        ),
+    )
+    .await
+    .context("ACP model selection timeout; protocol outcome unconfirmed")??;
+    *observed = reported_session_model(&response)?;
+    ensure!(
+        observed.as_deref() == Some(model),
+        "ACP requested model was not confirmed"
+    );
+    Ok(())
+}
+
 fn validate_role_credential_target(
     target: &ResolvedExecutionTarget,
     credential: &crate::credential_registry::Credential,
@@ -66,6 +149,45 @@ struct RoleModelEvidence<'a> {
     requested: Option<&'a str>,
     configured: Option<&'a str>,
     observed: Option<&'a str>,
+}
+
+fn antigravity_role_image(target: &ResolvedExecutionTarget) -> &str {
+    match target.runtime_image_digest.as_deref() {
+        Some(crate::acp_capabilities::ANTIGRAVITY_CORRELATED_IMAGE_DIGEST) => {
+            crate::acp_capabilities::ANTIGRAVITY_CORRELATED_IMAGE
+        }
+        Some(crate::credential_enrollment::ANTIGRAVITY_DIGEST) | None => ANTIGRAVITY_IMAGE,
+        Some(image) => image,
+    }
+}
+
+fn validate_role_runtime_target(
+    role: &RoleDefinition,
+    target: &ResolvedExecutionTarget,
+) -> Result<()> {
+    let (image, revision) = match target.provider.as_str() {
+        "codex" => (
+            target
+                .runtime_image_digest
+                .as_deref()
+                .unwrap_or(crate::codex_credential_enrollment::CODEX_IMAGE_DIGEST),
+            crate::codex_bridge::REVISION,
+        ),
+        "antigravity" => (
+            antigravity_role_image(target),
+            crate::acp_capabilities::ANTIGRAVITY_ACP_ADAPTER_REVISION,
+        ),
+        _ => anyhow::bail!("unsupported role runtime"),
+    };
+    let digest = image.rsplit_once('@').map_or(image, |(_, digest)| digest);
+    let capability = crate::acp_capabilities::qualified_tool_audit_correlation(digest, revision);
+    if let Some(required) = role.allowed_capabilities.required_tool_audit_correlation {
+        ensure!(
+            capability.satisfies(required),
+            "RUNTIME_CAPABILITY_MISMATCH"
+        );
+    }
+    Ok(())
 }
 
 fn role_model_evidence<'a>(
@@ -183,6 +305,7 @@ impl AcpRoleLifecycle {
             "SUPERVISOR_START" => "SUPERVISOR_START_FAILED",
             "ACP_INITIALIZE" => "ACP_INITIALIZE_FAILED",
             "SESSION_CREATION" => "ACP_SESSION_CREATION_FAILED",
+            "MODEL_SELECTION" => "ACP_MODEL_SELECTION_FAILED",
             "PROMPT_DISPATCH" | "PROMPT_IN_FLIGHT" => "ACP_PROMPT_FAILED",
             "CLEANUP" => "ACP_CLEANUP_FAILED",
             "HANDOFF" => "HANDOFF_PARSE_FAILED",
@@ -276,6 +399,64 @@ impl std::fmt::Display for RoleExecutionCancelled {
 }
 
 impl std::error::Error for RoleExecutionCancelled {}
+
+/// Issued only after a pre-prompt operational failure has durable terminal
+/// evidence. The coordinator rechecks that evidence before selecting a peer.
+#[derive(Debug)]
+pub(super) struct RoleOperationalFailure {
+    pub(super) agent_execution_id: String,
+    reason: &'static str,
+}
+
+impl std::fmt::Display for RoleOperationalFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.reason)
+    }
+}
+
+impl std::error::Error for RoleOperationalFailure {}
+
+pub(super) fn safe_operational_failure(metadata: &serde_json::Value) -> bool {
+    let lifecycle = &metadata["lifecycle"];
+    lifecycle["outcome"] == "FAILED"
+        && lifecycle["prompt_uncertainty"] == "NOT_DISPATCHED"
+        && lifecycle["persistence_state"] == "CONFIRMED"
+        && matches!(
+            lifecycle["cleanup_state"].as_str(),
+            Some("CONFIRMED" | "NO_RUNTIME_RESOURCE_CREATED")
+        )
+        && lifecycle["tool_audit_applicability"] == "NOT_APPLICABLE_BEFORE_TOOL_PHASE"
+        && matches!(
+            lifecycle["normalized_reason"].as_str(),
+            Some(
+                "CREDENTIAL_RESOLUTION_FAILED"
+                    | "CREDENTIAL_STAGING_FAILED"
+                    | "RUNTIME_PREPARATION_FAILED"
+                    | "SUPERVISOR_START_FAILED"
+                    | "ACP_INITIALIZE_FAILED"
+                    | "ACP_SESSION_CREATION_FAILED"
+                    | "ACP_MODEL_SELECTION_FAILED"
+            )
+        )
+}
+
+fn terminal_role_failure(
+    lifecycle: &AcpRoleLifecycle,
+    execution_id: &str,
+    reason: &'static str,
+) -> anyhow::Error {
+    if lifecycle.cleanup_state == "UNCONFIRMED" {
+        UnconfirmedRoleCleanup(reason.into()).into()
+    } else if safe_operational_failure(&serde_json::json!({"lifecycle":lifecycle.value()})) {
+        RoleOperationalFailure {
+            agent_execution_id: execution_id.into(),
+            reason,
+        }
+        .into()
+    } else {
+        anyhow::anyhow!(reason)
+    }
+}
 
 #[derive(Debug)]
 pub(super) struct RoleSupervisorTimeout;
@@ -618,6 +799,10 @@ async fn execute_real_acp_turn(
         "observed_model": null,
         "tool_call_audit": initial_audit,
         "lifecycle": lifecycle.value(),
+        "continuation_from_agent_execution_id": role_exec.agent_execution_ids.last(),
+        "input_handoff_id": role_exec.handoff_input_id,
+        "input_workspace_state_id": role_exec.input_workspace_state_id,
+        "selection_reason": target.resolution_reason,
     });
     store
         .start_agent_execution(
@@ -703,7 +888,11 @@ async fn execute_real_acp_turn(
         lifecycle.note_terminal_persistence_failure();
         return Err(RoleTerminalPersistenceUnconfirmed.into());
     }
-    Err(anyhow::anyhow!(normalized_reason))
+    Err(terminal_role_failure(
+        &lifecycle,
+        &agent_exec_id,
+        normalized_reason,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -748,6 +937,24 @@ async fn execute_real_acp_turn_body(
         agent_exec_id,
         &role_exec.id,
         "CREDENTIAL_RESOLVED",
+    )
+    .await?;
+
+    persist_agent_lifecycle_phase(
+        &store,
+        lifecycle,
+        agent_exec_id,
+        &role_exec.id,
+        "RUNTIME_SELECTION",
+    )
+    .await?;
+    validate_role_runtime_target(role, target)?;
+    confirm_agent_lifecycle_phase(
+        &store,
+        lifecycle,
+        agent_exec_id,
+        &role_exec.id,
+        "RUNTIME_SELECTED",
     )
     .await?;
 
@@ -927,10 +1134,7 @@ async fn execute_real_acp_turn_body(
         let binding_name = "antigravity-role-v1";
         let launch = Launch {
             adapter: Adapter::Antigravity,
-            image: target
-                .runtime_image_digest
-                .clone()
-                .unwrap_or_else(|| ANTIGRAVITY_IMAGE.into()),
+            image: antigravity_role_image(target).into(),
             command: vec![ACP_EXECUTABLE.into()],
             agent_name: "antigravity-acp".into(),
             agent_version: crate::acp_capabilities::ANTIGRAVITY_ACP_ADAPTER_REVISION.into(),
@@ -1158,6 +1362,7 @@ async fn execute_real_acp_turn_body(
         state.execution_profile,
         crate::execution::local::RoleExecutionProfile::DevLocal { .. }
     ) && role.workspace_access == WorkspaceAccess::ReadWrite;
+    let mut observed_model = None;
     let turn = tokio::select! {
         result = async {
     persist_agent_lifecycle_phase(
@@ -1168,7 +1373,7 @@ async fn execute_real_acp_turn_body(
         "ACP_INITIALIZE",
     )
     .await?;
-    let _init_res = acp_call(
+    let initialize_response = acp_call(
         &mut wire,
         &mut state,
         "initialize",
@@ -1206,6 +1411,12 @@ async fn execute_real_acp_turn_body(
     )
     .await
     .context("ACP initialize failed")?;
+    ensure!(
+        initialize_response["protocolVersion"] == 1
+            && initialize_response["agentInfo"]["name"] == req.runtime.launch.agent_name
+            && initialize_response["agentInfo"]["version"] == req.runtime.launch.agent_version,
+        "ACP installed identity mismatch"
+    );
 
     confirm_agent_lifecycle_phase(
         &store,
@@ -1235,6 +1446,8 @@ async fn execute_real_acp_turn_body(
     .await
     .context("ACP session/new failed")?;
 
+    observed_model = reported_session_model(&new_res)?;
+
     let session_id = new_res
         .get("sessionId")
         .and_then(|v| v.as_str())
@@ -1248,6 +1461,10 @@ async fn execute_real_acp_turn_body(
         "SESSION_CREATED",
     )
     .await?;
+
+    persist_agent_lifecycle_phase(&store, lifecycle, agent_exec_id, &role_exec.id, "MODEL_SELECTION").await?;
+    activate_role_model(&mut wire, &mut state, &session_id, target.resolved_model.as_deref(), &mut observed_model).await?;
+    confirm_agent_lifecycle_phase(&store, lifecycle, agent_exec_id, &role_exec.id, "MODEL_SELECTED").await?;
 
     if target.provider == "antigravity" {
         let _ = acp_call(
@@ -1470,7 +1687,7 @@ async fn execute_real_acp_turn_body(
     };
     let reason = lifecycle.normalized_reason.unwrap_or("COMPLETED");
     let failure_message = failure.as_ref().map(|_| reason.to_owned());
-    let model_evidence = role_model_evidence(target, None);
+    let model_evidence = role_model_evidence(target, observed_model.as_deref());
     let tool_call_audit =
         state
             .tool_call_audit
@@ -1502,7 +1719,7 @@ async fn execute_real_acp_turn_body(
                 "execution_profile": state.execution_profile,
                 "role_budget": {"limits":state.role_budget,"usage":state.role_usage},
                 "cleanup_confirmed": evidence.cleanup_confirmed,
-                "observed_model": null,
+                "observed_model": observed_model,
                 "tool_call_audit": tool_call_audit,
                 "lifecycle": lifecycle.value(),
             }),
@@ -1515,16 +1732,18 @@ async fn execute_real_acp_turn_body(
     }
     lifecycle.note_terminal_persistence_attempt();
 
-    if !evidence.cleanup_confirmed {
-        return Err(anyhow::anyhow!(
+    if lifecycle.cleanup_state != "CONFIRMED" {
+        return Err(UnconfirmedRoleCleanup(
             lifecycle
                 .normalized_reason
                 .unwrap_or("CLEANUP_RECEIPT_UNCONFIRMED")
-        ));
+                .into(),
+        )
+        .into());
     }
 
     if failure.is_some() {
-        return Err(anyhow::anyhow!(reason));
+        return Err(terminal_role_failure(lifecycle, agent_exec_id, reason));
     }
 
     Ok(RoleExecutionOutcome {
@@ -1538,6 +1757,68 @@ async fn execute_real_acp_turn_body(
 pub struct RealAcpRoleExecutor;
 
 impl RealAcpRoleExecutor {
+    /// Persist a controlled runtime-start failure without credentials, a
+    /// container or a provider prompt. Qualification can then exercise the
+    /// production coordinator's operational continuation boundary.
+    #[cfg(feature = "fault-injection")]
+    #[doc(hidden)]
+    pub async fn simulate_pre_prompt_runtime_failure(
+        &self,
+        pool: &PgPool,
+        role_execution: &RoleExecution,
+        target: &ResolvedExecutionTarget,
+    ) -> Result<RoleExecutionOutcome> {
+        let store = WorkflowStore::new(pool.clone());
+        let execution_id = format!("acp-exec-{}", id());
+        let now = crate::verification::now_millis();
+        let mut lifecycle = AcpRoleLifecycle::new();
+        lifecycle.enter("RUNTIME_PREPARATION");
+        lifecycle.record_error(&anyhow::anyhow!("injected runtime unavailable"));
+        let metadata = serde_json::json!({
+            "lifecycle":lifecycle.value(),
+            "fault_injection":{"boundary":"before_runtime_preparation"},
+            "tool_call_audit":ToolCallAudit::default().metadata(0,0,0),
+        });
+        store
+            .start_agent_execution(
+                &execution_id,
+                &role_execution.id,
+                "runtime-failure-fixture",
+                Some(&target.provider),
+                target.resolved_model.as_deref(),
+                now,
+                target.requested_model.as_deref(),
+                target.resolved_model.as_deref(),
+                &metadata,
+            )
+            .await?;
+        store
+            .finish_agent_execution(
+                &execution_id,
+                &role_execution.id,
+                now,
+                "FAILED",
+                Some("RUNTIME_PREPARATION_FAILED"),
+                None,
+                Some("RUNTIME_PREPARATION_FAILED"),
+                target.requested_model.as_deref(),
+                target.resolved_model.as_deref(),
+                None,
+                0,
+                0,
+                0,
+                0,
+                &serde_json::json!({}),
+                &metadata,
+            )
+            .await?;
+        Err(terminal_role_failure(
+            &lifecycle,
+            &execution_id,
+            "RUNTIME_PREPARATION_FAILED",
+        ))
+    }
+
     /// Execute a real ACP role turn with separate workflow and credential stores.
     /// Production callers normally use the same pool for both stores.
     #[cfg(feature = "fault-injection")]
@@ -1607,6 +1888,107 @@ impl RoleAgentExecutor for RealAcpRoleExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operational_continuation_excludes_uncertainty_and_semantic_failures() {
+        let mut lifecycle = AcpRoleLifecycle::new();
+        lifecycle.enter("RUNTIME_PREPARATION");
+        lifecycle.record_error(&anyhow::anyhow!("fixture"));
+        let eligible = serde_json::json!({"lifecycle":lifecycle.value()});
+        assert!(safe_operational_failure(&eligible));
+        for (field, value) in [
+            ("prompt_uncertainty", "IN_FLIGHT"),
+            ("prompt_uncertainty", "RESOLVED"),
+            ("cleanup_state", "UNCONFIRMED"),
+            ("persistence_state", "UNCONFIRMED"),
+            ("tool_audit_applicability", "APPLICABLE"),
+            ("normalized_reason", "ACP_PROMPT_FAILED"),
+            ("normalized_reason", "TOOL_BUDGET_EXHAUSTED"),
+            ("normalized_reason", "ROLE_EXECUTION_CANCELLED"),
+            ("normalized_reason", "CHANGES_REQUESTED"),
+            ("normalized_reason", "VERIFICATION_FAILED"),
+            ("normalized_reason", "IMPLEMENTATION_NO_CHANGE"),
+        ] {
+            let mut denied = eligible.clone();
+            denied["lifecycle"][field] = value.into();
+            assert!(!safe_operational_failure(&denied), "{field}={value}");
+        }
+        assert!(!safe_operational_failure(&serde_json::json!({})));
+    }
+
+    #[tokio::test]
+    async fn role_model_activation_requires_correlated_peer_confirmation() -> Result<()> {
+        for mode in ["config", "legacy", "mismatch", "empty", "transport"] {
+            let repo = tempfile::tempdir()?;
+            let mut state = AcpTurnState::new(repo.path(), WorkspaceAccess::ReadOnly);
+            let (input, peer_output) = tokio::io::duplex(4096);
+            let (peer_input, output) = tokio::io::duplex(4096);
+            let mut wire = Wire::new(input, output, 4096);
+            let mut peer = Wire::new(peer_input, peer_output, 4096);
+            let mut observed = Some("old-model".into());
+            let activation = activate_role_model(
+                &mut wire,
+                &mut state,
+                "session",
+                Some("model"),
+                &mut observed,
+            );
+            let peer_task = async {
+                let config = peer.read().await?;
+                assert_eq!(config["method"], "session/set_config_option");
+                if mode == "transport" {
+                    drop(peer);
+                    return Ok::<_, anyhow::Error>(());
+                }
+                if mode == "config" {
+                    peer.response_ok(config["id"].clone(), serde_json::json!({"configOptions":[{"id":"model","currentValue":"model"}]})).await?;
+                    return Ok(());
+                }
+                peer.response_error(config["id"].clone(), -32601, "unsupported")
+                    .await?;
+                let legacy = peer.read().await?;
+                assert_eq!(legacy["method"], "session/set_model");
+                let response = match mode {
+                    "legacy" => serde_json::json!({"models":{"currentModelId":"model"}}),
+                    "mismatch" => serde_json::json!({"models":{"currentModelId":"other-model"}}),
+                    _ => serde_json::json!({}),
+                };
+                peer.response_ok(legacy["id"].clone(), response).await?;
+                Ok(())
+            };
+            let (result, peer_result) = tokio::join!(activation, peer_task);
+            peer_result?;
+            assert_eq!(result.is_ok(), matches!(mode, "config" | "legacy"));
+            assert_eq!(
+                observed.as_deref(),
+                match mode {
+                    "config" | "legacy" => Some("model"),
+                    "mismatch" => Some("other-model"),
+                    "transport" => Some("old-model"),
+                    _ => None,
+                }
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn session_model_requires_peer_evidence() -> Result<()> {
+        assert_eq!(reported_session_model(&serde_json::json!({}))?, None);
+        assert_eq!(
+            reported_session_model(
+                &serde_json::json!({"models":{"currentModelId":"gemini-3.8-flash"}})
+            )?,
+            Some("gemini-3.8-flash".into())
+        );
+        assert!(
+            reported_session_model(
+                &serde_json::json!({"models":{"currentModelId":"unsafe\nmodel"}})
+            )
+            .is_err()
+        );
+        Ok(())
+    }
 
     #[test]
     fn wrong_credential_generation_is_rejected() {

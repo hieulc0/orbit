@@ -37,6 +37,218 @@ async fn teardown_test(ctx: TestContext) -> Result<()> {
     ctx.database.teardown().await
 }
 
+#[cfg(feature = "fault-injection")]
+struct OperationalFailureFixture {
+    mode: &'static str,
+    providers: std::sync::Mutex<Vec<String>>,
+}
+
+#[cfg(feature = "fault-injection")]
+#[async_trait::async_trait]
+impl RoleAgentExecutor for OperationalFailureFixture {
+    async fn execute_role(
+        &self,
+        pool: &PgPool,
+        workflow: &WorkflowRun,
+        execution: &RoleExecution,
+        role: &RoleDefinition,
+        target: &ResolvedExecutionTarget,
+        task: &str,
+        repository: &std::path::Path,
+        handoff: Option<&HandoffArtifact>,
+        cancellation: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<RoleExecutionOutcome> {
+        let first = {
+            let mut providers = self.providers.lock().unwrap();
+            providers.push(target.provider.clone());
+            providers.len() == 1
+        };
+        if first || self.mode == "second_failure" {
+            if self.mode == "semantic" {
+                anyhow::bail!("RUNTIME_PREPARATION_FAILED: ordinary text is not evidence");
+            }
+            let error = RealAcpRoleExecutor
+                .simulate_pre_prompt_runtime_failure(pool, execution, target)
+                .await
+                .expect_err("fault fixture must fail");
+            if self.mode == "uncertain_cleanup" {
+                sqlx::query("UPDATE orbit_agent_executions SET metadata=jsonb_set(metadata,'{lifecycle,cleanup_state}','\"UNCONFIRMED\"') WHERE role_execution_id=$1").bind(&execution.id).execute(pool).await?;
+            }
+            if self.mode == "mutated" {
+                std::fs::write(repository.join("unexpected.txt"), "unexpected mutation")?;
+            }
+            return Err(error);
+        }
+        let store = WorkflowStore::new(pool.clone());
+        let execution_id = format!("offline-exec-{}", id());
+        let metadata = serde_json::json!({"continuation_from_agent_execution_id":execution.agent_execution_ids.last(),"qualification":"offline coordinator contract only"});
+        store
+            .start_agent_execution(
+                &execution_id,
+                &execution.id,
+                "offline-fixture",
+                Some(&target.provider),
+                None,
+                0,
+                None,
+                None,
+                &metadata,
+            )
+            .await?;
+        let mut outcome = SimulatedRoleExecutor::new()
+            .execute_role(
+                pool,
+                workflow,
+                execution,
+                role,
+                target,
+                task,
+                repository,
+                handoff,
+                cancellation,
+            )
+            .await?;
+        store
+            .finish_agent_execution(
+                &execution_id,
+                &execution.id,
+                1,
+                "SUCCEEDED",
+                Some("fixture"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                0,
+                0,
+                0,
+                0,
+                &serde_json::json!({}),
+                &metadata,
+            )
+            .await?;
+        outcome.agent_execution_ids = vec![execution_id];
+        Ok(outcome)
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL; uses no providers or secrets"]
+#[cfg(feature = "fault-injection")]
+async fn operational_fallback_is_durable_bounded_and_fails_closed() -> Result<()> {
+    for (preferred, mode, expected_calls) in [
+        ("codex", "safe", 2),
+        ("antigravity", "safe", 2),
+        ("codex", "semantic", 1),
+        ("codex", "uncertain_cleanup", 1),
+        ("codex", "mutated", 1),
+        ("codex", "second_failure", 2),
+    ] {
+        let ctx = setup_test().await?;
+        let result = async {
+            enroll_sample_credentials(&ctx.engine.pool).await?;
+            if preferred == "antigravity" {
+                let credential = orbit::credential_registry::CredentialStore::new(&ctx.engine.pool)
+                    .get("antigravity-ch9b2013")
+                    .await?
+                    .context("synthetic credential missing")?;
+                let now = now_millis();
+                orbit::availability::AvailabilityStore::new(&ctx.engine.pool)
+                    .record(&orbit::availability::AvailabilitySnapshot {
+                        applies_to: orbit::availability::AvailabilityScope::Credential(
+                            credential.identity(),
+                        ),
+                        observed_at_ms: now,
+                        expires_at_ms: now + 60000,
+                        state: orbit::availability::AvailabilityState::Ready,
+                        quota_windows: vec![orbit::availability::QuotaWindow {
+                            label: "weekly".into(),
+                            duration_minutes: Some(10080),
+                            used_percent: None,
+                            remaining_percent: Some(80.0),
+                            resets_at_ms: Some(now + 3600000),
+                            exhausted: None,
+                        }],
+                        quota_buckets: vec![],
+                        quota_groups: vec![],
+                        source: orbit::availability::EvidenceSource::ProviderNativeStatus,
+                        confidence: orbit::availability::EvidenceConfidence::AuthoritativeNative,
+                        source_revision: "synthetic-offline-v1".into(),
+                        evidence_digest: format!("sha256:{}", "a".repeat(64)),
+                        provider_observed_at_ms: Some(now),
+                        provider_status_observation: None,
+                    })
+                    .await?;
+            }
+            let repository = common::TemporaryGitRepo::create()?;
+            let initial = compute_workspace_state(repository.path(), "HEAD").await?;
+            let workflow = ctx
+                .store
+                .create_workflow_run_full(
+                    "offline-fallback",
+                    &format!("attempt-{}", id()),
+                    1,
+                    None,
+                    None,
+                    None,
+                    Some("synthetic planner contract"),
+                    repository.path().to_str(),
+                    Some("HEAD"),
+                )
+                .await?;
+            let executor = Arc::new(OperationalFailureFixture {
+                mode,
+                providers: std::sync::Mutex::new(Vec::new()),
+            });
+            let coordinator = WorkflowCoordinator::new(ctx.engine.pool.clone(), executor.clone());
+            coordinator.step(&workflow.id).await?;
+            coordinator.step(&workflow.id).await?;
+            let selected = executor.providers.lock().unwrap().clone();
+            assert_eq!(selected.len(), expected_calls, "{preferred}/{mode}");
+            assert_eq!(selected[0], preferred);
+            let role = ctx
+                .store
+                .list_role_executions(&workflow.id)
+                .await?
+                .remove(0);
+            if mode == "safe" {
+                assert_ne!(selected[0], selected[1]);
+                assert_eq!(role.agent_execution_ids.len(), 2);
+                assert_eq!(role.status, RoleExecutionStatus::Succeeded);
+                assert_eq!(
+                    compute_workspace_state(repository.path(), "HEAD").await?,
+                    initial
+                );
+                let metadata: serde_json::Value =
+                    sqlx::query_scalar("SELECT metadata FROM orbit_agent_executions WHERE id=$1")
+                        .bind(&role.agent_execution_ids[1])
+                        .fetch_one(&ctx.engine.pool)
+                        .await?;
+                assert_eq!(
+                    metadata["continuation_from_agent_execution_id"].as_str(),
+                    Some(role.agent_execution_ids[0].as_str())
+                );
+                assert!(
+                    role.resolved_target
+                        .as_ref()
+                        .unwrap()
+                        .resolution_reason
+                        .contains(&initial.state_id)
+                );
+            } else {
+                assert_eq!(role.status, RoleExecutionStatus::Failed);
+            }
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        let teardown = teardown_test(ctx).await;
+        result?;
+        teardown?;
+    }
+    Ok(())
+}
+
 fn sample_policy() -> VerificationPolicy {
     VerificationPolicy {
         id: format!("pol-{}", id()),
@@ -713,16 +925,27 @@ async fn real_planner_codex_acp() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; run with ORBIT_TEST_DATABASE_URL"]
-async fn reviewer_excludes_runtime_without_exact_tool_audit() -> Result<()> {
+async fn reviewer_selects_exact_correlated_runtime() -> Result<()> {
     let ctx = setup_test().await?;
     enroll_sample_credentials(&ctx.engine.pool).await?;
 
     let role = RoleDefinition::reviewer_v1();
     let target = RoleRuntimeResolver::resolve_target_live(&ctx.engine.pool, &role, None).await?;
-    assert_eq!(target.provider, "codex");
-    assert_eq!(target.runtime_interface, "codex-acp");
-    assert_eq!(target.requested_model.as_deref(), Some("gpt-6-luna"));
-    assert!(target.resolution_reason.contains("CAPABILITY_MISMATCH"));
+    assert_eq!(target.provider, "antigravity");
+    assert_eq!(target.runtime_interface, "antigravity-acp");
+    assert_eq!(
+        target.requested_model.as_deref(),
+        Some("gemini-3.7-flash-high")
+    );
+    assert_eq!(
+        target.runtime_image_digest.as_deref(),
+        Some(orbit::acp_capabilities::ANTIGRAVITY_CORRELATED_IMAGE_DIGEST)
+    );
+    assert!(
+        target
+            .resolution_reason
+            .contains("tool_audit_correlation=EXACT")
+    );
 
     teardown_test(ctx).await
 }
@@ -751,6 +974,14 @@ async fn live_runtime_capability_resolution() -> Result<()> {
     let target = RoleRuntimeResolver::resolve_target_live(&ctx.engine.pool, &role, None).await?;
     assert_eq!(target.provider, "codex");
     assert!(target.runtime_image_digest.is_some());
+
+    let mut unknown = role.clone();
+    unknown.runtime_preferences = vec!["future-codex-acp".into(), "future-antigravity-acp".into()];
+    assert!(
+        RoleRuntimeResolver::resolve_target_live(&ctx.engine.pool, &unknown, None)
+            .await
+            .is_err()
+    );
 
     teardown_test(ctx).await
 }
@@ -865,9 +1096,11 @@ async fn reset_aware_resolver_prefers_earlier_weekly_reset() -> Result<()> {
 
     // Planner ordinarily prefers Codex. A safe, earlier Antigravity weekly
     // reset must move that account ahead in the actual resolver result.
+    let mut legacy_role = RoleDefinition::planner_v1();
+    legacy_role.runtime_preferences = vec!["codex-acp".into(), "antigravity-terminal-acp".into()];
     let exact = RoleRuntimeResolver::resolve_ranked_targets_live(
         &ctx.engine.pool,
-        &RoleDefinition::planner_v1(),
+        &legacy_role,
         None,
         RuntimeQuotaSelectionPolicy::default(),
     )
@@ -901,7 +1134,7 @@ async fn reset_aware_resolver_prefers_earlier_weekly_reset() -> Result<()> {
     assert!(ranked[0].resolution_reason.contains("known_weekly_reset"));
     assert!(ranked[0].resolution_reason.contains("7d_remaining=70.0%"));
 
-    role.runtime_preferences = vec!["antigravity-acp".into()];
+    role.runtime_preferences = vec!["antigravity-terminal-acp".into()];
     role.allowed_capabilities.required_tool_audit_correlation =
         Some(orbit::acp_capabilities::ToolAuditCorrelationCapability::Exact);
     let error = RoleRuntimeResolver::resolve_ranked_targets_live(
@@ -915,7 +1148,7 @@ async fn reset_aware_resolver_prefers_earlier_weekly_reset() -> Result<()> {
     assert!(error.to_string().contains("CAPABILITY_MISMATCH"));
 
     let mut exact_role = RoleDefinition::planner_v1();
-    exact_role.runtime_preferences = vec!["codex-acp".into(), "antigravity-acp".into()];
+    exact_role.runtime_preferences = vec!["codex-acp".into(), "antigravity-terminal-acp".into()];
     let fallback_error = RoleRuntimeResolver::resolve_ranked_targets_live(
         &ctx.engine.pool,
         &exact_role,

@@ -70,15 +70,40 @@ pub(crate) fn build_role_prompt(
         role,
         advertised_tools,
     } = tool_context;
-    let provider_tool_names = if provider == "codex" {
-        crate::codex_bridge::dynamic_tool_names(advertised_tools)?
+    let provider_tools = if provider == "codex" {
+        advertised_tools
+            .iter()
+            .zip(crate::codex_bridge::dynamic_tool_names(advertised_tools)?)
+            .collect::<Vec<_>>()
+    } else if provider == "antigravity" {
+        // The pinned adapter exposes these brokered tools. Do not advertise
+        // native filesystem or terminal tools that bypass Orbit callbacks.
+        advertised_tools
+            .iter()
+            .filter_map(|name| {
+                let provider_name = match name.as_str() {
+                    "read_file" => "client_view_file",
+                    "write_file" => "client_create_file",
+                    "edit_file" => "client_edit_file",
+                    "shell" => "orbit_terminal",
+                    _ => return None,
+                };
+                Some((name, provider_name.to_owned()))
+            })
+            .collect::<Vec<_>>()
     } else {
-        advertised_tools.to_vec()
+        advertised_tools
+            .iter()
+            .zip(advertised_tools.iter().cloned())
+            .collect::<Vec<_>>()
     };
-    let tool_list = provider_tool_names.join(", ");
-    let mutation_tool_list = advertised_tools
+    let provider_tool_names = provider_tools
         .iter()
-        .zip(provider_tool_names.iter())
+        .map(|(_, name)| name.as_str())
+        .collect::<Vec<_>>();
+    let tool_list = provider_tool_names.join(", ");
+    let mutation_tool_list = provider_tools
+        .iter()
         .filter_map(|(canonical_name, provider_name)| {
             crate::tool_surface::CanonicalToolName::from_wire(canonical_name)
                 .map(crate::tool_surface::ToolMetadata::for_tool)
@@ -150,9 +175,13 @@ pub(crate) fn build_role_prompt(
     } else {
         prompt
     };
-    let prompt = format!(
-        "{prompt}\n\nORBIT TOOLS ADVERTISED TO THIS ROLE: {tool_list}\n\nFile reads are bounded pages. Read result metadata is under `_meta.orbit` and includes `bytes_returned`, `total_size`, `truncated`, `next_offset`, and `next_line`; when truncated, repeat the same read with `line` set to `next_line`. The `line` argument is a 1-based line number and `limit`, when supplied, is a maximum line count. For very long lines, use `offset` and `max_bytes` (mutually exclusive with line/limit) and continue from `next_offset`. Prefer search followed by a targeted range read."
-    );
+    let read_guidance = if provider == "antigravity" {
+        "File reads are bounded. Use client_view_file with absolute_path inside the repository workspace and 1-based start_line/end_line for targeted ranges. The adapter exposes file content without the callback's pagination metadata; do not assume one unbounded read contains the entire file."
+    } else {
+        "File reads are bounded pages. Read result metadata is under `_meta.orbit` and includes `bytes_returned`, `total_size`, `truncated`, `next_offset`, and `next_line`; when truncated, repeat the same read with `line` set to `next_line`. The `line` argument is a 1-based line number and `limit`, when supplied, is a maximum line count. For very long lines, use `offset` and `max_bytes` (mutually exclusive with line/limit) and continue from `next_offset`. Prefer search followed by a targeted range read."
+    };
+    let prompt =
+        format!("{prompt}\n\nORBIT TOOLS ADVERTISED TO THIS ROLE: {tool_list}\n\n{read_guidance}");
     let prompt = if role.role_id == "reviewer" {
         format!(
             "{prompt}\n\nCONFIGURED VERIFICATION CHECK IDS: {}\nThe suggested_additional_checks field accepts only exact IDs from this list. Use [] when no additional configured check is needed. Put advice about commands or future checks in the review summary, not in suggested_additional_checks.",
@@ -162,8 +191,21 @@ pub(crate) fn build_role_prompt(
         prompt
     };
     let prompt = if role.role_id == "implementer" {
+        let discovery_tools = provider_tools
+            .iter()
+            .filter(|(name, _)| matches!(name.as_str(), "list_directory" | "find_path" | "grep"))
+            .map(|(_, name)| name.as_str())
+            .collect::<Vec<_>>();
+        let discovery_guidance = if discovery_tools.is_empty() {
+            "Use paths identified by the task, planner handoff, or documentation manifest. If a lookup returns PATH_NOT_FOUND, report the unresolved path rather than inventing an unavailable discovery tool.".to_owned()
+        } else {
+            format!(
+                "Discover paths with {} before guessing names for files the task does not identify. If a lookup returns PATH_NOT_FOUND, inspect the workspace with those tools and retry using a discovered path.",
+                discovery_tools.join(", ")
+            )
+        };
         format!(
-            "{prompt}\n\nHANDOFF CHANGED FILES: Report the complete candidate path set changed relative to the workflow base revision. During repair this includes earlier candidate changes as well as files changed by the repair.\n\nDiscover paths with list_directory, find_path, or grep before guessing names for files the task does not identify. If a lookup returns PATH_NOT_FOUND, inspect the workspace with those tools and retry using a discovered path."
+            "{prompt}\n\nHANDOFF CHANGED FILES: Report the complete candidate path set changed relative to the workflow base revision. During repair this includes earlier candidate changes as well as files changed by the repair.\n\n{discovery_guidance}"
         )
     } else {
         prompt
@@ -178,6 +220,49 @@ mod tests {
     use crate::workflow::WorkspaceAccess;
     use anyhow::Context;
     use tempfile::tempdir;
+
+    #[test]
+    fn antigravity_prompt_matches_brokered_tool_names_and_arguments() -> Result<()> {
+        for role in [
+            RoleDefinition::planner_v1(),
+            RoleDefinition::implementer_v1(),
+            RoleDefinition::reviewer_v1(),
+        ] {
+            let mut tools = repository_tools_for_role(&role);
+            if role.workspace_access == WorkspaceAccess::ReadWrite {
+                tools.push("shell".to_owned());
+            }
+            let prompt = build_role_prompt(
+                RolePromptToolContext {
+                    provider: "antigravity",
+                    role: &role,
+                    advertised_tools: &tools,
+                },
+                "Inspect and update src.rs",
+                Path::new("/workspace"),
+                "HEAD",
+                None,
+                None,
+                &[],
+            )?;
+            assert!(prompt.contains("client_view_file"));
+            assert!(prompt.contains("absolute_path"));
+            assert!(prompt.contains("start_line/end_line"));
+            assert!(!prompt.contains("next_offset"));
+            assert!(!prompt.contains("list_directory"));
+            assert!(!prompt.contains("find_path"));
+            assert!(!prompt.contains("grep"));
+            if role.workspace_access == WorkspaceAccess::ReadWrite {
+                assert!(prompt.contains("client_create_file, client_edit_file"));
+                assert!(prompt.contains("orbit_terminal"));
+                assert!(prompt.contains("report the unresolved path"));
+            } else {
+                assert!(!prompt.contains("client_create_file"));
+                assert!(!prompt.contains("orbit_terminal"));
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn provider_tool_lists_match_role_prompt_and_permissions() -> Result<()> {
@@ -272,7 +357,9 @@ mod tests {
                 assert!(
                     prompt.contains("Orbit runs configured authoritative verification separately")
                 );
-                assert!(prompt.contains("Discover paths with list_directory, find_path, or grep"));
+                assert!(prompt.contains(
+                    "Discover paths with orbit_list_directory, orbit_find_path, orbit_grep"
+                ));
                 assert!(prompt.contains("PATH_NOT_FOUND"));
                 assert!(prompt.contains(
                     "complete candidate path set changed relative to the workflow base revision"

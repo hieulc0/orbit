@@ -28,6 +28,20 @@ fn qualified_tool_audit_capability_is_bound_to_image_and_adapter_revision() {
     );
     assert_eq!(
         qualified_tool_audit_correlation(
+            orbit::acp_capabilities::ANTIGRAVITY_CORRELATED_IMAGE_DIGEST,
+            orbit::acp_capabilities::ANTIGRAVITY_ACP_ADAPTER_REVISION,
+        ),
+        ToolAuditCorrelationCapability::Exact
+    );
+    assert_eq!(
+        qualified_tool_audit_correlation(
+            orbit::acp_capabilities::ANTIGRAVITY_CORRELATED_IMAGE_DIGEST,
+            "unqualified-adapter-revision",
+        ),
+        ToolAuditCorrelationCapability::Unknown
+    );
+    assert_eq!(
+        qualified_tool_audit_correlation(
             orbit::codex_credential_enrollment::CODEX_IMAGE_DIGEST,
             "unqualified-bridge-revision",
         ),

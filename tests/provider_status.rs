@@ -900,6 +900,60 @@ fn codex_legacy_and_map_identity_match_is_observed_not_assumed() {
 }
 
 #[test]
+fn codex_ordinary_meter_requires_native_identity_and_consistent_windows() {
+    use orbit::provider_status::codex_ordinary_quota_bucket_fingerprint as identify;
+    let resource = || {
+        let mut resource = resource();
+        resource.credential.provider = "codex".into();
+        resource
+    };
+    let native = json!({
+        "rateLimits": {"limitId":"codex", "limitName":null,
+            "primary":{"usedPercent":12,"windowDurationMins":300,"resetsAt":1730947200}},
+        "rateLimitsByLimitId": {
+            "codex":{"limitId":"codex", "limitName":null,
+                "primary":{"usedPercent":12,"windowDurationMins":300,"resetsAt":1730947200}},
+            "other":{"limitId":"other", "limitName":"default",
+                "primary":{"usedPercent":0,"windowDurationMins":300,"resetsAt":1730947200}}
+        }
+    });
+    let fingerprint = identify(&resource(), &native).expect("explicit native meter");
+    let snapshot = codex_rate_limits_snapshot(
+        &resource(),
+        "",
+        &serde_json::to_vec(&native).unwrap(),
+        10,
+        20,
+    )
+    .unwrap();
+    let bucket = snapshot
+        .quota_buckets
+        .iter()
+        .find(|b| b.provider_bucket_fingerprint == fingerprint)
+        .unwrap();
+    assert_eq!(bucket.provider_label, None);
+    assert_eq!(bucket.scope, None);
+    assert_eq!(bucket.windows[0].remaining_percent, Some(88.0));
+    for pointer in ["/rateLimits/limitId", "/rateLimitsByLimitId/codex/limitId"] {
+        let mut absent = native.clone();
+        *absent.pointer_mut(pointer).unwrap() = json!(null);
+        assert_eq!(identify(&resource(), &absent), None);
+        let mut mismatched = native.clone();
+        *mismatched.pointer_mut(pointer).unwrap() = json!("other");
+        assert_eq!(identify(&resource(), &mismatched), None);
+    }
+    let mut inconsistent = native.clone();
+    inconsistent["rateLimits"]["primary"]["usedPercent"] = json!(99);
+    assert_eq!(identify(&resource(), &inconsistent), None);
+    let mut map_only = native.clone();
+    map_only.as_object_mut().unwrap().remove("rateLimits");
+    assert_eq!(identify(&resource(), &map_only), None);
+    let mut changed_runtime = resource();
+    changed_runtime.runtime.agent_revision = "unknown-runtime".into();
+    assert_eq!(identify(&changed_runtime, &native), None);
+}
+
+#[test]
 fn codex_0156_observed_rate_limit_schema_is_understood_without_retaining_raw_ids() {
     // Sanitized fixture mirrors the one live-observed shape. Every account,
     // bucket, description, and reset value here is synthetic.

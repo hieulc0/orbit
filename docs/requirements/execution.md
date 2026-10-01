@@ -171,6 +171,14 @@ The coordinator checks the selected credential generation again before launch;
 `actual_model` remains unset unless the runtime reports an observed model. A
 missing cleanup receipt leaves the mutation lock fenced for reconciliation.
 
+Operational provider fallback is bounded to one alternate and requires a typed
+pre-prompt failure, persisted terminal evidence, zero provider/tool activity,
+confirmed cleanup or proof that no runtime resource was created, and an unchanged
+candidate. Missing or altered evidence fails closed. Selection must still meet
+the role's capability and quota policy. The new execution must preserve the
+Attempt workspace and durable handoff and record its predecessor. Semantic
+failures and unknown provider effects must not become automatic provider retries.
+
 ### Process outcomes and cleanup
 
 Verification command policy uses the observed process outcome: numeric exit,

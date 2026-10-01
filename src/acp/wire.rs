@@ -29,7 +29,7 @@ impl std::fmt::Display for StreamClosed {
 
 impl std::error::Error for StreamClosed {}
 
-/// Safe, explicit correlation metadata used only by the pinned Codex bridge.
+/// Safe, explicit correlation metadata carried by qualified runtime adapters.
 /// Values are identifiers, never tool arguments or provider payloads.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OrbitToolInvocationMeta {

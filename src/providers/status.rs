@@ -118,6 +118,50 @@ pub fn codex_rate_limits_observation(
     }
 }
 
+/// Identify the ordinary Codex meter only from the pinned native contract:
+/// an explicit `codex` limit ID in the legacy view and the matching bucket.
+/// Labels, map order, bucket counts and matching percentages confer no identity.
+/// This observation does not establish account binding or exact-model scope.
+pub fn codex_ordinary_quota_bucket_fingerprint(
+    resource: &ExecutionResourceIdentity,
+    value: &Value,
+) -> Option<String> {
+    if resource.validate().is_err()
+        || resource.runtime.agent_revision != crate::codex_bridge::CODEX_VERSION
+        || resource.runtime.adapter != "codex_bridge"
+        || resource.credential.provider != "codex"
+    {
+        return None;
+    }
+    let parsed = parse_codex_rate_limits(resource, value).ok()?;
+    let legacy = value.get("rateLimits")?.as_object()?;
+    if legacy.get("limitId").and_then(Value::as_str) != Some("codex") {
+        return None;
+    }
+    let legacy_windows = parse_windows(legacy)?;
+    let fingerprint = codex_quota_bucket_fingerprint(resource, "codex").ok()?;
+    parsed.quota_buckets.into_iter().find_map(|bucket| {
+        (bucket.provider_bucket_fingerprint == fingerprint
+            && !bucket.windows.is_empty()
+            && bucket.windows == legacy_windows)
+            .then_some(bucket.provider_bucket_fingerprint)
+    })
+}
+
+fn codex_quota_bucket_fingerprint(
+    resource: &ExecutionResourceIdentity,
+    limit_id: &str,
+) -> Result<String> {
+    Ok(format!(
+        "qb1:{}",
+        digest(&serde_json::to_vec(&(
+            "orbit.provider_quota_bucket.v1",
+            resource.credential.provider.as_str(),
+            limit_id,
+        ))?)
+    ))
+}
+
 impl AntigravityUsageCapture {
     /// Build credential-scoped quota evidence only when the complete observed
     /// bucket structure passed validation. The status itself stays UNKNOWN:
@@ -1067,17 +1111,8 @@ fn parse_codex_rate_limits(
             let label = format!("bucket.{}", digest(key.as_bytes()));
             quota_windows.extend(project_legacy_windows(&parsed, &label));
             quota_buckets.push(QuotaBucket {
-                provider_bucket_fingerprint: format!(
-                    "qb1:{}",
-                    digest(
-                        &serde_json::to_vec(&(
-                            "orbit.provider_quota_bucket.v1",
-                            resource.credential.provider.as_str(),
-                            key.as_str()
-                        ))
-                        .map_err(|_| ())?
-                    )
-                ),
+                provider_bucket_fingerprint: codex_quota_bucket_fingerprint(resource, key)
+                    .map_err(|_| ())?,
                 provider_label,
                 scope: None,
                 windows: parsed,
@@ -1097,17 +1132,8 @@ fn parse_codex_rate_limits(
             let label = format!("bucket.{}", digest(limit_id.as_bytes()));
             quota_windows = project_legacy_windows(&parsed, &label);
             quota_buckets.push(QuotaBucket {
-                provider_bucket_fingerprint: format!(
-                    "qb1:{}",
-                    digest(
-                        &serde_json::to_vec(&(
-                            "orbit.provider_quota_bucket.v1",
-                            resource.credential.provider.as_str(),
-                            limit_id
-                        ))
-                        .map_err(|_| ())?
-                    )
-                ),
+                provider_bucket_fingerprint: codex_quota_bucket_fingerprint(resource, limit_id)
+                    .map_err(|_| ())?,
                 provider_label,
                 scope: None,
                 windows: parsed,

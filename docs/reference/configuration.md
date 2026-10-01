@@ -305,11 +305,17 @@ permission approvals do not prove that Orbit executed the effect.
 | Maintained `codex-acp` 1.11.0 | Native approvals and display metadata do not replace native execution with Orbit callbacks | Compatibility reference and initialize-only probe; not Orbit's coding backend |
 | Unmodified Antigravity ACP 1.1.1 | Client files are mediated; native commands execute in the provider harness | Not eligible for brokered terminal execution |
 | Orbit Antigravity `agy_acp_server_1.1.1-orbit-terminal-v2` | Versioned overlay removes native commands and local file fallback, exposing client-terminal calls | Catalog OAuth validation and model execution are distinct; model acceptance must identify this exact pinned runtime |
+| Orbit Antigravity `agy_acp_server_1.1.1-orbit-correlated-tools-v2` | Native action IDs are preserved through brokered file and atomic shell callbacks; native tools, MCP, hooks and browser agents are disabled | EXACT correlation applies only to its declared immutable image and native adapter pair; account eligibility and complete workflow acceptance remain separate |
 | Maintained Claude ACP 0.76.0 | Native `claude_code` tool preset and inherited settings; reviewed client helpers do not establish native Read/Write/Bash mediation | No Orbit execution bridge for native Read/Write/Bash mediation |
 
 The CLI/editor workflow requires EXACT provider/tool/callback correlation when
-its policy says so. Antigravity's PARTIAL correlation cannot satisfy that
-requirement. The stdio editor service is a distinct interface over Orbit's
+its policy says so. The legacy Antigravity terminal runtime's PARTIAL correlation
+cannot satisfy that requirement. The `antigravity-acp` and
+`antigravity-correlated-acp` role preferences select the correlated image;
+`antigravity-terminal-acp` explicitly selects the legacy runtime. The current role
+catalog requests `gemini-3.7-flash-high` for the correlated runtime. ACP must
+confirm the selected model before a prompt is dispatched; an unavailable model
+fails closed. The stdio editor service is a distinct interface over Orbit's
 coordinator; protocol qualification is not actual Zed GUI acceptance.
 Use [the roadmap](../ROADMAP.md) for current acceptance gates.
 

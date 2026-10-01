@@ -460,6 +460,9 @@ pub async fn probe_cataloged_once(
     let mut snapshot = snapshot;
     apply_identity_value_comparison(&mut snapshot, receipt.account_identity_value_comparison);
     Ok(ProbeOutcome {
+        ordinary_quota_bucket_fingerprint: confirmed_ordinary_quota_bucket(
+            resource, &value, &snapshot,
+        ),
         snapshot,
         receipt,
         provider_scope_fingerprint,
@@ -488,6 +491,23 @@ pub struct ProbeOutcome {
     pub snapshot: AvailabilitySnapshot,
     pub receipt: ProbeReceipt,
     pub provider_scope_fingerprint: Option<String>,
+    /// Fresh account-bound ordinary meter identity; never an exact-model quota claim.
+    /// Historical catalog snapshots and display fallback labels are not reinterpreted.
+    pub ordinary_quota_bucket_fingerprint: Option<String>,
+}
+
+fn confirmed_ordinary_quota_bucket(
+    resource: &ExecutionResourceIdentity,
+    value: &Value,
+    snapshot: &AvailabilitySnapshot,
+) -> Option<String> {
+    let evidence = snapshot.provider_status_observation.as_ref()?;
+    if evidence.quota_promotion != QuotaEvidencePromotion::Promoted
+        || evidence.ordinary_usage_allowed != Some(true)
+    {
+        return None;
+    }
+    crate::provider_status::codex_ordinary_quota_bucket_fingerprint(resource, value)
 }
 
 /// Only the expected-ID path or a previously confirmed fingerprint can
@@ -1006,6 +1026,9 @@ pub async fn probe_once(
     let mut snapshot = snapshot;
     apply_identity_value_comparison(&mut snapshot, receipt.account_identity_value_comparison);
     Ok(ProbeOutcome {
+        ordinary_quota_bucket_fingerprint: confirmed_ordinary_quota_bucket(
+            resource, &value, &snapshot,
+        ),
         snapshot,
         receipt,
         provider_scope_fingerprint,
@@ -1389,6 +1412,72 @@ mod tests {
             model: "fixture-model".into(),
             reasoning_effort: None,
         }
+    }
+
+    #[test]
+    fn ordinary_meter_is_withheld_until_account_and_usage_are_confirmed() -> Result<()> {
+        let mut resource = resource();
+        resource.credential.provider = "codex".into();
+        let value = json!({"accountId":"fixture-account", "ordinaryUsageAllowed":true,
+            "rateLimits":{"limitId":"codex","primary":{"usedPercent":12,"windowDurationMins":300,"resetsAt":100}},
+            "rateLimitsByLimitId":{"codex":{"limitId":"codex","primary":{"usedPercent":12,"windowDurationMins":300,"resetsAt":100}}}});
+        let (mut snapshot, _, _) = normalize_observation(
+            &resource,
+            ProbeBinding::ExpectedAccountId("fixture-account"),
+            &value,
+            10,
+            20,
+        )?;
+        assert_eq!(
+            super::confirmed_ordinary_quota_bucket(&resource, &value, &snapshot),
+            None
+        );
+        apply_identity_value_comparison(
+            &mut snapshot,
+            crate::availability::ProviderIdentityValueComparison::ExactValueMatch,
+        );
+        assert!(super::confirmed_ordinary_quota_bucket(&resource, &value, &snapshot).is_some());
+        for comparison in [
+            crate::availability::ProviderIdentityValueComparison::NotComparable,
+            crate::availability::ProviderIdentityValueComparison::ExactValueMismatch,
+        ] {
+            let mut unconfirmed = snapshot.clone();
+            apply_identity_value_comparison(&mut unconfirmed, comparison);
+            assert_eq!(
+                super::confirmed_ordinary_quota_bucket(&resource, &value, &unconfirmed),
+                None
+            );
+        }
+        for allowed in [json!(null), json!(false)] {
+            let mut changed = value.clone();
+            changed["ordinaryUsageAllowed"] = allowed;
+            let (mut restricted, _, _) = normalize_observation(
+                &resource,
+                ProbeBinding::ExpectedAccountId("fixture-account"),
+                &changed,
+                10,
+                20,
+            )?;
+            apply_identity_value_comparison(
+                &mut restricted,
+                crate::availability::ProviderIdentityValueComparison::ExactValueMatch,
+            );
+            assert_eq!(
+                super::confirmed_ordinary_quota_bucket(&resource, &changed, &restricted),
+                None
+            );
+        }
+        let (mut enrolled, _, _) =
+            normalize_observation(&resource, ProbeBinding::Enroll, &value, 10, 20)?;
+        apply_identity_value_comparison(
+            &mut enrolled,
+            crate::availability::ProviderIdentityValueComparison::ExactValueMatch,
+        );
+        assert_eq!(
+            super::confirmed_ordinary_quota_bucket(&resource, &value, &enrolled),
+            None
+        );
+        Ok(())
     }
 
     #[test]

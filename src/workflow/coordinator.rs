@@ -191,6 +191,7 @@ use live_role_execution::*;
 /// Production Workflow Coordinator driving workflow runs to completion.
 pub struct WorkflowCoordinator {
     pool: PgPool,
+    credential_catalog_pool: PgPool,
     store: WorkflowStore,
     verification_store: VerificationStore,
     regression_store: RegressionStore,
@@ -206,6 +207,7 @@ impl WorkflowCoordinator {
         let verification_store = VerificationStore::new(pool.clone());
         let regression_store = RegressionStore::new(pool.clone());
         Self {
+            credential_catalog_pool: pool.clone(),
             pool,
             store,
             verification_store,
@@ -215,6 +217,15 @@ impl WorkflowCoordinator {
             quota_selection_policy: RuntimeQuotaSelectionPolicy::default(),
             verification_environment: None,
         }
+    }
+
+    /// Select accounts from an explicitly supplied catalog while workflow
+    /// effects and evidence remain in this coordinator's control plane.
+    #[cfg(feature = "fault-injection")]
+    #[doc(hidden)]
+    pub fn with_credential_catalog(mut self, pool: PgPool) -> Self {
+        self.credential_catalog_pool = pool;
+        self
     }
 
     pub fn with_quota_selection_policy(
@@ -254,6 +265,128 @@ impl WorkflowCoordinator {
         &self.pool
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_role_with_operational_fallback(
+        &self,
+        workflow: &WorkflowRun,
+        role_execution: &RoleExecution,
+        role: &RoleDefinition,
+        target: &ResolvedExecutionTarget,
+        task_text: &str,
+        repository: &Path,
+        input_handoff: Option<&HandoffArtifact>,
+        cancellation: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<RoleExecutionOutcome> {
+        let initial_state = compute_workspace_state(
+            repository,
+            workflow.base_revision.as_deref().unwrap_or("HEAD"),
+        )
+        .await?;
+        let first = self
+            .executor
+            .execute_role(
+                &self.pool,
+                workflow,
+                role_execution,
+                role,
+                target,
+                task_text,
+                repository,
+                input_handoff,
+                cancellation.clone(),
+            )
+            .await;
+        let error = match first {
+            Ok(outcome) => return Ok(outcome),
+            Err(error) => error,
+        };
+        let Some(failure) = error.downcast_ref::<live_role_execution::RoleOperationalFailure>()
+        else {
+            return Err(error);
+        };
+        if *cancellation.borrow() {
+            return Err(error);
+        }
+        let current_role = self
+            .store
+            .get_role_execution(&role_execution.id)
+            .await?
+            .context("fallback role missing")?;
+        ensure!(
+            current_role.status == RoleExecutionStatus::Running
+                && current_role.agent_execution_ids.last() == Some(&failure.agent_execution_id),
+            "FALLBACK_EXECUTION_OWNER_MISMATCH"
+        );
+        let evidence: Option<(String, Option<String>, i64, i64, serde_json::Value)> = sqlx::query_as(
+            "SELECT status, provider, turn_count, tool_call_count, metadata FROM orbit_agent_executions WHERE id = $1 AND role_execution_id = $2",
+        ).bind(&failure.agent_execution_id).bind(&role_execution.id).fetch_optional(&self.pool).await?;
+        let Some((status, provider, turns, calls, metadata)) = evidence else {
+            return Err(UnconfirmedRoleCleanup("FALLBACK_EVIDENCE_UNCONFIRMED".into()).into());
+        };
+        if status != "FAILED"
+            || provider.as_deref() != Some(target.provider.as_str())
+            || turns != 0
+            || calls != 0
+            || !live_role_execution::safe_operational_failure(&metadata)
+        {
+            return Err(UnconfirmedRoleCleanup("FALLBACK_EVIDENCE_UNCONFIRMED".into()).into());
+        }
+        ensure!(
+            compute_workspace_state(
+                repository,
+                workflow.base_revision.as_deref().unwrap_or("HEAD")
+            )
+            .await?
+                == initial_state,
+            "WORKSPACE_MUTATION_VIOLATION: pre-prompt fallback candidate changed"
+        );
+        let candidates = RoleRuntimeResolver::resolve_ranked_targets_live(
+            &self.credential_catalog_pool,
+            role,
+            None,
+            self.quota_selection_policy,
+        )
+        .await?;
+        let Some(mut alternate) = candidates
+            .into_iter()
+            .find(|candidate| candidate.provider != target.provider)
+        else {
+            return Err(error);
+        };
+        alternate.resolution_reason.push_str(&format!(
+            "; operational_fallback_from={}; workspace_state={}",
+            failure.agent_execution_id, initial_state.state_id
+        ));
+        self.store
+            .set_role_execution_resolved(&role_execution.id, &alternate)
+            .await?;
+        let continuing_role = self
+            .store
+            .get_role_execution(&role_execution.id)
+            .await?
+            .context("fallback role missing")?;
+        // One alternate only. Semantic outcomes and uncertain provider effects
+        // never enter this path, and an alternate failure cannot recurse.
+        let mut outcome = self
+            .executor
+            .execute_role(
+                &self.pool,
+                workflow,
+                &continuing_role,
+                role,
+                &alternate,
+                task_text,
+                repository,
+                input_handoff,
+                cancellation,
+            )
+            .await?;
+        outcome
+            .agent_execution_ids
+            .insert(0, failure.agent_execution_id.clone());
+        Ok(outcome)
+    }
+
     /// Advance the workflow run by one state transition.
     pub async fn step(&self, wf_id: &str) -> Result<WorkflowStepResult> {
         let mut claim = self.store.claim_workflow_step(wf_id).await?;
@@ -274,6 +407,7 @@ impl WorkflowCoordinator {
         };
         let owned = Self {
             pool: self.pool.clone(),
+            credential_catalog_pool: self.credential_catalog_pool.clone(),
             store: self.store.with_step_claim(claim.clone()),
             verification_store: VerificationStore::new(self.pool.clone()),
             regression_store: RegressionStore::new(self.pool.clone()),
@@ -373,7 +507,7 @@ impl WorkflowCoordinator {
             WorkflowStage::Planning => {
                 let role = RoleDefinition::planner_v1();
                 let target = RoleRuntimeResolver::resolve_target_live_with_policy(
-                    &self.pool,
+                    &self.credential_catalog_pool,
                     &role,
                     None,
                     self.quota_selection_policy,
@@ -397,9 +531,7 @@ impl WorkflowCoordinator {
                     .await?;
 
                 let outcome = self
-                    .executor
-                    .execute_role(
-                        &self.pool,
+                    .execute_role_with_operational_fallback(
                         &wf,
                         &role_exec,
                         &role,
@@ -546,7 +678,7 @@ impl WorkflowCoordinator {
             WorkflowStage::Implementing => {
                 let role = RoleDefinition::implementer_v1();
                 let target = RoleRuntimeResolver::resolve_target_live_with_policy(
-                    &self.pool,
+                    &self.credential_catalog_pool,
                     &role,
                     None,
                     self.quota_selection_policy,
@@ -583,9 +715,7 @@ impl WorkflowCoordinator {
                     .await?;
 
                 let outcome = self
-                    .executor
-                    .execute_role(
-                        &self.pool,
+                    .execute_role_with_operational_fallback(
                         &wf,
                         &role_exec,
                         &role,
@@ -893,7 +1023,7 @@ impl WorkflowCoordinator {
 
                 let role = RoleDefinition::implementer_v1();
                 let target = RoleRuntimeResolver::resolve_target_live_with_policy(
-                    &self.pool,
+                    &self.credential_catalog_pool,
                     &role,
                     None,
                     self.quota_selection_policy,
@@ -935,9 +1065,7 @@ impl WorkflowCoordinator {
                     .await?;
 
                 let outcome = self
-                    .executor
-                    .execute_role(
-                        &self.pool,
+                    .execute_role_with_operational_fallback(
                         &wf,
                         &role_exec,
                         &role,
@@ -1134,7 +1262,7 @@ impl WorkflowCoordinator {
                 }
                 let role = RoleDefinition::reviewer_v1();
                 let target = RoleRuntimeResolver::resolve_target_live_with_policy(
-                    &self.pool,
+                    &self.credential_catalog_pool,
                     &role,
                     None,
                     self.quota_selection_policy,
@@ -1163,9 +1291,7 @@ impl WorkflowCoordinator {
                     .await?;
 
                 let outcome = self
-                    .executor
-                    .execute_role(
-                        &self.pool,
+                    .execute_role_with_operational_fallback(
                         &wf,
                         &role_exec,
                         &role,

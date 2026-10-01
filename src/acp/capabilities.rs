@@ -45,6 +45,9 @@ pub enum ToolAuditCorrelationCapability {
 }
 
 pub const ANTIGRAVITY_ACP_ADAPTER_REVISION: &str = "agy_acp_server_1.1.1";
+pub const ANTIGRAVITY_CORRELATED_IMAGE_DIGEST: &str =
+    "sha256:3fdbfa55a3b1da1a4f5a849f6aef52c681186d67116eb93770ae4b492008c2c1";
+pub const ANTIGRAVITY_CORRELATED_IMAGE: &str = "localhost/orbit-antigravity-runtime:agy_acp_server_1.1.1-orbit-correlated-tools-v2@sha256:3fdbfa55a3b1da1a4f5a849f6aef52c681186d67116eb93770ae4b492008c2c1";
 
 impl ToolAuditCorrelationCapability {
     pub fn satisfies(self, required: Self) -> bool {
@@ -72,6 +75,9 @@ pub fn qualified_tool_audit_correlation(
             "sha256:5e2441ec351e6dc1ce2100111d0e56a08199b4c9d419150fbd236786a1895895",
             "orbit-codex-acp-bridge-v2",
         ) => ToolAuditCorrelationCapability::Exact,
+        (ANTIGRAVITY_CORRELATED_IMAGE_DIGEST, ANTIGRAVITY_ACP_ADAPTER_REVISION) => {
+            ToolAuditCorrelationCapability::Exact
+        }
         (
             "sha256:3e7415f6f732ae4168b98a6fb0e14e0fba965020cf5cc1fc5a3b35867b4cf830",
             "agy_acp_server_1.1.1",

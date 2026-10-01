@@ -66,6 +66,34 @@ service. PostgreSQL owns accepted plans, reservations, receipts, session records
 and artifacts. Provider computation is externally uncertain, never implicitly
 exactly-once. Each real agent needs independent mediation and account evidence.
 
+### Native action correlation
+
+Authoritative roles require an independently qualified image and adapter pair.
+The correlated Antigravity overlay preserves the native harness action ID at
+dispatch and binds it to a fresh Orbit invocation. A task-local context carries
+that binding to the callback envelope and native result. Names, counts, timing
+and FIFO permission frames never establish identity.
+
+Brokered file actions use client callbacks. A shell action uses one atomic
+`orbit/shell` callback that returns a bounded exit code and output after cleanup.
+Native tools, browser agents, MCP servers and ambient hooks are disabled in this
+overlay. The original terminal overlay retains PARTIAL correlation and cannot
+satisfy an EXACT role requirement. New image or adapter identities remain UNKNOWN
+until separately qualified.
+
+### Operational continuation
+
+The coordinator permits at most one alternate provider after a typed operational
+failure before prompt dispatch. It rechecks the failed execution's persisted
+terminal evidence, cleanup, role ownership and unchanged workspace, then uses
+the normal capability and quota resolver to choose a different provider.
+
+Continuation retains the Task, Attempt, workspace and role. It starts a new
+AgentExecution linked to the failed execution, the existing durable input handoff
+and the exact workspace identity. Provider sessions are newly created.
+Reviewer changes, failed tests, implementation errors and unresolved provider
+effects remain workflow outcomes; they do not trigger this continuation.
+
 ```text
 Authenticated API → Engine operations → PostgreSQL accepted state
                           |
@@ -196,8 +224,17 @@ exactly to milliseconds. `exhausted` remains absent unless reported.
 
 For confirmed scope, `ordinaryUsageAllowed=true` permits credential-wide READY;
 `false` means LIMITED, not exact-model quota exhaustion. Missing permission or
-unconfirmed scope remains UNKNOWN. The configured Luna target uses the `default`
-bucket; `gpt-reserve` does not determine its admission.
+unconfirmed scope remains UNKNOWN. Reserve quota does not establish ordinary
+usage headroom.
+
+The displayed `default` label is an Orbit fallback for an unlabeled bucket and
+cannot establish meter identity. A fresh guarded probe can identify the ordinary
+meter when the native legacy view explicitly reports `limitId=codex`, the
+normalized bucket has that fingerprint, and its windows match the legacy view.
+This follows the [pinned provider meter selection](https://github.com/openai/codex/blob/rust-v0.156.0/codex-rs/app-server/src/request_processors/account_processor.rs).
+The probe exposes this fingerprint only after account identity and ordinary usage
+permission are confirmed. It neither assigns exact-model scope nor reinterprets
+historical snapshots. Absent or conflicting identity remains UNKNOWN.
 
 ### Antigravity
 

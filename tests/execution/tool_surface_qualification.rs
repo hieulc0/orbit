@@ -419,6 +419,140 @@ async fn resolve_live_target(
 }
 
 #[cfg(feature = "fault-injection")]
+async fn guard_live_codex_quota(catalog: &PgPool) -> Result<()> {
+    use orbit::codex_status_probe as probe;
+    let credential = orbit::credential_registry::CredentialStore::new(catalog)
+        .get("codex-main")
+        .await?
+        .context("Codex qualification credential missing")?;
+    let binding = orbit::provider_scope::BindingStore::new(catalog)
+        .inspect(&credential.identity())
+        .await?
+        .context("Codex provider scope missing")?;
+    ensure!(
+        binding.state == orbit::provider_scope::BindingState::Confirmed,
+        "live Codex scope is not confirmed"
+    );
+    let backend = orbit::secret_backend::LocalPrivateSecretBackend::default_for_operator()?;
+    let (runtime, resource) = probe::cataloged_codex_runtime(&credential)?;
+    let control = probe::private_control_tempdir()?;
+    let outcome = probe::probe_cataloged_once(
+        probe::CatalogCredentialSource {
+            pool: catalog,
+            backend: &backend,
+            reference: &credential.reference,
+        },
+        &runtime,
+        &resource,
+        probe::ProbeBinding::ConfirmedFingerprint(&binding.fingerprint),
+        control.path(),
+        Duration::from_secs(60),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("live Codex quota probe failed"))?;
+    ensure!(
+        outcome.receipt.cleanup_confirmed
+            && outcome.receipt.authenticated_account_present
+            && outcome.receipt.correlated_status_response
+            && !outcome.receipt.model_turn_started
+            && !outcome.receipt.model_thread_created,
+        "live Codex quota receipt incomplete"
+    );
+    let now = orbit::verification::now_millis();
+    ensure!(
+        outcome.snapshot.observed_at_ms <= now && now < outcome.snapshot.expires_at_ms,
+        "live Codex quota is stale"
+    );
+    let ordinary_bucket = outcome
+        .ordinary_quota_bucket_fingerprint
+        .context("live Codex ordinary quota bucket identity is unknown")?;
+    let windows = outcome
+        .snapshot
+        .quota_buckets
+        .iter()
+        .filter(|bucket| {
+            bucket.scope.is_none() && bucket.provider_bucket_fingerprint == ordinary_bucket
+        })
+        .flat_map(|bucket| bucket.windows.iter())
+        .collect::<Vec<_>>();
+    let remaining = |duration| {
+        windows
+            .iter()
+            .filter(|window| {
+                window.duration_minutes == Some(duration)
+                    && window.resets_at_ms.is_some_and(|reset| reset > now)
+            })
+            .filter_map(|window| {
+                window
+                    .remaining_percent
+                    .or_else(|| window.remaining_fraction.map(|fraction| fraction * 100.0))
+                    .or_else(|| window.used_percent.map(|used| 100.0 - used))
+            })
+            .reduce(f64::min)
+    };
+    let short = remaining(300).context("live Codex 5h quota is unknown")?;
+    let weekly = remaining(10080).context("live Codex weekly quota is unknown")?;
+    ensure!(
+        short >= 15.0 && weekly >= 5.0,
+        "LIVE_CODEX_QUOTA_GUARD: 5h={short:.1}%, weekly={weekly:.1}%; minimum=15%/5%"
+    );
+    eprintln!(
+        "LIVE_CODEX_QUOTA_GUARD: native ordinary meter, confirmed account; 5h={short:.1}%, weekly={weekly:.1}%; minimum=15%/5%"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "fault-injection")]
+struct LiveCatalogRoleExecutor {
+    catalog: PgPool,
+    injected: std::sync::Mutex<std::collections::BTreeSet<String>>,
+}
+
+#[cfg(feature = "fault-injection")]
+#[async_trait::async_trait]
+impl RoleAgentExecutor for LiveCatalogRoleExecutor {
+    async fn execute_role(
+        &self,
+        pool: &PgPool,
+        workflow: &WorkflowRun,
+        execution: &RoleExecution,
+        role: &RoleDefinition,
+        target: &ResolvedExecutionTarget,
+        task: &str,
+        repository: &Path,
+        handoff: Option<&HandoffArtifact>,
+        cancellation: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<RoleExecutionOutcome> {
+        let inject = matches!(
+            (role.role_id.as_str(), target.provider.as_str()),
+            ("planner", "codex") | ("reviewer", "antigravity")
+        ) && self.injected.lock().unwrap().insert(role.role_id.clone());
+        if inject {
+            return RealAcpRoleExecutor
+                .simulate_pre_prompt_runtime_failure(pool, execution, target)
+                .await;
+        }
+        if target.provider == "codex" {
+            guard_live_codex_quota(&self.catalog).await?;
+        }
+        RealAcpRoleExecutor
+            .execute_role_with_credential_catalog(
+                pool,
+                &self.catalog,
+                workflow,
+                execution,
+                role,
+                target,
+                task,
+                repository,
+                handoff,
+                cancellation,
+            )
+            .await
+    }
+}
+
+#[cfg(feature = "fault-injection")]
 fn sanitized_live_selection_summary(target: &ResolvedExecutionTarget) -> serde_json::Value {
     let fields: BTreeMap<&str, &str> = target
         .resolution_reason
@@ -3397,6 +3531,32 @@ async fn real_codex_coding_fixture() -> Result<()> {
 #[ignore = "requires explicit live-provider opt-in and a private control-plane URL file"]
 #[cfg(feature = "fault-injection")]
 async fn real_antigravity_review_fixture() -> Result<()> {
+    run_antigravity_role_fixture(false, "reviewer").await
+}
+
+#[tokio::test]
+#[ignore = "requires explicit live-provider opt-in; candidate remains unqualified"]
+#[cfg(feature = "fault-injection")]
+async fn real_antigravity_correlated_review_fixture() -> Result<()> {
+    run_antigravity_role_fixture(true, "reviewer").await
+}
+
+#[tokio::test]
+#[ignore = "requires explicit live-provider opt-in; candidate remains unqualified"]
+#[cfg(feature = "fault-injection")]
+async fn real_antigravity_correlated_planner_fixture() -> Result<()> {
+    run_antigravity_role_fixture(true, "planner").await
+}
+
+#[tokio::test]
+#[ignore = "requires explicit live-provider opt-in, rootless Podman and Linux user namespaces"]
+#[cfg(feature = "fault-injection")]
+async fn real_antigravity_correlated_implementer_fixture() -> Result<()> {
+    run_antigravity_role_fixture(true, "implementer").await
+}
+
+#[cfg(feature = "fault-injection")]
+async fn run_antigravity_role_fixture(correlated_candidate: bool, role_id: &str) -> Result<()> {
     let credential_catalog_pool = explicitly_authorized_live_credential_catalog().await?;
     let ctx = match setup_test().await {
         Ok(ctx) => ctx,
@@ -3420,6 +3580,8 @@ async fn real_antigravity_review_fixture() -> Result<()> {
         init_git_repo(p)?;
 
         fs::write(p.join("src.rs"), "fn original() {}\n")?;
+        fs::write(p.join("README.md"), "# Synthetic arithmetic fixture\n")?;
+        fs::write(p.join("test.sh"), "#!/bin/sh\nset -eu\nrustc --test src.rs -o /tmp/arithmetic-tests\n/tmp/arithmetic-tests\n")?;
         std::process::Command::new("git")
             .args(["add", "."])
             .current_dir(p)
@@ -3429,10 +3591,9 @@ async fn real_antigravity_review_fixture() -> Result<()> {
             .current_dir(p)
             .output()?;
 
-        fs::write(
-            p.join("src.rs"),
-            "fn original() {}\npub fn multiply(a: i32, b: i32) -> i32 {\n    a * b\n}\n",
-        )?;
+        if role_id == "reviewer" {
+            fs::write(p.join("src.rs"), "fn original() {}\npub fn multiply(a: i32, b: i32) -> i32 {\n    a * b\n}\n")?;
+        }
 
         let candidate_repository_path = p.canonicalize()?.to_string_lossy().into_owned();
         let attempt_id = format!("att-{}", id());
@@ -3460,18 +3621,53 @@ async fn real_antigravity_review_fixture() -> Result<()> {
             "Antigravity fixture workflow is not bound to its temporary repository"
         );
 
-        let role = RoleDefinition::reviewer_v1();
-        let target =
-            resolve_live_target(&credential_catalog_pool, &role, "antigravity", None).await?;
+        let role = match role_id {
+            "planner" => RoleDefinition::planner_v1(),
+            "implementer" => RoleDefinition::implementer_v1(),
+            "reviewer" => RoleDefinition::reviewer_v1(),
+            _ => anyhow::bail!("unsupported fixture role"),
+        };
+        if role_id == "implementer" {
+            ctx.store.pin_execution_profile(&wf.id, &orbit::execution::local::RoleExecutionProfile::DevLocal { bubblewrap: PathBuf::from("/usr/bin/bwrap") }).await?;
+        }
+        let mut selection_role = role.clone();
+        if correlated_candidate {
+            // Credential/quota selection uses the established runtime catalog.
+            // Only this explicitly opted-in disposable fixture admits the
+            // candidate image to collect evidence before capability promotion.
+            selection_role.allowed_capabilities.required_tool_audit_correlation =
+                Some(orbit::acp_capabilities::ToolAuditCorrelationCapability::Partial);
+        }
+        let mut target = resolve_live_target(&credential_catalog_pool, &selection_role, "antigravity", None).await?;
+        if correlated_candidate {
+            target.runtime_interface = "antigravity-correlated-candidate".into();
+            target.runtime_image_digest = Some(orbit::acp_capabilities::ANTIGRAVITY_CORRELATED_IMAGE.into());
+            target.resolution_reason.push_str("; qualification_candidate=UNQUALIFIED");
+            // Exact qualification intent from the preceding session discovery.
+            // This does not promote the normal runtime catalog.
+            target.requested_model = Some("gemini-3.7-flash-high".into());
+            target.resolved_model = Some("gemini-3.7-flash-high".into());
+        }
         println!(
             "B3.4 live role selection: {}",
             serde_json::to_string(&sanitized_live_selection_summary(&target))?
         );
         let role_exec = ctx
             .store
-            .create_role_execution(&wf.id, &role, "REVIEWING", 0, None, None)
+            .create_role_execution(&wf.id, &role, &role_id.to_ascii_uppercase(), 0, None, None)
             .await?;
         audit_role_execution_id = Some(role_exec.id.clone());
+        ctx.store.set_role_execution_resolved(&role_exec.id, &target).await?;
+        let role_exec = ctx.store.get_role_execution(&role_exec.id).await?.context("fixture role missing")?;
+        if role_id == "implementer" {
+            ctx.store.acquire_workspace_mutation_lock(&attempt_id, &role_exec.id).await?;
+        }
+
+        let task = match role_id {
+            "planner" => "Read src.rs using the advertised read callback and plan addition of a multiply function. Produce the plan handoff.",
+            "implementer" => "Read src.rs using the advertised read callback. Add public multiply(a:i32,b:i32)->i32 using a*b, add a unit test asserting multiply(3,4)==12, and document multiply in README.md using the advertised mutation callbacks. Run exactly one orbit_terminal command `test ! -e /home/hieulc/.orbit/private && printf sandbox-ready` to check the confined terminal. Do not modify test.sh. Produce the implementation handoff.",
+            _ => "Review the newly added multiply function in src.rs. Read src.rs using the advertised read callback before producing the review handoff.",
+        };
 
         let outcome = RealAcpRoleExecutor
             .execute_role_with_credential_catalog(
@@ -3481,7 +3677,7 @@ async fn real_antigravity_review_fixture() -> Result<()> {
                 &role_exec,
                 &role,
                 &target,
-                "Review the newly added multiply function in src.rs",
+                task,
                 p,
                 None,
                 tokio::sync::watch::channel(false).1,
@@ -3502,7 +3698,37 @@ async fn real_antigravity_review_fixture() -> Result<()> {
             .store
             .check_workspace_mutation_lock(&attempt_id, &role_exec.id)
             .await?;
-        ensure!(!lock_held, "reviewer unexpectedly held a mutation lock");
+        ensure!(lock_held == (role_id == "implementer"), "fixture mutation ownership differs from role authority");
+
+        let payload: serde_json::Value = match role_id {
+            "planner" => serde_json::to_value(extract_structured_envelope::<PlanHandoff>(&outcome.raw_output, "plan")?)?,
+            "implementer" => serde_json::to_value(extract_structured_envelope::<ImplementationHandoff>(&outcome.raw_output, "implementation")?)?,
+            _ => serde_json::to_value(extract_structured_envelope::<ReviewDecision>(&outcome.raw_output, "review")?)?,
+        };
+        let workspace = compute_workspace_state(p, "HEAD").await?;
+        let handoff_type = match role_id { "planner" => HandoffType::Plan, "implementer" => HandoffType::Implementation, _ => HandoffType::Review };
+        let handoff = ctx.store.save_handoff_artifact(&wf.id, Some(&role_exec.id), handoff_type, Some(&workspace.state_id), payload).await?;
+        ensure!(ctx.store.get_handoff_artifact(&handoff.id).await?.context("handoff missing")?.workspace_state_id.as_deref() == Some(&workspace.state_id), "handoff lost candidate binding");
+
+        if correlated_candidate {
+            let execution_id = outcome.agent_execution_ids.first().context("missing agent execution")?;
+            let (status, calls, successes, failures, counts, metadata) = load_agent_tool_audit(&ctx.engine.pool, execution_id).await?;
+            ensure!(status == "SUCCEEDED" && calls > 0 && successes == calls && failures == 0, "candidate has unsuccessful or absent tool evidence");
+            ensure!(b34_audit_has_exact_correlations(&metadata["tool_call_audit"], usize::try_from(calls)?), "candidate correlation evidence is incomplete or ambiguous");
+            ensure!(metadata["observed_model"].as_str() == target.resolved_model.as_deref(), "selected model was not reported by runtime");
+            ensure!(metadata["cleanup_confirmed"] == true, "candidate cleanup was not confirmed");
+            if role_id == "implementer" {
+                ensure!(counts["terminal.create"] == 1, "candidate did not exercise one atomic terminal callback");
+                ensure!(counts["fs.write_text_file"].as_i64().unwrap_or(0) >= 2, "candidate did not exercise file mutation callbacks");
+                ensure!(fs::read_to_string(p.join("src.rs"))?.contains("pub fn multiply"), "candidate source missing");
+                use orbit::verification::{EnvironmentIdentity, VerificationPlan, VerificationStep, VerificationStore, VerificationRunResult, execute_verification_plan};
+                let verification = execute_verification_plan(&VerificationStore::new(ctx.engine.pool.clone()), &attempt_id, &workspace,
+                    &VerificationPlan::new("arithmetic", "Arithmetic candidate", vec![VerificationStep::new_command("arithmetic", "Rust arithmetic tests", vec!["sh".into(), "test.sh".into()])]), p,
+                    EnvironmentIdentity { execution_profile:"sandboxed-container".into(), isolation:"rootless-podman".into(), oci_runtime:Some("podman".into()), runtime_image:Some("localhost/orbit-s9-verification@sha256:73fa989caa01cba6c284e53005aefd3f40a6be85f0f6a1612a7360b8e6342692".into()), runtime_image_digest:Some("sha256:8326e0c4dcd2dec8101272e317856a4608d8fb4c42ced2f8ab71e3068b96b047".into()), ..Default::default() }, None).await?;
+                ensure!(verification.overall_result == Some(VerificationRunResult::Passed) && verification.workspace_state_id == workspace.state_id, "candidate authoritative verification failed or lost state binding: result={:?}, steps={:?}", verification.overall_result, verification.step_runs);
+                ctx.store.release_workspace_mutation_lock(&attempt_id, &role_exec.id).await?;
+            }
+        }
 
         ensure_disposable_schema_has_no_credentials(&ctx.engine.pool).await?;
         Ok(())
@@ -3511,4 +3737,88 @@ async fn real_antigravity_review_fixture() -> Result<()> {
 
     print_live_fixture_audit(&ctx.engine.pool, audit_role_execution_id.as_deref()).await;
     finish_live_fixture(credential_catalog_pool, ctx, fixture_result).await
+}
+
+#[tokio::test]
+#[ignore = "requires explicit live-provider opt-in, guarded quota, rootless Podman and namespaces"]
+#[cfg(feature = "fault-injection")]
+async fn real_mixed_provider_workflow_and_operational_fallback() -> Result<()> {
+    use orbit::{
+        regression_strategy::{SelectionPolicy, VerificationCheck, VerificationTier},
+        verification::{EnvironmentIdentity, VerificationPolicy, VerificationRunResult},
+    };
+    let catalog = explicitly_authorized_live_credential_catalog().await?;
+    // Refuse before creating a workflow if there is no fresh, scoped headroom.
+    if let Err(error) = guard_live_codex_quota(&catalog).await {
+        catalog.close().await;
+        return Err(error);
+    }
+    let ctx = match setup_test().await {
+        Ok(ctx) => ctx,
+        Err(error) => {
+            catalog.close().await;
+            return Err(error);
+        }
+    };
+    let result = async {
+        ensure_live_catalog_is_separate(&catalog, &ctx.engine.pool, &ctx.database.schema).await?;
+        ensure_disposable_schema_has_no_credentials(&ctx.engine.pool).await?;
+        let repo = common::TemporaryGitRepo::create()?;
+        fs::write(repo.path().join("src.rs"), "fn original() {}\n")?;
+        fs::write(repo.path().join("test.sh"), "#!/bin/sh\nset -eu\nrustc --test src.rs -o /tmp/arithmetic-tests\n/tmp/arithmetic-tests\n")?;
+        let git = std::process::Command::new("git").args(["add", "."]).current_dir(repo.path()).output()?;
+        ensure!(git.status.success(), "synthetic fixture staging failed");
+        let git = std::process::Command::new("git").args(["commit", "-m", "synthetic arithmetic baseline"]).current_dir(repo.path()).output()?;
+        ensure!(git.status.success(), "synthetic fixture commit failed");
+        let mut policy = VerificationPolicy::new("arithmetic", "Arithmetic candidate");
+        policy.required_steps = vec!["arithmetic".into()];
+        let mut selection = SelectionPolicy::new("arithmetic", "Arithmetic candidate");
+        selection.canonical_digest = true;
+        selection.checks.push(VerificationCheck::new_command("arithmetic", "Arithmetic Rust tests", vec![VerificationTier::Fast, VerificationTier::Standard, VerificationTier::Full], vec!["sh".into(), "test.sh".into()]));
+        ctx.store.verification_store().save_policy(&policy).await?;
+        orbit::regression_strategy::RegressionStore::new(ctx.engine.pool.clone()).insert_selection_policy(&selection).await?;
+        let task = "Inspect src.rs, add public multiply(a:i32,b:i32)->i32 using a*b and a unit test multiply(3,4)==12, and document multiply in README.md. Keep test.sh unchanged. Use advertised read and mutation callbacks. Each role must read src.rs. Produce structured role handoffs. This is a synthetic arithmetic qualification repository.";
+        let workflow = ctx.store.create_workflow_run_full("arithmetic", &format!("attempt-{}", id()), 1, Some(&policy), None, Some(&selection), Some(task), repo.path().to_str(), Some("HEAD")).await?;
+        let executor = std::sync::Arc::new(LiveCatalogRoleExecutor {catalog:catalog.clone(),injected:std::sync::Mutex::new(Default::default())});
+        let coordinator = WorkflowCoordinator::new(ctx.engine.pool.clone(), executor).with_credential_catalog(catalog.clone()).with_verification_environment(EnvironmentIdentity {
+            execution_profile:"sandboxed-container".into(),isolation:"rootless-podman".into(),oci_runtime:Some("podman".into()),runtime_image:Some("localhost/orbit-s9-verification@sha256:73fa989caa01cba6c284e53005aefd3f40a6be85f0f6a1612a7360b8e6342692".into()),runtime_image_digest:Some("sha256:8326e0c4dcd2dec8101272e317856a4608d8fb4c42ced2f8ab71e3068b96b047".into()),..Default::default()
+        })?;
+        for _ in 0..12 {
+            let step = coordinator.step(&workflow.id).await?;
+            if matches!(step, WorkflowStepResult::Terminal(_)) { break; }
+        }
+        let workflow = ctx.store.get_workflow_run(&workflow.id).await?.context("workflow missing")?;
+        let roles = ctx.store.list_role_executions(&workflow.id).await?;
+        for role in &roles { print_live_fixture_audit(&ctx.engine.pool, Some(&role.id)).await; }
+        ensure!(workflow.status == WorkflowStage::Completed, "mixed workflow did not complete: {:?}", workflow.status);
+        let mut successful_providers = std::collections::BTreeSet::new();
+        let mut directions = std::collections::BTreeSet::new();
+        for role in roles {
+            ensure!(role.status == RoleExecutionStatus::Succeeded, "mixed role failed");
+            let mut previous = None;
+            for execution_id in &role.agent_execution_ids {
+                let (status,calls,successes,failures,_,metadata) = load_agent_tool_audit(&ctx.engine.pool, execution_id).await?;
+                let provider: String = sqlx::query_scalar("SELECT provider FROM orbit_agent_executions WHERE id=$1").bind(execution_id).fetch_one(&ctx.engine.pool).await?;
+                if status == "FAILED" {
+                    ensure!(metadata["fault_injection"]["boundary"] == "before_runtime_preparation" && metadata["lifecycle"]["prompt_uncertainty"] == "NOT_DISPATCHED" && calls == 0, "injected operational failure evidence incomplete");
+                    previous = Some((provider,execution_id));
+                } else {
+                    ensure!(calls > 0 && successes == calls && failures == 0 && b34_audit_has_exact_correlations(&metadata["tool_call_audit"], usize::try_from(calls)?) && metadata["cleanup_confirmed"] == true, "successful mixed role lacks exact evidence");
+                    successful_providers.insert(provider.clone());
+                    if let Some((failed_provider,failed_id)) = previous.take() {
+                        ensure!(metadata["continuation_from_agent_execution_id"].as_str() == Some(failed_id.as_str()), "continuation predecessor was lost");
+                        directions.insert((failed_provider,provider));
+                    }
+                }
+            }
+        }
+        ensure!(successful_providers.len() == 2 && directions.contains(&("codex".into(),"antigravity".into())) && directions.contains(&("antigravity".into(),"codex".into())), "mixed providers or fallback direction missing");
+        let state = compute_workspace_state(repo.path(), "HEAD").await?;
+        ensure!(workflow.current_workspace_state_id.as_deref() == Some(&state.state_id), "completed candidate lost workspace identity");
+        let runs = ctx.store.verification_store().list_runs(&workflow.attempt_id).await?;
+        ensure!(!runs.is_empty() && runs.iter().all(|run| run.workspace_state_id == state.state_id && run.overall_result == Some(VerificationRunResult::Passed)), "independent verification lost exact candidate binding");
+        ensure_disposable_schema_has_no_credentials(&ctx.engine.pool).await?;
+        Ok(())
+    }.await;
+    finish_live_fixture(catalog, ctx, result).await
 }
