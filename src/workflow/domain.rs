@@ -458,13 +458,20 @@ pub struct FailureEvidenceHandoff {
 
 impl PlanHandoff {
     pub fn validate(&self) -> Result<()> {
-        ensure!(
-            !self.summary.trim().is_empty(),
-            "PlanHandoff summary must not be empty"
-        );
+        self.validate_read_only()?;
         ensure!(
             !self.implementation_steps.is_empty(),
             "PlanHandoff must contain implementation steps"
+        );
+        Ok(())
+    }
+
+    /// An explanation can finish without proposing implementation work. This
+    /// validation is usable only under the separately pinned read-only flow.
+    pub fn validate_read_only(&self) -> Result<()> {
+        ensure!(
+            !self.summary.trim().is_empty(),
+            "PlanHandoff summary must not be empty"
         );
         Ok(())
     }
@@ -1112,6 +1119,8 @@ impl WorkflowStore {
                     handoff.workspace_state_id == current.current_workspace_state_id,
                     "read-only handoff has a stale candidate"
                 );
+                serde_json::from_value::<PlanHandoff>(handoff.structured_payload.clone())?
+                    .validate_read_only()?;
                 let role_id = handoff
                     .role_execution_id
                     .context("read-only handoff needs a role")?;

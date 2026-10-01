@@ -597,12 +597,22 @@ impl WorkflowCoordinator {
                     }
                 };
 
+                let read_only = self
+                    .store
+                    .flow(wf_id)
+                    .await?
+                    .is_some_and(|flow| flow.read_only);
                 let plan: PlanHandoff = match extract_structured_envelope::<PlanHandoff>(
                     &outcome.raw_output,
                     "PlanHandoff",
                 ) {
                     Ok(p) => {
-                        if let Err(e) = p.validate() {
+                        let validation = if read_only {
+                            p.validate_read_only()
+                        } else {
+                            p.validate()
+                        };
+                        if let Err(e) = validation {
                             let err_msg =
                                 format!("ROLE_OUTPUT_INVALID: plan validation error: {e:#}");
                             self.store
@@ -666,12 +676,7 @@ impl WorkflowCoordinator {
                     )
                     .await?;
 
-                if self
-                    .store
-                    .flow(wf_id)
-                    .await?
-                    .is_some_and(|flow| flow.read_only)
-                {
+                if read_only {
                     let state_id = wf
                         .current_workspace_state_id
                         .as_deref()

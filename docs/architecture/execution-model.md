@@ -378,6 +378,10 @@ provide hostile-workload memory or CPU isolation for the whole service.
 review, release preparation and security review use a planner inspection and a
 structured handoff; they do not claim implementation review or verification.
 A successful handoff must match the unchanged candidate before analysis completes.
+The coordinator binds that candidate before dispatch. A read-only explanation
+requires a nonempty summary and may leave implementation steps empty; mutable
+planning still requires implementation steps. Neither artifact grants new tool
+authority or substitutes for verification of a code change.
 
 Fix bug, implement feature, refactor and dependency update select PLAN, IMPLEMENT,
 FAST, STANDARD, REVIEW and FULL. Documentation with explicit `--risk low` may use

@@ -680,12 +680,23 @@ async fn read_only_flow_completes_only_with_matching_successful_handoff() -> Res
         let plan = PlanHandoff {
             summary: "Repository explanation".into(),
             affected_areas: vec!["docs".into()],
-            implementation_steps: vec!["No mutation".into()],
+            implementation_steps: vec![],
             expected_files: vec![],
             risks: vec![],
             verification_notes: vec!["Read-only analysis".into()],
             open_questions: vec![],
         };
+        ensure!(
+            plan.validate().is_err(),
+            "mutable plan lost implementation-step requirement"
+        );
+        plan.validate_read_only()?;
+        let mut empty = plan.clone();
+        empty.summary.clear();
+        ensure!(
+            empty.validate_read_only().is_err(),
+            "empty explanation admitted"
+        );
         let handoff = store
             .save_handoff_artifact(
                 &run.id,
