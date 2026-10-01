@@ -6,9 +6,12 @@ Current behavior belongs in [architecture](architecture/README.md), interfaces i
 
 ## Pending acceptance
 
-- **Zed GUI integration:** exercise progress, replay, cancellation, diff navigation,
-  apply/discard and interrupted-action recovery in an actual disposable editor session.
-  ACP protocol or fixture acceptance cannot substitute for GUI evidence.
+- **Intent-based flow selection:** select bounded read-only, small-fix and larger
+  engineering flows from intent and risk, and expose roles, profile and required
+  verification before substantial work.
+- **Editor action recovery:** qualify operator reconciliation after interrupted
+  candidate application or discard in the selected editor. Normal reconnect and
+  explicit candidate actions do not establish forced-crash recovery.
 - **External BA/SA integration:** use the development bridge at `../orbit-ba-bridge`
   with an identified authenticated conversation, typed requirements/proposal artifacts,
   challenge resolution, a frozen acceptance contract, real implementation/review/verification,

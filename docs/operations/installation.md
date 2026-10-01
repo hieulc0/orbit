@@ -914,6 +914,19 @@ directory in the editor for inspection. The original project changes only after
 an explicit `/apply` with the accepted candidate identity. `/discard` releases
 the retained attempt workspace, including after application.
 
+The file finder searches the current project. To inspect a managed file outside
+that project, add it with the installed Zed launcher:
+
+```sh
+zed --add /absolute/managed/attempt/calc.c
+```
+
+Use `zeditor` where that is the installed launcher. For a separate editor profile,
+pass the same `--user-data-dir` used when opening the project. Opening an attempt
+file does not retarget the existing Orbit task or grant access to another root;
+its configured repository and managed candidate remain authoritative. Zed may
+display its multi-root warning when another root is added for inspection.
+
 Choose `investigate` for bounded read-only repository reasoning, or an explicit
 change mode for implementation. The existing read-only planner supplies the
 interactive reasoning role; its prompt can explain intent or propose work but
