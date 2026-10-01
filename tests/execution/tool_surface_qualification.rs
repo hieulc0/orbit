@@ -4182,6 +4182,10 @@ impl ConnectedOrbitAcpClient {
         parameters: serde_json::Value,
     ) -> Result<serde_json::Value> {
         use agent_client_protocol::Agent;
+        // The SDK adds ACP's extension prefix on the wire.
+        let method = method
+            .strip_prefix('_')
+            .context("extension prefix required")?;
         let response = self
             .connection
             .ext_method(agent_client_protocol::ExtRequest::new(
