@@ -1,7 +1,7 @@
 //! ACP v1 stdio presentation and editor actions. Workflow decisions remain in
 //! the coordinator; the wire exposes no implementer filesystem callbacks.
-use crate::acp::{service::EditorService, wire::Wire};
 use crate::workflow::flow::Skill;
+use crate::{acp::wire::Wire, interactive::InteractiveService};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-fn modes(service: &EditorService, current: &str) -> Value {
+fn modes(service: &InteractiveService, current: &str) -> Value {
     let skills = [
         Skill::Investigate,
         Skill::FixBug,
@@ -67,7 +67,7 @@ fn commands() -> Value {
 }
 
 async fn update(
-    service: &EditorService,
+    service: &InteractiveService,
     output: &mut Wire,
     session_id: &str,
     update: Value,
@@ -78,7 +78,7 @@ async fn update(
 }
 
 async fn text(
-    service: &EditorService,
+    service: &InteractiveService,
     output: &mut Wire,
     session_id: &str,
     text: &str,
@@ -112,18 +112,16 @@ pub fn render_dashboard(dashboard: &Value) -> String {
         .as_array()
         .and_then(|items| items.last());
     let budget = execution.map(|item| &item["budget"]);
-    let calls = budget
-        .and_then(|value| value["usage"]["total_calls"].as_u64())
-        .unwrap_or(0);
-    let max_calls = budget
-        .and_then(|value| value["limits"]["max_total_calls"].as_u64())
-        .unwrap_or(0);
-    let reads = budget
-        .and_then(|value| value["usage"]["file_read_bytes"].as_u64())
-        .unwrap_or(0);
-    let max_reads = budget
-        .and_then(|value| value["limits"]["max_file_read_bytes"].as_u64())
-        .unwrap_or(0);
+    let counter = |group: &str, field: &str| {
+        budget
+            .and_then(|value| value[group][field].as_u64())
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".into())
+    };
+    let calls = counter("usage", "total_calls");
+    let max_calls = counter("limits", "max_total_calls");
+    let reads = counter("usage", "file_read_bytes");
+    let max_reads = counter("limits", "max_file_read_bytes");
     let flow = &dashboard["flow"];
     let mut panel = format!(
         "\n## Orbit task\n\n| State | Value |\n| --- | --- |\n| Task | `{}` |\n| Workflow | `{}` |\n| Flow / status | {} / {} |\n| Role | {} |\n| Provider / model / account | {} / {} / {} |\n| Repository calls | {} / {} |\n| File read bytes | {} / {} |\n| Candidate | `{}` |\n| Cleanup / execution | {} / {} |\n\n",
@@ -152,6 +150,16 @@ pub fn render_dashboard(dashboard: &Value) -> String {
             .unwrap_or("unknown"),
         session["state"].as_str().unwrap_or("unknown")
     );
+    panel.push_str(&format!(
+        "Stage: {} · execution profile: {}\n",
+        label(Some(workflow), "current_stage"),
+        label(Some(&dashboard["execution_profile"]), "profile")
+    ));
+    for field in ["failure_reason", "cancellation_reason"] {
+        if workflow[field].is_string() {
+            panel.push_str(&format!("\nReason: {}\n", label(Some(workflow), field)));
+        }
+    }
     if let Some(budget) = budget {
         if budget["usage"]["exhausted"] == true {
             panel.push_str(
@@ -229,11 +237,20 @@ pub fn render_dashboard(dashboard: &Value) -> String {
 }
 
 async fn dashboard_update(
-    service: &EditorService,
+    service: &InteractiveService,
     output: &mut Wire,
     session_id: &str,
 ) -> Result<()> {
     let dashboard = service.dashboard(session_id).await?;
+    publish_dashboard(service, output, session_id, &dashboard).await
+}
+
+async fn publish_dashboard(
+    service: &InteractiveService,
+    output: &mut Wire,
+    session_id: &str,
+    dashboard: &Value,
+) -> Result<()> {
     let stage = dashboard["workflow"]["status"]
         .as_str()
         .unwrap_or("created");
@@ -256,7 +273,7 @@ async fn dashboard_update(
         service,
         output,
         session_id,
-        &render_dashboard(&dashboard),
+        &render_dashboard(dashboard),
         false,
     )
     .await
@@ -293,9 +310,10 @@ fn prompt_text(params: &Value) -> Result<String> {
 }
 
 /// One connection has bounded framing, one reader and at most four active
-/// workflow futures. Disconnect cancels them and waits for their cleanup.
+/// workflow futures. Disconnect drains admitted work to its normal gate;
+/// only an explicit cancellation changes durable workflow authority.
 pub async fn serve(
-    service: EditorService,
+    service: InteractiveService,
     input: impl tokio::io::AsyncRead + Send + Unpin + 'static,
     output: impl tokio::io::AsyncWrite + Send + Unpin + 'static,
 ) -> Result<()> {
@@ -315,7 +333,8 @@ pub async fn serve(
     let mut requests = BTreeSet::new();
     let mut active = BTreeMap::<String, Value>::new();
     let mut jobs = tokio::task::JoinSet::new();
-    let mut progress = tokio::time::interval(Duration::from_secs(10));
+    let mut progress = tokio::time::interval(Duration::from_secs(1));
+    let mut last_snapshots = BTreeMap::<String, String>::new();
     let result = async {
         loop {
             tokio::select! {
@@ -360,12 +379,16 @@ pub async fn serve(
                                 ensure!(params.get("mcpServers").is_none_or(|servers| servers == &json!([])), "external MCP authority is not admitted");
                                 ensure!(Path::new(params["cwd"].as_str().context("cwd required")?).canonicalize()? == service.config().repository, "session repository mismatch");
                                 for notification in service.notifications(&session_id).await? { output.notify("session/update", notification).await?; }
+                                dashboard_update(&service,&mut output,&session_id).await?;
                                 Ok(Some(json!({"modes":modes(&service,&session.mode)})))
                             }
                             "session/set_mode" => { let mode = params["modeId"].as_str().context("modeId required")?; service.set_mode(&session_id, mode).await?; update(&service, &mut output, &session_id, json!({"sessionUpdate":"current_mode_update","currentModeId":mode})).await?; Ok(Some(json!({}))) }
                             "_orbit/session/status" => Ok(Some(service.dashboard(&session_id).await?)),
                             "_orbit/session/open" => Ok(Some(json!({"workspacePath":session.worktree.context("worktree missing")?.workspace}))),
-                            "_orbit/session/diff" => { let diff = session.worktree.context("worktree missing")?.diff().await?; let offset = params["offset"].as_u64().unwrap_or(0) as usize; ensure!(offset <= diff.len() && diff.is_char_boundary(offset), "invalid diff offset"); let mut end = (offset + 32 * 1024).min(diff.len()); while !diff.is_char_boundary(end) { end -= 1; } Ok(Some(json!({"diff":&diff[offset..end],"totalBytes":diff.len(),"nextOffset":if end < diff.len() {Some(end)} else {None},"truncated":end < diff.len()}))) }
+                            "_orbit/session/diff" => {
+                                let offset = params.get("offset").map(|value| value.as_u64().context("invalid diff offset")).transpose()?.unwrap_or(0);
+                                Ok(Some(service.candidate_diff(&session_id, usize::try_from(offset)?).await?))
+                            }
                             "_orbit/candidate/recover_application" => { service.recover_application(&session_id, params["workspaceStateId"].as_str().context("candidate identity required")?).await?; Ok(Some(json!({}))) }
                             "_orbit/candidate/apply" | "_orbit/candidate/discard" => { service.candidate_action(&session_id, params["workspaceStateId"].as_str().context("candidate identity required")?, method.ends_with("apply")).await?; Ok(Some(json!({}))) }
                             "session/prompt" => {
@@ -378,7 +401,13 @@ pub async fn serve(
                                     match parts.next().unwrap_or("") {
                                         "/status" => { dashboard_update(&service,&mut output,&session_id).await?; return Ok(Some(json!({"stopReason":"end_turn"}))); }
                                         "/open" => { let path = session.worktree.context("worktree missing")?.workspace; text(&service,&mut output,&session_id,&format!("Managed attempt: `{}`",path.display()),false).await?; return Ok(Some(json!({"stopReason":"end_turn"}))); }
-                                        "/diff" => { let diff = session.worktree.context("worktree missing")?.diff().await?; text(&service,&mut output,&session_id,&format!("```diff\n{diff}\n```"),false).await?; return Ok(Some(json!({"stopReason":"end_turn"}))); }
+                                        "/diff" => {
+                                            let offset = parts.next().map(str::parse::<usize>).transpose()?.unwrap_or(0);
+                                            ensure!(parts.next().is_none(), "unexpected diff arguments");
+                                            let page = service.candidate_diff(&session_id, offset).await?;
+                                            text(&service,&mut output,&session_id,&format!("```diff\n{}\n```\nNext offset: {}",page["diff"].as_str().unwrap_or(""),page["nextOffset"]),false).await?;
+                                            return Ok(Some(json!({"stopReason":"end_turn"})));
+                                        }
                                         "/cancel" => { service.cancel(&session_id).await?; dashboard_update(&service,&mut output,&session_id).await?; return Ok(Some(json!({"stopReason":"cancelled"}))); }
                                         command @ ("/apply" | "/discard") => { let expected = parts.next().context("candidate identity required")?; ensure!(parts.next().is_none(), "unexpected candidate action arguments"); service.candidate_action(&session_id,expected,command == "/apply").await?; dashboard_update(&service,&mut output,&session_id).await?; return Ok(Some(json!({"stopReason":"end_turn"}))); }
                                         "/continue" | "/review" => {}
@@ -402,6 +431,7 @@ pub async fn serve(
                 completed = jobs.join_next(), if !jobs.is_empty() => {
                     let (session_id, result) = completed.context("editor worker disappeared")?.context("editor worker panicked")?;
                     let request_id = active.remove(&session_id).context("editor prompt ownership lost")?;
+                    last_snapshots.remove(&session_id);
                     dashboard_update(&service,&mut output,&session_id).await?;
                     if result.is_err() { text(&service,&mut output,&session_id,"Orbit could not advance this workflow. Inspect its durable role, verification and cleanup evidence before resuming.",false).await?; }
                     let dashboard = service.dashboard(&session_id).await?;
@@ -412,14 +442,23 @@ pub async fn serve(
                     }
                     output.response_ok(request_id,json!({"stopReason":if dashboard["workflow"]["status"] == "cancelled" {"cancelled"} else {"end_turn"}})).await?;
                 }
-                _ = progress.tick(), if !active.is_empty() => { for session_id in active.keys() { dashboard_update(&service,&mut output,session_id).await?; } }
+                _ = progress.tick(), if !active.is_empty() => {
+                    for session_id in active.keys() {
+                        let dashboard = service.dashboard(session_id).await?;
+                        let digest = crate::model::digest(&serde_json::to_vec(&dashboard)?);
+                        if last_snapshots.get(session_id) != Some(&digest) {
+                            publish_dashboard(&service,&mut output,session_id,&dashboard).await?;
+                            last_snapshots.insert(session_id.clone(),digest);
+                        }
+                    }
+                }
             }
         }
         Ok::<_,anyhow::Error>(())
     }.await;
-    for session_id in active.keys() {
-        let _ = service.cancel(session_id).await;
-    }
+    // A connection owns delivery, not the workflow. Retain execution futures
+    // until their coordinator gate and supervised cleanup even if output fails.
+    // Another client may reconnect, inspect, or explicitly cancel that work.
     while jobs.join_next().await.is_some() {}
     reader.abort();
     result

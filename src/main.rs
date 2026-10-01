@@ -2428,11 +2428,12 @@ async fn connect_durable_catalog_engine(database_url: &str) -> Result<(Engine, t
 /// Unlike credential enrollment, interactive control is not tied to one local
 /// catalog deployment. Existing server migrations must be present.
 async fn interactive_service(
-    args: &InteractiveArgs,
+    config_file: &Path,
+    database_url_file: Option<&Path>,
 ) -> Result<orbit::interactive::InteractiveService> {
     use tokio::io::AsyncReadExt;
     let mut bytes = Vec::new();
-    tokio::fs::File::open(&args.config)
+    tokio::fs::File::open(config_file)
         .await?
         .take(128 * 1024 + 1)
         .read_to_end(&mut bytes)
@@ -2443,7 +2444,7 @@ async fn interactive_service(
     );
     let config: orbit::interactive::ServiceConfig = serde_json::from_slice(&bytes)?;
     config.validate()?;
-    let url = read_private_database_url(args.database_url_file.as_deref()).await?;
+    let url = read_private_database_url(database_url_file).await?;
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(12)
         .connect(url.as_str())
@@ -2527,7 +2528,7 @@ fn print_interactive_value(value: &serde_json::Value, output: Output) -> Result<
 async fn run_interactive_cli(args: &InteractiveArgs, output: Output) -> Result<()> {
     use InteractiveAction::*;
     use tokio::io::AsyncReadExt;
-    let service = interactive_service(args).await?;
+    let service = interactive_service(&args.config, args.database_url_file.as_deref()).await?;
     let value = match &args.action {
         New => serde_json::to_value(service.new_session(&service.config().repository).await?)?,
         Start {
@@ -3325,31 +3326,8 @@ async fn main() -> Result<()> {
         database_url_file,
     } = &cli.command
     {
-        use tokio::io::AsyncReadExt;
-        let mut bytes = Vec::new();
-        tokio::fs::File::open(config)
-            .await?
-            .take(128 * 1024 + 1)
-            .read_to_end(&mut bytes)
-            .await?;
-        anyhow::ensure!(
-            bytes.len() <= 128 * 1024,
-            "ACP configuration exceeds bounds"
-        );
-        let config: orbit::acp::service::ServiceConfig = serde_json::from_slice(&bytes)?;
-        let database_url = read_private_database_url(database_url_file.as_deref()).await?;
-        let (engine, scratch) = connect_durable_catalog_engine(database_url.as_str()).await?;
-        let coordinator = std::sync::Arc::new(workflow_coordinator_with_environment(
-            engine.pool.clone(),
-            config.verification_environment.clone(),
-        )?);
-        let service =
-            orbit::acp::service::EditorService::new(engine.pool.clone(), config, coordinator)?;
-        let result =
-            orbit::acp::editor::serve(service, tokio::io::stdin(), tokio::io::stdout()).await;
-        engine.pool.close().await;
-        drop(scratch);
-        return result;
+        let service = interactive_service(config, database_url_file.as_deref()).await?;
+        return orbit::acp::editor::serve(service, tokio::io::stdin(), tokio::io::stdout()).await;
     }
     if let Commands::AcpLaunchDigest { config } = &cli.command {
         use tokio::io::AsyncReadExt;

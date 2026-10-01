@@ -597,7 +597,7 @@ async fn acp_v1_stdio_is_typed_bounded_and_replays_session_notifications() -> Re
         let stored=service.notifications(session).await?;
         let (loaded,replayed)=exchange(&mut client,4,"session/load",json!({"sessionId":session,"cwd":repo.path(),"mcpServers":[]})).await?;
         let _:agent_client_protocol::LoadSessionResponse=serde_json::from_value(loaded["result"].clone())?;
-        ensure!(stored==replayed,"session replay differs from durable transcript");
+        ensure!(replayed.starts_with(&stored) && replayed.len()>stored.len(),"session replay or fresh durable view missing");
         let (denied,_)=exchange(&mut client,5,"fs/write_text_file",json!({"sessionId":session,"path":"README.md","content":"denied"})).await?;
         ensure!(denied.get("error").is_some(),"editor granted direct filesystem authority");
         let expected=service.dashboard(session).await?["candidate"]["state_id"].as_str().unwrap().to_owned();

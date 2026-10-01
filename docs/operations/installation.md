@@ -831,6 +831,8 @@ on standard input/output. It uses the existing PostgreSQL stores, runtime
 selection, role execution, callbacks, verification and cancellation. It creates
 no network listener. The operator launching the process grants the client its
 session and candidate actions; the client receives no filesystem or shell callbacks.
+It loads the same initialized database and product service as the
+[interactive CLI](#interactive-cli); launching it does not migrate a database.
 
 ### Operator configuration
 
@@ -887,8 +889,24 @@ credentials stay in the operator catalog and supervised runtime.
 ACP initialization, new session, load/replay, prompt, cancel and mode selection
 are supported. Reload replays the durable notifications before its response, as
 required by [ACP session setup](https://agentclientprotocol.com/protocol/v1/session-setup).
-The panel uses standard plan/message notifications. A typed stdio qualification
-is distinct from an actual Zed GUI acceptance run.
+It then publishes a fresh durable-state view. Active work publishes changed
+status snapshots through standard plan/message notifications; these observations
+do not grant workflow authority. A real ACP-client qualification is distinct
+from an actual Zed GUI acceptance run.
+
+Disconnecting the client does not cancel admitted work. The server drains it to
+its normal coordinator gate and cleanup; reconnect with the same session ID to
+inspect that durable work. Use explicit cancel to revoke it. Forced server death
+can leave uncertain external effects: existing fenced recovery requires
+reconciliation, and never replays an uncertain provider turn automatically.
+Completed gates and managed candidate state survive a normal server restart.
+
+Choose `investigate` for bounded read-only repository reasoning, or an explicit
+change mode for implementation. The existing read-only planner supplies the
+interactive reasoning role; its prompt can explain intent or propose work but
+cannot grant itself write authority or weaken verification. Starting a different
+objective requires a new session. Modes and all role capabilities remain Orbit
+policy, rather than editor or provider-session decisions.
 
 ### Interactive actions
 
@@ -902,10 +920,10 @@ handoffs are shown after a turn; large payloads have explicit truncated previews
 | --- | --- |
 | `/status` | Refresh the durable panel |
 | `/open` | Show the managed attempt path |
-| `/diff` | Show candidate changes |
+| `/diff [OFFSET]` | Show a bounded candidate diff page and its next offset |
 | `/continue` | Advance to the review gate |
 | `/review` | Request review from REVIEWING and run final verification |
-| `/cancel` | Cancel, then wait for supervised cleanup |
+| `/cancel` | Persist cancellation; inspect state for confirmed supervised cleanup |
 | `/apply WorkspaceStateId` | Apply an accepted exact candidate to the clean original checkout |
 | `/discard WorkspaceStateId` | Remove that exact retained candidate after cleanup |
 

@@ -37,6 +37,21 @@ journal below must not be used as an invented role-workflow event history.
 Reconnect by session ID and requery durable state. Provider history and client
 connection lifetime do not own tasks, candidates or evidence.
 
+### ACP presentation
+
+`orbit acp-serve` translates ACP v1 requests and standard session updates through
+this same service. Initialize/new/load/prompt/mode/cancel manage client interaction;
+Orbit commands and bounded extensions expose status, diff, worktree path, review
+and exact candidate actions. External client filesystem and terminal callbacks
+grant no repository authority at this interface.
+
+Session load replays retained notifications and publishes a fresh state view.
+Active progress observes changed durable snapshots. A disconnected stream owns
+no cancellation decision: admitted work drains to its normal gate, and another
+client may reload or explicitly cancel it. A forced server failure uses existing
+fenced recovery and external-effect reconciliation, rather than unsafe turn replay.
+See [operator setup and actions](../operations/installation.md#editor-acp-service-and-zed).
+
 ## Transport compatibility and journal streaming
 
 The API supports journal streaming, JSONL and reusable worker transports. It preserves

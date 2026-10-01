@@ -4089,3 +4089,232 @@ async fn real_interactive_cli_reconnect_candidate_and_active_cancellation() -> R
     }.await;
     finish_live_fixture(catalog, ctx, result).await
 }
+
+#[cfg(feature = "fault-injection")]
+#[derive(Clone, Default)]
+struct InteractiveAcpClient {
+    notifications: std::rc::Rc<std::cell::RefCell<Vec<serde_json::Value>>>,
+}
+
+#[cfg(feature = "fault-injection")]
+#[async_trait::async_trait(?Send)]
+impl agent_client_protocol::Client for InteractiveAcpClient {
+    async fn request_permission(
+        &self,
+        _: agent_client_protocol::RequestPermissionRequest,
+    ) -> agent_client_protocol::Result<agent_client_protocol::RequestPermissionResponse> {
+        Ok(agent_client_protocol::RequestPermissionResponse::new(
+            agent_client_protocol::RequestPermissionOutcome::Cancelled,
+        ))
+    }
+    async fn session_notification(
+        &self,
+        notification: agent_client_protocol::SessionNotification,
+    ) -> agent_client_protocol::Result<()> {
+        self.notifications
+            .borrow_mut()
+            .push(serde_json::to_value(notification).unwrap());
+        Ok(())
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+struct ConnectedOrbitAcpClient {
+    connection: std::rc::Rc<agent_client_protocol::ClientSideConnection>,
+    observations: InteractiveAcpClient,
+    io: tokio::task::JoinHandle<agent_client_protocol::Result<()>>,
+    process: tokio::process::Child,
+    diagnostics: tokio::task::JoinHandle<Vec<u8>>,
+}
+
+#[cfg(feature = "fault-injection")]
+impl ConnectedOrbitAcpClient {
+    async fn connect(config: &Path, database: &Path) -> Result<Self> {
+        use agent_client_protocol::Agent;
+        use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+        let mut process = tokio::process::Command::new(env!("CARGO_BIN_EXE_orbit"))
+            .args(["acp-serve", "--config"])
+            .arg(config)
+            .arg("--database-url-file")
+            .arg(database)
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        let mut stderr = process.stderr.take().unwrap();
+        let diagnostics = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            let _ = tokio::io::AsyncReadExt::read_to_end(&mut stderr, &mut bytes).await;
+            bytes
+        });
+        let observations = InteractiveAcpClient::default();
+        let (connection, io) = agent_client_protocol::ClientSideConnection::new(
+            observations.clone(),
+            process.stdin.take().unwrap().compat_write(),
+            process.stdout.take().unwrap().compat(),
+            |future| {
+                tokio::task::spawn_local(future);
+            },
+        );
+        let io = tokio::task::spawn_local(io);
+        let connection = std::rc::Rc::new(connection);
+        let initialized = connection
+            .initialize(agent_client_protocol::InitializeRequest::new(
+                agent_client_protocol::ProtocolVersion::V1,
+            ))
+            .await?;
+        ensure!(
+            initialized.agent_capabilities.load_session,
+            "real ACP client cannot reload"
+        );
+        Ok(Self {
+            connection,
+            observations,
+            io,
+            process,
+            diagnostics,
+        })
+    }
+    async fn request(
+        &self,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        use agent_client_protocol::Agent;
+        let response = self
+            .connection
+            .ext_method(agent_client_protocol::ExtRequest::new(
+                method,
+                serde_json::value::to_raw_value(&parameters)?.into(),
+            ))
+            .await?;
+        Ok(serde_json::from_str(response.0.get())?)
+    }
+    async fn disconnect(self) -> Result<()> {
+        let Self {
+            connection,
+            observations: _,
+            io,
+            mut process,
+            diagnostics,
+        } = self;
+        drop(connection);
+        io.abort();
+        let _ = io.await;
+        // The client closes its streams; the server retains admitted work until
+        // its ordinary coordinator gate, rather than cancelling the task.
+        let status = tokio::time::timeout(Duration::from_secs(600), process.wait()).await??;
+        eprintln!(
+            "REAL_ORBIT_ACP_DISCONNECT status={status}; {}",
+            String::from_utf8_lossy(&diagnostics.await?)
+        );
+        Ok(())
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+#[tokio::test]
+#[ignore = "requires explicitly authorized live providers, private catalog, pinned verification and disposable PostgreSQL"]
+async fn real_acp_sdk_client_recovers_disconnected_coding_and_read_only_roles() -> Result<()> {
+    tokio::task::LocalSet::new().run_until(async {
+        use agent_client_protocol::{Agent, ContentBlock, LoadSessionRequest, NewSessionRequest, PromptRequest, SetSessionModeRequest, StopReason};
+        use orbit::{execution::local::RoleExecutionProfile, interactive::ServiceConfig, regression_strategy::{SelectionPolicy, VerificationCheck, VerificationTier}, verification::{EnvironmentIdentity, VerificationRunResult}, workflow::flow::Risk};
+        use std::os::unix::fs::PermissionsExt;
+        let environment: EnvironmentIdentity = serde_json::from_slice(&fs::read(std::env::var("ORBIT_TEST_VERIFICATION_ENVIRONMENT_FILE")?)?)?;
+        let catalog = explicitly_authorized_live_credential_catalog().await?;
+        guard_live_codex_quota(&catalog).await?;
+        let database = common::DisposablePgTestContext::create("interactive_acp",3).await?;
+        let ctx = TestContext { store: WorkflowStore::new(database.engine.pool.clone()), database };
+        let result = async {
+            ensure_live_catalog_is_separate(&catalog,&ctx.engine.pool,&ctx.database.schema).await?;
+            ensure_disposable_schema_has_no_credentials(&ctx.engine.pool).await?;
+            let repository=common::TemporaryGitRepo::create()?;
+            fs::write(repository.path().join("calc.c"),"int original(void) { return 0; }\n")?;
+            fs::write(repository.path().join("test.sh"),"#!/bin/sh\nset -eu\ncc -Wall -Wextra -Werror calc.c -o /tmp/candidate-test\n/tmp/candidate-test\n")?;
+            for args in [vec!["add","."],vec!["commit","-m","synthetic ACP baseline"]] {
+                ensure!(std::process::Command::new("git").args(args).current_dir(repository.path()).output()?.status.success(),"fixture commit failed");
+            }
+            let baseline=compute_workspace_state(repository.path(),"HEAD").await?;
+            let root=orbit::codex_status_probe::private_control_tempdir()?;
+            let managed=root.path().join("managed"); fs::create_dir(&managed)?; fs::set_permissions(&managed,fs::Permissions::from_mode(0o700))?;
+            let private=tempfile::Builder::new().prefix("acp-qualification-").permissions(fs::Permissions::from_mode(0o700)).tempdir_in(orbit::secret_backend::operator_home()?.join(".orbit/private"))?;
+            let database_file=private.path().join("database-url");
+            let mut file=fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&database_file)?;
+            std::io::Write::write_all(&mut file,ctx.database.url.as_bytes())?; drop(file);
+            let mut selection=SelectionPolicy::new("acp-arithmetic","ACP arithmetic"); selection.canonical_digest=true;
+            selection.checks.push(VerificationCheck::new_command("arithmetic","C compile/run",vec![VerificationTier::Fast,VerificationTier::Standard,VerificationTier::Full],vec!["sh".into(),"test.sh".into()]));
+            let config=ServiceConfig {repository:repository.path().canonicalize()?,workspaces:managed.canonicalize()?,agent_execution_profile:RoleExecutionProfile::DevLocal {bubblewrap:PathBuf::from("/usr/bin/bwrap")},verification_environment:environment.clone(),selection_policy:selection,risk:Risk::Conservative,skill:None,external_role:None};
+            let config_file=root.path().join("interactive.json"); fs::write(&config_file,serde_json::to_vec(&config)?)?;
+            let first=ConnectedOrbitAcpClient::connect(&config_file,&database_file).await?;
+            let session=first.connection.new_session(NewSessionRequest::new(repository.path())).await?.session_id;
+            first.connection.set_session_mode(SetSessionModeRequest::new(session.clone(),"implement_feature")).await?;
+            let task="Synthetic C coding task: read calc.c; add int multiply(int a,int b) returning a*b and main checking multiply(3,4)==12. Document it in README.md, keep test.sh unchanged, run sh test.sh through the confined terminal. All roles read calc.c using advertised callbacks. No staging or commits. Return structured role handoffs.";
+            let connection=first.connection.clone(); let owned=session.clone();
+            let prompt=tokio::task::spawn_local(async move {connection.prompt(PromptRequest::new(owned,vec![ContentBlock::from(task)])).await});
+            let workflow_id=tokio::time::timeout(Duration::from_secs(90),async {
+                loop {
+                    let ready: Option<String>=sqlx::query_scalar("SELECT re.workflow_run_id FROM orbit_agent_executions ae JOIN orbit_role_executions re ON re.id=ae.role_execution_id WHERE ae.status='RUNNING' AND ae.metadata->'lifecycle'->>'phase'='PROMPT_IN_FLIGHT' LIMIT 1").fetch_optional(&ctx.engine.pool).await?;
+                    if let Some(id)=ready {break Ok::<_,anyhow::Error>(id);}
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }).await??;
+            let before=first.request("_orbit/session/status",json!({"sessionId":session})).await?;
+            ensure!(before["workflow"]["id"]==workflow_id,"ACP task missing");
+            prompt.abort(); let _=prompt.await;
+            first.disconnect().await?;
+            let after=ctx.store.get_workflow_run(&workflow_id).await?.unwrap();
+            ensure!(after.status==orbit::workflow::WorkflowStage::Reviewing,"client disconnect changed workflow authority: {:?}",after.status);
+            let second=ConnectedOrbitAcpClient::connect(&config_file,&database_file).await?;
+            second.connection.load_session(LoadSessionRequest::new(session.clone(),repository.path())).await?;
+            let restored=second.request("_orbit/session/status",json!({"sessionId":session})).await?;
+            ensure!(restored["session"]["worktree"]==before["session"]["worktree"] && restored["workflow"]["id"]==workflow_id && restored["workflow"]["task_prompt"]==task,"ACP reconnect lost exact durable state");
+            let diff=second.request("_orbit/session/diff",json!({"sessionId":session})).await?;
+            ensure!(diff["diff"].as_str().is_some_and(|text|text.contains("multiply")),"ACP candidate missing");
+            let reviewed=second.connection.prompt(PromptRequest::new(session.clone(),vec![ContentBlock::from("/review")])).await?;
+            ensure!(reviewed.stop_reason==StopReason::EndTurn,"ACP review did not complete");
+            let accepted=second.request("_orbit/session/status",json!({"sessionId":session})).await?;
+            ensure!(accepted["workflow"]["status"]=="completed","ACP workflow not completed");
+            let candidate=accepted["candidate"]["state_id"].as_str().unwrap();
+            let runs=ctx.store.verification_store().list_runs(&after.attempt_id).await?;
+            ensure!(runs.len()==3 && runs.iter().all(|run|run.workspace_state_id==candidate && run.overall_result==Some(VerificationRunResult::Passed) && run.environment_identity.runtime_image_digest==environment.runtime_image_digest),"ACP verification identity lost");
+            for role in ctx.store.list_role_executions(&workflow_id).await? {
+                print_live_fixture_audit(&ctx.engine.pool,Some(&role.id)).await;
+                for execution in &role.agent_execution_ids {
+                    let (status,calls,successes,failures,_,metadata)=load_agent_tool_audit(&ctx.engine.pool,execution).await?;
+                    ensure!(status=="SUCCEEDED" && calls>0 && calls==successes && failures==0 && metadata["cleanup_confirmed"]==true && b34_audit_has_exact_correlations(&metadata["tool_call_audit"],usize::try_from(calls)?),"ACP role evidence incomplete");
+                }
+            }
+            let notes=serde_json::to_string(&*second.observations.notifications.borrow())?;
+            ensure!(notes.contains("execution profile") && notes.contains("Verification") && notes.contains("reviewer") && notes.contains("APPROVE"),"real ACP client lost workflow/evidence view");
+            ensure!(compute_workspace_state(repository.path(),"HEAD").await?.state_id==baseline.state_id,"ACP altered source before apply");
+            // Existing read-only planner authority serves bounded interactive
+            // reasoning; explicit flow selection grants no mutation authority.
+            let question=second.connection.new_session(NewSessionRequest::new(repository.path())).await?.session_id;
+            second.connection.set_session_mode(SetSessionModeRequest::new(question.clone(),"investigate")).await?;
+            second.connection.prompt(PromptRequest::new(question.clone(),vec![ContentBlock::from("Read calc.c and explain original(). Do not edit files. Return a structured PlanHandoff with the explanation and no implementation request.")])).await?;
+            let answer=second.request("_orbit/session/status",json!({"sessionId":question})).await?;
+            ensure!(answer["workflow"]["status"]=="completed" && answer["flow"]["read_only"]==true && answer["changed_files"]["total"]==0,"bounded interactive reasoning gained mutation authority");
+            let readonly_id=answer["workflow"]["id"].as_str().unwrap();
+            for role in ctx.store.list_role_executions(readonly_id).await? {
+                print_live_fixture_audit(&ctx.engine.pool,Some(&role.id)).await;
+                ensure!(role.role_id=="planner" && role.status==RoleExecutionStatus::Succeeded,"read-only role mismatch");
+                for execution in &role.agent_execution_ids {
+                    let (status,calls,successes,failures,_,metadata)=load_agent_tool_audit(&ctx.engine.pool,execution).await?;
+                    ensure!(status=="SUCCEEDED" && calls>0 && calls==successes && failures==0 && metadata["cleanup_confirmed"]==true && metadata["tool_call_audit"]["summary"]["mutating"]==0 && b34_audit_has_exact_correlations(&metadata["tool_call_audit"],usize::try_from(calls)?),"read-only ACP role lacks exact bounded evidence");
+                }
+            }
+            second.request("_orbit/candidate/discard",json!({"sessionId":question,"workspaceStateId":answer["candidate"]["state_id"]})).await?;
+            ensure!(second.request("_orbit/candidate/apply",json!({"sessionId":session,"workspaceStateId":"stale"})).await.is_err(),"ACP admitted stale apply");
+            second.request("_orbit/candidate/apply",json!({"sessionId":session,"workspaceStateId":candidate})).await?;
+            let base=accepted["session"]["worktree"]["base_revision"].as_str().unwrap();
+            ensure!(compute_workspace_state(repository.path(),base).await?.state_id==candidate,"ACP applied different identity");
+            second.request("_orbit/candidate/discard",json!({"sessionId":session,"workspaceStateId":candidate})).await?;
+            second.disconnect().await?;
+            ensure_disposable_schema_has_no_credentials(&ctx.engine.pool).await?;
+            println!("REAL_ORBIT_ACP_ACCEPTANCE {}",json!({"workflow":workflow_id,"candidate":candidate,"active_disconnect":true,"new_server_reconnect":true,"read_only_role":true,"trusted_verification_runs":runs.len(),"exact_apply_discard":true}));
+            Ok(())
+        }.await;
+        finish_live_fixture(catalog,ctx,result).await
+    }).await
+}
