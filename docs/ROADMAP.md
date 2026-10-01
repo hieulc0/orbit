@@ -6,10 +6,6 @@ Current behavior belongs in [architecture](architecture/README.md), interfaces i
 
 ## Pending acceptance
 
-- **Independent provider/fallback review:** obtain independent approval of native
-  action correlation and bounded operational continuation before advancing
-  editor-facing acceptance. Individual role checks cannot replace complete
-  workflow qualification and review.
 - **Zed GUI integration:** exercise progress, replay, cancellation, diff navigation,
   apply/discard and interrupted-action recovery in an actual disposable editor session.
   ACP protocol or fixture acceptance cannot substitute for GUI evidence.
