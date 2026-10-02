@@ -1,5 +1,7 @@
 //! Durable interactive control over the existing workflow coordinator and stores.
 //! Client requests never grant a provider direct repository mutation authority.
+pub mod preferences;
+
 use crate::{
     execution::{local::RoleExecutionProfile, worktree::ManagedWorktree},
     model::id,
@@ -82,6 +84,7 @@ pub struct InteractiveService {
     pool: PgPool,
     config: ServiceConfig,
     coordinator: Arc<WorkflowCoordinator>,
+    cli_context: Option<(PathBuf, PathBuf)>,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct InteractiveSession {
@@ -93,6 +96,29 @@ pub struct InteractiveSession {
 }
 
 impl InteractiveService {
+    pub fn with_cli_context(mut self, config: PathBuf, database: PathBuf) -> Self {
+        self.cli_context = Some((config, database));
+        self
+    }
+    pub fn cli_handoff(&self, session: &str) -> String {
+        let quote = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
+        let base = if let Some((config, database)) = &self.cli_context {
+            format!(
+                "orbit interactive --config {} --database-url-file {}",
+                quote(&config.to_string_lossy()),
+                quote(&database.to_string_lossy())
+            )
+        } else {
+            "orbit interactive --config /path/to/interactive.json --database-url-file /path/to/private/database-url".into()
+        };
+        format!(
+            "## Continue in Orbit CLI\n\nSame durable session; no task copying or provider history.\n```sh\n{base} show {}\n{base} continue {}\n{base} preferences {}\n```\nUse review, diff, cancel, apply or discard on this same session where available. The Orbit CLI is orchestration, not an interactive shell.",
+            quote(session),
+            quote(session),
+            quote(session)
+        )
+    }
+
     pub fn config(&self) -> &ServiceConfig {
         &self.config
     }
@@ -155,6 +181,7 @@ impl InteractiveService {
             pool,
             config,
             coordinator,
+            cli_context: None,
         })
     }
 
@@ -234,15 +261,21 @@ impl InteractiveService {
             }
             return Ok(workflow);
         }
+        ensure!(
+            self.preferences(session_id).await?.interaction == preferences::InteractionMode::Flow,
+            "SELECT_FLOW_EXPLICITLY_BEFORE_MUTATION"
+        );
         let worktree = session.worktree.context("managed candidate missing")?;
         worktree.validate().await?;
         let operation = id();
-        let claimed = sqlx::query("UPDATE orbit_editor_sessions SET state = 'STARTING', operation_id = $2 WHERE id = $1 AND state = 'READY' AND workflow_run_id IS NULL").bind(session_id).bind(&operation).execute(&self.pool).await?;
+        let claimed = sqlx::query("UPDATE orbit_editor_sessions SET state = 'STARTING', operation_id = $2 WHERE id = $1 AND state = 'READY' AND workflow_run_id IS NULL AND COALESCE(preferences->>'interaction', 'flow') = 'flow'").bind(session_id).bind(&operation).execute(&self.pool).await?;
         ensure!(
             claimed.rows_affected() == 1,
             "EDITOR_OPERATION_ALREADY_CLAIMED"
         );
         let started = async {
+            let preferences = self.preferences(session_id).await?;
+            ensure!(preferences.interaction == preferences::InteractionMode::Flow, "SELECT_FLOW_EXPLICITLY_BEFORE_MUTATION");
             let mode_skill: Option<Skill> = if session.mode == "auto" {None} else {Some(serde_json::from_value(json!(session.mode))?)};
             let reasoning = crate::workflow::reasoning::ReasoningStore::new(self.pool.clone());
             let contract = reasoning.status(session_id).await?;
@@ -252,7 +285,7 @@ impl InteractiveService {
             };
             let flow = if !contract.is_null() { FlowDefinition::select(Skill::ImplementFeature, Risk::Conservative) }
                 else if self.config.external_role.is_some() { ensure!(self.config.external_role == Some(crate::workflow::reasoning::ExternalRole::SystemArchitect), "BA submits typed requirements through the external role interface"); FlowDefinition::select(Skill::Investigate,Risk::Conservative) }
-                else {FlowDefinition::select(self.config.skill.or(mode_skill).unwrap_or_else(|| FlowDefinition::infer(&task)), self.config.risk)};
+                else {FlowDefinition::select(self.config.skill.or(preferences.flow_skill()).or(mode_skill).unwrap_or_else(|| FlowDefinition::infer(&task)), self.config.risk)};
             let regression = RegressionStore::new(self.pool.clone());
             regression.insert_selection_policy(&self.config.selection_policy).await?;
             let mut policy = flow.regression_policy(format!("editor-policy-{session_id}"));
@@ -264,7 +297,7 @@ impl InteractiveService {
             let workflow = store.create_workflow_run_full(&format!("task-{session_id}"), &format!("attempt-{session_id}"), 3, None, Some(&policy), Some(&self.config.selection_policy), Some(&task), worktree.workspace.to_str(), Some(&worktree.base_revision)).await?;
             let attached = sqlx::query("UPDATE orbit_editor_sessions SET workflow_run_id = $3 WHERE id = $1 AND state = 'STARTING' AND operation_id = $2").bind(session_id).bind(&operation).bind(&workflow.id).execute(&self.pool).await?;
             ensure!(attached.rows_affected() == 1, "EDITOR_OPERATION_OWNER_LOST");
-            store.pin_execution_profile(&workflow.id, &self.config.agent_execution_profile).await?;
+            store.pin_execution_profile(&workflow.id, &preferences.execution_profile(&self.config)?).await?;
             store.pin_flow(&workflow.id, &flow).await?;
             if !contract.is_null() { reasoning.bind_workflow(session_id, &workflow.id).await?; }
             let ready = sqlx::query("UPDATE orbit_editor_sessions SET state = 'READY', operation_id = NULL WHERE id = $1 AND state = 'STARTING' AND operation_id = $2").bind(session_id).bind(&operation).execute(&self.pool).await?;
@@ -320,6 +353,12 @@ impl InteractiveService {
     }
 
     pub async fn cancel(&self, session_id: &str) -> Result<()> {
+        self.session(session_id).await?;
+        let mut admission = self.pool.begin().await?;
+        sqlx::query("SELECT id FROM orbit_editor_sessions WHERE id = $1 FOR UPDATE")
+            .bind(session_id)
+            .fetch_one(&mut *admission)
+            .await?;
         if self.config.external_role.is_some() {
             let session = self.session(session_id).await?;
             if let Some(workflow) = session.workflow_run_id {
@@ -332,11 +371,23 @@ impl InteractiveService {
                 );
             }
         }
+        let conversations: Vec<String> = sqlx::query_scalar(
+            "SELECT workflow_run_id FROM orbit_interactive_turns WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+        for workflow in conversations {
+            self.coordinator
+                .cancel_workflow(&workflow, "cancelled by interactive client")
+                .await?;
+        }
         if let Some(workflow) = self.session(session_id).await?.workflow_run_id {
             self.coordinator
                 .cancel_workflow(&workflow, "cancelled by interactive client")
                 .await?;
         }
+        admission.commit().await?;
         Ok(())
     }
 
@@ -358,6 +409,15 @@ impl InteractiveService {
             "EXTERNAL_ROLE_AUTHORITY_DENIED"
         );
         let session = self.session(session_id).await?;
+        let conversations: Vec<String> = sqlx::query_scalar(
+            "SELECT workflow_run_id FROM orbit_interactive_turns WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+        for workflow in conversations {
+            self.require_cleanup(&workflow).await?;
+        }
         ensure!(
             session.state == "READY" || (!apply && session.state == "APPLIED"),
             "candidate action is not available"
@@ -566,10 +626,17 @@ impl InteractiveService {
         };
         let store = WorkflowStore::new(self.pool.clone());
         let mut result = json!({"session":session,"candidate":candidate,"candidate_observation":if candidate.is_some() {"available"} else {"unavailable"}});
-        result["execution_profile"] = serde_json::to_value(&self.config.agent_execution_profile)?;
+        result["preferences"] = serde_json::to_value(self.preferences(session_id).await?)?;
+        result["orchestrator"] = self.conversation_view(session_id).await?;
+        result["execution_profile"] = serde_json::to_value(
+            self.preferences(session_id)
+                .await?
+                .execution_profile(&self.config)?,
+        )?;
         result["reasoning"] = crate::workflow::reasoning::ReasoningStore::new(self.pool.clone())
             .status(session_id)
             .await?;
+        let mut observed_paths = Vec::new();
         if let Some(worktree) = &session.worktree
             && candidate.is_some()
         {
@@ -579,6 +646,7 @@ impl InteractiveService {
             )
             .await?;
             result["changed_files"] = json!({"paths":paths.iter().take(128).collect::<Vec<_>>(), "total":paths.len(), "truncated":paths.len() > 128});
+            observed_paths = paths;
         }
         if let Some(workflow_id) = &session.workflow_run_id {
             let workflow = store
@@ -610,7 +678,12 @@ impl InteractiveService {
             result["verification"] = Value::Array(VerificationStore::new(self.pool.clone()).list_runs(&workflow.attempt_id).await?.iter().map(|run| json!({"id":run.id,"tier":run.tier,"status":run.status,"result":run.overall_result,"workspace_state_id":run.workspace_state_id,"environment":run.environment_identity})).collect());
             result["execution_profile"] =
                 serde_json::to_value(store.execution_profile(workflow_id).await?)?;
-            result["flow"] = serde_json::to_value(store.flow(workflow_id).await?)?;
+            let flow = store.flow(workflow_id).await?;
+            if let Some(flow) = &flow {
+                let (review, completion) = flow.effective_tiers(&observed_paths);
+                result["effective_tiers"] = json!({"review":review,"completion":completion});
+            }
+            result["flow"] = serde_json::to_value(flow)?;
             let mut summaries = Vec::new();
             for role in roles.iter().rev().take(8).rev() {
                 if let Some(handoff_id) = &role.handoff_output_id

@@ -1124,12 +1124,21 @@ impl WorkflowStore {
                 let role_id = handoff
                     .role_execution_id
                     .context("read-only handoff needs a role")?;
+                let expected_role =
+                    if crate::interactive::preferences::turn_preferences(&self.pool, wf_id)
+                        .await?
+                        .is_some()
+                    {
+                        "orchestrator"
+                    } else {
+                        "planner"
+                    };
                 ensure!(
                     self.list_role_executions(wf_id)
                         .await?
                         .iter()
                         .any(|role| role.id == role_id
-                            && role.role_id == "planner"
+                            && role.role_id == expected_role
                             && role.status == RoleExecutionStatus::Succeeded),
                     "read-only role has not succeeded"
                 );

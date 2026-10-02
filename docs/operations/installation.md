@@ -927,24 +927,74 @@ file does not retarget the existing Orbit task or grant access to another root;
 its configured repository and managed candidate remain authoritative. Zed may
 display its multi-root warning when another root is added for inspection.
 
-Choose `investigate` for bounded read-only repository reasoning, or an explicit
-change mode for implementation. The existing read-only planner supplies the
-interactive reasoning role; its prompt can explain intent or propose work but
-cannot grant itself write authority or weaken verification. Starting a different
-objective requires a new session. Modes and all role capabilities remain Orbit
-policy, rather than editor or provider-session decisions.
+### Conversation and execution preferences
+
+Orbit exposes native ACP selectors where the client supports them, with
+`/preferences` as a command alternative. Preferences survive reconnect. For
+example, `/preferences interaction chat` selects conversation and
+`/preferences provider gemini` prefers Gemini for the orchestrator.
+
+| Interaction | Behavior |
+| --- | --- |
+| Chat | Talk with a read-only orchestrator, inspect repository context and discuss the task |
+| Agent | One bounded read-only investigation per request |
+| Flow | Submit an explicit objective to Orbit's existing workflow |
+
+Chat and Agent never grant repository writes or terminal access. A request to
+change code requires an explicit switch to Flow and submission of the task.
+Mutating single-agent shortcuts are not available. A new workflow objective uses
+another session; conversation can continue in the same session before a workflow
+or after it finishes. Wait for completion before chatting alongside an active flow.
+
+The **orchestrator** answers the human. Workflow **planner**, **implementer** and
+**reviewer** are separate roles. Orchestrator provider/model preferences do not
+retarget those roles. Auto uses normal resolver policy; a preferred Codex or Gemini
+runtime/model can lose to an eligible alternative. Inspect `/agents` for observed
+selections and ranking reasons. Capability, credentials, quota and runtime validity
+remain mandatory. Only currently qualified resolver models are offered.
+
+Reasoning defaults to Auto. Fast, Balanced and Deep request Codex low, medium and
+high effort respectively; Orbit requires exact runtime confirmation before sending
+that turn. These choices require an eligible Codex runtime. Gemini supports Auto
+here; a separate effort request is rejected. Auto is not a promise about the
+provider's internal reasoning level.
+
+Execution profile Auto uses the operator's admitted profile. DEV_LOCAL is offered
+only when configured by the operator; TRUSTED keeps local terminal execution
+disabled. DEV_LOCAL uses confined repository callbacks and Bubblewrap exploratory
+terminal feedback; final authoritative verification remains separately pinned
+TRUSTED OCI execution. Neither selector grants extra role capabilities.
+
+Flow preferences select existing Orbit policies: read-only investigation,
+documentation change or full engineering. Auto retains current policy. A
+conservative documentation change still requires full verification; lower-risk
+operator policy escalates when changed paths demand it. No editor-defined Quick
+or Standard workflow or automatic intent classifier is added. Profile and flow
+are immutable once the workflow starts; conversation preferences snapshot per turn.
+
+### Continue in Orbit CLI
+
+`/cli` displays commands for the same durable session and selected configuration.
+Run its `show`, `preferences` or `continue` command in a terminal to inspect or
+resume the task. Use the same session for review, diff, cancellation and exact
+candidate actions. No copying of tasks or provider chat history is required.
+The Orbit CLI is an orchestration client, not an interactive attempt shell.
 
 ### Interactive actions
 
-The panel shows task, flow, current role, provider/model/logical account, all five
-resource counters, candidate identity and paths, verification, quota observation
-freshness/reset timestamps, execution and confirmed cleanup. Unknown quota is
-shown as unavailable; status does not silently probe a provider. Structured role
-handoffs are shown after a turn; large payloads have explicit truncated previews.
+The compact view separates orchestrator and workflow agents, shows current stages,
+candidate paths/identity and verification/review results. `/agents` explains observed
+selections; `/inspect` adds durable diagnostics, logical accounts, budgets, quota
+freshness/reset, execution and cleanup. Unknown facts remain unavailable; inspection
+does not silently probe a provider. Agent terminal feedback is not verification truth.
 
 | Command | Action |
 | --- | --- |
-| `/status` | Refresh the durable panel |
+| `/status` | Refresh the compact durable view |
+| `/preferences [KEY VALUE]` | Inspect or set interaction, provider, model, reasoning, profile or flow |
+| `/agents` | Inspect orchestrator and workflow-agent selections |
+| `/inspect` | Detailed workflow, verification, quota and resource diagnostics |
+| `/cli` | Show same-session Orbit CLI commands |
 | `/open` | Show the managed attempt path |
 | `/diff [OFFSET]` | Show a bounded candidate diff page and its next offset |
 | `/continue` | Advance to the review gate |

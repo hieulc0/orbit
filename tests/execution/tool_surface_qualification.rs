@@ -4330,6 +4330,18 @@ async fn real_acp_sdk_client_recovers_disconnected_coding_and_read_only_roles() 
 #[tokio::test]
 #[ignore = "requires explicitly authorized actual disposable Zed GUI, live providers, pinned verification and disposable PostgreSQL"]
 async fn real_zed_gui_managed_candidate_lifecycle() -> Result<()> {
+    qualify_real_editor(false).await
+}
+
+#[cfg(feature = "fault-injection")]
+#[tokio::test]
+#[ignore = "requires explicitly authorized actual disposable Zed GUI, orchestrator conversation, live providers, pinned verification and disposable PostgreSQL"]
+async fn real_zed_gui_orchestrator_preferences_and_workflow() -> Result<()> {
+    qualify_real_editor(true).await
+}
+
+#[cfg(feature = "fault-injection")]
+async fn qualify_real_editor(orchestration: bool) -> Result<()> {
     use orbit::{
         execution::local::RoleExecutionProfile,
         interactive::ServiceConfig,
@@ -4374,7 +4386,7 @@ async fn real_zed_gui_managed_candidate_lifecycle() -> Result<()> {
         std::io::Write::write_all(&mut file,ctx.database.url.as_bytes())?; drop(file);
         let mut selection=SelectionPolicy::new("editor-arithmetic","Editor arithmetic"); selection.canonical_digest=true;
         selection.checks.push(VerificationCheck::new_command("arithmetic","C compile/run",vec![VerificationTier::Fast,VerificationTier::Standard,VerificationTier::Full],vec!["sh".into(),"test.sh".into()]));
-        let config=ServiceConfig {repository:repository.path().canonicalize()?,workspaces:managed.canonicalize()?,agent_execution_profile:RoleExecutionProfile::DevLocal {bubblewrap:PathBuf::from("/usr/bin/bwrap")},verification_environment:environment.clone(),selection_policy:selection,risk:Risk::Conservative,skill:Some(Skill::ImplementFeature),external_role:None};
+        let config=ServiceConfig {repository:repository.path().canonicalize()?,workspaces:managed.canonicalize()?,agent_execution_profile:RoleExecutionProfile::DevLocal {bubblewrap:PathBuf::from("/usr/bin/bwrap")},verification_environment:environment.clone(),selection_policy:selection,risk:Risk::Conservative,skill:if orchestration {None} else {Some(Skill::ImplementFeature)},external_role:None};
         let config_file=root.path().join("interactive.json"); fs::write(&config_file,serde_json::to_vec(&config)?)?;
         let profile=root.path().join("zed-profile"); let settings=profile.join("data/config"); fs::create_dir_all(&settings)?;
         let run_token=id();
@@ -4386,9 +4398,9 @@ async fn real_zed_gui_managed_candidate_lifecycle() -> Result<()> {
         let mut previous=String::new();
         let completion=tokio::time::timeout(Duration::from_secs(1800),async {
             loop {
-                let sessions=sqlx::query("SELECT s.id,s.state,s.workflow_run_id,wf.status,wf.current_workspace_state_id FROM orbit_editor_sessions s LEFT JOIN orbit_workflow_runs wf ON wf.id=s.workflow_run_id ORDER BY s.id").fetch_all(&ctx.engine.pool).await?;
+                let sessions=sqlx::query("SELECT s.id,s.state,s.preferences,s.workflow_run_id,wf.status,wf.current_workspace_state_id FROM orbit_editor_sessions s LEFT JOIN orbit_workflow_runs wf ON wf.id=s.workflow_run_id ORDER BY s.id").fetch_all(&ctx.engine.pool).await?;
                 let source=compute_workspace_state(repository.path(),&baseline.baseline_revision).await?;
-                let observation=json!({"source_is_baseline":source.state_id==baseline.state_id,"source_state":source.state_id,"sessions":sessions.iter().map(|row|json!({"id":row.get::<String,_>("id"),"state":row.get::<String,_>("state"),"workflow":row.get::<Option<String>,_>("workflow_run_id"),"status":row.get::<Option<String>,_>("status"),"candidate":row.get::<Option<String>,_>("current_workspace_state_id")})).collect::<Vec<_>>()});
+                let observation=json!({"source_is_baseline":source.state_id==baseline.state_id,"source_state":source.state_id,"sessions":sessions.iter().map(|row|json!({"id":row.get::<String,_>("id"),"state":row.get::<String,_>("state"),"preferences":row.get::<serde_json::Value,_>("preferences"),"workflow":row.get::<Option<String>,_>("workflow_run_id"),"status":row.get::<Option<String>,_>("status"),"candidate":row.get::<Option<String>,_>("current_workspace_state_id")})).collect::<Vec<_>>()});
                 let serialized=serde_json::to_string(&observation)?;
                 if serialized!=previous {
                     use std::io::Write;
@@ -4426,6 +4438,25 @@ async fn real_zed_gui_managed_candidate_lifecycle() -> Result<()> {
         ensure!(ctx.store.get_workflow_run(cancelled).await?.context("cancelled workflow absent")?.status==orbit::workflow::WorkflowStage::Cancelled,"GUI cancellation not durable");
         let confirmed:i64=sqlx::query_scalar("SELECT count(*) FROM orbit_agent_executions ae JOIN orbit_role_executions re ON re.id=ae.role_execution_id WHERE re.workflow_run_id=$1 AND ae.status='CANCELLED' AND ae.metadata->>'cleanup_confirmed'='true'").bind(cancelled).fetch_one(&ctx.engine.pool).await?;
         ensure!(confirmed>0,"GUI cancellation never stopped an actual provider execution");
+        if orchestration {
+            let session:String=sqlx::query_scalar("SELECT id FROM orbit_editor_sessions WHERE workflow_run_id=$1").bind(workflow_id).fetch_one(&ctx.engine.pool).await?;
+            let turns=sqlx::query("SELECT workflow_run_id, preferences FROM orbit_interactive_turns WHERE session_id=$1 ORDER BY sequence").bind(&session).fetch_all(&ctx.engine.pool).await?;
+            ensure!(turns.len()==2,"orchestrator conversation/agent evidence missing");
+            for (index,turn) in turns.iter().enumerate() {
+                let turn_id:String=turn.get("workflow_run_id"); let pref:serde_json::Value=turn.get("preferences");
+                let turn_workflow=ctx.store.get_workflow_run(&turn_id).await?.context("orchestrator workflow missing")?;
+                ensure!(turn_workflow.status==orbit::workflow::WorkflowStage::Completed && ctx.store.flow(&turn_id).await?.is_some_and(|flow|flow.read_only) && turn_workflow.current_workspace_state_id.as_deref()==Some(baseline.state_id.as_str()),"conversation became writable, changed candidate, or remained incomplete");
+                ensure!(pref["interaction"]==if index==0 {"chat"} else {"agent"},"interaction not snapshotted");
+                let roles=ctx.store.list_role_executions(&turn_id).await?;
+                ensure!(roles.len()==1 && roles[0].role_id=="orchestrator" && roles[0].status==RoleExecutionStatus::Succeeded && roles[0].agent_execution_ids.len()==1,"bounded orchestrator role mismatch");
+                print_live_fixture_audit(&ctx.engine.pool,Some(&roles[0].id)).await;
+                let (status,calls,successes,failures,_,metadata)=load_agent_tool_audit(&ctx.engine.pool,&roles[0].agent_execution_ids[0]).await?;
+                ensure!(status=="SUCCEEDED" && calls>0 && calls==successes && failures==0 && metadata["cleanup_confirmed"]==true && metadata["tool_call_audit"]["summary"]["mutating"]==0 && metadata["role_budget"]["usage"]["terminal_calls"]==0 && b34_audit_has_exact_correlations(&metadata["tool_call_audit"],usize::try_from(calls)?),"orchestrator lacks exact read-only audit/cleanup");
+                if index==0 { ensure!(pref["reasoning"]=="deep" && metadata["requested_reasoning_effort"]=="high" && metadata["observed_reasoning_effort"]=="high","reasoning request not actually confirmed"); }
+                println!("ACTUAL_ORCHESTRATOR_ACCEPTANCE {}",json!({"workflow":turn_id,"preferences":pref,"calls":calls,"metadata":metadata}));
+            }
+            ensure!(completion["gui_receipt"]["orchestration"]==true && completion["gui_receipt"]["cli_handoff"]==true,"actual cockpit/CLI receipts missing");
+        }
         ensure_disposable_schema_has_no_credentials(&ctx.engine.pool).await?;
         println!("ACTUAL_ZED_ACCEPTANCE {}",json!({"workflow":workflow_id,"candidate":candidate,"trusted_verification_runs":runs.len(),"actual_cancelled_executions":confirmed,"exact_apply_discard":true,"gui_receipt":completion}));
         Ok(())

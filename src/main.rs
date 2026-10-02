@@ -363,6 +363,17 @@ struct InteractiveArgs {
 
 #[derive(Subcommand)]
 enum InteractiveAction {
+    /// Inspect or update durable interactive user preferences.
+    Preferences {
+        session_id: String,
+        key: Option<String>,
+        value: Option<String>,
+    },
+    /// Run one bounded read-only orchestrator turn.
+    Chat {
+        session_id: String,
+        question: String,
+    },
     /// Create a durable session and detached managed candidate.
     New,
     /// Pin initial user instructions without dispatching a provider.
@@ -2450,14 +2461,23 @@ async fn interactive_service(
         .connect(url.as_str())
         .await
         .map_err(|_| anyhow::anyhow!("interactive control-plane connection failed"))?;
-    let ready: bool = sqlx::query_scalar("SELECT to_regclass('orbit_editor_sessions') IS NOT NULL AND to_regclass('orbit_workflow_runs') IS NOT NULL").fetch_one(&pool).await?;
+    let ready: bool = sqlx::query_scalar("SELECT to_regclass('orbit_editor_sessions') IS NOT NULL AND to_regclass('orbit_workflow_runs') IS NOT NULL AND to_regclass('orbit_interactive_turns') IS NOT NULL").fetch_one(&pool).await?;
     anyhow::ensure!(
         ready,
         "initialize the selected control-plane migrations before interactive use"
     );
     let coordinator =
         interactive_coordinator(pool.clone(), config.verification_environment.clone()).await?;
-    orbit::interactive::InteractiveService::new(pool, config, std::sync::Arc::new(coordinator))
+    let service = orbit::interactive::InteractiveService::new(
+        pool,
+        config,
+        std::sync::Arc::new(coordinator),
+    )?;
+    Ok(if let Some(database) = database_url_file {
+        service.with_cli_context(config_file.canonicalize()?, database.canonicalize()?)
+    } else {
+        service
+    })
 }
 
 async fn interactive_coordinator(
@@ -2530,6 +2550,26 @@ async fn run_interactive_cli(args: &InteractiveArgs, output: Output) -> Result<(
     use tokio::io::AsyncReadExt;
     let service = interactive_service(&args.config, args.database_url_file.as_deref()).await?;
     let value = match &args.action {
+        Preferences {
+            session_id,
+            key,
+            value,
+        } => match (key, value) {
+            (Some(key), Some(value)) => {
+                serde_json::to_value(service.set_preference(session_id, key, value).await?)?
+            }
+            (None, None) => serde_json::to_value(service.preferences(session_id).await?)?,
+            _ => anyhow::bail!("provide both preference key and value"),
+        },
+        Chat {
+            session_id,
+            question,
+        } => {
+            service.start_conversation(session_id, question).await?;
+            let mut run = Box::pin(service.run_conversation(session_id));
+            tokio::select! {result=&mut run=>result?, _=tokio::signal::ctrl_c()=>{service.cancel(session_id).await?; let _=run.await;}}
+            service.dashboard(session_id).await?
+        }
         New => serde_json::to_value(service.new_session(&service.config().repository).await?)?,
         Start {
             session_id,
@@ -2549,7 +2589,14 @@ async fn run_interactive_cli(args: &InteractiveArgs, output: Output) -> Result<(
             let id = session_id.clone();
             let executing = service.clone();
             let review = matches!(&args.action, Review { .. });
-            let mut run = Box::pin(executing.run(&id, review));
+            let conversation = !review && service.session(session_id).await?.state == "STARTING";
+            let mut run = Box::pin(async {
+                if conversation {
+                    executing.run_conversation(&id).await
+                } else {
+                    executing.run(&id, review).await
+                }
+            });
             tokio::select! {
                 result = &mut run => result?,
                 _ = tokio::signal::ctrl_c() => {

@@ -1,5 +1,7 @@
 //! ACP v1 stdio presentation and editor actions. Workflow decisions remain in
 //! the coordinator; the wire exposes no implementer filesystem callbacks.
+use super::editor_view;
+use crate::interactive::preferences::InteractionMode;
 use crate::workflow::flow::Skill;
 use crate::{acp::wire::Wire, interactive::InteractiveService};
 use anyhow::{Context, Result, ensure};
@@ -49,6 +51,19 @@ fn commands() -> Value {
             "status",
             "Show task, flow, roles, budgets, quota and cleanup",
         ),
+        (
+            "preferences",
+            "Inspect or set interaction/provider/model/reasoning/profile/flow",
+        ),
+        (
+            "agents",
+            "Inspect orchestrator and workflow agent selections",
+        ),
+        (
+            "inspect",
+            "Detailed workflow, verification, quota and audit inspector",
+        ),
+        ("cli", "Continue the same durable session in Orbit CLI"),
         ("diff", "View candidate changes"),
         ("open", "Open the managed attempt path"),
         ("continue", "Continue feedback until review is ready"),
@@ -97,6 +112,10 @@ async fn text(
 }
 
 pub fn render_dashboard(dashboard: &Value) -> String {
+    editor_view::render_compact(dashboard)
+}
+
+fn render_inspector(dashboard: &Value) -> String {
     let workflow = &dashboard["workflow"];
     let session = &dashboard["session"];
     let status = workflow["status"].as_str().unwrap_or("ready");
@@ -251,24 +270,13 @@ async fn publish_dashboard(
     session_id: &str,
     dashboard: &Value,
 ) -> Result<()> {
-    let stage = dashboard["workflow"]["status"]
-        .as_str()
-        .unwrap_or("created");
-    let completion = dashboard["flow"]["completion_tier"]
-        .as_str()
-        .unwrap_or("FULL");
-    let entries = ["PLAN", "IMPLEMENT", "VERIFY", "REVIEW", completion];
-    let position = match stage {
-        "planning" => 0,
-        "implementing" | "repairing" => 1,
-        "verifying" => 2,
-        "reviewing" => 3,
-        "regression" => 4,
-        "completed" => 5,
-        _ => 0,
-    };
-    let read_only = dashboard["flow"]["read_only"] == true;
-    update(service, output, session_id, json!({"sessionUpdate":"plan","entries":entries.iter().enumerate().filter(|(index,_)| !read_only || *index == 0).map(|(index, name)| json!({"content":name,"priority":"medium","status":if position > index {"completed"} else if position == index {"in_progress"} else {"pending"}})).collect::<Vec<_>>()})).await?;
+    update(
+        service,
+        output,
+        session_id,
+        json!({"sessionUpdate":"plan","entries":editor_view::stage_entries(dashboard)}),
+    )
+    .await?;
     text(
         service,
         output,
@@ -363,7 +371,7 @@ pub async fn serve(
                             ensure!(params.get("mcpServers").is_none_or(|servers| servers == &json!([])), "external MCP authority is not admitted");
                             let session = service.new_session(Path::new(params["cwd"].as_str().context("cwd required")?)).await?;
                             let mode = if let Some(skill) = service.config().skill { let mode = serde_json::to_value(skill)?.as_str().unwrap().to_owned(); service.set_mode(&session.id, &mode).await?; mode } else {"auto".into()};
-                            return Ok(Some(json!({"sessionId":session.id,"modes":modes(&service,&mode)})));
+                            return Ok(Some(json!({"sessionId":session.id,"modes":modes(&service,&mode),"configOptions":session_options(&service,&session.id).await?})));
                         }
                         let session_id = session_id(params)?.to_owned();
                         let session = service.session(&session_id).await?;
@@ -379,8 +387,9 @@ pub async fn serve(
                                 ensure!(Path::new(params["cwd"].as_str().context("cwd required")?).canonicalize()? == service.config().repository, "session repository mismatch");
                                 for notification in service.notifications(&session_id).await? { output.notify("session/update", notification).await?; }
                                 dashboard_update(&service,&mut output,&session_id).await?;
-                                Ok(Some(json!({"modes":modes(&service,&session.mode)})))
+                                Ok(Some(json!({"modes":modes(&service,&session.mode),"configOptions":session_options(&service,&session_id).await?})))
                             }
+                            "session/set_config_option" => { service.set_preference(&session_id, params["configId"].as_str().context("configId required")?,params["value"].as_str().context("select value required")?).await?; let options=session_options(&service,&session_id).await?; update(&service,&mut output,&session_id,json!({"sessionUpdate":"config_option_update","configOptions":options})).await?; Ok(Some(json!({"configOptions":options}))) }
                             "session/set_mode" => { let mode = params["modeId"].as_str().context("modeId required")?; service.set_mode(&session_id, mode).await?; update(&service, &mut output, &session_id, json!({"sessionUpdate":"current_mode_update","currentModeId":mode})).await?; Ok(Some(json!({}))) }
                             "_orbit/session/status" => Ok(Some(service.dashboard(&session_id).await?)),
                             "_orbit/session/open" => Ok(Some(json!({"workspacePath":session.worktree.context("worktree missing")?.workspace}))),
@@ -402,6 +411,15 @@ pub async fn serve(
                                 if prompt.starts_with('/') {
                                     let mut parts = prompt.split_whitespace();
                                     match parts.next().unwrap_or("") {
+                                        "/preferences" => {
+                                            if let Some(key)=parts.next() { let value=parts.next().context("preference value required")?; ensure!(parts.next().is_none(), "unexpected preference arguments"); service.set_preference(&session_id,key,value).await?; }
+                                            let options=session_options(&service,&session_id).await?;
+                                            update(&service,&mut output,&session_id,json!({"sessionUpdate":"config_option_update","configOptions":options})).await?;
+                                            text(&service,&mut output,&session_id,&format!("Preferences (not authority):\n```json\n{}\n```\nUse /preferences key value. Chat/Agent are read-only; Flow starts an explicit task. Gemini supports Auto reasoning only. Non-Auto reasoning uses the pinned Codex bridge with exact effort confirmation. Workflow agents remain independent.",serde_json::to_string_pretty(&service.preferences(&session_id).await?)?),false).await?;
+                                            return Ok(Some(json!({"stopReason":"end_turn"})));
+                                        }
+                                        "/agents" | "/inspect" => { let dashboard=service.dashboard(&session_id).await?; let view=if prompt.trim()=="/agents" {editor_view::render_agents(&dashboard)} else {format!("{}\n{}",editor_view::render_agents(&dashboard),render_inspector(&dashboard))}; text(&service,&mut output,&session_id,&view,false).await?; return Ok(Some(json!({"stopReason":"end_turn"}))); }
+                                        "/cli" => { text(&service,&mut output,&session_id,&service.cli_handoff(&session_id),false).await?; return Ok(Some(json!({"stopReason":"end_turn"}))); }
                                         "/status" => { dashboard_update(&service,&mut output,&session_id).await?; return Ok(Some(json!({"stopReason":"end_turn"}))); }
                                         "/open" => { let path = session.worktree.context("worktree missing")?.workspace; text(&service,&mut output,&session_id,&format!("Managed attempt: `{}`",path.display()),false).await?; return Ok(Some(json!({"stopReason":"end_turn"}))); }
                                         "/diff" => {
@@ -416,13 +434,20 @@ pub async fn serve(
                                         "/continue" | "/review" => {}
                                         _ => anyhow::bail!("unknown Orbit command"),
                                     }
-                                } else { ensure!(session.workflow_run_id.is_none(), "task is already pinned; use /continue or create a new session"); ensure!(!active.contains_key(&session_id) && active.len() < 4, "interactive execution capacity reached"); service.start(&session_id,&prompt).await?; }
+                                } else {
+                                    ensure!(!active.contains_key(&session_id) && active.len() < 4, "interactive execution capacity reached");
+                                    if service.preferences(&session_id).await?.interaction == InteractionMode::Flow {
+                                        ensure!(session.workflow_run_id.is_none(), "task is already pinned; use /continue or create a new session");
+                                        service.start(&session_id,&prompt).await?;
+                                    } else { service.start_conversation(&session_id,&prompt).await?; }
+                                }
                                 ensure!(!active.contains_key(&session_id), "prompt already active for this session");
                                 ensure!(active.len() < 4, "interactive execution capacity reached");
                                 let review = prompt.trim() == "/review";
                                 let worker = service.clone();
                                 let worker_session = session_id.clone();
-                                jobs.spawn(async move { let result = worker.run(&worker_session,review).await; (worker_session,result) });
+                                let conversation = service.session(&session_id).await?.state == "STARTING";
+                                jobs.spawn(async move { let result = if conversation { worker.run_conversation(&worker_session).await } else { worker.run(&worker_session,review).await }; (worker_session,result,conversation) });
                                 active.insert(session_id,request_id.clone());
                                 Ok(None)
                             }
@@ -442,22 +467,24 @@ pub async fn serve(
                             }
                         }
                         Ok(None) => {},
-                        Err(_) => output.response_error(request_id,-32603,"EDITOR_REQUEST_FAILED").await?
+                        Err(error) => {
+                            let reason=error.to_string();
+                            let code=reason.split([':', ' ']).next().unwrap_or("EDITOR_REQUEST_FAILED");
+                            let message=if code.len()<=64 && code.bytes().all(|b|b.is_ascii_uppercase()||b==b'_') {code} else {"EDITOR_REQUEST_FAILED"};
+                            output.response_error(request_id,-32603,message).await?;
+                        }
                     }
                 }
                 completed = jobs.join_next(), if !jobs.is_empty() => {
-                    let (session_id, result) = completed.context("editor worker disappeared")?.context("editor worker panicked")?;
+                    let (session_id, result, conversation) = completed.context("editor worker disappeared")?.context("editor worker panicked")?;
                     let request_id = active.remove(&session_id).context("editor prompt ownership lost")?;
                     last_snapshots.remove(&session_id);
                     dashboard_update(&service,&mut output,&session_id).await?;
                     if result.is_err() { text(&service,&mut output,&session_id,"Orbit could not advance this workflow. Inspect its durable role, verification and cleanup evidence before resuming.",false).await?; }
                     let dashboard = service.dashboard(&session_id).await?;
-                    if let Some(handoffs) = dashboard["handoffs"].as_array() {
-                        for handoff in handoffs {
-                            text(&service, &mut output, &session_id, &format!("\n{} handoff:\n```json\n{}\n```", handoff["role"].as_str().unwrap_or("role"), serde_json::to_string_pretty(&handoff["handoff"]["structured_payload"])?), false).await?;
-                        }
+                    if conversation && let Some(turn) = dashboard["orchestrator"].as_array().and_then(|v|v.last()) && let Some(answer) = turn["answer"].as_str() { text(&service,&mut output,&session_id,&format!("\n**Orchestrator**\n\n{answer}\n"),false).await?;
                     }
-                    output.response_ok(request_id,json!({"stopReason":if dashboard["workflow"]["status"] == "cancelled" {"cancelled"} else {"end_turn"}})).await?;
+                    output.response_ok(request_id,json!({"stopReason":if (conversation && dashboard["orchestrator"].as_array().and_then(|v|v.last()).is_some_and(|v|v["status"]=="CANCELLED")) || (!conversation && dashboard["workflow"]["status"] == "cancelled") {"cancelled"} else {"end_turn"}})).await?;
                 }
                 _ = progress.tick(), if !active.is_empty() => {
                     for session_id in active.keys() {
@@ -479,4 +506,15 @@ pub async fn serve(
     while jobs.join_next().await.is_some() {}
     reader.abort();
     result
+}
+
+async fn session_options(service: &InteractiveService, session: &str) -> Result<Value> {
+    Ok(editor_view::config_options(
+        &serde_json::to_value(service.preferences(session).await?)?,
+        matches!(
+            service.config().agent_execution_profile,
+            crate::execution::local::RoleExecutionProfile::DevLocal { .. }
+        ),
+        service.config().skill.is_some(),
+    ))
 }

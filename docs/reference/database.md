@@ -47,3 +47,11 @@ and recursive cancellation. It favors auditable correctness over throughput.
 Reads remain available, but claims/reconciliation scan active run aggregates and
 large trees can increase lock duration. The bounded local implementation is not
 a throughput, high-availability, storage-loss, or production qualification.
+
+## Interactive user preferences
+
+`orbit_editor_sessions.preferences` stores non-authoritative user preferences.
+`orbit_interactive_turns` links conversational workflows to the owning session,
+with an immutable preference snapshot and matching operation identity. Admission
+publishes that association and session ownership atomically. Task, role, candidate,
+handoff and verification records stay in their existing authoritative stores.

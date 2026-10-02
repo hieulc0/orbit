@@ -143,6 +143,11 @@ impl Engine {
         sqlx::raw_sql(include_str!("../../migrations/0028_external_reasoning.sql"))
             .execute(&mut *migration)
             .await?;
+        sqlx::raw_sql(include_str!(
+            "../../migrations/0029_interactive_preferences.sql"
+        ))
+        .execute(&mut *migration)
+        .await?;
         migration.commit().await?;
         Ok(Self {
             pool,

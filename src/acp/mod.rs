@@ -11,3 +11,5 @@ pub mod terminal;
 pub mod wire;
 
 pub use preflight::*;
+
+pub mod editor_view;

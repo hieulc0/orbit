@@ -30,6 +30,11 @@ when their syntax is valid.
 ## Interactive control
 
 All actions take `orbit interactive --config FILE --database-url-file PRIVATE_FILE`.
+`preferences SESSION [KEY VALUE]` reads or updates validated product preferences.
+`chat SESSION QUESTION` runs one bounded read-only turn after selecting Chat or Agent.
+`continue SESSION` resumes a linked conversational execution when one is active,
+or the existing workflow otherwise. All clients use the same durable session;
+see [conversation and execution preferences](../operations/installation.md#conversation-and-execution-preferences).
 The database and repository configuration are operator-selected; this is local
 control over PostgreSQL, not an HTTP client. See [setup and reconnect](../operations/installation.md#interactive-cli).
 

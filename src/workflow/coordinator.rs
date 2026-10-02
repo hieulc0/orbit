@@ -535,7 +535,20 @@ impl WorkflowCoordinator {
             }
 
             WorkflowStage::Planning => {
-                let role = RoleDefinition::planner_v1();
+                let role = if let Some(preferences) =
+                    crate::interactive::preferences::turn_preferences(&self.pool, wf_id).await?
+                {
+                    ensure!(
+                        self.store
+                            .flow(wf_id)
+                            .await?
+                            .is_some_and(|flow| flow.read_only),
+                        "ORCHESTRATOR_REQUIRES_READ_ONLY_FLOW"
+                    );
+                    preferences.orchestrator_role()?
+                } else {
+                    RoleDefinition::planner_v1()
+                };
                 let target = RoleRuntimeResolver::resolve_target_live_with_policy(
                     &self.credential_catalog_pool,
                     &role,
@@ -2387,7 +2400,7 @@ impl RoleAgentExecutor for SimulatedRoleExecutor {
             .push(role.role_id.clone());
 
         let raw_output = match role.role_id.as_str() {
-            "planner" => {
+            "planner" | "orchestrator" => {
                 let guard = self.plan_response.lock().unwrap();
                 guard.clone().unwrap_or_else(|| {
                     format!(

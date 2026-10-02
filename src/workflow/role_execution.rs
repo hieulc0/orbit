@@ -787,6 +787,13 @@ async fn execute_real_acp_turn(
                 "antigravity" => Some(ANTIGRAVITY_IMAGE.to_string()),
                 _ => None,
             });
+    let preferences =
+        crate::interactive::preferences::turn_preferences(workflow_state_pool, &wf_run.id).await?;
+    let requested_effort = preferences
+        .as_ref()
+        .map(|p| p.effort(&target.provider))
+        .transpose()?
+        .flatten();
     let initial_metadata = serde_json::json!({
         "provider": target.provider,
         "account_reference": target.credential_id,
@@ -796,6 +803,7 @@ async fn execute_real_acp_turn(
         "expected_runtime_identity": target.runtime_interface,
         "expected_runtime_profile": expected_runtime_profile,
         "cleanup_confirmed": false,
+        "requested_reasoning_effort": requested_effort,
         "observed_model": null,
         "tool_call_audit": initial_audit,
         "lifecycle": lifecycle.value(),
@@ -949,6 +957,13 @@ async fn execute_real_acp_turn_body(
     )
     .await?;
     validate_role_runtime_target(role, target)?;
+    let preferences =
+        crate::interactive::preferences::turn_preferences(workflow_state_pool, &wf_run.id).await?;
+    let requested_effort = preferences
+        .as_ref()
+        .map(|p| p.effort(&target.provider))
+        .transpose()?
+        .flatten();
     confirm_agent_lifecycle_phase(
         &store,
         lifecycle,
@@ -1079,7 +1094,7 @@ async fn execute_real_acp_turn_body(
                 files,
                 scopes: Vec::new(),
             },
-            reasoning_effort: None,
+            reasoning_effort: requested_effort.map(str::to_owned),
         };
         rt.validate()?;
         rt
@@ -1363,6 +1378,7 @@ async fn execute_real_acp_turn_body(
         crate::execution::local::RoleExecutionProfile::DevLocal { .. }
     ) && role.workspace_access == WorkspaceAccess::ReadWrite;
     let mut observed_model = None;
+    let mut observed_effort: Option<String> = None;
     let turn = tokio::select! {
         result = async {
     persist_agent_lifecycle_phase(
@@ -1447,6 +1463,10 @@ async fn execute_real_acp_turn_body(
     .context("ACP session/new failed")?;
 
     observed_model = reported_session_model(&new_res)?;
+    if let Some(requested) = requested_effort {
+        observed_effort = new_res.pointer("/_meta/orbit/codexReasoningEffort").and_then(serde_json::Value::as_str).map(str::to_owned);
+        ensure!(observed_effort.as_deref() == Some(requested), "REASONING_EFFORT_UNCONFIRMED: prompt not dispatched");
+    }
 
     let session_id = new_res
         .get("sessionId")
@@ -1720,6 +1740,8 @@ async fn execute_real_acp_turn_body(
                 "role_budget": {"limits":state.role_budget,"usage":state.role_usage},
                 "cleanup_confirmed": evidence.cleanup_confirmed,
                 "observed_model": observed_model,
+                "requested_reasoning_effort": requested_effort,
+                "observed_reasoning_effort": observed_effort,
                 "tool_call_audit": tool_call_audit,
                 "lifecycle": lifecycle.value(),
             }),

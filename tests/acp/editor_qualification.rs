@@ -595,6 +595,11 @@ async fn acp_v1_stdio_is_typed_bounded_and_replays_session_notifications() -> Re
         let _:agent_client_protocol::SessionNotification=serde_json::from_value(declared["params"].clone())?;
         ensure!(declared["params"]["sessionId"]==session && declared["params"]["update"]["sessionUpdate"]=="available_commands_update","post-response command menu missing");
         ensure!(declared["params"]["update"]["availableCommands"].as_array().is_some_and(|commands|commands.iter().any(|command|command["name"]=="diff")),"candidate diff command missing");
+        let (configured,updates)=exchange(&mut client,100,"session/set_config_option",json!({"sessionId":session,"configId":"interaction","value":"chat"})).await?;
+        let _:agent_client_protocol::SetSessionConfigOptionResponse=serde_json::from_value(configured["result"].clone())?;
+        ensure!(configured["result"]["configOptions"][0]["currentValue"]=="chat" && updates.iter().any(|n|n["update"]["sessionUpdate"]=="config_option_update"),"native preference update missing");
+        let (unsupported,_)=exchange(&mut client,101,"session/set_config_option",json!({"sessionId":session,"configId":"reasoning","value":"ultra"})).await?;
+        ensure!(unsupported.get("error").is_some(),"unsupported preference accepted");
         let (status,notes)=exchange(&mut client,3,"session/prompt",json!({"sessionId":session,"prompt":[{"type":"text","text":"/status"}]})).await?;
         let _:agent_client_protocol::PromptResponse=serde_json::from_value(status["result"].clone())?;
         ensure!(notes.len()>=3,"progress panel missing");
@@ -602,6 +607,7 @@ async fn acp_v1_stdio_is_typed_bounded_and_replays_session_notifications() -> Re
         let (loaded,replayed)=exchange(&mut client,4,"session/load",json!({"sessionId":session,"cwd":repo.path(),"mcpServers":[]})).await?;
         let _:agent_client_protocol::LoadSessionResponse=serde_json::from_value(loaded["result"].clone())?;
         ensure!(replayed.starts_with(&stored) && replayed.len()>stored.len(),"session replay or fresh durable view missing");
+        ensure!(loaded["result"]["configOptions"][0]["currentValue"]=="chat","native preference lost on reload");
         let refreshed=client.read().await?;
         let _:agent_client_protocol::SessionNotification=serde_json::from_value(refreshed["params"].clone())?;
         ensure!(refreshed["params"]["update"]["sessionUpdate"]=="available_commands_update","restored command menu missing");
@@ -782,4 +788,306 @@ async fn read_only_session_pins_candidate_before_role_dispatch() -> Result<()> {
     .await;
     database.teardown().await?;
     result
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL"]
+async fn interactive_preferences_and_conversation_ownership_are_durable() -> Result<()> {
+    use orbit::interactive::preferences::*;
+    use orbit::workflow::{
+        HandoffType, PlanHandoff, RoleRuntimeResolver, RuntimeQuotaSelectionPolicy, WorkflowStage,
+    };
+    let database = common::DisposablePgTestContext::create("interactive_preferences", 3).await?;
+    let result = async {
+        let repo = common::TemporaryGitRepo::create()?;
+        let root = tempfile::tempdir()?;
+        let settings = config(&repo, &root)?;
+        let client = service(&database.engine.pool, settings.clone())?;
+        let session = client.new_session(repo.path()).await?;
+        let baseline = client.dashboard(&session.id).await?["candidate"].clone();
+        client
+            .set_preference(&session.id, "interaction", "chat")
+            .await?;
+        client
+            .set_preference(&session.id, "provider", "codex")
+            .await?;
+        client
+            .set_preference(&session.id, "model", "gpt-6-luna")
+            .await?;
+        client
+            .set_preference(&session.id, "reasoning", "deep")
+            .await?;
+        let reconnect = service(&database.engine.pool, settings.clone())?;
+        ensure!(
+            reconnect.preferences(&session.id).await? == client.preferences(&session.id).await?,
+            "preference reconstruct mismatch"
+        );
+        ensure!(
+            client
+                .set_preference(&session.id, "profile", "dev_local")
+                .await
+                .is_err(),
+            "operator profile bypassed"
+        );
+        ensure!(
+            client
+                .set_preference(&session.id, "provider", "gemini")
+                .await
+                .is_err(),
+            "unsupported reasoning/model accepted"
+        );
+        ensure!(
+            client
+                .start(&session.id, "silently implement")
+                .await
+                .is_err(),
+            "chat granted implementation"
+        );
+        ensure!(
+            client.session(&session.id).await?.state == "READY",
+            "effect-free denial poisoned session"
+        );
+        let workflow = client
+            .start_conversation(&session.id, "explain; never mutate")
+            .await?;
+        ensure!(
+            client.session(&session.id).await?.workflow_run_id.is_none(),
+            "conversation became primary workflow"
+        );
+        let mut wrong_settings = settings.clone();
+        wrong_settings.risk = Risk::Low;
+        let wrong = service(&database.engine.pool, wrong_settings)?;
+        ensure!(
+            wrong.cancel(&session.id).await.is_err(),
+            "wrong settings admitted cancellation"
+        );
+        ensure!(
+            wrong.conversation_view(&session.id).await.is_err(),
+            "wrong settings admitted conversation inspection"
+        );
+        ensure!(
+            WorkflowStore::new(database.engine.pool.clone())
+                .get_workflow_run(&workflow)
+                .await?
+                .unwrap()
+                .status
+                == WorkflowStage::Created,
+            "identity denial cancelled another session"
+        );
+        let snapshot = turn_preferences(&database.engine.pool, &workflow)
+            .await?
+            .unwrap();
+        ensure!(
+            snapshot.reasoning == ReasoningPreference::Deep,
+            "turn preferences not pinned"
+        );
+        ensure!(
+            client
+                .start_conversation(&session.id, "duplicate")
+                .await
+                .is_err(),
+            "concurrent turn accepted"
+        );
+        ensure!(
+            client
+                .set_preference(&session.id, "reasoning", "fast")
+                .await
+                .is_err(),
+            "active turn retargeted"
+        );
+        ensure!(
+            client
+                .candidate_action(&session.id, baseline["state_id"].as_str().unwrap(), false)
+                .await
+                .is_err(),
+            "active read erased"
+        );
+        let role = snapshot.orchestrator_role()?;
+        ensure!(
+            RoleRuntimeResolver::resolve_target_live_with_policy(
+                &database.engine.pool,
+                &role,
+                None,
+                RuntimeQuotaSelectionPolicy::default()
+            )
+            .await
+            .is_err(),
+            "preference bypassed missing credentials"
+        );
+        let store = WorkflowStore::new(database.engine.pool.clone());
+        ensure!(
+            store.flow(&workflow).await?.unwrap().read_only,
+            "chat selected a writable flow"
+        );
+        let state = baseline["state_id"].as_str().unwrap();
+        store
+            .transition_workflow_stage(&workflow, WorkflowStage::Planning, Some(state), None, None)
+            .await?;
+        ensure!(
+            store
+                .transition_workflow_stage(
+                    &workflow,
+                    WorkflowStage::Completed,
+                    Some(state),
+                    None,
+                    None
+                )
+                .await
+                .is_err(),
+            "conversation completed without exact evidence"
+        );
+        let execution = store
+            .create_role_execution(&workflow, &role, "PLANNING", 0, Some(state), None)
+            .await?;
+        let handoff = store
+            .save_handoff_artifact(
+                &workflow,
+                Some(&execution.id),
+                HandoffType::Plan,
+                Some(state),
+                serde_json::to_value(PlanHandoff {
+                    summary: "Read-only answer".into(),
+                    affected_areas: vec![],
+                    implementation_steps: vec![],
+                    expected_files: vec![],
+                    risks: vec![],
+                    verification_notes: vec![],
+                    open_questions: vec![],
+                })?,
+            )
+            .await?;
+        store
+            .complete_role_execution_success(&execution.id, Some(state), Some(&handoff.id))
+            .await?;
+        store
+            .transition_workflow_stage(&workflow, WorkflowStage::Completed, Some(state), None, None)
+            .await?;
+        reconnect.run_conversation(&session.id).await?;
+        let display = reconnect.dashboard(&session.id).await?;
+        ensure!(
+            display["orchestrator"][0]["answer"] == "Read-only answer"
+                && display["candidate"] == baseline,
+            "reconnect lost answer or exact candidate"
+        );
+        ensure!(
+            display["preferences"]["interaction"] == "chat",
+            "reconnect lost interaction"
+        );
+        ensure!(
+            std::fs::read_to_string(repo.path().join("README.md"))? == "offline fixture baseline\n",
+            "chat changed source"
+        );
+        // A blocked admission never exposes a new operation without its turn.
+        let mut fence=database.engine.pool.begin().await?;
+        sqlx::query("SELECT id FROM orbit_editor_sessions WHERE id=$1 FOR UPDATE").bind(&session.id).fetch_one(&mut *fence).await?;
+        let before:i64=sqlx::query_scalar("SELECT count(*) FROM orbit_workflow_runs").fetch_one(&database.engine.pool).await?;
+        let starting=client.clone(); let current_id=session.id.clone();
+        let admission=tokio::spawn(async move {starting.start_conversation(&current_id,"second bounded turn").await});
+        tokio::time::timeout(std::time::Duration::from_secs(5),async {
+            loop {let count:i64=sqlx::query_scalar("SELECT count(*) FROM orbit_workflow_runs").fetch_one(&database.engine.pool).await?; if count>before{return Ok::<_,anyhow::Error>(());} tokio::task::yield_now().await;}
+        }).await??;
+        ensure!(reconnect.session(&session.id).await?.state=="READY","unlinked turn exposed as runnable");
+        ensure!(reconnect.run_conversation(&session.id).await.is_err(),"old turn consumed pending admission");
+        fence.commit().await?;
+        let admitted=admission.await??;
+        let associated:String=sqlx::query_scalar("SELECT t.workflow_run_id FROM orbit_editor_sessions s JOIN orbit_interactive_turns t ON t.session_id=s.id AND t.operation_id=s.operation_id WHERE s.id=$1").bind(&session.id).fetch_one(&database.engine.pool).await?;
+        ensure!(associated==admitted && associated!=workflow,"runner did not bind current operation");
+        reconnect.cancel(&session.id).await?;
+        reconnect.run_conversation(&session.id).await?;
+        ensure!(store.get_workflow_run(&admitted).await?.unwrap().status==WorkflowStage::Cancelled,"cancellation missed published admission");
+        client
+            .set_preference(&session.id, "interaction", "agent")
+            .await?;
+        let cancelled = client
+            .start_conversation(&session.id, "bounded investigation")
+            .await?;
+        client.cancel(&session.id).await?;
+        reconnect.run_conversation(&session.id).await?;
+        ensure!(
+            store.get_workflow_run(&cancelled).await?.unwrap().status == WorkflowStage::Cancelled,
+            "conversation cancellation not durable"
+        );
+        client
+            .set_preference(&session.id, "interaction", "flow")
+            .await?;
+        client
+            .set_preference(&session.id, "flow", "engineering")
+            .await?;
+        let main = client
+            .start(&session.id, "explicit engineering operation")
+            .await?;
+        ensure!(
+            !store.flow(&main).await?.unwrap().read_only,
+            "explicit flow not configured by Orbit"
+        );
+        ensure!(
+            client
+                .set_preference(&session.id, "flow", "investigate")
+                .await
+                .is_err(),
+            "pinned workflow altered"
+        );
+        ensure!(
+            client
+                .set_preference(&session.id, "profile", "trusted")
+                .await
+                .is_err(),
+            "pinned profile altered"
+        );
+        client.cancel(&session.id).await?;
+        client.candidate_action(&session.id, state, false).await?;
+        Ok(())
+    }
+    .await;
+    database.teardown().await?;
+    result
+}
+
+#[test]
+fn editor_selectors_and_candidate_views_are_observations() -> Result<()> {
+    use orbit::acp::editor_view::*;
+    use orbit::interactive::preferences::SessionPreferences;
+    let preferences = serde_json::to_value(SessionPreferences::default())?;
+    let options = config_options(&preferences, true, false);
+    ensure!(
+        options.as_array().unwrap().len() == 6,
+        "missing preference selectors"
+    );
+    let mut d = json!({"preferences":preferences,"execution_profile":{"profile":"dev_local"},"workflow":{"status":"reviewing","current_stage":"REVIEWING"},"flow":{"completion_tier":"FULL","review_tier":"STANDARD"},"roles":[{"role_id":"planner","status":"succeeded","resolved_target":{"provider":"codex","resolved_model":"gpt-6-luna"}},{"role_id":"implementer","status":"succeeded","resolved_target":{"provider":"antigravity","resolved_model":"gemini-3.7-flash-high"}}],"candidate":{"state_id":"exact"},"changed_files":{"total":1,"paths":["src/app.rs"]},"verification":[{"tier":"FAST","result":"PASSED","workspace_state_id":"stale"},{"tier":"STANDARD","result":"PASSED","workspace_state_id":"exact"}]});
+    let entries = stage_entries(&d);
+    ensure!(
+        entries[2]["status"] != "completed" && entries[3]["status"] == "completed",
+        "stale verification presented as current"
+    );
+    let compact = render_compact(&d);
+    ensure!(
+        compact.contains("Orchestrator")
+            && compact.contains("Workflow implementer")
+            && compact.contains("src/app.rs")
+            && compact.contains("other candidate"),
+        "cockpit obscured distinct responsibility or evidence"
+    );
+    d["flow"]["review_tier"] = json!("FAST");
+    d["flow"]["completion_tier"] = json!("FAST");
+    d["effective_tiers"] = json!({"review":"STANDARD","completion":"FULL"});
+    let escalated = stage_entries(&d);
+    ensure!(
+        escalated.iter().any(|s| s["content"] == "STANDARD")
+            && escalated.iter().any(|s| s["content"] == "FULL"),
+        "effective verification escalation hidden"
+    );
+    d["effective_tiers"] = json!({"review":"FAST","completion":"FAST"});
+    ensure!(
+        stage_entries(&d)
+            .iter()
+            .any(|s| s["content"] == "FAST (final)"),
+        "final verification gate hidden"
+    );
+    d["preferences"]["provider"] = json!("gemini");
+    let options = config_options(&d["preferences"], false, false);
+    ensure!(
+        options[3]["options"].as_array().unwrap().len() == 1,
+        "unsupported Gemini reasoning advertised"
+    );
+    Ok(())
 }
