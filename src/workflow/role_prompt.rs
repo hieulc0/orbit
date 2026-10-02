@@ -225,6 +225,44 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn orchestrator_prompt_advertises_only_authorized_repository_reads() -> Result<()> {
+        let role =
+            crate::interactive::preferences::SessionPreferences::default().orchestrator_role()?;
+        let tools = repository_tools_for_role(&role);
+        assert_eq!(tools.len(), 7);
+        for tool in &tools {
+            let metadata = crate::tool_surface::ToolMetadata::for_tool(
+                crate::tool_surface::CanonicalToolName::from_wire(tool).unwrap(),
+            );
+            assert!(metadata.is_role_allowed("orchestrator"));
+            assert!(!metadata.mutating);
+        }
+        for (provider, read_tool) in [
+            ("codex", "orbit_read_file"),
+            ("antigravity", "client_view_file"),
+        ] {
+            let prompt = build_role_prompt(
+                RolePromptToolContext {
+                    provider,
+                    role: &role,
+                    advertised_tools: &tools,
+                },
+                "Explain this function",
+                Path::new("/workspace"),
+                "HEAD",
+                None,
+                None,
+                &[],
+            )?;
+            assert!(prompt.contains(read_tool));
+            assert!(!prompt.contains("orbit_terminal"));
+            assert!(!prompt.contains("orbit_write_file"));
+            assert!(!prompt.contains("client_create_file"));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn antigravity_prompt_matches_brokered_tool_names_and_arguments() -> Result<()> {
         for role in [
             RoleDefinition::planner_v1(),

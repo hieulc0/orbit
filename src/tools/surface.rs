@@ -169,7 +169,12 @@ impl ToolMetadata {
             CanonicalToolName::FsReadTextFile => (
                 false,
                 false,
-                vec!["planner".into(), "implementer".into(), "reviewer".into()],
+                vec![
+                    "planner".into(),
+                    "implementer".into(),
+                    "reviewer".into(),
+                    "orchestrator".into(),
+                ],
                 65536,
                 30,
                 true,
@@ -177,7 +182,12 @@ impl ToolMetadata {
             CanonicalToolName::FsListDirectory => (
                 false,
                 false,
-                vec!["planner".into(), "implementer".into(), "reviewer".into()],
+                vec![
+                    "planner".into(),
+                    "implementer".into(),
+                    "reviewer".into(),
+                    "orchestrator".into(),
+                ],
                 65536,
                 30,
                 true,
@@ -185,7 +195,12 @@ impl ToolMetadata {
             CanonicalToolName::FsFindPath => (
                 false,
                 false,
-                vec!["planner".into(), "implementer".into(), "reviewer".into()],
+                vec![
+                    "planner".into(),
+                    "implementer".into(),
+                    "reviewer".into(),
+                    "orchestrator".into(),
+                ],
                 65536,
                 30,
                 true,
@@ -193,7 +208,12 @@ impl ToolMetadata {
             CanonicalToolName::SearchGrep => (
                 false,
                 false,
-                vec!["planner".into(), "implementer".into(), "reviewer".into()],
+                vec![
+                    "planner".into(),
+                    "implementer".into(),
+                    "reviewer".into(),
+                    "orchestrator".into(),
+                ],
                 65536,
                 60,
                 true,
@@ -201,7 +221,12 @@ impl ToolMetadata {
             CanonicalToolName::GitStatus => (
                 false,
                 false,
-                vec!["planner".into(), "implementer".into(), "reviewer".into()],
+                vec![
+                    "planner".into(),
+                    "implementer".into(),
+                    "reviewer".into(),
+                    "orchestrator".into(),
+                ],
                 65536,
                 30,
                 true,
@@ -209,7 +234,12 @@ impl ToolMetadata {
             CanonicalToolName::GitDiff => (
                 false,
                 false,
-                vec!["planner".into(), "implementer".into(), "reviewer".into()],
+                vec![
+                    "planner".into(),
+                    "implementer".into(),
+                    "reviewer".into(),
+                    "orchestrator".into(),
+                ],
                 65536,
                 30,
                 true,
@@ -217,7 +247,12 @@ impl ToolMetadata {
             CanonicalToolName::GitShow => (
                 false,
                 false,
-                vec!["planner".into(), "implementer".into(), "reviewer".into()],
+                vec![
+                    "planner".into(),
+                    "implementer".into(),
+                    "reviewer".into(),
+                    "orchestrator".into(),
+                ],
                 65536,
                 30,
                 true,
@@ -1613,6 +1648,91 @@ mod tests {
         assert!(!term.is_role_allowed("planner"));
         assert!(term.is_role_allowed("implementer"));
         assert!(!term.is_role_allowed("reviewer"));
+    }
+
+    #[test]
+    fn orchestrator_authorization_is_limited_to_repository_observation() -> Result<()> {
+        use CanonicalToolName::*;
+        let repository = tempdir()?;
+        let identity = repository.path().to_str().unwrap();
+        for tool in [
+            FsReadTextFile,
+            FsListDirectory,
+            FsFindPath,
+            SearchGrep,
+            GitStatus,
+            GitDiff,
+            GitShow,
+        ] {
+            let metadata = authorize_repository_tool(
+                tool,
+                Some("orchestrator"),
+                WorkspaceAccess::ReadOnly,
+                repository.path(),
+                Some(identity),
+                1,
+                150,
+            )?;
+            assert!(!metadata.mutating);
+            assert!(!metadata.requires_mutation_lock);
+        }
+        for tool in [
+            FsWriteTextFile,
+            FsEditFile,
+            FsCreateDirectory,
+            FsMove,
+            FsCopy,
+            FsDeleteFile,
+            FsDeleteDirectory,
+            TerminalCreate,
+            TerminalOutput,
+            TerminalWaitForExit,
+            TerminalKill,
+            TerminalRelease,
+        ] {
+            for access in [WorkspaceAccess::ReadOnly, WorkspaceAccess::ReadWrite] {
+                let error = authorize_repository_tool(
+                    tool,
+                    Some("orchestrator"),
+                    access,
+                    repository.path(),
+                    Some(identity),
+                    1,
+                    150,
+                )
+                .unwrap_err();
+                assert!(!ToolMetadata::for_tool(tool).is_role_allowed("orchestrator"));
+                assert!(
+                    error.to_string().contains(ERR_ROLE_NOT_ALLOWED)
+                        || error.to_string().contains(ERR_READ_ONLY_ROLE)
+                );
+            }
+        }
+        assert!(
+            authorize_repository_tool(
+                FsReadTextFile,
+                Some("orchestrator"),
+                WorkspaceAccess::ReadOnly,
+                repository.path(),
+                None,
+                1,
+                150
+            )
+            .is_err()
+        );
+        assert!(
+            authorize_repository_tool(
+                FsReadTextFile,
+                Some("orchestrator"),
+                WorkspaceAccess::ReadOnly,
+                repository.path(),
+                Some(identity),
+                151,
+                150
+            )
+            .is_err()
+        );
+        Ok(())
     }
 
     #[test]
