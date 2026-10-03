@@ -1073,7 +1073,7 @@ async fn execute_real_acp_turn_body(
                 model: target
                     .resolved_model
                     .clone()
-                    .or_else(|| Some("gpt-6-luna".into())),
+                    .or_else(|| Some(crate::providers::accepted_runtimes::CODEX.model.into())),
                 runtime: "agent.codex-role-v1".into(),
                 tools: Default::default(),
                 permissions: Vec::new(),

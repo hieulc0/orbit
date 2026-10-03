@@ -1,6 +1,7 @@
 //! Product session preferences and bounded read-only conversational executions.
 //! Preferences never grant tools or replace resolver eligibility checks.
 use super::*;
+use crate::providers::accepted_runtimes as catalog;
 use crate::workflow::{RoleDefinition, WorkspaceAccess};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -11,6 +12,15 @@ pub enum InteractionMode {
     #[default]
     Flow,
 }
+impl InteractionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::Agent => "agent",
+            Self::Flow => "flow",
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningPreference {
@@ -19,6 +29,16 @@ pub enum ReasoningPreference {
     Fast,
     Balanced,
     Deep,
+}
+impl ReasoningPreference {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Fast => "fast",
+            Self::Balanced => "balanced",
+            Self::Deep => "deep",
+        }
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -45,14 +65,11 @@ impl Default for SessionPreferences {
 impl SessionPreferences {
     pub fn validate(&self) -> Result<()> {
         ensure!(
-            matches!(self.provider.as_str(), "auto" | "codex" | "gemini"),
+            self.provider == "auto" || catalog::by_provider_preference(&self.provider).is_some(),
             "UNSUPPORTED_PROVIDER_PREFERENCE"
         );
         ensure!(
-            matches!(
-                self.model.as_str(),
-                "auto" | "gpt-6-luna" | "gemini-3.7-flash-high"
-            ),
+            self.model == "auto" || catalog::by_model(&self.model).is_some(),
             "UNSUPPORTED_MODEL_PREFERENCE"
         );
         ensure!(
@@ -67,19 +84,53 @@ impl SessionPreferences {
             "UNSUPPORTED_FLOW_PREFERENCE"
         );
         ensure!(
-            !(self.provider == "codex" && self.model.starts_with("gemini"))
-                && !(self.provider == "gemini" && self.model.starts_with("gpt")),
+            self.provider == "auto"
+                || self.model == "auto"
+                || catalog::by_model(&self.model)
+                    .is_some_and(|runtime| runtime.provider_preference == self.provider),
             "PROVIDER_MODEL_PREFERENCE_MISMATCH"
         );
         ensure!(
             self.reasoning == ReasoningPreference::Auto
-                || (self.provider != "gemini" && !self.model.starts_with("gemini")),
+                || self
+                    .preferred_runtime()
+                    .is_none_or(|runtime| runtime.effort(self.reasoning.as_str()).is_some()),
             "REASONING_UNSUPPORTED: Gemini has no separately qualified effort control"
         );
         Ok(())
     }
     pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
+        // Publish a complete validated preference, including combined selections.
+        // Failed updates must leave even an in-memory preference unchanged.
+        let mut next = self.clone();
+        next.set_value(key, value)?;
+        next.validate()?;
+        *self = next;
+        Ok(())
+    }
+    fn set_value(&mut self, key: &str, value: &str) -> Result<()> {
         match key {
+            "orchestrator" => {
+                if value == "auto" {
+                    self.provider = "auto".into();
+                    self.model = "auto".into();
+                } else if let Some(provider) = value.strip_prefix("provider:") {
+                    let runtime = catalog::by_provider_preference(provider)
+                        .context("UNSUPPORTED_PROVIDER_PREFERENCE")?;
+                    self.provider = runtime.provider_preference.into();
+                    self.model = "auto".into();
+                } else if let Some(model) = value.strip_prefix("model:") {
+                    let runtime =
+                        catalog::by_model(model).context("UNSUPPORTED_MODEL_PREFERENCE")?;
+                    self.provider = "auto".into();
+                    self.model = runtime.model.into();
+                } else {
+                    let runtime =
+                        catalog::by_id(value).context("UNSUPPORTED_ORCHESTRATOR_PREFERENCE")?;
+                    self.provider = runtime.provider_preference.into();
+                    self.model = runtime.model.into();
+                }
+            }
             "interaction" => self.interaction = serde_json::from_value(json!(value))?,
             "provider" => self.provider = value.into(),
             "model" => self.model = value.into(),
@@ -88,20 +139,34 @@ impl SessionPreferences {
             "flow" => self.flow = value.into(),
             _ => anyhow::bail!("UNSUPPORTED_PREFERENCE"),
         }
-        self.validate()
+        Ok(())
+    }
+    pub fn preferred_runtime(&self) -> Option<&'static catalog::AcceptedRuntime> {
+        catalog::by_model(&self.model).or_else(|| catalog::by_provider_preference(&self.provider))
+    }
+    /// Reconstruct the selector without losing advanced provider/model-only intent.
+    pub fn orchestrator_selection(&self) -> String {
+        match (self.provider.as_str(), self.model.as_str()) {
+            ("auto", "auto") => "auto".into(),
+            (provider, "auto") => format!("provider:{provider}"),
+            ("auto", model) => format!("model:{model}"),
+            _ => self
+                .preferred_runtime()
+                .map(|runtime| runtime.id.into())
+                .unwrap_or_else(|| "invalid".into()),
+        }
     }
     pub fn effort(&self, provider: &str) -> Result<Option<&'static str>> {
         self.validate()?;
         if self.reasoning == ReasoningPreference::Auto {
             return Ok(None);
         }
-        ensure!(provider == "codex", "REASONING_UNSUPPORTED");
-        Ok(Some(match self.reasoning {
-            ReasoningPreference::Fast => "low",
-            ReasoningPreference::Balanced => "medium",
-            ReasoningPreference::Deep => "high",
-            ReasoningPreference::Auto => unreachable!(),
-        }))
+        let effort = catalog::ACCEPTED
+            .iter()
+            .find(|runtime| runtime.provider == provider)
+            .and_then(|runtime| runtime.effort(self.reasoning.as_str()))
+            .context("REASONING_UNSUPPORTED")?;
+        Ok(Some(effort))
     }
     pub fn orchestrator_role(&self) -> Result<RoleDefinition> {
         self.validate()?;
@@ -115,9 +180,19 @@ impl SessionPreferences {
         role.allowed_capabilities.shell = false;
         if self.reasoning != ReasoningPreference::Auto {
             // Only the pinned Codex bridge confirms a separate reasoning effort.
-            role.runtime_preferences = vec!["codex-acp".into()];
-        } else if self.provider == "gemini" || self.model.starts_with("gemini") {
-            role.runtime_preferences = vec!["antigravity-acp".into(), "codex-acp".into()];
+            role.runtime_preferences = catalog::ACCEPTED
+                .iter()
+                .filter(|runtime| runtime.effort(self.reasoning.as_str()).is_some())
+                .map(|runtime| runtime.runtime_preference.into())
+                .collect();
+        } else if self
+            .preferred_runtime()
+            .is_some_and(|runtime| runtime.id == catalog::GEMINI.id)
+        {
+            role.runtime_preferences = vec![
+                catalog::GEMINI.runtime_preference.into(),
+                catalog::CODEX.runtime_preference.into(),
+            ];
         }
         Ok(role)
     }
@@ -391,6 +466,85 @@ impl InteractiveService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn combined_orchestrator_preferences_are_atomic_and_catalog_bound() -> Result<()> {
+        let mut p = SessionPreferences::default();
+        for runtime in catalog::ACCEPTED {
+            p.set("orchestrator", runtime.id)?;
+            assert_eq!(p.provider, runtime.provider_preference);
+            assert_eq!(p.model, runtime.model);
+            assert_eq!(p.orchestrator_selection(), runtime.id);
+            p.set("orchestrator", "auto")?;
+            assert_eq!((&*p.provider, &*p.model), ("auto", "auto"));
+        }
+        p.set("orchestrator", "codex")?;
+        p.set("reasoning", "deep")?;
+        for (key, value) in [
+            ("orchestrator", "gemini"),
+            ("provider", "gemini"),
+            ("model", "gemini-3.7-flash-high"),
+            ("model", "gpt-5-codex"),
+            ("model", "gemini-3.8-flash"),
+            ("orchestrator", "unknown"),
+            ("provider", "unknown"),
+        ] {
+            let before = p.clone();
+            assert!(p.set(key, value).is_err());
+            assert_eq!(p, before, "rejected update changed preferences");
+        }
+        for (reasoning, effort) in [
+            ("auto", None),
+            ("fast", Some("low")),
+            ("balanced", Some("medium")),
+            ("deep", Some("high")),
+        ] {
+            p.set("reasoning", reasoning)?;
+            assert_eq!(p.effort("codex")?, effort);
+        }
+        p.set("reasoning", "auto")?;
+        p.set("orchestrator", "gemini")?;
+        assert_eq!(p.effort("antigravity")?, None);
+        for reasoning in ["fast", "balanced", "deep"] {
+            let before = p.clone();
+            assert!(p.set("reasoning", reasoning).is_err());
+            assert_eq!(p, before);
+        }
+        p.set("orchestrator", "auto")?;
+        p.set("reasoning", "deep")?;
+        assert_eq!(
+            p.orchestrator_role()?.runtime_preferences,
+            [catalog::CODEX.runtime_preference]
+        );
+        assert!(p.effort("antigravity").is_err());
+        p.set("reasoning", "auto")?;
+        for advanced in [
+            "provider:codex",
+            "provider:gemini",
+            "model:gpt-6-luna",
+            "model:gemini-3.7-flash-high",
+        ] {
+            p.set("orchestrator", advanced)?;
+            assert_eq!(p.orchestrator_selection(), advanced);
+            let saved: SessionPreferences = serde_json::from_value(serde_json::to_value(&p)?)?;
+            assert_eq!(saved, p);
+        }
+        assert!(p.set("orchestrator", "model:fixture").is_err());
+        assert!(p.set("orchestrator", "provider:unknown").is_err());
+        // Orchestrator configuration is not a workflow-role assignment.
+        assert_eq!(
+            RoleDefinition::planner_v1().runtime_preferences,
+            ["codex-acp", "antigravity-acp"]
+        );
+        assert_eq!(
+            RoleDefinition::implementer_v1().runtime_preferences,
+            ["codex-acp", "antigravity-acp"]
+        );
+        assert_eq!(
+            RoleDefinition::reviewer_v1().runtime_preferences,
+            ["antigravity-acp", "codex-acp"]
+        );
+        Ok(())
+    }
     #[test]
     fn preferences_are_bounded_policy_inputs() -> Result<()> {
         let mut p = SessionPreferences::default();

@@ -1159,6 +1159,58 @@ async fn reset_aware_resolver_prefers_earlier_weekly_reset() -> Result<()> {
     .expect_err("operational fallback cannot use a partial-audit runtime");
     assert!(fallback_error.to_string().contains("CAPABILITY_MISMATCH"));
 
+    // A combined orchestrator preference still passes through the same
+    // credential, capability and reset-aware admission policy.
+    let mut preferences = orbit::interactive::preferences::SessionPreferences::default();
+    preferences.set("orchestrator", "codex")?;
+    let preferred = RoleRuntimeResolver::resolve_ranked_targets_live(
+        &ctx.engine.pool,
+        &preferences.orchestrator_role()?,
+        None,
+        RuntimeQuotaSelectionPolicy::default(),
+    )
+    .await?;
+    assert_eq!(
+        preferred[0].provider, "antigravity",
+        "preference replaced resolver ranking"
+    );
+    preferences.set("reasoning", "deep")?;
+    let effort_role = preferences.orchestrator_role()?;
+    let exact =
+        RoleRuntimeResolver::resolve_target_live(&ctx.engine.pool, &effort_role, None).await?;
+    assert_eq!(exact.provider, "codex");
+    assert_eq!(exact.resolved_model.as_deref(), Some("gpt-6-luna"));
+    assert_eq!(
+        exact.runtime_image_digest.as_deref(),
+        Some(orbit::codex_credential_enrollment::CODEX_IMAGE_DIGEST)
+    );
+    let mut depleted = codex_snapshot.clone();
+    depleted.observed_at_ms += 1;
+    depleted.quota_windows[0].used_percent = Some(90.0);
+    depleted.quota_windows[0].remaining_percent = Some(10.0);
+    availability.record(&depleted).await?;
+    let denied = RoleRuntimeResolver::resolve_target_live(&ctx.engine.pool, &effort_role, None)
+        .await
+        .expect_err("combined preference bypassed quota floor");
+    assert!(denied.to_string().contains("below_min_5h_remaining"));
+    let mut restored = codex_snapshot;
+    restored.observed_at_ms += 2;
+    availability.record(&restored).await?;
+    sqlx::query(
+        "UPDATE orbit_credential_representations SET state='invalid' WHERE credential_id=$1",
+    )
+    .bind(&codex.id)
+    .execute(&ctx.engine.pool)
+    .await?;
+    let denied = RoleRuntimeResolver::resolve_target_live(&ctx.engine.pool, &effort_role, None)
+        .await
+        .expect_err("combined preference bypassed invalid credential representation");
+    assert!(
+        denied
+            .to_string()
+            .contains("missing_or_invalid_current_runtime_representation")
+    );
+
     teardown_test(ctx).await
 }
 

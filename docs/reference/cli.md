@@ -31,6 +31,9 @@ when their syntax is valid.
 
 All actions take `orbit interactive --config FILE --database-url-file PRIVATE_FILE`.
 `preferences SESSION [KEY VALUE]` reads or updates validated product preferences.
+`preferences SESSION orchestrator auto|codex|gemini` atomically sets the same
+provider/model preference represented by the editor's Orchestrator selector.
+Advanced keys `provider`, `model`, `profile` and `flow` remain available.
 `chat SESSION QUESTION` sends a request using the current interaction mode. Chat/Agent
 remain read-only; Flow may admit a validated mutating proposal.
 `continue SESSION` resumes a linked conversational execution when one is active,

@@ -939,10 +939,19 @@ display its multi-root warning when another root is added for inspection.
 
 ### Conversation and execution preferences
 
-Orbit exposes native ACP selectors where the client supports them, with
-`/preferences` as a command alternative. Preferences survive reconnect. For
-example, `/preferences interaction chat` selects conversation and
-`/preferences provider gemini` prefers Gemini for the orchestrator.
+Orbit exposes three native ACP selectors: **Interaction**, **Orchestrator** and
+**Reasoning**. Preferences survive reconnect. Orchestrator offers Auto,
+Codex / gpt-6-luna and Gemini / gemini-3.7-flash-high. Selecting a pair updates
+the provider and model preferences together. Auto clears both preferences;
+normal capability, credential, runtime and quota policy chooses the execution.
+These are accepted choices, not every model reported by provider discovery.
+
+Use `/preferences` for advanced controls and to inspect the underlying values.
+For example, `/preferences interaction chat` selects conversation,
+`/preferences orchestrator codex` selects the Codex pair, and
+`/preferences orchestrator auto` restores automatic selection. Provider-only
+and model-only preferences remain supported; their current native selector
+labels identify that narrower preference rather than displaying Auto.
 
 | Interaction | Behavior |
 | --- | --- |
@@ -977,6 +986,14 @@ that turn. These choices require an eligible Codex runtime. Gemini supports Auto
 here; a separate effort request is rejected. Auto is not a promise about the
 provider's internal reasoning level.
 
+Gemini's Reasoning selector offers Auto only; Codex and Orchestrator Auto offer
+Auto, Fast, Balanced and Deep. With Orchestrator Auto, a non-Auto effort still
+requires an eligible runtime qualified for that effort. Select Reasoning Auto
+before switching from Codex with explicit effort to Gemini; an incompatible
+selection is rejected without changing preferences. An active turn cannot be
+retargeted; its preference snapshot remains immutable.
+
+Execution profile and manual Flow are advanced `/preferences` controls.
 Execution profile Auto uses the operator's admitted profile. DEV_LOCAL is offered
 only when configured by the operator; TRUSTED keeps local terminal execution
 disabled. DEV_LOCAL uses confined repository callbacks and Bubblewrap exploratory

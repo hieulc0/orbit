@@ -589,6 +589,7 @@ async fn acp_v1_stdio_is_typed_bounded_and_replays_session_notifications() -> Re
         let _:agent_client_protocol::InitializeResponse=serde_json::from_value(initialized["result"].clone())?;
         let (created,notes)=exchange(&mut client,2,"session/new",json!({"cwd":repo.path(),"mcpServers":[]})).await?;
         let _:agent_client_protocol::NewSessionResponse=serde_json::from_value(created["result"].clone())?;
+        ensure!(created["result"]["configOptions"].as_array().unwrap().iter().map(|o|o["id"].as_str().unwrap()).collect::<Vec<_>>()==["interaction","orchestrator","reasoning"],"primary preference surface is not coherent");
         ensure!(notes.is_empty(),"new-session notification preceded client registration");
         let session=created["result"]["sessionId"].as_str().unwrap();
         let declared=client.read().await?;
@@ -598,6 +599,20 @@ async fn acp_v1_stdio_is_typed_bounded_and_replays_session_notifications() -> Re
         let (configured,updates)=exchange(&mut client,100,"session/set_config_option",json!({"sessionId":session,"configId":"interaction","value":"chat"})).await?;
         let _:agent_client_protocol::SetSessionConfigOptionResponse=serde_json::from_value(configured["result"].clone())?;
         ensure!(configured["result"]["configOptions"][0]["currentValue"]=="chat" && updates.iter().any(|n|n["update"]["sessionUpdate"]=="config_option_update"),"native preference update missing");
+        let (codex,updates)=exchange(&mut client,102,"session/set_config_option",json!({"sessionId":session,"configId":"orchestrator","value":"codex"})).await?;
+        ensure!(codex["result"]["configOptions"][1]["currentValue"]=="codex" && updates.iter().all(|n|n["update"]["sessionUpdate"]!="agent_message_chunk"),"selection update polluted conversation");
+        let (deep,_)=exchange(&mut client,103,"session/set_config_option",json!({"sessionId":session,"configId":"reasoning","value":"deep"})).await?;
+        ensure!(deep["result"]["configOptions"][2]["currentValue"]=="deep","explicit effort not retained");
+        let before=service.preferences(session).await?;
+        let (mismatch,_)=exchange(&mut client,104,"session/set_config_option",json!({"sessionId":session,"configId":"orchestrator","value":"gemini"})).await?;
+        ensure!(mismatch.get("error").is_some() && service.preferences(session).await?==before,"combined update bypassed reasoning or changed rejected state");
+        exchange(&mut client,105,"session/set_config_option",json!({"sessionId":session,"configId":"reasoning","value":"auto"})).await?;
+        let (gemini,_)=exchange(&mut client,106,"session/set_config_option",json!({"sessionId":session,"configId":"orchestrator","value":"gemini"})).await?;
+        let _:agent_client_protocol::SetSessionConfigOptionResponse=serde_json::from_value(gemini["result"].clone())?;
+        ensure!(gemini["result"]["configOptions"][1]["currentValue"]=="gemini" && gemini["result"]["configOptions"][2]["options"].as_array().unwrap().len()==1,"contextual Gemini preferences missing");
+        ensure!(service.preferences(session).await?.provider=="gemini" && service.preferences(session).await?.model=="gemini-3.7-flash-high","product and ACP preference stores diverged");
+        let (advanced,notes)=exchange(&mut client,107,"session/prompt",json!({"sessionId":session,"prompt":[{"type":"text","text":"/preferences profile trusted"}]})).await?;
+        ensure!(advanced.get("result").is_some() && notes.iter().any(|n|n["update"]["content"]["text"].as_str().is_some_and(|text|text.contains("profile") && text.contains("flow"))),"advanced preferences unavailable");
         let (unsupported,_)=exchange(&mut client,101,"session/set_config_option",json!({"sessionId":session,"configId":"reasoning","value":"ultra"})).await?;
         ensure!(unsupported.get("error").is_some(),"unsupported preference accepted");
         let (status,notes)=exchange(&mut client,3,"session/prompt",json!({"sessionId":session,"prompt":[{"type":"text","text":"/status"}]})).await?;
@@ -608,6 +623,7 @@ async fn acp_v1_stdio_is_typed_bounded_and_replays_session_notifications() -> Re
         let _:agent_client_protocol::LoadSessionResponse=serde_json::from_value(loaded["result"].clone())?;
         ensure!(replayed.starts_with(&stored) && replayed.len()>stored.len(),"session replay or fresh durable view missing");
         ensure!(loaded["result"]["configOptions"][0]["currentValue"]=="chat","native preference lost on reload");
+        ensure!(loaded["result"]["configOptions"][1]["currentValue"]=="gemini" && loaded["result"]["configOptions"][2]["options"].as_array().unwrap().len()==1,"combined selection lost on reload");
         let refreshed=client.read().await?;
         let _:agent_client_protocol::SessionNotification=serde_json::from_value(refreshed["params"].clone())?;
         ensure!(refreshed["params"]["update"]["sessionUpdate"]=="available_commands_update","restored command menu missing");
@@ -809,10 +825,7 @@ async fn interactive_preferences_and_conversation_ownership_are_durable() -> Res
             .set_preference(&session.id, "interaction", "chat")
             .await?;
         client
-            .set_preference(&session.id, "provider", "codex")
-            .await?;
-        client
-            .set_preference(&session.id, "model", "gpt-6-luna")
+            .set_preference(&session.id, "orchestrator", "codex")
             .await?;
         client
             .set_preference(&session.id, "reasoning", "deep")
@@ -895,6 +908,8 @@ async fn interactive_preferences_and_conversation_ownership_are_durable() -> Res
                 .is_err(),
             "active turn retargeted"
         );
+        ensure!(client.set_preference(&session.id,"orchestrator","gemini").await.is_err(),"active combined selection retargeted");
+        ensure!(orbit::interactive::preferences::turn_preferences(&database.engine.pool,&workflow).await?.unwrap()==snapshot,"active snapshot changed");
         ensure!(
             client
                 .candidate_action(&session.id, baseline["state_id"].as_str().unwrap(), false)
@@ -999,9 +1014,14 @@ async fn interactive_preferences_and_conversation_ownership_are_durable() -> Res
         client
             .set_preference(&session.id, "interaction", "agent")
             .await?;
+        client.set_preference(&session.id,"reasoning","auto").await?;
+        client.set_preference(&session.id,"orchestrator","gemini").await?;
         let cancelled = client
             .start_conversation(&session.id, "bounded investigation")
             .await?;
+        let next=orbit::interactive::preferences::turn_preferences(&database.engine.pool,&cancelled).await?.unwrap();
+        ensure!(next.provider=="gemini" && next.model=="gemini-3.7-flash-high" && next.reasoning==ReasoningPreference::Auto,"next turn did not snapshot new preference");
+        ensure!(orbit::interactive::preferences::turn_preferences(&database.engine.pool,&workflow).await?.unwrap()==snapshot,"later preference rewrote old snapshot");
         client.cancel(&session.id).await?;
         reconnect.run_conversation(&session.id).await?;
         ensure!(
@@ -1049,9 +1069,9 @@ fn editor_selectors_and_candidate_views_are_observations() -> Result<()> {
     use orbit::acp::editor_view::*;
     use orbit::interactive::preferences::SessionPreferences;
     let preferences = serde_json::to_value(SessionPreferences::default())?;
-    let options = config_options(&preferences, true, false);
+    let options = config_options(&serde_json::from_value(preferences.clone())?);
     ensure!(
-        options.as_array().unwrap().len() == 6,
+        options.as_array().unwrap().len() == 3,
         "missing preference selectors"
     );
     let mut d = json!({"preferences":preferences,"execution_profile":{"profile":"dev_local"},"workflow":{"status":"reviewing","current_stage":"REVIEWING"},"flow":{"completion_tier":"FULL","review_tier":"STANDARD"},"roles":[{"role_id":"planner","status":"succeeded","resolved_target":{"provider":"codex","resolved_model":"gpt-6-luna"}},{"role_id":"implementer","status":"succeeded","resolved_target":{"provider":"antigravity","resolved_model":"gemini-3.7-flash-high"}}],"candidate":{"state_id":"exact"},"changed_files":{"total":1,"paths":["src/app.rs"]},"verification":[{"tier":"FAST","result":"PASSED","workspace_state_id":"stale"},{"tier":"STANDARD","result":"PASSED","workspace_state_id":"exact"}]});
@@ -1085,10 +1105,82 @@ fn editor_selectors_and_candidate_views_are_observations() -> Result<()> {
         "final verification gate hidden"
     );
     d["preferences"]["provider"] = json!("gemini");
-    let options = config_options(&d["preferences"], false, false);
+    let options = config_options(&serde_json::from_value(d["preferences"].clone())?);
     ensure!(
-        options[3]["options"].as_array().unwrap().len() == 1,
+        options[2]["options"].as_array().unwrap().len() == 1,
         "unsupported Gemini reasoning advertised"
+    );
+    Ok(())
+}
+
+#[test]
+fn primary_preferences_are_catalog_derived_and_reasoning_is_contextual() -> Result<()> {
+    use orbit::{
+        acp::editor_view::config_options, interactive::preferences::SessionPreferences,
+        providers::accepted_runtimes as catalog,
+    };
+    let mut preferences = SessionPreferences::default();
+    let options = config_options(&preferences);
+    assert_eq!(
+        options
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["interaction", "orchestrator", "reasoning"]
+    );
+    assert_eq!(options[1]["currentValue"], "auto");
+    assert_eq!(
+        options[1]["options"].as_array().unwrap().len(),
+        catalog::ACCEPTED.len() + 1
+    );
+    for runtime in catalog::ACCEPTED {
+        assert_eq!(
+            options[1]["options"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|o| o["value"] == runtime.id)
+                .count(),
+            1
+        );
+        preferences.set("orchestrator", runtime.id)?;
+        let projected = config_options(&preferences);
+        assert_eq!(projected[1]["currentValue"], runtime.id);
+        assert_eq!(
+            projected[2]["options"].as_array().unwrap().len(),
+            runtime.reasoning_efforts.len() + 1
+        );
+        for (id, _) in runtime.reasoning_efforts {
+            assert!(
+                projected[2]["options"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|o| o["value"] == *id)
+            );
+        }
+    }
+    preferences.set("orchestrator", "auto")?;
+    preferences.set("reasoning", "deep")?;
+    assert_eq!(config_options(&preferences)[2]["currentValue"], "deep");
+    preferences.set("reasoning", "auto")?;
+    preferences.set("orchestrator", "provider:gemini")?;
+    let advanced = config_options(&preferences);
+    assert_eq!(advanced[1]["currentValue"], "provider:gemini");
+    assert_eq!(advanced[2]["options"].as_array().unwrap().len(), 1);
+    assert!(
+        advanced[1]["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o["name"] == "Gemini (provider only)")
+    );
+    preferences.set("orchestrator", "model:gpt-6-luna")?;
+    assert_eq!(
+        config_options(&preferences)[1]["currentValue"],
+        "model:gpt-6-luna"
     );
     Ok(())
 }
@@ -1908,6 +2000,92 @@ async fn real_zed_presentation_smoke_fixture() -> Result<()> {
                     observer.close_product(product).await?;
                     let retained:i64=sqlx::query_scalar("SELECT count(*) FROM orbit_editor_sessions WHERE state<>'DISCARDED'").fetch_one(&database.engine.pool).await?;
                     ensure!(retained==0, "managed worktree retained");
+                    return Ok::<_,anyhow::Error>(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+        }).await??;
+        Ok::<_,anyhow::Error>(())
+    }.await;
+    database.teardown().await?;
+    result
+}
+
+#[cfg(feature = "fault-injection")]
+#[tokio::test]
+#[ignore = "requires explicitly authorized disposable Zed GUI and two bounded read-only provider turns"]
+async fn real_zed_orchestrator_catalog_preferences() -> Result<()> {
+    use anyhow::Context;
+    use sqlx::Row;
+    use std::os::unix::fs::OpenOptionsExt;
+    ensure!(
+        std::env::var("ORBIT_EDITOR_GUI_OPT_IN").as_deref() == Ok("I_AUTHORIZE_DISPOSABLE_ZED_GUI"),
+        "GUI opt-in required"
+    );
+    let evidence =
+        std::path::PathBuf::from(std::env::var("ORBIT_EDITOR_GUI_EVIDENCE_DIR")?).canonicalize()?;
+    let database = common::DisposablePgTestContext::create("interactive_editor", 3).await?;
+    let result = async {
+        let repo = common::TemporaryGitRepo::create()?;
+        let root = tempfile::tempdir()?;
+        let operator_config = config(&repo, &root)?;
+        let observer = service(&database.engine.pool, operator_config.clone())?;
+        let config_file = root.path().join("interactive.json");
+        std::fs::write(&config_file, serde_json::to_vec(&operator_config)?)?;
+        let private = tempfile::Builder::new().prefix("preference-qualification-").permissions(std::fs::Permissions::from_mode(0o700)).tempdir_in(orbit::secret_backend::operator_home()?.join(".orbit/private"))?;
+        let database_file = private.path().join("database-url");
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&database_file)?;
+        std::io::Write::write_all(&mut file, database.url.as_bytes())?;
+        drop(file);
+        let profile = root.path().join("zed-profile");
+        let settings = profile.join("data/config");
+        std::fs::create_dir_all(&settings)?;
+        let catalog_file = std::env::var("ORBIT_B34_LIVE_CREDENTIAL_DATABASE_URL_FILE")?;
+        std::fs::write(settings.join("settings.json"), serde_json::to_vec_pretty(&json!({"telemetry":{"metrics":false,"diagnostics":false},"agent_servers":{"Orbit":{"type":"custom","command":env!("CARGO_BIN_EXE_orbit"),"args":["acp-serve","--config",config_file],"env":{"ORBIT_DATABASE_URL_FILE":database_file,"ORBIT_B34_LIVE_PROVIDER_OPT_IN":"I_AUTHORIZE_LIVE_PROVIDER_CALLS","ORBIT_B34_LIVE_CREDENTIAL_DATABASE_URL_FILE":catalog_file}}}}))?)?;
+        std::fs::write(evidence.join("current.json"), serde_json::to_vec_pretty(&json!({"repository":repo.path(),"schema":database.schema,"profile":profile,"config_file":config_file,"database_file":database_file,"binary":env!("CARGO_BIN_EXE_orbit")}))?)?;
+        tokio::time::timeout(std::time::Duration::from_secs(900), async {
+            loop {
+                if evidence.join("abort.json").exists() {
+                    let pending: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM orbit_agent_executions WHERE status='RUNNING' OR NOT COALESCE(metadata->>'cleanup_confirmed'='true' OR metadata->'lifecycle'->>'cleanup_state'='NO_RUNTIME_RESOURCE_CREATED', false))").fetch_one(&database.engine.pool).await?;
+                    if pending {
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                        continue;
+                    }
+                    let executions: Vec<Value> = sqlx::query_scalar("SELECT metadata FROM orbit_agent_executions ORDER BY started_at_ms").fetch_all(&database.engine.pool).await?;
+                    std::fs::write(evidence.join("aborted-execution-evidence.json"), serde_json::to_vec_pretty(&executions)?)?;
+                    anyhow::bail!("GUI qualification aborted after confirmed provider cleanup");
+                }
+                let sessions = sqlx::query("SELECT id,state,preferences FROM orbit_editor_sessions ORDER BY id").fetch_all(&database.engine.pool).await?;
+                let turns = sqlx::query("SELECT t.session_id,t.workflow_run_id,wf.status FROM orbit_interactive_turns t JOIN orbit_workflow_runs wf ON wf.id=t.workflow_run_id ORDER BY t.sequence").fetch_all(&database.engine.pool).await?;
+                std::fs::write(evidence.join("state.json"),serde_json::to_vec_pretty(&json!({"sessions":sessions.iter().map(|r|json!({"id":r.get::<String,_>("id"),"state":r.get::<String,_>("state"),"status":null,"preferences":r.get::<Value,_>("preferences")})).collect::<Vec<_>>(),"turns":turns.iter().map(|r|json!({"session":r.get::<String,_>("session_id"),"workflow":r.get::<String,_>("workflow_run_id"),"status":r.get::<String,_>("status")})).collect::<Vec<_>>()}))?)?;
+                if evidence.join("complete.json").exists() {
+                    ensure!(sessions.len()==1 && turns.len()==2, "unexpected product/workflow count");
+                    let product = sessions[0].get::<String,_>("id");
+                    let conversation = observer.conversation_view(&product).await?;
+                    let responses = conversation.as_array().context("conversation missing")?;
+                    ensure!(responses.len()==2 && responses.iter().all(|turn| turn["status"]=="COMPLETED" && turn["answer"].as_str().is_some_and(|answer| !answer.trim().is_empty())), "provider execution did not produce completed conversational answers");
+                    let preferences = observer.preferences(&product).await?;
+                    ensure!(preferences.provider=="gemini" && preferences.model=="gemini-3.7-flash-high" && preferences.reasoning==orbit::interactive::preferences::ReasoningPreference::Auto,"reconnect lost preferences");
+                    let entries=orbit::acp::editor_view::config_options(&preferences);
+                    ensure!(entries.as_array().context("options missing")?.len()==3 && entries[1]["currentValue"]=="gemini" && entries[2]["options"].as_array().context("reasoning missing")?.len()==1,"primary options mismatch");
+                    let executions: Vec<Value> = sqlx::query_scalar("SELECT metadata FROM orbit_agent_executions ORDER BY started_at_ms").fetch_all(&database.engine.pool).await?;
+                    ensure!(executions.len()==2 && executions[0]["provider"]=="codex" && executions[0]["resolved_model"]=="gpt-6-luna" && executions[0]["requested_reasoning_effort"]=="high" && executions[0]["observed_reasoning_effort"]=="high", "Codex preference/effort was not confirmed");
+                    ensure!(executions[1]["provider"]=="antigravity" && executions[1]["resolved_model"]=="gemini-3.7-flash-high" && executions[1]["requested_reasoning_effort"].is_null() && executions[1]["observed_reasoning_effort"].is_null(), "Gemini selection/effort mismatch");
+                    for execution in &executions {
+                        ensure!(execution["cleanup_confirmed"]==true && execution["tool_call_audit"]["summary"]["mutating"]==0 && execution["role_budget"]["usage"]["terminal_calls"]==0 && execution["tool_call_audit"]["summary"]["total"].as_u64().unwrap_or(0)>0,"readonly observation/cleanup mismatch");
+                        ensure!(execution["tool_call_audit"]["summary"]["unmatched_callbacks"]==0 && execution["tool_call_audit"]["summary"]["unmatched_provider_calls"]==0 && execution["tool_call_audit"]["summary"]["callback_count"]==execution["tool_call_audit"]["summary"]["total"], "provider tool audit was not exactly reconciled");
+                    }
+                    let dashboard=observer.dashboard(&product).await?;
+                    ensure!(dashboard["workflow"].is_null() && orbit::acp::editor_view::stage_entries(&dashboard).is_empty(),"Chat started an engineering workflow");
+                    let notes=observer.notifications(&product).await?;
+                    ensure!(notes.iter().all(|n| n["update"]["sessionUpdate"]!="plan" && !n["update"]["content"]["text"].as_str().is_some_and(|t|t.contains("## Orbit"))),"background diagnostics returned");
+                    ensure!(std::fs::read_to_string(repo.path().join("README.md"))?=="offline fixture baseline\n","source checkout changed");
+                    std::fs::write(evidence.join("transcript.json"),serde_json::to_vec_pretty(&notes)?)?;
+                    std::fs::write(evidence.join("conversation.json"),serde_json::to_vec_pretty(&conversation)?)?;
+                    std::fs::write(evidence.join("execution-evidence.json"),serde_json::to_vec_pretty(&executions)?)?;
+                    std::fs::write(evidence.join("recovered-options.json"),serde_json::to_vec_pretty(&entries)?)?;
+                    observer.close_product(&product).await?;
+                    ensure!(observer.session(&product).await?.state=="DISCARDED","context not cleaned");
                     return Ok::<_,anyhow::Error>(());
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;

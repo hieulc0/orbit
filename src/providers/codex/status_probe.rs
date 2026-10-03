@@ -64,7 +64,7 @@ pub fn cataloged_codex_runtime(
         "Codex credential is not enrolled"
     );
     let binding_name = "codex-status-v1";
-    let model = "gpt-6-luna";
+    let model = crate::providers::accepted_runtimes::CODEX.model;
     let launch = Launch {
         adapter: Adapter::Codex,
         image: enrolled::CODEX_IMAGE.into(),

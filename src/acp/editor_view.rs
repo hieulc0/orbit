@@ -11,77 +11,66 @@ fn label(value: &Value) -> String {
         .collect()
 }
 
-pub fn config_options(preferences: &Value, dev_local: bool, pinned_flow: bool) -> Value {
-    let option = |id: &str, name: &str, category: &str, values: &[(&str, &str)]| json!({"id":id,"name":name,"category":category,"type":"select","currentValue":preferences[id],"options":values.iter().map(|(value,name)|json!({"value":value,"name":name})).collect::<Vec<_>>()});
-    let reasoning =
-        if preferences["provider"] == "gemini" || preferences["model"] == "gemini-3.7-flash-high" {
-            vec![("auto", "Auto (runtime default)")]
-        } else {
-            vec![
-                ("auto", "Auto"),
-                ("fast", "Fast (Codex low)"),
-                ("balanced", "Balanced (Codex medium)"),
-                ("deep", "Deep (Codex high)"),
-            ]
-        };
-    let profiles = if dev_local {
-        vec![
-            ("auto", "Auto (operator profile)"),
-            ("dev_local", "DEV_LOCAL"),
-            ("trusted", "TRUSTED"),
-        ]
-    } else {
-        vec![("auto", "Auto (operator profile)"), ("trusted", "TRUSTED")]
-    };
-    let flows = if pinned_flow {
-        vec![("auto", "Operator-pinned flow")]
-    } else {
-        vec![
-            ("auto", "Auto (current policy)"),
-            ("investigate", "Read-only investigation"),
-            ("documentation", "Documentation change"),
-            ("engineering", "Full engineering"),
-        ]
-    };
+pub fn config_options(preferences: &crate::interactive::preferences::SessionPreferences) -> Value {
+    use crate::providers::accepted_runtimes as catalog;
+    let option = |id: &str, name: &str, category: &str, current: &str, values: Vec<Value>| json!({"id":id,"name":name,"category":category,"type":"select","currentValue":current,"options":values});
+    let mut orchestrators = vec![json!({"value":"auto","name":"Orchestrator: Auto"})];
+    orchestrators.extend(catalog::ACCEPTED.iter().map(|runtime| json!({"value":runtime.id,"name":format!("{} / {}", runtime.display_name, runtime.model)})));
+    let current = preferences.orchestrator_selection();
+    // Advanced controls can express provider-only or model-only preferences.
+    // Show the actual current value rather than relabeling it as unrestricted Auto.
+    if let Some(runtime) = preferences.preferred_runtime() {
+        if current.starts_with("provider:") {
+            orchestrators.push(
+                json!({"value":current,"name":format!("{} (provider only)", runtime.display_name)}),
+            );
+        } else if current.starts_with("model:") {
+            orchestrators.push(
+                json!({"value":current,"name":format!("{} (model preference)", runtime.model)}),
+            );
+        }
+    }
+    let mut reasoning = vec![json!({"value":"auto","name":"Reasoning: Auto"})];
+    let runtimes = preferences
+        .preferred_runtime()
+        .map(std::slice::from_ref)
+        .unwrap_or(catalog::ACCEPTED);
+    let mut seen = std::collections::BTreeSet::new();
+    for runtime in runtimes {
+        for (name, _) in runtime.reasoning_efforts {
+            if seen.insert(name) {
+                let mut label = name.to_string();
+                label[..1].make_ascii_uppercase();
+                reasoning.push(json!({"value":name,"name":format!("Reasoning: {label}")}));
+            }
+        }
+    }
     json!([
         option(
             "interaction",
             "Interaction",
             "mode",
-            &[
-                ("chat", "Chat (read-only)"),
-                ("agent", "Agent (bounded read-only)"),
-                ("flow", "Flow (explicit task)")
+            preferences.interaction.as_str(),
+            vec![
+                json!({"value":"chat","name":"Chat (read-only)"}),
+                json!({"value":"agent","name":"Agent (bounded read-only)"}),
+                json!({"value":"flow","name":"Flow (explicit task)"})
             ]
         ),
         option(
-            "provider",
-            "Orchestrator provider",
-            "_orbit_provider",
-            &[
-                ("auto", "Auto"),
-                ("codex", "Prefer Codex"),
-                ("gemini", "Prefer Gemini")
-            ]
-        ),
-        option(
+            "orchestrator",
+            "Orchestrator",
             "model",
-            "Orchestrator model",
-            "model",
-            &[
-                ("auto", "Auto"),
-                ("gpt-6-luna", "Prefer gpt-6-luna"),
-                ("gemini-3.7-flash-high", "Prefer gemini-3.7-flash-high")
-            ]
+            &current,
+            orchestrators
         ),
         option(
             "reasoning",
-            "Orchestrator reasoning",
+            "Reasoning",
             "thought_level",
-            &reasoning
-        ),
-        option("profile", "Execution profile", "_orbit_profile", &profiles),
-        option("flow", "Flow preference", "_orbit_flow", &flows)
+            preferences.reasoning.as_str(),
+            reasoning
+        )
     ])
 }
 

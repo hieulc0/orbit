@@ -61,6 +61,21 @@ Orbit commands and bounded extensions expose status, diff, worktree path, review
 and exact candidate actions. External client filesystem and terminal callbacks
 grant no repository authority at this interface.
 
+Modern ACP `configOptions` expose Interaction, Orchestrator and Reasoning. The
+combined Orchestrator option writes the existing provider/model preference
+fields in one validated operation; no separate preference store exists.
+Options derive from Orbit's accepted runtime/model catalog, not runtime
+discovery. Eligibility and exact dispatch confirmation remain mandatory.
+Advanced profile, provider-only, model-only and manual flow settings remain
+available through `/preferences` and the peer CLI.
+
+Legacy ACP `modes` retain their flow-preset contract for older clients; they are
+not Chat/Agent/Flow interaction modes. Modern clients use `configOptions` for
+interaction. For legacy direct task creation, operator-pinned flow takes
+precedence over the explicit flow preference, then the legacy preset, then task
+inference. Product Skill/Flow proposals use Orbit policy and immutable turn
+preferences. Neither interface grants additional role authority.
+
 Session load replays retained notifications and publishes a fresh state view.
 Active progress observes changed durable snapshots. A disconnected stream owns
 no cancellation decision: admitted work drains to its normal gate, and another
