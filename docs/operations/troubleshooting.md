@@ -552,8 +552,8 @@ Antigravity fixtures require separate live account authorization.
 
 The two live fixtures are opt-in individually. Set `ORBIT_TEST_DATABASE_URL` to
 the disposable qualification database, set
-`ORBIT_B34_LIVE_PROVIDER_OPT_IN=I_AUTHORIZE_LIVE_PROVIDER_CALLS`, and set
-`ORBIT_B34_LIVE_CREDENTIAL_DATABASE_URL_FILE` to an explicit absolute path for
+`ORBIT_QUALIFICATION_PROVIDER_OPT_IN=I_AUTHORIZE_LIVE_PROVIDER_CALLS`, and set
+`ORBIT_QUALIFICATION_CREDENTIAL_DATABASE_URL_FILE` to an explicit absolute path for
 the private control-plane URL file under Orbit's private root. The file must
 target the loopback control-plane catalog on port 55442. Its connection is
 read-only: the tests read credentials directly from that catalog and never copy
@@ -673,3 +673,11 @@ hashes, inspect the actual patch and every test-report command/exit result, and
 match the run ID to the baseline record. The test proves a bounded self-hosted
 repository workflow, not arbitrary autonomous development, live-model competence,
 or production readiness. Project-owner acceptance remains a separate decision.
+
+Qualification uses `ORBIT_QUALIFICATION_PROVIDER_OPT_IN` and
+`ORBIT_QUALIFICATION_CREDENTIAL_DATABASE_URL_FILE`. Historical numbered variable
+names are retired: old names are rejected, and combining old and current names
+fails explicitly. The fault-injection feature guard, exact authorization token,
+private file checks, read-only credential catalog and separate disposable
+accepted database remain required. These variables do not enable live calls in
+a normal production build.

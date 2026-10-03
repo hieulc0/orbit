@@ -37,7 +37,7 @@ pub fn config_options(preferences: &crate::interactive::preferences::SessionPref
         .unwrap_or(catalog::ACCEPTED);
     let mut seen = std::collections::BTreeSet::new();
     for runtime in runtimes {
-        for (name, _) in runtime.reasoning_efforts {
+        for name in runtime.reasoning_efforts {
             if seen.insert(name) {
                 let mut label = name.to_string();
                 label[..1].make_ascii_uppercase();

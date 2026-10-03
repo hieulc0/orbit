@@ -1174,7 +1174,7 @@ async fn reset_aware_resolver_prefers_earlier_weekly_reset() -> Result<()> {
         preferred[0].provider, "antigravity",
         "preference replaced resolver ranking"
     );
-    preferences.set("reasoning", "deep")?;
+    preferences.set("reasoning", "high")?;
     let effort_role = preferences.orchestrator_role()?;
     let exact =
         RoleRuntimeResolver::resolve_target_live(&ctx.engine.pool, &effort_role, None).await?;

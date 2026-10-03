@@ -273,9 +273,9 @@ async fn dispatch_correlated_fixture_callback(
 #[cfg(feature = "fault-injection")]
 const LIVE_PROVIDER_OPT_IN: &str = "I_AUTHORIZE_LIVE_PROVIDER_CALLS";
 #[cfg(feature = "fault-injection")]
-const LIVE_PROVIDER_OPT_IN_ENV: &str = "ORBIT_B34_LIVE_PROVIDER_OPT_IN";
+const LIVE_PROVIDER_OPT_IN_ENV: &str = "ORBIT_QUALIFICATION_PROVIDER_OPT_IN";
 #[cfg(feature = "fault-injection")]
-const LIVE_CREDENTIAL_URL_FILE_ENV: &str = "ORBIT_B34_LIVE_CREDENTIAL_DATABASE_URL_FILE";
+const LIVE_CREDENTIAL_URL_FILE_ENV: &str = "ORBIT_QUALIFICATION_CREDENTIAL_DATABASE_URL_FILE";
 
 #[cfg(feature = "fault-injection")]
 async fn explicitly_authorized_live_credential_catalog() -> Result<PgPool> {
@@ -4398,8 +4398,8 @@ async fn qualify_real_editor(orchestration: bool, reasoning: bool) -> Result<()>
         let profile=root.path().join("zed-profile"); let settings=profile.join("data/config"); fs::create_dir_all(&settings)?;
         let run_token=id();
         let instructions="Synthetic C repository: inspect calc.c. Add int multiply(int a,int b) returning a*b and main checking multiply(3,4)==12. Document multiply in README.md. Keep test.sh unchanged. Run sh test.sh with the advertised confined terminal. Every role reads calc.c with native callbacks. Do not stage or commit. Return structured handoffs.";
-        let catalog_file=std::env::var("ORBIT_B34_LIVE_CREDENTIAL_DATABASE_URL_FILE")?;
-        fs::write(settings.join("settings.json"),serde_json::to_vec_pretty(&json!({"telemetry":{"metrics":false,"diagnostics":false},"agent_servers":{"Orbit":{"type":"custom","command":env!("CARGO_BIN_EXE_orbit"),"args":["acp-serve","--config",config_file],"env":{"ORBIT_DATABASE_URL_FILE":database_file,"ORBIT_B34_LIVE_PROVIDER_OPT_IN":"I_AUTHORIZE_LIVE_PROVIDER_CALLS","ORBIT_B34_LIVE_CREDENTIAL_DATABASE_URL_FILE":catalog_file}}}}))?)?;
+        let catalog_file=std::env::var("ORBIT_QUALIFICATION_CREDENTIAL_DATABASE_URL_FILE")?;
+        fs::write(settings.join("settings.json"),serde_json::to_vec_pretty(&json!({"telemetry":{"metrics":false,"diagnostics":false},"agent_servers":{"Orbit":{"type":"custom","command":env!("CARGO_BIN_EXE_orbit"),"args":["acp-serve","--config",config_file],"env":{"ORBIT_DATABASE_URL_FILE":database_file,"ORBIT_QUALIFICATION_PROVIDER_OPT_IN":"I_AUTHORIZE_LIVE_PROVIDER_CALLS","ORBIT_QUALIFICATION_CREDENTIAL_DATABASE_URL_FILE":catalog_file}}}}))?)?;
         fs::write(evidence.join("current.json"),serde_json::to_vec_pretty(&json!({"run_token":run_token,"repository":repository.path(),"schema":ctx.database.schema,"settings":settings.join("settings.json"),"profile":profile,"config_file":config_file,"database_file":database_file,"binary":env!("CARGO_BIN_EXE_orbit"),"instructions":instructions,"baseline":baseline}))?)?;
         println!("ACTUAL_ZED_FIXTURE_READY {}",evidence.join("current.json").display());
         let mut previous=String::new();
@@ -4462,7 +4462,7 @@ async fn qualify_real_editor(orchestration: bool, reasoning: bool) -> Result<()>
                 print_live_fixture_audit(&ctx.engine.pool,Some(&roles[0].id)).await;
                 let (status,calls,successes,failures,_,metadata)=load_agent_tool_audit(&ctx.engine.pool,&roles[0].agent_execution_ids[0]).await?;
                 ensure!(status=="SUCCEEDED" && calls>0 && calls==successes && failures==0 && metadata["cleanup_confirmed"]==true && metadata["tool_call_audit"]["summary"]["mutating"]==0 && metadata["role_budget"]["usage"]["terminal_calls"]==0 && b34_audit_has_exact_correlations(&metadata["tool_call_audit"],usize::try_from(calls)?),"orchestrator lacks exact read-only audit/cleanup");
-                if index==0 { ensure!(pref["reasoning"]=="deep" && metadata["requested_reasoning_effort"]=="high" && metadata["observed_reasoning_effort"]=="high","reasoning request not actually confirmed"); }
+                if index==0 { ensure!(pref["reasoning"]=="high" && metadata["requested_reasoning_effort"]=="high" && metadata["observed_reasoning_effort"]=="high","reasoning request not actually confirmed"); }
                 println!("ACTUAL_ORCHESTRATOR_ACCEPTANCE {}",json!({"workflow":turn_id,"preferences":pref,"calls":calls,"metadata":metadata}));
             }
             ensure!(completion["gui_receipt"]["orchestration"]==true && completion["gui_receipt"]["cli_handoff"]==true,"actual cockpit/CLI receipts missing");
@@ -4599,10 +4599,10 @@ async fn qualify_reasoning_editor_results(
         }
         if kind == "explanation" {
             ensure!(
-                preferences["reasoning"] == "deep"
+                preferences["reasoning"] == "high"
                     && metadata["requested_reasoning_effort"] == "high"
                     && metadata["observed_reasoning_effort"] == "high",
-                "Deep reasoning not runtime confirmed"
+                "Native high reasoning not runtime confirmed"
             );
         } else {
             ensure!(

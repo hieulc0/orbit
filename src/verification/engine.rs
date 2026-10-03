@@ -875,7 +875,7 @@ pub async fn execute_verification_command_isolated_with_network(
             format!("/workspace/{}", rel_cwd)
         };
 
-        // Deterministic clean environment defaults per B2 specification
+        // A clean environment prevents verification from inheriting host state.
         let mut env_map: BTreeMap<String, String> = BTreeMap::new();
         env_map.insert("HOME".to_string(), "/tmp/orbit-home".to_string());
         env_map.insert("CI".to_string(), "1".to_string());

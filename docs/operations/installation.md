@@ -980,14 +980,14 @@ runtime/model can lose to an eligible alternative. Inspect `/agents` for observe
 selections and ranking reasons. Capability, credentials, quota and runtime validity
 remain mandatory. Only currently qualified resolver models are offered.
 
-Reasoning defaults to Auto. Fast, Balanced and Deep request Codex low, medium and
-high effort respectively; Orbit requires exact runtime confirmation before sending
+Reasoning defaults to Auto. Low, Medium and High request the same native Codex
+effort values; Orbit requires exact runtime confirmation before sending
 that turn. These choices require an eligible Codex runtime. Gemini supports Auto
 here; a separate effort request is rejected. Auto is not a promise about the
 provider's internal reasoning level.
 
 Gemini's Reasoning selector offers Auto only; Codex and Orchestrator Auto offer
-Auto, Fast, Balanced and Deep. With Orchestrator Auto, a non-Auto effort still
+Auto, Low, Medium and High. With Orchestrator Auto, a non-Auto effort still
 requires an eligible runtime qualified for that effort. Select Reasoning Auto
 before switching from Codex with explicit effort to Gemini; an incompatible
 selection is rejected without changing preferences. An active turn cannot be

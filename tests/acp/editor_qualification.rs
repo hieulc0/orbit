@@ -601,8 +601,8 @@ async fn acp_v1_stdio_is_typed_bounded_and_replays_session_notifications() -> Re
         ensure!(configured["result"]["configOptions"][0]["currentValue"]=="chat" && updates.iter().any(|n|n["update"]["sessionUpdate"]=="config_option_update"),"native preference update missing");
         let (codex,updates)=exchange(&mut client,102,"session/set_config_option",json!({"sessionId":session,"configId":"orchestrator","value":"codex"})).await?;
         ensure!(codex["result"]["configOptions"][1]["currentValue"]=="codex" && updates.iter().all(|n|n["update"]["sessionUpdate"]!="agent_message_chunk"),"selection update polluted conversation");
-        let (deep,_)=exchange(&mut client,103,"session/set_config_option",json!({"sessionId":session,"configId":"reasoning","value":"deep"})).await?;
-        ensure!(deep["result"]["configOptions"][2]["currentValue"]=="deep","explicit effort not retained");
+        let (high,_)=exchange(&mut client,103,"session/set_config_option",json!({"sessionId":session,"configId":"reasoning","value":"high"})).await?;
+        ensure!(high["result"]["configOptions"][2]["currentValue"]=="high","explicit effort not retained");
         let before=service.preferences(session).await?;
         let (mismatch,_)=exchange(&mut client,104,"session/set_config_option",json!({"sessionId":session,"configId":"orchestrator","value":"gemini"})).await?;
         ensure!(mismatch.get("error").is_some() && service.preferences(session).await?==before,"combined update bypassed reasoning or changed rejected state");
@@ -828,7 +828,7 @@ async fn interactive_preferences_and_conversation_ownership_are_durable() -> Res
             .set_preference(&session.id, "orchestrator", "codex")
             .await?;
         client
-            .set_preference(&session.id, "reasoning", "deep")
+            .set_preference(&session.id, "reasoning", "high")
             .await?;
         let reconnect = service(&database.engine.pool, settings.clone())?;
         ensure!(
@@ -891,7 +891,7 @@ async fn interactive_preferences_and_conversation_ownership_are_durable() -> Res
             .await?
             .unwrap();
         ensure!(
-            snapshot.reasoning == ReasoningPreference::Deep,
+            snapshot.reasoning == ReasoningPreference::High,
             "turn preferences not pinned"
         );
         ensure!(
@@ -903,7 +903,7 @@ async fn interactive_preferences_and_conversation_ownership_are_durable() -> Res
         );
         ensure!(
             client
-                .set_preference(&session.id, "reasoning", "fast")
+                .set_preference(&session.id, "reasoning", "low")
                 .await
                 .is_err(),
             "active turn retargeted"
@@ -1022,6 +1022,12 @@ async fn interactive_preferences_and_conversation_ownership_are_durable() -> Res
         let next=orbit::interactive::preferences::turn_preferences(&database.engine.pool,&cancelled).await?.unwrap();
         ensure!(next.provider=="gemini" && next.model=="gemini-3.7-flash-high" && next.reasoning==ReasoningPreference::Auto,"next turn did not snapshot new preference");
         ensure!(orbit::interactive::preferences::turn_preferences(&database.engine.pool,&workflow).await?.unwrap()==snapshot,"later preference rewrote old snapshot");
+        let inspection = orbit::control_plane::config_inspection::session(&database.engine.pool,&session.id,client.config()).await?;
+        ensure!(inspection["current"]["value"]["provider"]=="gemini" && inspection["current"]["source"]=="durable_product_session", "inspection lost current preference authority");
+        ensure!(inspection["admitted_turns"]["source"]=="immutable_turn_snapshots" && inspection["admitted_turns"]["value"].as_array().unwrap().iter().any(|turn|turn["workflow"]==workflow && turn["preferences"]["reasoning"]=="high"), "inspection confused admitted snapshot with current preferences");
+        let mut unrelated = client.config().clone();
+        unrelated.skill = Some(Skill::Investigate);
+        ensure!(orbit::control_plane::config_inspection::session(&database.engine.pool,&session.id,&unrelated).await.is_err(),"inspection accepted mismatched product configuration");
         client.cancel(&session.id).await?;
         reconnect.run_conversation(&session.id).await?;
         ensure!(
@@ -1152,7 +1158,7 @@ fn primary_preferences_are_catalog_derived_and_reasoning_is_contextual() -> Resu
             projected[2]["options"].as_array().unwrap().len(),
             runtime.reasoning_efforts.len() + 1
         );
-        for (id, _) in runtime.reasoning_efforts {
+        for id in runtime.reasoning_efforts {
             assert!(
                 projected[2]["options"]
                     .as_array()
@@ -1163,8 +1169,8 @@ fn primary_preferences_are_catalog_derived_and_reasoning_is_contextual() -> Resu
         }
     }
     preferences.set("orchestrator", "auto")?;
-    preferences.set("reasoning", "deep")?;
-    assert_eq!(config_options(&preferences)[2]["currentValue"], "deep");
+    preferences.set("reasoning", "high")?;
+    assert_eq!(config_options(&preferences)[2]["currentValue"], "high");
     preferences.set("reasoning", "auto")?;
     preferences.set("orchestrator", "provider:gemini")?;
     let advanced = config_options(&preferences);
@@ -1970,8 +1976,8 @@ async fn real_zed_presentation_smoke_fixture() -> Result<()> {
         let profile = root.path().join("zed-profile");
         let settings = profile.join("data/config");
         std::fs::create_dir_all(&settings)?;
-        let catalog_file = std::env::var("ORBIT_B34_LIVE_CREDENTIAL_DATABASE_URL_FILE")?;
-        std::fs::write(settings.join("settings.json"), serde_json::to_vec_pretty(&json!({"telemetry":{"metrics":false,"diagnostics":false},"agent_servers":{"Orbit":{"type":"custom","command":env!("CARGO_BIN_EXE_orbit"),"args":["acp-serve","--config",config_file],"env":{"ORBIT_DATABASE_URL_FILE":database_file,"ORBIT_B34_LIVE_PROVIDER_OPT_IN":"I_AUTHORIZE_LIVE_PROVIDER_CALLS","ORBIT_B34_LIVE_CREDENTIAL_DATABASE_URL_FILE":catalog_file}}}}))?)?;
+        let catalog_file = std::env::var("ORBIT_QUALIFICATION_CREDENTIAL_DATABASE_URL_FILE")?;
+        std::fs::write(settings.join("settings.json"), serde_json::to_vec_pretty(&json!({"telemetry":{"metrics":false,"diagnostics":false},"agent_servers":{"Orbit":{"type":"custom","command":env!("CARGO_BIN_EXE_orbit"),"args":["acp-serve","--config",config_file],"env":{"ORBIT_DATABASE_URL_FILE":database_file,"ORBIT_QUALIFICATION_PROVIDER_OPT_IN":"I_AUTHORIZE_LIVE_PROVIDER_CALLS","ORBIT_QUALIFICATION_CREDENTIAL_DATABASE_URL_FILE":catalog_file}}}}))?)?;
         std::fs::write(evidence.join("current.json"), serde_json::to_vec_pretty(&json!({"repository":repo.path(),"schema":database.schema,"profile":profile,"config_file":config_file,"database_file":database_file,"binary":env!("CARGO_BIN_EXE_orbit")}))?)?;
         tokio::time::timeout(std::time::Duration::from_secs(600), async {
             loop {
@@ -2040,8 +2046,8 @@ async fn real_zed_orchestrator_catalog_preferences() -> Result<()> {
         let profile = root.path().join("zed-profile");
         let settings = profile.join("data/config");
         std::fs::create_dir_all(&settings)?;
-        let catalog_file = std::env::var("ORBIT_B34_LIVE_CREDENTIAL_DATABASE_URL_FILE")?;
-        std::fs::write(settings.join("settings.json"), serde_json::to_vec_pretty(&json!({"telemetry":{"metrics":false,"diagnostics":false},"agent_servers":{"Orbit":{"type":"custom","command":env!("CARGO_BIN_EXE_orbit"),"args":["acp-serve","--config",config_file],"env":{"ORBIT_DATABASE_URL_FILE":database_file,"ORBIT_B34_LIVE_PROVIDER_OPT_IN":"I_AUTHORIZE_LIVE_PROVIDER_CALLS","ORBIT_B34_LIVE_CREDENTIAL_DATABASE_URL_FILE":catalog_file}}}}))?)?;
+        let catalog_file = std::env::var("ORBIT_QUALIFICATION_CREDENTIAL_DATABASE_URL_FILE")?;
+        std::fs::write(settings.join("settings.json"), serde_json::to_vec_pretty(&json!({"telemetry":{"metrics":false,"diagnostics":false},"agent_servers":{"Orbit":{"type":"custom","command":env!("CARGO_BIN_EXE_orbit"),"args":["acp-serve","--config",config_file],"env":{"ORBIT_DATABASE_URL_FILE":database_file,"ORBIT_QUALIFICATION_PROVIDER_OPT_IN":"I_AUTHORIZE_LIVE_PROVIDER_CALLS","ORBIT_QUALIFICATION_CREDENTIAL_DATABASE_URL_FILE":catalog_file}}}}))?)?;
         std::fs::write(evidence.join("current.json"), serde_json::to_vec_pretty(&json!({"repository":repo.path(),"schema":database.schema,"profile":profile,"config_file":config_file,"database_file":database_file,"binary":env!("CARGO_BIN_EXE_orbit")}))?)?;
         tokio::time::timeout(std::time::Duration::from_secs(900), async {
             loop {

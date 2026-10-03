@@ -26,17 +26,26 @@ impl InteractionMode {
 pub enum ReasoningPreference {
     #[default]
     Auto,
-    Fast,
-    Balanced,
-    Deep,
+    // Read compatibility for already persisted snapshots. New requests accept
+    // native spellings only; serialization never writes the historical labels.
+    #[serde(alias = "fast")]
+    Low,
+    #[serde(alias = "balanced")]
+    Medium,
+    #[serde(alias = "deep")]
+    High,
+    Xhigh,
+    Max,
 }
 impl ReasoningPreference {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Auto => "auto",
-            Self::Fast => "fast",
-            Self::Balanced => "balanced",
-            Self::Deep => "deep",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
         }
     }
 }
@@ -92,10 +101,13 @@ impl SessionPreferences {
         );
         ensure!(
             self.reasoning == ReasoningPreference::Auto
-                || self
-                    .preferred_runtime()
-                    .is_none_or(|runtime| runtime.effort(self.reasoning.as_str()).is_some()),
-            "REASONING_UNSUPPORTED: Gemini has no separately qualified effort control"
+                || self.preferred_runtime().map_or_else(
+                    || catalog::ACCEPTED
+                        .iter()
+                        .any(|runtime| runtime.effort(self.reasoning.as_str()).is_some()),
+                    |runtime| runtime.effort(self.reasoning.as_str()).is_some()
+                ),
+            "REASONING_UNSUPPORTED: no accepted target supports the requested native value"
         );
         Ok(())
     }
@@ -134,7 +146,13 @@ impl SessionPreferences {
             "interaction" => self.interaction = serde_json::from_value(json!(value))?,
             "provider" => self.provider = value.into(),
             "model" => self.model = value.into(),
-            "reasoning" => self.reasoning = serde_json::from_value(json!(value))?,
+            "reasoning" => {
+                ensure!(
+                    matches!(value, "auto" | "low" | "medium" | "high" | "xhigh" | "max"),
+                    "UNSUPPORTED_NATIVE_REASONING"
+                );
+                self.reasoning = serde_json::from_value(json!(value))?;
+            }
             "profile" => self.profile = value.into(),
             "flow" => self.flow = value.into(),
             _ => anyhow::bail!("UNSUPPORTED_PREFERENCE"),
@@ -467,6 +485,32 @@ impl InteractiveService {
 mod tests {
     use super::*;
     #[test]
+    fn native_reasoning_is_bounded_by_current_qualification() -> Result<()> {
+        for native in ["low", "medium", "high", "xhigh", "max"] {
+            let value: ReasoningPreference = serde_json::from_value(json!(native))?;
+            assert_eq!(value.as_str(), native);
+            let mut preference = SessionPreferences::default();
+            assert_eq!(
+                preference.set("reasoning", native).is_ok(),
+                catalog::ACCEPTED
+                    .iter()
+                    .any(|runtime| runtime.effort(native).is_some())
+            );
+        }
+        for (legacy, native) in [("fast", "low"), ("balanced", "medium"), ("deep", "high")] {
+            let snapshot: ReasoningPreference = serde_json::from_value(json!(legacy))?;
+            assert_eq!(serde_json::to_value(snapshot)?, json!(native));
+            assert!(
+                SessionPreferences::default()
+                    .set("reasoning", legacy)
+                    .is_err()
+            );
+        }
+        assert!(serde_json::from_value::<ReasoningPreference>(json!("High")).is_err());
+        assert!(catalog::by_model("gemini-3.8-flash-high").is_none());
+        Ok(())
+    }
+    #[test]
     fn combined_orchestrator_preferences_are_atomic_and_catalog_bound() -> Result<()> {
         let mut p = SessionPreferences::default();
         for runtime in catalog::ACCEPTED {
@@ -478,7 +522,7 @@ mod tests {
             assert_eq!((&*p.provider, &*p.model), ("auto", "auto"));
         }
         p.set("orchestrator", "codex")?;
-        p.set("reasoning", "deep")?;
+        p.set("reasoning", "high")?;
         for (key, value) in [
             ("orchestrator", "gemini"),
             ("provider", "gemini"),
@@ -494,9 +538,9 @@ mod tests {
         }
         for (reasoning, effort) in [
             ("auto", None),
-            ("fast", Some("low")),
-            ("balanced", Some("medium")),
-            ("deep", Some("high")),
+            ("low", Some("low")),
+            ("medium", Some("medium")),
+            ("high", Some("high")),
         ] {
             p.set("reasoning", reasoning)?;
             assert_eq!(p.effort("codex")?, effort);
@@ -504,13 +548,13 @@ mod tests {
         p.set("reasoning", "auto")?;
         p.set("orchestrator", "gemini")?;
         assert_eq!(p.effort("antigravity")?, None);
-        for reasoning in ["fast", "balanced", "deep"] {
+        for reasoning in ["low", "medium", "high"] {
             let before = p.clone();
             assert!(p.set("reasoning", reasoning).is_err());
             assert_eq!(p, before);
         }
         p.set("orchestrator", "auto")?;
-        p.set("reasoning", "deep")?;
+        p.set("reasoning", "high")?;
         assert_eq!(
             p.orchestrator_role()?.runtime_preferences,
             [catalog::CODEX.runtime_preference]
@@ -553,9 +597,9 @@ mod tests {
             p.orchestrator_role()?.runtime_preferences[0],
             "antigravity-acp"
         );
-        assert!(p.set("reasoning", "deep").is_err());
+        assert!(p.set("reasoning", "high").is_err());
         let mut p = SessionPreferences::default();
-        p.set("reasoning", "deep")?;
+        p.set("reasoning", "high")?;
         assert_eq!(p.effort("codex")?, Some("high"));
         assert!(p.effort("antigravity").is_err());
         let role = p.orchestrator_role()?;

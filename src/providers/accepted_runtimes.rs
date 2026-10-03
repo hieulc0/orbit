@@ -13,7 +13,7 @@ pub struct AcceptedRuntime {
     pub runtime_interface: &'static str,
     pub image_digest: &'static str,
     pub adapter_revision: &'static str,
-    pub reasoning_efforts: &'static [(&'static str, &'static str)],
+    pub reasoning_efforts: &'static [&'static str],
 }
 
 pub const CODEX: AcceptedRuntime = AcceptedRuntime {
@@ -26,7 +26,7 @@ pub const CODEX: AcceptedRuntime = AcceptedRuntime {
     runtime_interface: "codex-acp",
     image_digest: crate::codex_credential_enrollment::CODEX_IMAGE_DIGEST,
     adapter_revision: crate::codex_bridge::REVISION,
-    reasoning_efforts: &[("fast", "low"), ("balanced", "medium"), ("deep", "high")],
+    reasoning_efforts: &["low", "medium", "high"],
 };
 
 pub const GEMINI: AcceptedRuntime = AcceptedRuntime {
@@ -74,7 +74,8 @@ impl AcceptedRuntime {
     pub fn effort(&self, reasoning: &str) -> Option<&'static str> {
         self.reasoning_efforts
             .iter()
-            .find_map(|(name, effort)| (*name == reasoning).then_some(*effort))
+            .copied()
+            .find(|effort| *effort == reasoning)
     }
 }
 

@@ -70,7 +70,7 @@ impl ServiceConfig {
         );
         Ok(())
     }
-    fn digest(&self) -> Result<String> {
+    pub(crate) fn digest(&self) -> Result<String> {
         let mut value = serde_json::to_value(self)?;
         value
             .as_object_mut()

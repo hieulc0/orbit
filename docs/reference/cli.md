@@ -16,6 +16,7 @@
 | `signal`, `approve` | Deliver durable signals and assigned human decisions |
 | `credential` | Enroll, inspect, rotate, revoke and observe catalog credentials |
 | `workflow` | Start and advance role workflows under pinned policy |
+| `config show` | Inspect effective configuration and provenance without resolving secrets |
 | `interactive` | Control durable managed-worktree sessions and inspect candidates |
 | `acp-serve`, `acp-probe`, `acp-launch-digest` | Editor interface, credential-free initialization and launch pinning |
 | `identity`, `projects`, `audit` | Scoped operator identity, visible projects and authorization history |

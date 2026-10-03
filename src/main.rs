@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use orbit::{
     api::{self, App, Config, Submit},
     availability::AvailabilityStore,
@@ -430,6 +430,11 @@ enum InteractiveAction {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Inspect effective configuration and provenance without resolving secrets.
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
     /// Control durable managed-worktree tasks independently of editor protocols.
     Interactive(InteractiveArgs),
     /// Serve Orbit workflows and managed candidates to ACP editor clients.
@@ -655,6 +660,127 @@ enum Commands {
         #[arg(long)]
         output: PathBuf,
     },
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Aggregate existing authorities; no configuration or runtime state changes.
+    Show {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        server_config: Option<PathBuf>,
+        #[arg(long, requires = "config")]
+        session: Option<String>,
+        #[arg(long, env = "ORBIT_DATABASE_URL_FILE", hide_env_values = true)]
+        database_url_file: Option<PathBuf>,
+    },
+}
+
+fn argument_source(matches: &clap::ArgMatches, name: &str) -> &'static str {
+    match matches.value_source(name) {
+        Some(clap::parser::ValueSource::CommandLine) => "CLI option",
+        Some(clap::parser::ValueSource::EnvVariable) => "environment",
+        Some(clap::parser::ValueSource::DefaultValue) => "built-in default",
+        _ => "not configured",
+    }
+}
+
+fn inspection_config<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(128 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() <= 128 * 1024,
+        "inspection configuration exceeds bounds"
+    );
+    serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("invalid inspection configuration"))
+}
+
+async fn show_configuration(
+    cli: &Cli,
+    matches: &clap::ArgMatches,
+    action: &ConfigAction,
+) -> Result<()> {
+    let ConfigAction::Show {
+        config,
+        server_config,
+        session,
+        database_url_file,
+    } = action;
+    let supplied: Option<serde_json::Value> =
+        config.as_deref().map(inspection_config).transpose()?;
+    let product: Option<orbit::interactive::ServiceConfig> = supplied
+        .as_ref()
+        .map(|value| {
+            serde_json::from_value(value.clone())
+                .map_err(|_| anyhow::anyhow!("invalid product inspection configuration"))
+        })
+        .transpose()?;
+    if let Some(product) = &product {
+        product.validate()?;
+    }
+    let mut value = orbit::control_plane::config_inspection::effective(product.as_ref());
+    if let Some(supplied) = &supplied {
+        orbit::control_plane::config_inspection::product_provenance(&mut value, supplied);
+    }
+    if let Some(path) = server_config {
+        value["server"] =
+            orbit::control_plane::config_inspection::server(&inspection_config(path)?);
+    }
+    let show = matches
+        .subcommand_matches("config")
+        .and_then(|m| m.subcommand_matches("show"))
+        .context("configuration arguments unavailable")?;
+    let token_source = if cli.token_file.is_some() {
+        argument_source(matches, "token_file")
+    } else {
+        argument_source(matches, "token")
+    };
+    value["connections"] = orbit::control_plane::config_inspection::connection_metadata(
+        database_url_file.is_some() || session.is_some(),
+        if database_url_file.is_none() && session.is_some() {
+            "built-in private file default"
+        } else {
+            argument_source(show, "database_url_file")
+        },
+        !cli.token.is_empty() || cli.token_file.is_some(),
+        token_source,
+    );
+    value["connections"]["api_credential"]["conflict"] =
+        serde_json::json!(!cli.token.is_empty() && cli.token_file.is_some());
+    if let Some(identifier) = session {
+        let url = read_private_database_url(database_url_file.as_deref()).await?;
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .after_connect(|connection, _| {
+                Box::pin(async move {
+                    sqlx::query("SET default_transaction_read_only=on")
+                        .execute(connection)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect(url.as_str())
+            .await
+            .map_err(|_| anyhow::anyhow!("configuration inspection database connection failed"))?;
+        value["session"] = orbit::control_plane::config_inspection::session(
+            &pool,
+            identifier,
+            product
+                .as_ref()
+                .context("product config required for session inspection")?,
+        )
+        .await?;
+        value["connections"]["database"]["resolved"] = serde_json::json!(true);
+        pool.close().await;
+    }
+    match cli.output_format {
+        Output::Jsonl => println!("{}", serde_json::to_string(&value)?),
+        _ => println!("{}", serde_json::to_string_pretty(&value)?),
+    }
+    Ok(())
 }
 
 async fn read_private_database_url(file: Option<&Path>) -> Result<Zeroizing<String>> {
@@ -2494,12 +2620,7 @@ async fn interactive_coordinator(
     environment: orbit::verification::EnvironmentIdentity,
 ) -> Result<orbit::workflow_coordinator::WorkflowCoordinator> {
     #[cfg(feature = "fault-injection")]
-    if let Some(path) = std::env::var_os("ORBIT_B34_LIVE_CREDENTIAL_DATABASE_URL_FILE") {
-        anyhow::ensure!(
-            std::env::var("ORBIT_B34_LIVE_PROVIDER_OPT_IN").as_deref()
-                == Ok("I_AUTHORIZE_LIVE_PROVIDER_CALLS"),
-            "live fixture requires explicit opt-in"
-        );
+    if let Some(path) = orbit::providers::qualification::credential_database_file()? {
         let url = read_private_database_url(Some(Path::new(&path))).await?;
         validate_durable_catalog_url(url.as_str())?;
         let catalog = sqlx::postgres::PgPoolOptions::new()
@@ -3386,7 +3507,11 @@ async fn credential_status_report(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let cli = Cli::from_arg_matches(&matches)?;
+    if let Commands::Config { action } = &cli.command {
+        return show_configuration(&cli, &matches, action).await;
+    }
     let mut output_format = cli.output_format;
     if let Commands::Interactive(args) = &cli.command {
         return run_interactive_cli(args, output_format).await;
@@ -4636,6 +4761,7 @@ async fn main() -> Result<()> {
     };
     let client = Client::new(cli.url, token)?;
     let value = match cli.command {
+        Commands::Config { .. } => unreachable!("inspection precedes secret resolution"),
         Commands::Verification(_) => {
             unreachable!("local verification handled before API credential resolution")
         }

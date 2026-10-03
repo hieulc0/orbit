@@ -361,3 +361,39 @@ Values are installation inputs, not grants or evidence of availability. Keep
 secrets outside Git, command arguments, repository tools and diagnostic output.
 Use [installation](../operations/installation.md) for deployment-specific setup
 and [troubleshooting](../operations/troubleshooting.md) for qualification variables.
+
+## Effective configuration inspection
+
+`orbit config show` aggregates existing authorities without changing settings or
+resolving secrets. It shows resolver defaults and the source-bound accepted
+runtime/model descriptors. This is not a runtime registry or an availability
+check.
+
+Use `--config /path/to/orbit-editor.json` to inspect the product configuration,
+`--server-config /path/to/server.json` for safe server metadata, and
+`--config ... --session SESSION` to inspect current durable preferences separately
+from the latest 16 immutable turn snapshots. Session inspection requires a
+matching product configuration and uses a read-only PostgreSQL transaction.
+Connection metadata is redacted. A session query reads the private database URL;
+ordinary config inspection does not resolve that file or API credentials.
+
+| Domain | Authority and precedence | Persistence and change scope |
+| --- | --- | --- |
+| Product repository, workspace, execution and verification policy | Explicit operator product file; omitted optional risk/skill use typed defaults | File; sessions check its stored digest, admitted executions retain their identities |
+| Server bindings, authorization and storage | Explicit server file; inspection reports counts/configured metadata only | File; restart-sensitive, accepted plans retain referenced binding snapshots |
+| Database/API credential input | CLI option overrides environment; direct database operations otherwise use the private default file | Operator private source; credential values are never shown |
+| Resolver quota floors | Domain policy defaults (15% short window, 5% weekly); explicit policy APIs retain ownership | Selection policy; inspection is not a fresh quota observation |
+| Accepted runtime/model descriptors | Source-bound accepted catalog; discovery does not add entries | Immutable source identities; current eligibility still belongs to the resolver |
+| User preference | PostgreSQL product session, shared by ACP and CLI | Applies to subsequent admitted turns; active turns cannot be retargeted |
+| Admitted turn | Immutable PostgreSQL preference snapshot and resolved execution identity | Existing execution only; current preferences cannot rewrite it |
+
+Reasoning uses provider-native canonical values. The bounded representation can
+express `low`, `medium`, `high`, `xhigh` and `max`, but selectable support comes
+from the qualified runtime/model descriptor. Current Codex support is `low`,
+`medium`, `high`; current Gemini 3.7 supports Auto only. Auto sends no explicit
+effort. Additional native levels and Gemini 3.8 remain unqualified here.
+
+Old persisted reasoning spellings have a read compatibility path that preserves
+their original native effort without rewriting rows. New inputs reject those
+historical spellings; new serialized preferences use native values. This
+compatibility does not qualify an additional effort or runtime.
