@@ -6,9 +6,6 @@ Current behavior belongs in [architecture](architecture/README.md), interfaces i
 
 ## Pending acceptance
 
-- **Intent-based flow selection:** select bounded read-only, small-fix and larger
-  engineering flows from intent and risk, and expose roles, profile and required
-  verification before substantial work.
 - **Editor action recovery:** qualify operator reconciliation after interrupted
   candidate application or discard in the selected editor. Normal reconnect and
   explicit candidate actions do not establish forced-crash recovery.
