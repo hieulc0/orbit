@@ -55,3 +55,11 @@ a throughput, high-availability, storage-loss, or production qualification.
 with an immutable preference snapshot and matching operation identity. Admission
 publishes that association and session ownership atomically. Task, role, candidate,
 handoff and verification records stay in their existing authoritative stores.
+
+`orbit_intent_decisions` stores one immutable typed proposal per reasoning turn,
+its policy result, clarification/block status, actual accepted preferences and
+child candidate association. Acceptance time orders current child selection,
+independently of proposal order. Product and turn `intent_generation` values
+fence cancellation against late Auto admission. Decisions remain non-authoritative
+until fenced acceptance; existing workflow/role/workspace/evidence records remain
+authoritative. Unaccepted children cannot execute through product operations.

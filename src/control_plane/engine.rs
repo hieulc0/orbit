@@ -148,6 +148,9 @@ impl Engine {
         ))
         .execute(&mut *migration)
         .await?;
+        sqlx::raw_sql(include_str!("../../migrations/0030_interactive_intent.sql"))
+            .execute(&mut *migration)
+            .await?;
         migration.commit().await?;
         Ok(Self {
             pool,

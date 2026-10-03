@@ -670,6 +670,35 @@ impl WorkflowCoordinator {
                     }
                 };
 
+                if role.role_id == "orchestrator"
+                    && let Err(error) = crate::interactive::intent::record_proposal(
+                        &self.pool,
+                        wf_id,
+                        &outcome.raw_output,
+                        None,
+                    )
+                    .await
+                {
+                    let message = format!("ROLE_OUTPUT_INVALID: intent proposal: {error:#}");
+                    self.store
+                        .complete_role_execution_failed(
+                            &role_exec.id,
+                            "ROLE_OUTPUT_INVALID",
+                            &message,
+                        )
+                        .await?;
+                    self.store
+                        .transition_workflow_stage(
+                            wf_id,
+                            WorkflowStage::Failed,
+                            None,
+                            None,
+                            Some(&message),
+                        )
+                        .await?;
+                    return Ok(WorkflowStepResult::Terminal(WorkflowStage::Failed));
+                }
+
                 let handoff = self
                     .store
                     .save_handoff_artifact(
@@ -2491,6 +2520,15 @@ impl RoleAgentExecutor for SimulatedRoleExecutor {
             other => bail!("unexpected role id in simulator: {other}"),
         };
 
+        let raw_output = if role.role_id == "orchestrator"
+            && !raw_output.contains("<<<ORBIT_INTENT_START>>>")
+        {
+            format!(
+                "<<<ORBIT_INTENT_START>>>\n{{\"skill\":\"explain\",\"proposed_flow\":\"investigation\",\"rationale\":\"Simulated read-only observation\",\"scope\":[],\"clarification_questions\":[]}}\n<<<ORBIT_INTENT_END>>>\n{raw_output}"
+            )
+        } else {
+            raw_output
+        };
         Ok(RoleExecutionOutcome {
             raw_output,
             agent_execution_ids: vec![format!("sim-agent-{}", id())],

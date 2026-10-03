@@ -4330,18 +4330,25 @@ async fn real_acp_sdk_client_recovers_disconnected_coding_and_read_only_roles() 
 #[tokio::test]
 #[ignore = "requires explicitly authorized actual disposable Zed GUI, live providers, pinned verification and disposable PostgreSQL"]
 async fn real_zed_gui_managed_candidate_lifecycle() -> Result<()> {
-    qualify_real_editor(false).await
+    qualify_real_editor(false, false).await
 }
 
 #[cfg(feature = "fault-injection")]
 #[tokio::test]
 #[ignore = "requires explicitly authorized actual disposable Zed GUI, orchestrator conversation, live providers, pinned verification and disposable PostgreSQL"]
 async fn real_zed_gui_orchestrator_preferences_and_workflow() -> Result<()> {
-    qualify_real_editor(true).await
+    qualify_real_editor(true, false).await
 }
 
 #[cfg(feature = "fault-injection")]
-async fn qualify_real_editor(orchestration: bool) -> Result<()> {
+#[tokio::test]
+#[ignore = "requires authorized actual disposable Zed GUI, live reasoning, pinned verification and disposable PostgreSQL"]
+async fn real_zed_gui_reasoning_intent_and_flow() -> Result<()> {
+    qualify_real_editor(true, true).await
+}
+
+#[cfg(feature = "fault-injection")]
+async fn qualify_real_editor(orchestration: bool, reasoning: bool) -> Result<()> {
     use orbit::{
         execution::local::RoleExecutionProfile,
         interactive::ServiceConfig,
@@ -4398,9 +4405,10 @@ async fn qualify_real_editor(orchestration: bool) -> Result<()> {
         let mut previous=String::new();
         let completion=tokio::time::timeout(Duration::from_secs(1800),async {
             loop {
-                let sessions=sqlx::query("SELECT s.id,s.state,s.preferences,s.workflow_run_id,wf.status,wf.current_workspace_state_id FROM orbit_editor_sessions s LEFT JOIN orbit_workflow_runs wf ON wf.id=s.workflow_run_id ORDER BY s.id").fetch_all(&ctx.engine.pool).await?;
+                let sessions=sqlx::query("SELECT s.id,s.state,s.preferences,COALESCE(s.workflow_run_id,child.workflow_run_id) AS workflow_run_id,child.id AS candidate_session_id,child.state AS candidate_session_state,wf.status,wf.current_workspace_state_id FROM orbit_editor_sessions s LEFT JOIN LATERAL (SELECT c.id,c.state,c.workflow_run_id FROM orbit_intent_decisions d JOIN orbit_editor_sessions c ON c.id=d.flow_session_id WHERE d.session_id=s.id AND d.status='ACCEPTED' ORDER BY d.accepted_at DESC LIMIT 1) child ON true LEFT JOIN orbit_workflow_runs wf ON wf.id=COALESCE(s.workflow_run_id,child.workflow_run_id) ORDER BY s.id").fetch_all(&ctx.engine.pool).await?;
                 let source=compute_workspace_state(repository.path(),&baseline.baseline_revision).await?;
-                let observation=json!({"source_is_baseline":source.state_id==baseline.state_id,"source_state":source.state_id,"sessions":sessions.iter().map(|row|json!({"id":row.get::<String,_>("id"),"state":row.get::<String,_>("state"),"preferences":row.get::<serde_json::Value,_>("preferences"),"workflow":row.get::<Option<String>,_>("workflow_run_id"),"status":row.get::<Option<String>,_>("status"),"candidate":row.get::<Option<String>,_>("current_workspace_state_id")})).collect::<Vec<_>>()});
+                let turns=sqlx::query("SELECT t.session_id,t.workflow_run_id,t.sequence,t.preferences,wf.status,d.proposal,d.policy_result,d.status AS decision_status FROM orbit_interactive_turns t JOIN orbit_workflow_runs wf ON wf.id=t.workflow_run_id LEFT JOIN orbit_intent_decisions d ON d.turn_workflow_id=t.workflow_run_id ORDER BY t.session_id,t.sequence").fetch_all(&ctx.engine.pool).await?;
+                let observation=json!({"source_is_baseline":source.state_id==baseline.state_id,"source_state":source.state_id,"sessions":sessions.iter().map(|row|json!({"id":row.get::<String,_>("id"),"state":row.get::<String,_>("state"),"preferences":row.get::<serde_json::Value,_>("preferences"),"candidate_session":row.get::<Option<String>,_>("candidate_session_id"),"candidate_state":row.get::<Option<String>,_>("candidate_session_state"),"workflow":row.get::<Option<String>,_>("workflow_run_id"),"status":row.get::<Option<String>,_>("status"),"candidate":row.get::<Option<String>,_>("current_workspace_state_id")})).collect::<Vec<_>>(),"turns":turns.iter().map(|row|json!({"session":row.get::<String,_>("session_id"),"workflow":row.get::<String,_>("workflow_run_id"),"sequence":row.get::<i64,_>("sequence"),"preferences":row.get::<serde_json::Value,_>("preferences"),"status":row.get::<String,_>("status"),"proposal":row.get::<Option<serde_json::Value>,_>("proposal"),"policy":row.get::<Option<serde_json::Value>,_>("policy_result"),"decision_status":row.get::<Option<String>,_>("decision_status")})).collect::<Vec<_>>()});
                 let serialized=serde_json::to_string(&observation)?;
                 if serialized!=previous {
                     use std::io::Write;
@@ -4438,7 +4446,9 @@ async fn qualify_real_editor(orchestration: bool) -> Result<()> {
         ensure!(ctx.store.get_workflow_run(cancelled).await?.context("cancelled workflow absent")?.status==orbit::workflow::WorkflowStage::Cancelled,"GUI cancellation not durable");
         let confirmed:i64=sqlx::query_scalar("SELECT count(*) FROM orbit_agent_executions ae JOIN orbit_role_executions re ON re.id=ae.role_execution_id WHERE re.workflow_run_id=$1 AND ae.status='CANCELLED' AND ae.metadata->>'cleanup_confirmed'='true'").bind(cancelled).fetch_one(&ctx.engine.pool).await?;
         ensure!(confirmed>0,"GUI cancellation never stopped an actual provider execution");
-        if orchestration {
+        if reasoning {
+            qualify_reasoning_editor_results(&ctx, &completion, &baseline.state_id, &evidence).await?;
+        } else if orchestration {
             let session:String=sqlx::query_scalar("SELECT id FROM orbit_editor_sessions WHERE workflow_run_id=$1").bind(workflow_id).fetch_one(&ctx.engine.pool).await?;
             let turns=sqlx::query("SELECT workflow_run_id, preferences FROM orbit_interactive_turns WHERE session_id=$1 ORDER BY sequence").bind(&session).fetch_all(&ctx.engine.pool).await?;
             ensure!(turns.len()==2,"orchestrator conversation/agent evidence missing");
@@ -4462,4 +4472,169 @@ async fn qualify_real_editor(orchestration: bool) -> Result<()> {
         Ok(())
     }.await;
     finish_live_fixture(catalog, ctx, result).await
+}
+
+#[cfg(feature = "fault-injection")]
+async fn qualify_reasoning_editor_results(
+    ctx: &TestContext,
+    completion: &serde_json::Value,
+    baseline: &str,
+    evidence: &Path,
+) -> Result<()> {
+    let product = completion["product"]
+        .as_str()
+        .context("product session missing")?;
+    let cases = completion["cases"]
+        .as_array()
+        .context("reasoning cases missing")?;
+    ensure!(cases.len() == 6, "required reasoning cases incomplete");
+    let expected = [
+        "explanation",
+        "investigation",
+        "ambiguity",
+        "policy",
+        "mutation",
+        "active_question",
+    ];
+    for (case, kind) in cases.iter().zip(expected) {
+        ensure!(case["kind"] == kind, "reasoning case order mismatch");
+        let turn = case["turn"].as_str().context("reasoning turn missing")?;
+        let row = sqlx::query("SELECT t.session_id,t.user_request,t.preferences,d.proposal,d.policy_result,d.status,d.flow_session_id FROM orbit_interactive_turns t JOIN orbit_intent_decisions d ON d.turn_workflow_id=t.workflow_run_id WHERE t.workflow_run_id=$1")
+            .bind(turn).fetch_one(&ctx.engine.pool).await?;
+        ensure!(
+            row.get::<String, _>("session_id") == product
+                && !row.get::<String, _>("user_request").is_empty(),
+            "reasoning ownership/request lost"
+        );
+        let proposal: serde_json::Value = row.get("proposal");
+        let policy: serde_json::Value = row.get("policy_result");
+        let preferences: serde_json::Value = row.get("preferences");
+        let status: String = row.get("status");
+        match kind {
+            "explanation" | "active_question" => ensure!(
+                proposal["skill"] == "explain" && status == "READ_ONLY",
+                "question admitted coding flow"
+            ),
+            "investigation" => ensure!(
+                proposal["skill"] == "investigate" && status == "READ_ONLY",
+                "investigation authority changed"
+            ),
+            "ambiguity" => ensure!(
+                status == "CLARIFICATION"
+                    && proposal["clarification_questions"]
+                        .as_array()
+                        .is_some_and(|v| !v.is_empty())
+                    && row.get::<Option<String>, _>("flow_session_id").is_none(),
+                "ambiguity dispatched mutation"
+            ),
+            "policy" => ensure!(
+                status == "BLOCKED"
+                    && policy["flow"].is_null()
+                    && row.get::<Option<String>, _>("flow_session_id").is_none(),
+                "manual downgrade bypassed policy"
+            ),
+            "mutation" => {
+                ensure!(
+                    status == "ACCEPTED"
+                        && preferences["interaction"] == "flow"
+                        && preferences["flow"] == "auto"
+                        && policy["flow"]["read_only"] == false,
+                    "Auto mutation not policy admitted"
+                );
+                let child = row.get::<String, _>("flow_session_id");
+                let actual: String = sqlx::query_scalar(
+                    "SELECT workflow_run_id FROM orbit_editor_sessions WHERE id=$1",
+                )
+                .bind(child)
+                .fetch_one(&ctx.engine.pool)
+                .await?;
+                ensure!(
+                    actual == completion["workflow"],
+                    "decision did not associate actual engineering workflow"
+                );
+            }
+            _ => unreachable!(),
+        }
+        let run = ctx
+            .store
+            .get_workflow_run(turn)
+            .await?
+            .context("reasoning execution absent")?;
+        ensure!(
+            run.status == orbit::workflow::WorkflowStage::Completed
+                && run.current_workspace_state_id.as_deref() == Some(baseline)
+                && ctx
+                    .store
+                    .flow(turn)
+                    .await?
+                    .is_some_and(|flow| flow.read_only),
+            "reasoning mutated product baseline"
+        );
+        let roles = ctx.store.list_role_executions(turn).await?;
+        ensure!(
+            roles.len() == 1
+                && roles[0].role_id == "orchestrator"
+                && roles[0].status == RoleExecutionStatus::Succeeded
+                && roles[0].agent_execution_ids.len() == 1,
+            "reasoning role boundary changed"
+        );
+        print_live_fixture_audit(&ctx.engine.pool, Some(&roles[0].id)).await;
+        let (state, calls, successes, failures, _, metadata) =
+            load_agent_tool_audit(&ctx.engine.pool, &roles[0].agent_execution_ids[0]).await?;
+        ensure!(
+            state == "SUCCEEDED"
+                && calls == successes
+                && failures == 0
+                && metadata["cleanup_confirmed"] == true
+                && metadata["tool_call_audit"]["summary"]["mutating"] == 0
+                && metadata["role_budget"]["usage"]["terminal_calls"] == 0
+                && b34_audit_has_exact_correlations(
+                    &metadata["tool_call_audit"],
+                    usize::try_from(calls)?
+                ),
+            "reasoning audit/cleanup mismatch"
+        );
+        if matches!(kind, "explanation" | "investigation") {
+            ensure!(calls > 0, "repository observation missing");
+        }
+        if kind == "explanation" {
+            ensure!(
+                preferences["reasoning"] == "deep"
+                    && metadata["requested_reasoning_effort"] == "high"
+                    && metadata["observed_reasoning_effort"] == "high",
+                "Deep reasoning not runtime confirmed"
+            );
+        } else {
+            ensure!(
+                preferences["reasoning"] == "auto"
+                    && metadata["requested_reasoning_effort"].is_null(),
+                "Auto reasoning invented provider setting"
+            );
+        }
+        println!(
+            "ACTUAL_REASONING_CASE {}",
+            json!({"kind":kind,"turn":turn,"proposal":proposal,"policy":policy,"preferences":preferences,"role":roles[0],"calls":calls,"metadata":metadata})
+        );
+    }
+    let reconnect: serde_json::Value =
+        serde_json::from_slice(&fs::read(evidence.join("reconnect-observation.json"))?)?;
+    let cli: serde_json::Value =
+        serde_json::from_slice(&fs::read(evidence.join("cli-handoff-observation.json"))?)?;
+    ensure!(
+        reconnect["session"]["id"] == product
+            && cli["session"]["id"] == product
+            && reconnect["workflow"]["id"] == completion["workflow"]
+            && reconnect["candidate"] == cli["candidate"]
+            && reconnect["decisions"] == cli["decisions"]
+            && completion["gui_receipt"]["reasoning"] == true,
+        "GUI reconnect or CLI decision/candidate mismatch"
+    );
+    let accepted: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM orbit_intent_decisions WHERE session_id=$1 AND status='ACCEPTED'",
+    )
+    .bind(product)
+    .fetch_one(&ctx.engine.pool)
+    .await?;
+    ensure!(accepted == 1, "conversation duplicated engineering flow");
+    Ok(())
 }

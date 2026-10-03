@@ -173,6 +173,14 @@ pub(crate) fn build_role_prompt(
             task_text = task_text,
         ),
     };
+    let prompt = if role.role_id == "orchestrator" {
+        format!(
+            "{prompt}\nAdditionally return one separate typed intent envelope before the answer handoff. Never place execution authority in either envelope. Skills: explain, investigate, software_fix, software_change, software_refactor, documentation_change, review. Flows: investigation, documentation, engineering. Use investigation for read-only requests, documentation for scoped markdown changes, engineering for software changes. objective is the self-contained human objective, resolving referential clarification from durable context (never just the first option). scope contains only repository-relative paths you actually observed or clearly identify as proposed. clarification_questions is nonempty when materially different interpretations need human choice. Do not start a flow to answer a status question. Format exactly:\n<<<ORBIT_INTENT_START>>>\n{{\"skill\":\"explain\",\"proposed_flow\":\"investigation\",\"rationale\":\"Reason for this proposal\",\"objective\":\"Self-contained human objective\",\"scope\":[],\"clarification_questions\":[]}}\n<<<ORBIT_INTENT_END>>>\n"
+        )
+    } else {
+        prompt
+    };
+
     let prompt = if advertised_tools.iter().any(|tool| tool == "shell") {
         prompt.replace("Terminal execution is unavailable in this assignment. That does not prevent implementation: use the advertised Orbit mutation callbacks.", "Terminal execution is available through the advertised Orbit shell callback in a confined developer-local workspace without host credentials or network.")
     } else {

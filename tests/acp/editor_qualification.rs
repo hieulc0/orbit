@@ -962,6 +962,7 @@ async fn interactive_preferences_and_conversation_ownership_are_durable() -> Res
         store
             .transition_workflow_stage(&workflow, WorkflowStage::Completed, Some(state), None, None)
             .await?;
+        orbit::interactive::intent::record_proposal(&database.engine.pool,&workflow,"<<<ORBIT_INTENT_START>>>{\"skill\":\"explain\",\"proposed_flow\":\"investigation\",\"rationale\":\"Read-only fixture\",\"scope\":[],\"clarification_questions\":[]}<<<ORBIT_INTENT_END>>>",None).await?;
         reconnect.run_conversation(&session.id).await?;
         let display = reconnect.dashboard(&session.id).await?;
         ensure!(
@@ -1090,4 +1091,596 @@ fn editor_selectors_and_candidate_views_are_observations() -> Result<()> {
         "unsupported Gemini reasoning advertised"
     );
     Ok(())
+}
+
+fn proposal(
+    skill: orbit::interactive::intent::IntentSkill,
+    flow: orbit::interactive::intent::ProposedFlow,
+    scope: &[&str],
+) -> orbit::interactive::intent::IntentProposal {
+    orbit::interactive::intent::IntentProposal {
+        skill,
+        proposed_flow: flow,
+        rationale: "Observed bounded repository scope".into(),
+        objective: "Change the requested repository behavior".into(),
+        scope: scope.iter().map(|s| s.to_string()).collect(),
+        clarification_questions: vec![],
+    }
+}
+
+#[test]
+fn intent_policy_is_bounded_and_cannot_grant_authority() -> Result<()> {
+    use orbit::interactive::{intent::*, preferences::*};
+    let repo = common::TemporaryGitRepo::create()?;
+    let root = tempfile::tempdir()?;
+    let mut config = config(&repo, &root)?;
+    config.risk = Risk::Low;
+    let mut prefs = SessionPreferences::default();
+    for skill in [
+        IntentSkill::Explain,
+        IntentSkill::Investigate,
+        IntentSkill::Review,
+    ] {
+        let p = proposal(skill, ProposedFlow::Investigation, &["src/resolver.rs"]);
+        let policy = validate_intent(&p, "explain the resolver", &prefs, &config)?;
+        ensure!(
+            policy.status == "READ_ONLY" && policy.flow.is_none(),
+            "question admitted coding flow"
+        );
+    }
+    for skill in [
+        IntentSkill::SoftwareFix,
+        IntentSkill::SoftwareChange,
+        IntentSkill::SoftwareRefactor,
+    ] {
+        let p = proposal(skill, ProposedFlow::Documentation, &["src/resolver.rs"]);
+        let policy = validate_intent(&p, "small resolver change", &prefs, &config)?;
+        ensure!(
+            policy.escalated && policy.flow.unwrap().completion_tier == VerificationTier::Full,
+            "model downgraded software policy"
+        );
+    }
+    let docs = proposal(
+        IntentSkill::DocumentationChange,
+        ProposedFlow::Documentation,
+        &["docs/guide.md"],
+    );
+    ensure!(
+        validate_intent(&docs, "update prose", &prefs, &config)?
+            .flow
+            .unwrap()
+            .skill
+            == Skill::UpdateDocumentation,
+        "documentation flow not reused"
+    );
+    ensure!(
+        validate_intent(
+            &docs,
+            "change credential authorization rules",
+            &prefs,
+            &config
+        )?
+        .escalated,
+        "sensitive objective downgraded"
+    );
+    prefs.flow = "investigate".into();
+    ensure!(
+        validate_intent(&docs, "edit guide", &prefs, &config)?.status == "BLOCKED",
+        "manual read-only flow admitted mutation"
+    );
+    prefs.flow = "engineering".into();
+    ensure!(
+        validate_intent(&docs, "edit guide", &prefs, &config)?
+            .flow
+            .unwrap()
+            .completion_tier
+            == VerificationTier::Full,
+        "stronger override lost"
+    );
+    let mut ambiguous = docs.clone();
+    ambiguous.clarification_questions =
+        vec!["Ranking only, or eligibility and fallback too?".into()];
+    ensure!(
+        validate_intent(&ambiguous, "replace resolver", &prefs, &config)?.status == "CLARIFICATION",
+        "ambiguous request dispatched flow"
+    );
+    let raw = format!(
+        "<<<ORBIT_INTENT_START>>>{}<<<ORBIT_INTENT_END>>>",
+        serde_json::to_string(&docs)?
+    );
+    ensure!(
+        IntentProposal::parse(&raw)? == docs,
+        "typed proposal not recoverable"
+    );
+    ensure!(
+        IntentProposal::parse(&(raw.clone() + &raw)).is_err(),
+        "duplicate envelopes accepted"
+    );
+    let mut invalid = serde_json::to_value(&docs)?;
+    invalid["grant_write"] = json!(true);
+    ensure!(
+        serde_json::from_value::<IntentProposal>(invalid).is_err(),
+        "model introduced authority fields"
+    );
+    let mut invalid = docs;
+    invalid.scope = vec!["../outside".into()];
+    ensure!(invalid.validate().is_err(), "scope escape accepted");
+    let role = prefs.orchestrator_role()?;
+    ensure!(
+        role.workspace_access == orbit::workflow::WorkspaceAccess::ReadOnly
+            && !role.allowed_capabilities.shell
+            && !role.allowed_capabilities.repo_write,
+        "skill became authority"
+    );
+    Ok(())
+}
+
+async fn complete_intent_fixture(
+    client: &EditorService,
+    pool: &sqlx::PgPool,
+    product: &str,
+    request: &str,
+    p: orbit::interactive::intent::IntentProposal,
+    release: bool,
+) -> Result<String> {
+    use orbit::workflow::{HandoffType, PlanHandoff, WorkflowStage};
+    let turn = client.start_conversation(product, request).await?;
+    let store = WorkflowStore::new(pool.clone());
+    let worktree = client.session(product).await?.worktree.unwrap();
+    let candidate = state(&worktree).await?;
+    store
+        .transition_workflow_stage(&turn, WorkflowStage::Planning, Some(&candidate), None, None)
+        .await?;
+    let snapshot = orbit::interactive::preferences::turn_preferences(pool, &turn)
+        .await?
+        .unwrap();
+    let role = store
+        .create_role_execution(
+            &turn,
+            &snapshot.orchestrator_role()?,
+            "PLANNING",
+            0,
+            Some(&candidate),
+            None,
+        )
+        .await?;
+    let raw = format!(
+        "<<<ORBIT_INTENT_START>>>{}<<<ORBIT_INTENT_END>>>",
+        serde_json::to_string(&p)?
+    );
+    orbit::interactive::intent::record_proposal(pool, &turn, &raw, None).await?;
+    let handoff = store
+        .save_handoff_artifact(
+            &turn,
+            Some(&role.id),
+            HandoffType::Plan,
+            Some(&candidate),
+            serde_json::to_value(PlanHandoff {
+                summary: "Bounded test response".into(),
+                affected_areas: vec![],
+                implementation_steps: vec![],
+                expected_files: vec![],
+                risks: vec![],
+                verification_notes: vec![],
+                open_questions: p.clarification_questions,
+            })?,
+        )
+        .await?;
+    store
+        .complete_role_execution_success(&role.id, Some(&candidate), Some(&handoff.id))
+        .await?;
+    store
+        .transition_workflow_stage(
+            &turn,
+            WorkflowStage::Completed,
+            Some(&candidate),
+            None,
+            None,
+        )
+        .await?;
+    if release {
+        client.run_conversation(product).await?;
+    }
+    Ok(turn)
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL; no providers or secrets"]
+async fn intent_decisions_replay_and_fence_product_flow_admission() -> Result<()> {
+    use orbit::interactive::intent::*;
+    use orbit::workflow::WorkflowStage;
+    let database = common::DisposablePgTestContext::create("interactive_intent", 3).await?;
+    let result = async {
+        let repo = common::TemporaryGitRepo::create()?;
+        let root = tempfile::tempdir()?;
+        let settings = config(&repo, &root)?;
+        let client = service(&database.engine.pool, settings.clone())?;
+        let reconnect = service(&database.engine.pool, settings)?;
+        let product = client.new_session(repo.path()).await?;
+        client
+            .set_preference(&product.id, "interaction", "chat")
+            .await?;
+        let explanation = complete_intent_fixture(
+            &client,
+            &database.engine.pool,
+            &product.id,
+            "explain resolver",
+            proposal(
+                IntentSkill::Explain,
+                ProposedFlow::Investigation,
+                &["README.md"],
+            ),
+            true,
+        )
+        .await?;
+        let investigation = complete_intent_fixture(
+            &client,
+            &database.engine.pool,
+            &product.id,
+            "investigate failure",
+            proposal(
+                IntentSkill::Investigate,
+                ProposedFlow::Investigation,
+                &["README.md"],
+            ),
+            true,
+        )
+        .await?;
+        ensure!(
+            reconnect
+                .decisions(&product.id)
+                .await?
+                .as_array()
+                .unwrap()
+                .len()
+                == 2
+                && reconnect.flow_session(&product.id).await?.is_none(),
+            "read-only reasoning created coding workflow"
+        );
+        let mut ambiguous = proposal(
+            IntentSkill::SoftwareRefactor,
+            ProposedFlow::Engineering,
+            &["src/resolver.rs"],
+        );
+        ambiguous.clarification_questions = vec!["Ranking or all eligibility/fallback?".into()];
+        let clarification = complete_intent_fixture(
+            &client,
+            &database.engine.pool,
+            &product.id,
+            "replace resolver",
+            ambiguous,
+            true,
+        )
+        .await?;
+        client
+            .set_preference(&product.id, "interaction", "flow")
+            .await?;
+        ensure!(
+            client
+                .accept_decision(&product.id, &clarification)
+                .await
+                .is_err(),
+            "clarification admitted flow"
+        );
+        client
+            .set_preference(&product.id, "interaction", "chat")
+            .await?;
+        client
+            .set_preference(&product.id, "flow", "investigate")
+            .await?;
+        let mut resolved = proposal(
+            IntentSkill::SoftwareFix,
+            ProposedFlow::Documentation,
+            &["src/resolver.rs"],
+        );
+        resolved.objective =
+            "Change resolver ranking only; preserve eligibility and fallback".into();
+        let decision = complete_intent_fixture(
+            &client,
+            &database.engine.pool,
+            &product.id,
+            "the first option",
+            resolved.clone(),
+            true,
+        )
+        .await?;
+        ensure!(
+            client
+                .decisions(&product.id)
+                .await?
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()["status"]
+                == "BLOCKED",
+            "weak manual policy was not blocked"
+        );
+        client
+            .set_preference(&product.id, "interaction", "flow")
+            .await?;
+        ensure!(
+            client
+                .accept_decision(&product.id, &decision)
+                .await
+                .is_err(),
+            "weak flow bypassed policy"
+        );
+        client
+            .set_preference(&product.id, "flow", "engineering")
+            .await?;
+        let workflow = client.accept_decision(&product.id, &decision).await?;
+        ensure!(
+            client.accept_decision(&product.id, &decision).await? == workflow,
+            "replay created duplicate flow"
+        );
+        let child = client.flow_session(&product.id).await?.unwrap();
+        let store = WorkflowStore::new(database.engine.pool.clone());
+        let admitted = store.get_workflow_run(&workflow).await?.unwrap();
+        ensure!(
+            admitted.task_prompt.unwrap().contains(&resolved.objective)
+                && !store.flow(&workflow).await?.unwrap().read_only,
+            "clarification objective or engineering policy lost"
+        );
+        let before = client.dashboard(&product.id).await?;
+        ensure!(
+            before["session"]["id"] == product.id
+                && before["session"]["workflow_run_id"].is_null()
+                && before["candidate_session"]["id"] == child,
+            "product fabricated child session state"
+        );
+        client
+            .set_preference(&product.id, "interaction", "chat")
+            .await?;
+        let question = complete_intent_fixture(
+            &client,
+            &database.engine.pool,
+            &product.id,
+            "what stage are we in?",
+            proposal(IntentSkill::Explain, ProposedFlow::Investigation, &[]),
+            true,
+        )
+        .await?;
+        ensure!(
+            client.flow_session(&product.id).await?.as_deref() == Some(child.as_str())
+                && store.get_workflow_run(&workflow).await?.unwrap().status
+                    == WorkflowStage::Created,
+            "active question duplicated or advanced workflow"
+        );
+        ensure!(
+            client.close_product(&product.id).await.is_err(),
+            "closed active child authority"
+        );
+        let replay = reconnect.dashboard(&product.id).await?;
+        ensure!(
+            replay["decisions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|d| d["id"] == decision && d["accepted_preferences"]["flow"] == "engineering")
+                && replay["candidate"] == before["candidate"],
+            "reconnect lost decision/override/candidate"
+        );
+        client.cancel(&product.id).await?;
+        let candidate = client.dashboard(&product.id).await?["candidate"]["state_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        client
+            .candidate_action(&product.id, &candidate, false)
+            .await?;
+        client
+            .set_preference(&product.id, "interaction", "chat")
+            .await?;
+        let earlier = complete_intent_fixture(
+            &client,
+            &database.engine.pool,
+            &product.id,
+            "an earlier pending change",
+            proposal(
+                IntentSkill::SoftwareChange,
+                ProposedFlow::Engineering,
+                &["src/lib.rs"],
+            ),
+            true,
+        )
+        .await?;
+        let second = complete_intent_fixture(
+            &client,
+            &database.engine.pool,
+            &product.id,
+            "another code change",
+            proposal(
+                IntentSkill::SoftwareChange,
+                ProposedFlow::Engineering,
+                &["src/resolver.rs"],
+            ),
+            true,
+        )
+        .await?;
+        client
+            .set_preference(&product.id, "interaction", "flow")
+            .await?;
+        let second_workflow = client.accept_decision(&product.id, &second).await?;
+        ensure!(
+            second_workflow != workflow
+                && client.flow_session(&product.id).await?.as_deref() != Some(child.as_str()),
+            "product could not span sequential flows"
+        );
+        let second_child = client.flow_session(&product.id).await?.unwrap();
+        client.cancel(&second_child).await?;
+        let candidate = client.dashboard(&product.id).await?["candidate"]["state_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        client
+            .candidate_action(&product.id, &candidate, false)
+            .await?;
+        client
+            .set_preference(&product.id, "interaction", "flow")
+            .await?;
+        let earlier_workflow = client.accept_decision(&product.id, &earlier).await?;
+        ensure!(
+            client.dashboard(&product.id).await?["workflow"]["id"] == earlier_workflow,
+            "out-of-order acceptance resolved a discarded newer proposal"
+        );
+        client.cancel(&product.id).await?;
+        let candidate = client.dashboard(&product.id).await?["candidate"]["state_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        client
+            .candidate_action(&product.id, &candidate, false)
+            .await?;
+        // Cancellation after reasoning completion but before Auto acceptance
+        // must revoke the old turn even when its role is already terminal.
+        let paused = complete_intent_fixture(
+            &client,
+            &database.engine.pool,
+            &product.id,
+            "change behavior",
+            proposal(
+                IntentSkill::SoftwareFix,
+                ProposedFlow::Engineering,
+                &["src/lib.rs"],
+            ),
+            false,
+        )
+        .await?;
+        client.cancel(&product.id).await?;
+        reconnect.run_conversation(&product.id).await?;
+        ensure!(
+            reconnect
+                .validate_decision(&product.id, &paused)
+                .await?
+                .status
+                == "CANCELLED"
+                && reconnect
+                    .accept_decision(&product.id, &paused)
+                    .await
+                    .is_err(),
+            "Auto admission survived cancellation"
+        );
+        client.close_product(&product.id).await?;
+        ensure!(
+            std::fs::read_to_string(repo.path().join("README.md"))? == "offline fixture baseline\n",
+            "reasoning mutated source"
+        );
+        let _ = (explanation, investigation, question);
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    database.teardown().await?;
+    result
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL; no providers or secrets"]
+async fn cancellation_during_intent_preparation_cannot_publish_or_dispatch() -> Result<()> {
+    use orbit::interactive::intent::*;
+    use orbit::workflow::WorkflowStage;
+    use sqlx::Row;
+    let database = common::DisposablePgTestContext::create("intent_cancel_fence", 6).await?;
+    let result = async {
+        let repo = common::TemporaryGitRepo::create()?;
+        let root = tempfile::tempdir()?;
+        let client = service(&database.engine.pool, config(&repo, &root)?)?;
+        let product = client.new_session(repo.path()).await?;
+        client.set_preference(&product.id, "interaction", "chat").await?;
+        let decision = complete_intent_fixture(&client, &database.engine.pool, &product.id,
+            "change implementation", proposal(IntentSkill::SoftwareFix, ProposedFlow::Engineering, &["src/lib.rs"]), true).await?;
+        client.set_preference(&product.id, "interaction", "flow").await?;
+        // Hold preparation immediately before publishing the child's READY state.
+        // This is a database test boundary, not a production dispatch hook.
+        sqlx::raw_sql("CREATE FUNCTION hold_candidate_ready() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF OLD.state='STARTING' AND NEW.state='READY' AND NEW.workflow_run_id IS NOT NULL THEN PERFORM pg_advisory_xact_lock(734018213); END IF; RETURN NEW; END $$; CREATE TRIGGER hold_candidate_ready BEFORE UPDATE ON orbit_editor_sessions FOR EACH ROW EXECUTE FUNCTION hold_candidate_ready();").execute(&database.engine.pool).await?;
+        let mut boundary = database.engine.pool.acquire().await?;
+        sqlx::query("SELECT pg_advisory_lock(734018213)").execute(&mut *boundary).await?;
+        let preparing = client.clone();
+        let product_id = product.id.clone();
+        let proposal_id = decision.clone();
+        let admission = tokio::spawn(async move { preparing.accept_decision(&product_id, &proposal_id).await });
+        let child = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let row = sqlx::query("SELECT s.id,s.workflow_run_id FROM orbit_intent_decisions d JOIN orbit_editor_sessions s ON s.id=d.flow_session_id WHERE d.turn_workflow_id=$1 AND d.status='STARTING' AND s.workflow_run_id IS NOT NULL")
+                    .bind(&decision).fetch_optional(&database.engine.pool).await?;
+                if let Some(row) = row { break Ok::<_,anyhow::Error>((row.get::<String,_>("id"),row.get::<String,_>("workflow_run_id"))); }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await??;
+        ensure!(client.flow_session(&product.id).await?.is_none(), "unaccepted child became current flow");
+        ensure!(client.run(&child.0, false).await.is_err(), "unaccepted child execution allowed");
+        ensure!(client.start(&child.0, "another objective").await.is_err(), "unaccepted child task admitted");
+        ensure!(client.set_preference(&child.0, "interaction", "chat").await.is_err(), "unaccepted child preferences changed");
+        ensure!(client.start_conversation(&child.0, "explain this candidate").await.is_err(), "unaccepted child admitted a provider-bearing turn");
+        ensure!(client.run_conversation(&child.0).await.is_err(), "unaccepted child conversation dispatched");
+        tokio::time::timeout(std::time::Duration::from_secs(10),client.cancel(&product.id)).await??;
+        sqlx::query("SELECT pg_advisory_unlock(734018213)").execute(&mut *boundary).await?;
+        drop(boundary);
+        ensure!(tokio::time::timeout(std::time::Duration::from_secs(10),admission).await??.is_err(), "cancelled preparation was accepted");
+        let store = WorkflowStore::new(database.engine.pool.clone());
+        ensure!(store.get_workflow_run(&child.1).await?.unwrap().status == WorkflowStage::Cancelled
+            && store.list_role_executions(&child.1).await?.is_empty(), "cancelled preparation dispatched a role");
+        ensure!(client.session(&child.0).await?.state == "DISCARDED"
+            && client.session(&product.id).await?.state == "READY"
+            && client.decisions(&product.id).await?.as_array().unwrap().last().unwrap()["status"] == "CANCELLED", "cancelled preparation retained candidate or admission owner");
+        client.close_product(&product.id).await?;
+        Ok::<_,anyhow::Error>(())
+    }.await;
+    database.teardown().await?;
+    result
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL; no providers or secrets"]
+async fn concurrent_proposals_and_product_close_have_one_fenced_owner() -> Result<()> {
+    use orbit::interactive::intent::*;
+    let database = common::DisposablePgTestContext::create("intent_concurrent_owner", 8).await?;
+    let result = async {
+        let repo = common::TemporaryGitRepo::create()?;
+        let root = tempfile::tempdir()?;
+        let client = service(&database.engine.pool, config(&repo, &root)?)?;
+        let product = client.new_session(repo.path()).await?;
+        client.set_preference(&product.id, "interaction", "chat").await?;
+        let first = complete_intent_fixture(&client,&database.engine.pool,&product.id,"first change",
+            proposal(IntentSkill::SoftwareFix,ProposedFlow::Engineering,&["src/lib.rs"]),true).await?;
+        let second = complete_intent_fixture(&client,&database.engine.pool,&product.id,"second change",
+            proposal(IntentSkill::SoftwareChange,ProposedFlow::Engineering,&["src/lib.rs"]),true).await?;
+        client.set_preference(&product.id,"interaction","flow").await?;
+        let mut fence = database.engine.pool.begin().await?;
+        sqlx::query("SELECT id FROM orbit_editor_sessions WHERE id=$1 FOR UPDATE").bind(&product.id).fetch_one(&mut *fence).await?;
+        let mut admissions = Vec::new();
+        for decision in [first,second] {
+            let caller=client.clone(); let session=product.id.clone();
+            admissions.push(tokio::spawn(async move {caller.accept_decision(&session,&decision).await}));
+        }
+        let closer=client.clone(); let session=product.id.clone();
+        let closing=tokio::spawn(async move {closer.close_product(&session).await});
+        tokio::time::timeout(std::time::Duration::from_secs(10),async {
+            loop {
+                let waiting:i64=sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE '%orbit_editor_sessions%FOR UPDATE%'").fetch_one(&database.engine.pool).await?;
+                if waiting>=3 {break Ok::<_,anyhow::Error>(());}
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await??;
+        fence.commit().await?;
+        let mut accepted=0;
+        for admission in admissions {
+            if tokio::time::timeout(std::time::Duration::from_secs(10),admission).await??.is_ok() {accepted+=1;}
+        }
+        let closed=tokio::time::timeout(std::time::Duration::from_secs(10),closing).await??.is_ok();
+        ensure!(accepted<=1 && ((accepted==1 && !closed) || (accepted==0 && closed)),
+            "admission and closure published incompatible owners");
+        if accepted==1 {
+            let child=client.flow_session(&product.id).await?.unwrap();
+            let workflow=client.session(&child).await?.workflow_run_id.unwrap();
+            ensure!(WorkflowStore::new(database.engine.pool.clone()).list_role_executions(&workflow).await?.is_empty(),"admission dispatched provider execution");
+            client.cancel(&product.id).await?;
+            let candidate=client.dashboard(&product.id).await?["candidate"]["state_id"].as_str().unwrap().to_owned();
+            client.candidate_action(&product.id,&candidate,false).await?;
+            client.close_product(&product.id).await?;
+        }
+        ensure!(client.session(&product.id).await?.state=="DISCARDED","product owner was not cleaned up");
+        Ok::<_,anyhow::Error>(())
+    }.await;
+    database.teardown().await?;
+    result
 }

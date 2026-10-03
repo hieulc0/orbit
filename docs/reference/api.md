@@ -37,6 +37,22 @@ journal below must not be used as an invented role-workflow event history.
 Reconnect by session ID and requery durable state. Provider history and client
 connection lifetime do not own tasks, candidates or evidence.
 
+### Intent decisions
+
+The product service exposes durable decision inspection and exact proposal
+acceptance over the same session. Each bounded orchestrator turn preserves its
+request and immutable preferences. `IntentProposal` contains a typed Skill,
+proposed existing Flow, rationale, resolved objective, bounded relative paths
+and clarification questions. Unknown fields and malformed envelopes are rejected.
+Orbit policy validates a proposal; the model cannot admit a workflow directly.
+
+Accepted decisions associate existing candidate sessions. Dashboard `session`
+is the actual product record; `candidate_session` is the actual current child
+record when present. `workflow`, `candidate`, roles and evidence refer to that
+child. No synthetic product/workflow tuple is an authoritative record. Acceptance
+replay returns the original workflow ID without dispatch. Close disposes product
+context only after all child candidates and executions are cleaned up.
+
 ### ACP presentation
 
 `orbit acp-serve` translates ACP v1 requests and standard session updates through

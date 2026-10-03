@@ -260,6 +260,7 @@ pub fn render_compact(d: &Value) -> String {
         ));
     }
     text.push_str("\n`/preferences` · `/agents` · `/inspect` · `/diff` · `/open` · `/cli` · `/continue` · `/review` · `/cancel`\nApply/discard remain explicit and require the exact candidate identity.\n");
+    text.push_str(&render_decisions(d, false));
     text
 }
 
@@ -300,5 +301,39 @@ pub fn render_agents(d: &Value) -> String {
     text.push_str(
         "\nUse `/inspect` for full durable diagnostic details, budgets, quota and audit.\n",
     );
+    text
+}
+
+/// Compact proposal presentation derives only durable policy and associations.
+pub fn render_decisions(d: &Value, detailed: bool) -> String {
+    let Some(decision) = d["decisions"].as_array().and_then(|v| v.last()) else {
+        return String::new();
+    };
+    let mut text = format!(
+        "\nSkill: {} · decision: {}\nFlow: {} · policy: {}\nWhy: {}\n",
+        label(&decision["proposal"]["skill"]),
+        label(&decision["status"]),
+        if decision["policy"]["flow"].is_null() {
+            "none (read-only or pending clarification)".into()
+        } else {
+            label(&decision["policy"]["flow"]["skill"])
+        },
+        label(&decision["policy"]["reason"]),
+        label(&decision["proposal"]["rationale"])
+    );
+    if let Some(questions) = decision["proposal"]["clarification_questions"].as_array() {
+        for q in questions {
+            text.push_str(&format!("- {}\n", label(q)));
+        }
+    }
+    if decision["status"] == "PROPOSED" || decision["status"] == "BLOCKED" {
+        text.push_str(&format!(
+            "Discuss, change preferences, or choose Flow and `/start {}`. Policy still applies.\n",
+            label(&decision["id"])
+        ));
+    }
+    if detailed {
+        text.push_str(&format!("Resolved objective: {}\nProposed flow: {} · escalation: {}\nAccepted preferences: {}\n",label(&decision["proposal"]["objective"]),label(&decision["proposal"]["proposed_flow"]),decision["policy"]["escalated"],decision["accepted_preferences"]));
+    }
     text
 }

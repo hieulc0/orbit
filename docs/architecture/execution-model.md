@@ -5,6 +5,7 @@
 - [Graphs and child execution](#graphs-and-child-execution)
 - [Repository and OCI execution](#repository-and-oci-execution)
 - [Developer-local tools and immutable skill flows](#developer-local-tools-and-immutable-skill-flows)
+- [Reasoning orchestrator and product sessions](#reasoning-orchestrator-and-product-sessions)
 - [Delegated work](#delegated-work)
 
 ## Tasks, attempts and roles
@@ -393,6 +394,45 @@ stronger checks. Flow identity and policy are immutable after workflow creation.
 The [editor service](../operations/installation.md#editor-acp-service-and-zed) uses these flows and the same coordinator.
 The [external reasoning interface](../operations/installation.md#external-requirements-and-ba-acceptance) adds frozen requirements
 and candidate-bound BA acceptance.
+
+## Reasoning orchestrator and product sessions
+
+The orchestrator belongs to the durable product session, outside engineering
+flows. It can explain, investigate, propose work and observe results before,
+during and after a workflow. Each response uses a bounded read-only execution;
+the internal read-only carrier supplies existing role/execution evidence without
+making the orchestrator a stage of the engineering flow.
+
+A typed intent proposal records Skill, proposed Flow, rationale, self-contained
+objective, repository-relative scope and clarification questions. Proposal data
+cannot grant tools or transition workflow stages. Orbit validates existing flow
+policy, operator profile admission and human interaction mode. Chat and Agent
+never dispatch mutation. Flow may admit a compatible proposal automatically;
+manual acceptance uses the same policy and cannot weaken required checks.
+Unknown scope and software work require engineering policy. Actual changed paths
+continue to govern verification strength through the coordinator.
+
+Each admitted workflow owns a separate managed candidate. The product's stable
+observation worktree retains its original revision; repository reads are baseline
+observations, not current candidate or source truth. Workflow, candidate and
+verification views query the existing durable records. A product can own multiple
+sequential flows, with the latest acceptance selecting its current child.
+The prior candidate must be discarded before admitting another flow. New child
+worktrees require a clean source checkout and snapshot Git HEAD. Concurrent source
+changes can make later apply stale; the cleanliness check is not an atomic source
+snapshot guarantee.
+
+Admission snapshots preferences and cancellation generation. Preparation occurs
+outside the product fence; no child execution is allowed until its association,
+flow and profile are accepted. Cancellation revokes pending decisions and old
+turn generations. Product closure rechecks retained children under the admission
+fence. A cancelled preparation disposes its undispatched candidate before
+releasing ownership; uncertain cleanup stays closed for recovery.
+
+User requests, proposals, clarifications, accepted preferences and workflow
+associations are stored by Orbit. Provider conversation history is disposable.
+Reconnect queries these records; replaying acceptance returns the same workflow.
+The CLI and ACP adapter use one product service and create no workflow authority.
 
 ## Delegated work
 

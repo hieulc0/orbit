@@ -31,7 +31,8 @@ when their syntax is valid.
 
 All actions take `orbit interactive --config FILE --database-url-file PRIVATE_FILE`.
 `preferences SESSION [KEY VALUE]` reads or updates validated product preferences.
-`chat SESSION QUESTION` runs one bounded read-only turn after selecting Chat or Agent.
+`chat SESSION QUESTION` sends a request using the current interaction mode. Chat/Agent
+remain read-only; Flow may admit a validated mutating proposal.
 `continue SESSION` resumes a linked conversational execution when one is active,
 or the existing workflow otherwise. All clients use the same durable session;
 see [conversation and execution preferences](../operations/installation.md#conversation-and-execution-preferences).
@@ -41,7 +42,10 @@ control over PostgreSQL, not an HTTP client. See [setup and reconnect](../operat
 | Action | Contract |
 | --- | --- |
 | `new` | Create a detached candidate and return its durable session ID |
-| `start SESSION --task-file FILE` | Pin UTF-8 instructions (at most 64 KiB); dispatch no provider |
+| `start SESSION --task-file FILE` | Reason about bounded UTF-8 instructions; Flow runs admitted work to its review gate |
+| `decision SESSION` | Inspect durable Skill, proposal, policy, clarification and accepted preferences |
+| `accept SESSION DECISION` | Admit the exact proposal in Flow mode; replay returns its existing workflow, without dispatch |
+| `close SESSION` | Dispose the observation workspace after all child candidates and executions are cleaned up |
 | `continue SESSION` | Advance the existing coordinator to the review gate |
 | `review SESSION` | Request review and final authoritative verification |
 | `show SESSION` | Query durable task/stage, roles and selection, profile, candidate and evidence |
@@ -52,15 +56,19 @@ control over PostgreSQL, not an HTTP client. See [setup and reconnect](../operat
 | `discard SESSION STATE` | Remove the exact candidate after confirmed cleanup |
 | `recover-application SESSION STATE` | Reconcile interrupted application by exact checkout identity |
 
-Repeat `start` with identical instructions to recover its existing workflow ID.
-Different objectives require a new session. Frozen external requirements, where
+Replay `accept` with the same decision ID to recover its existing workflow ID.
+Use `continue` to run admitted work. Each conversational request is a new bounded
+turn; reconnect queries existing decisions rather than resubmitting the request.
+A product session can span sequential workflows after the prior candidate is
+discarded. After apply, commit or discard source changes before starting another
+flow; new managed candidates snapshot Git HEAD. Frozen external requirements, where
 configured, determine the objective through their existing contract boundary.
 `show` remains usable after reconnect. `watch` polls every 500 ms and may coalesce
 intermediate changes: `snapshot_digest` identifies a view, not a durable event
 cursor. Reconnect by querying the session again. An unavailable candidate or
 unknown quota stays explicitly unavailable.
 
-Interrupting `continue` or `review` requests durable cancellation and waits for
+Interrupting `start`, `chat`, `continue` or `review` requests durable cancellation and waits for
 supervised cleanup. Interrupting `watch` only ends observation. A cancellation
 response can precede cleanup; candidate actions remain denied until cleanup is
 confirmed. Commands never substitute exploratory terminal feedback for trusted

@@ -810,6 +810,13 @@ and verification. Neither operation requires the provider's previous chat
 history. `watch SESSION --seconds 30` supplies bounded progress snapshots while
 another client drives work.
 
+`start` reasons about the instructions first. With Flow/Auto, an unambiguous
+compatible change proceeds to the review gate. Use `decision SESSION` to inspect
+the durable Skill, Flow and any clarification. Chat/Agent return a read-only
+answer or proposal. `accept SESSION DECISION` admits an exact proposal after
+switching to Flow; it does not dispatch, so follow it with `continue SESSION`.
+The same product session can span sequential flows after candidate disposal.
+
 Inspect the candidate and evidence before `apply SESSION WORKSPACE_STATE_ID`.
 The source checkout stays unchanged until this explicit operation; it must still
 be clean and match the candidate's base revision. Stale candidate identity is
@@ -818,6 +825,9 @@ cleanup, including an applied candidate once its contents are preserved in the
 source checkout. Cancel from another process with `cancel SESSION`, then inspect
 state and wait for confirmed cleanup before discarding. Apply is unavailable for
 cancelled or unaccepted work.
+
+After discarding all child candidates, `close SESSION` removes the product's
+observation worktree. Closing the UI itself does not discard a candidate.
 
 Use `recover-application` only to reconcile a recorded interrupted application;
 it proves checkout identity and never guesses whether a partial change is safe.
@@ -941,10 +951,18 @@ example, `/preferences interaction chat` selects conversation and
 | Flow | Submit an explicit objective to Orbit's existing workflow |
 
 Chat and Agent never grant repository writes or terminal access. A request to
-change code requires an explicit switch to Flow and submission of the task.
-Mutating single-agent shortcuts are not available. A new workflow objective uses
-another session; conversation can continue in the same session before a workflow
-or after it finishes. Wait for completion before chatting alongside an active flow.
+change code produces a durable proposal. Switch explicitly to Flow, then use
+`/start DECISION` and `/continue`, or submit a new request in Flow mode. Mutating
+single-agent shortcuts are not available. The same conversation can span multiple
+workflows after each candidate is discarded. Commit or discard applied source
+changes before starting the next flow.
+
+The orchestrator observes its stable repository baseline, identified in turn
+context. It does not read a concurrently changing candidate. Current candidate,
+verification and workflow information comes from Orbit state. Native Zed accepts
+one ordinary prompt per session at a time. After a flow reaches its review gate,
+you can switch to Chat and discuss that active workflow without starting another
+flow. `/status` and other control commands remain available during execution.
 
 The **orchestrator** answers the human. Workflow **planner**, **implementer** and
 **reviewer** are separate roles. Orchestrator provider/model preferences do not
@@ -966,11 +984,18 @@ terminal feedback; final authoritative verification remains separately pinned
 TRUSTED OCI execution. Neither selector grants extra role capabilities.
 
 Flow preferences select existing Orbit policies: read-only investigation,
-documentation change or full engineering. Auto retains current policy. A
+documentation change or full engineering. Auto asks the orchestrator to propose
+a typed Skill and existing Flow. Orbit validates the proposal before admission;
+clarification pauses admission, and an incompatible weaker manual flow is blocked.
+Software changes and unknown/non-documentation scope require engineering policy. A
 conservative documentation change still requires full verification; lower-risk
-operator policy escalates when changed paths demand it. No editor-defined Quick
-or Standard workflow or automatic intent classifier is added. Profile and flow
-are immutable once the workflow starts; conversation preferences snapshot per turn.
+operator policy escalates when changed paths demand it. There is no editor-defined workflow. Profile and flow
+are immutable once a workflow starts; conversation preferences snapshot per turn.
+The small Skill set covers explanation, investigation, software fixes/changes/
+refactoring, documentation and review. Classification grants no capabilities.
+Inspect `/decision` for the Skill, proposed/validated Flow, rationale, questions
+and accepted preferences. A stronger compatible manual flow can be selected
+before `/start`; a weaker one cannot remove mandatory verification.
 
 ### Continue in Orbit CLI
 
@@ -994,6 +1019,9 @@ does not silently probe a provider. Agent terminal feedback is not verification 
 | `/preferences [KEY VALUE]` | Inspect or set interaction, provider, model, reasoning, profile or flow |
 | `/agents` | Inspect orchestrator and workflow-agent selections |
 | `/inspect` | Detailed workflow, verification, quota and resource diagnostics |
+| `/decision` | Inspect durable Skill/Flow decisions and clarification questions |
+| `/start DECISION` | Accept that exact proposal in Flow mode; replay starts no work |
+| `/close` | Close the conversation after all flow candidates are discarded |
 | `/cli` | Show same-session Orbit CLI commands |
 | `/open` | Show the managed attempt path |
 | `/diff [OFFSET]` | Show a bounded candidate diff page and its next offset |
@@ -1003,8 +1031,10 @@ does not silently probe a provider. Agent terminal feedback is not verification 
 | `/apply WorkspaceStateId` | Apply an accepted exact candidate to the clean original checkout |
 | `/discard WorkspaceStateId` | Remove that exact retained candidate after cleanup |
 
-A normal task prompt creates one immutable task. Continuing uses `/continue`;
-a different task needs a new session. Read/control commands work while a prompt
+An ordinary prompt starts a bounded read-only reasoning turn. An unambiguous
+validated mutating proposal in Flow mode starts an existing workflow. Chat/Agent
+only return the proposal. Clarifications and decisions survive reconnect.
+Continuing admitted work uses `/continue`; the conversation can outlive that flow. Read/control commands work while a prompt
 is active. Apply and discard are explicit actions, not agent tools.
 
 Optional typed extensions provide `_orbit/session/status`, `/open`, `/diff`, and

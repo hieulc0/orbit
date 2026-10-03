@@ -1,7 +1,6 @@
 //! ACP v1 stdio presentation and editor actions. Workflow decisions remain in
 //! the coordinator; the wire exposes no implementer filesystem callbacks.
 use super::editor_view;
-use crate::interactive::preferences::InteractionMode;
 use crate::workflow::flow::Skill;
 use crate::{acp::wire::Wire, interactive::InteractiveService};
 use anyhow::{Context, Result, ensure};
@@ -64,6 +63,18 @@ fn commands() -> Value {
             "Detailed workflow, verification, quota and audit inspector",
         ),
         ("cli", "Continue the same durable session in Orbit CLI"),
+        (
+            "decision",
+            "Inspect durable Skill/Flow proposals and policy",
+        ),
+        (
+            "start",
+            "Accept a proposal in explicit Flow mode; pass its decision ID",
+        ),
+        (
+            "close",
+            "Close product after all flow candidates are discarded",
+        ),
         ("diff", "View candidate changes"),
         ("open", "Open the managed attempt path"),
         ("continue", "Continue feedback until review is ready"),
@@ -117,7 +128,9 @@ pub fn render_dashboard(dashboard: &Value) -> String {
 
 fn render_inspector(dashboard: &Value) -> String {
     let workflow = &dashboard["workflow"];
-    let session = &dashboard["session"];
+    let session = dashboard
+        .get("candidate_session")
+        .unwrap_or(&dashboard["session"]);
     let status = workflow["status"].as_str().unwrap_or("ready");
     let latest_role = dashboard["roles"].as_array().and_then(|roles| roles.last());
     let target = latest_role.map(|role| &role["resolved_target"]);
@@ -145,7 +158,7 @@ fn render_inspector(dashboard: &Value) -> String {
     let mut panel = format!(
         "\n## Orbit task\n\n| State | Value |\n| --- | --- |\n| Task | `{}` |\n| Workflow | `{}` |\n| Flow / status | {} / {} |\n| Role | {} |\n| Provider / model / account | {} / {} / {} |\n| Repository calls | {} / {} |\n| File read bytes | {} / {} |\n| Candidate | `{}` |\n| Cleanup / execution | {} / {} |\n\n",
         workflow["task_id"].as_str().unwrap_or("not started"),
-        session["workflow_run_id"].as_str().unwrap_or("not started"),
+        workflow["id"].as_str().unwrap_or("not started"),
         flow["skill"].as_str().unwrap_or("automatic"),
         status,
         label(latest_role, "role_id"),
@@ -392,7 +405,7 @@ pub async fn serve(
                             "session/set_config_option" => { service.set_preference(&session_id, params["configId"].as_str().context("configId required")?,params["value"].as_str().context("select value required")?).await?; let options=session_options(&service,&session_id).await?; update(&service,&mut output,&session_id,json!({"sessionUpdate":"config_option_update","configOptions":options})).await?; Ok(Some(json!({"configOptions":options}))) }
                             "session/set_mode" => { let mode = params["modeId"].as_str().context("modeId required")?; service.set_mode(&session_id, mode).await?; update(&service, &mut output, &session_id, json!({"sessionUpdate":"current_mode_update","currentModeId":mode})).await?; Ok(Some(json!({}))) }
                             "_orbit/session/status" => Ok(Some(service.dashboard(&session_id).await?)),
-                            "_orbit/session/open" => Ok(Some(json!({"workspacePath":session.worktree.context("worktree missing")?.workspace}))),
+                            "_orbit/session/open" => {let target=service.flow_session(&session_id).await?.unwrap_or_else(||session_id.clone());Ok(Some(json!({"workspacePath":service.session(&target).await?.worktree.context("worktree missing")?.workspace})))}
                             "_orbit/session/diff" => {
                                 let offset = params.get("offset").map(|value| value.as_u64().context("invalid diff offset")).transpose()?.unwrap_or(0);
                                 Ok(Some(service.candidate_diff(&session_id, usize::try_from(offset)?).await?))
@@ -419,9 +432,12 @@ pub async fn serve(
                                             return Ok(Some(json!({"stopReason":"end_turn"})));
                                         }
                                         "/agents" | "/inspect" => { let dashboard=service.dashboard(&session_id).await?; let view=if prompt.trim()=="/agents" {editor_view::render_agents(&dashboard)} else {format!("{}\n{}",editor_view::render_agents(&dashboard),render_inspector(&dashboard))}; text(&service,&mut output,&session_id,&view,false).await?; return Ok(Some(json!({"stopReason":"end_turn"}))); }
+                                        "/decision" => {text(&service,&mut output,&session_id,&editor_view::render_decisions(&service.dashboard(&session_id).await?,true),false).await?;return Ok(Some(json!({"stopReason":"end_turn"})));}
+                                        "/start" => {let decision=parts.next().context("decision identity required")?;ensure!(parts.next().is_none(),"unexpected start arguments");let workflow=service.accept_decision(&session_id,decision).await?;text(&service,&mut output,&session_id,&format!("Proposal accepted as `{workflow}`. Use /continue to run the current flow. Replaying acceptance creates no new work."),false).await?;return Ok(Some(json!({"stopReason":"end_turn"})));}
+                                        "/close" => {service.close_product(&session_id).await?;text(&service,&mut output,&session_id,"Product session closed; managed context cleaned.",false).await?;return Ok(Some(json!({"stopReason":"end_turn"})));}
                                         "/cli" => { text(&service,&mut output,&session_id,&service.cli_handoff(&session_id),false).await?; return Ok(Some(json!({"stopReason":"end_turn"}))); }
                                         "/status" => { dashboard_update(&service,&mut output,&session_id).await?; return Ok(Some(json!({"stopReason":"end_turn"}))); }
-                                        "/open" => { let path = session.worktree.context("worktree missing")?.workspace; text(&service,&mut output,&session_id,&format!("Managed attempt: `{}`",path.display()),false).await?; return Ok(Some(json!({"stopReason":"end_turn"}))); }
+                                        "/open" => { let target=service.flow_session(&session_id).await?.unwrap_or_else(||session_id.clone());let path = service.session(&target).await?.worktree.context("worktree missing")?.workspace; text(&service,&mut output,&session_id,&format!("Managed attempt: `{}`",path.display()),false).await?; return Ok(Some(json!({"stopReason":"end_turn"}))); }
                                         "/diff" => {
                                             let offset = parts.next().map(str::parse::<usize>).transpose()?.unwrap_or(0);
                                             ensure!(parts.next().is_none(), "unexpected diff arguments");
@@ -436,10 +452,7 @@ pub async fn serve(
                                     }
                                 } else {
                                     ensure!(!active.contains_key(&session_id) && active.len() < 4, "interactive execution capacity reached");
-                                    if service.preferences(&session_id).await?.interaction == InteractionMode::Flow {
-                                        ensure!(session.workflow_run_id.is_none(), "task is already pinned; use /continue or create a new session");
-                                        service.start(&session_id,&prompt).await?;
-                                    } else { service.start_conversation(&session_id,&prompt).await?; }
+                                    service.start_conversation(&session_id,&prompt).await?;
                                 }
                                 ensure!(!active.contains_key(&session_id), "prompt already active for this session");
                                 ensure!(active.len() < 4, "interactive execution capacity reached");
@@ -484,7 +497,7 @@ pub async fn serve(
                     let dashboard = service.dashboard(&session_id).await?;
                     if conversation && let Some(turn) = dashboard["orchestrator"].as_array().and_then(|v|v.last()) && let Some(answer) = turn["answer"].as_str() { text(&service,&mut output,&session_id,&format!("\n**Orchestrator**\n\n{answer}\n"),false).await?;
                     }
-                    output.response_ok(request_id,json!({"stopReason":if (conversation && dashboard["orchestrator"].as_array().and_then(|v|v.last()).is_some_and(|v|v["status"]=="CANCELLED")) || (!conversation && dashboard["workflow"]["status"] == "cancelled") {"cancelled"} else {"end_turn"}})).await?;
+                    output.response_ok(request_id,json!({"stopReason":if (conversation && dashboard["decisions"].as_array().and_then(|v|v.last()).is_some_and(|v|v["status"]=="CANCELLED")) || (conversation && dashboard["orchestrator"].as_array().and_then(|v|v.last()).is_some_and(|v|v["status"]=="CANCELLED")) || (!conversation && dashboard["workflow"]["status"] == "cancelled") {"cancelled"} else {"end_turn"}})).await?;
                 }
                 _ = progress.tick(), if !active.is_empty() => {
                     for session_id in active.keys() {

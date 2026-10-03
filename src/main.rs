@@ -369,14 +369,23 @@ enum InteractiveAction {
         key: Option<String>,
         value: Option<String>,
     },
-    /// Run one bounded read-only orchestrator turn.
+    /// Send a request using the session's interaction mode and flow policy.
     Chat {
         session_id: String,
         question: String,
     },
+    /// Inspect durable Skill/Flow proposals.
+    Decision { session_id: String },
+    /// Accept a durable proposal in explicit Flow interaction mode.
+    Accept {
+        session_id: String,
+        decision_id: String,
+    },
+    /// Close the product after all managed flow candidates are discarded.
+    Close { session_id: String },
     /// Create a durable session and detached managed candidate.
     New,
-    /// Pin initial user instructions without dispatching a provider.
+    /// Reason about instructions and run an admitted Flow to its review gate.
     Start {
         session_id: String,
         #[arg(long)]
@@ -2461,7 +2470,7 @@ async fn interactive_service(
         .connect(url.as_str())
         .await
         .map_err(|_| anyhow::anyhow!("interactive control-plane connection failed"))?;
-    let ready: bool = sqlx::query_scalar("SELECT to_regclass('orbit_editor_sessions') IS NOT NULL AND to_regclass('orbit_workflow_runs') IS NOT NULL AND to_regclass('orbit_interactive_turns') IS NOT NULL").fetch_one(&pool).await?;
+    let ready: bool = sqlx::query_scalar("SELECT to_regclass('orbit_editor_sessions') IS NOT NULL AND to_regclass('orbit_workflow_runs') IS NOT NULL AND to_regclass('orbit_interactive_turns') IS NOT NULL AND to_regclass('orbit_intent_decisions') IS NOT NULL").fetch_one(&pool).await?;
     anyhow::ensure!(
         ready,
         "initialize the selected control-plane migrations before interactive use"
@@ -2570,6 +2579,17 @@ async fn run_interactive_cli(args: &InteractiveArgs, output: Output) -> Result<(
             tokio::select! {result=&mut run=>result?, _=tokio::signal::ctrl_c()=>{service.cancel(session_id).await?; let _=run.await;}}
             service.dashboard(session_id).await?
         }
+        Decision { session_id } => service.decisions(session_id).await?,
+        Accept {
+            session_id,
+            decision_id,
+        } => {
+            serde_json::json!({"workflow_run_id":service.accept_decision(session_id,decision_id).await?})
+        }
+        Close { session_id } => {
+            service.close_product(session_id).await?;
+            serde_json::json!({"closed":true})
+        }
         New => serde_json::to_value(service.new_session(&service.config().repository).await?)?,
         Start {
             session_id,
@@ -2583,7 +2603,10 @@ async fn run_interactive_cli(args: &InteractiveArgs, output: Output) -> Result<(
                 .await?;
             anyhow::ensure!(bytes.len() <= 65536, "user instructions exceed bounds");
             let task = std::str::from_utf8(&bytes).context("user instructions must be UTF-8")?;
-            serde_json::json!({"workflow_run_id":service.start(session_id, task).await?})
+            service.start_conversation(session_id, task).await?;
+            let mut run = Box::pin(service.run_conversation(session_id));
+            tokio::select! {result=&mut run=>result?, _=tokio::signal::ctrl_c()=>{service.cancel(session_id).await?; let _=run.await;}}
+            service.dashboard(session_id).await?
         }
         Continue { session_id } | Review { session_id } => {
             let id = session_id.clone();
@@ -2653,7 +2676,7 @@ async fn run_interactive_cli(args: &InteractiveArgs, output: Output) -> Result<(
                     matches!(&args.action, Apply { .. }),
                 )
                 .await?;
-            serde_json::to_value(service.session(session_id).await?)?
+            service.dashboard(session_id).await?
         }
         RecoverApplication {
             session_id,
@@ -2662,7 +2685,7 @@ async fn run_interactive_cli(args: &InteractiveArgs, output: Output) -> Result<(
             service
                 .recover_application(session_id, workspace_state_id)
                 .await?;
-            serde_json::to_value(service.session(session_id).await?)?
+            service.dashboard(session_id).await?
         }
     };
     print_interactive_value(&value, output)
