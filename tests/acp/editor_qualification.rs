@@ -1506,6 +1506,23 @@ async fn intent_decisions_replay_and_fence_product_flow_admission() -> Result<()
                 && client.flow_session(&product.id).await?.as_deref() != Some(child.as_str()),
             "product could not span sequential flows"
         );
+        ensure!(
+            client
+                .run_decision(&product.id, &decision, false)
+                .await
+                .is_err()
+                && store
+                    .list_role_executions(&second_workflow)
+                    .await?
+                    .is_empty()
+                && store
+                    .get_workflow_run(&second_workflow)
+                    .await?
+                    .unwrap()
+                    .status
+                    == WorkflowStage::Created,
+            "old Auto continuation dispatched a replacement flow"
+        );
         let second_child = client.flow_session(&product.id).await?.unwrap();
         client.cancel(&second_child).await?;
         let candidate = client.dashboard(&product.id).await?["candidate"]["state_id"]

@@ -368,7 +368,7 @@ impl InteractiveService {
                 }
                 self.auto_accept_decision(session, &workflow, &snapshot)
                     .await?;
-                self.run(session, false).await?;
+                self.run_decision(session, &workflow, false).await?;
             }
         }
         Ok(())

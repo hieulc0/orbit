@@ -306,6 +306,16 @@ impl InteractiveService {
         self.admit_decision(product, decision, None).await
     }
 
+    /// Continue the candidate accepted by this decision, never a replacement
+    /// selected by a later product turn.
+    pub async fn run_decision(&self, product: &str, decision: &str, review: bool) -> Result<()> {
+        self.session(product).await?;
+        let child: String = sqlx::query_scalar("SELECT flow_session_id FROM orbit_intent_decisions WHERE session_id=$1 AND turn_workflow_id=$2 AND status='ACCEPTED'")
+            .bind(product).bind(decision).fetch_optional(&self.pool).await?
+            .context("FLOW_ASSOCIATION_NOT_ACCEPTED")?;
+        self.run_bound_workflow(&child, review).await
+    }
+
     pub(super) async fn auto_accept_decision(
         &self,
         product: &str,
