@@ -1093,6 +1093,69 @@ fn editor_selectors_and_candidate_views_are_observations() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn conversations_and_proposals_do_not_project_workflow_stages() {
+    use orbit::acp::editor_view::{render_conversation, render_decisions, stage_entries};
+    for interaction in ["chat", "agent"] {
+        for status in ["PLANNING", "RUNNING", "COMPLETED"] {
+            let mut dashboard = json!({
+                "preferences":{"interaction":interaction},
+                "orchestrator":[{"workflow_run_id":"turn", "status":status,"answer":"Observed repository explanation"}],
+                "candidate":{"state_id":"exact"},"changed_files":{"total":0}
+            });
+            assert!(stage_entries(&dashboard).is_empty());
+            let answer = render_conversation(&dashboard);
+            assert!(answer.contains("Observed repository explanation"));
+            assert!(!answer.contains("Candidate:") && !answer.contains("Workflow:"));
+            dashboard["decisions"] = json!([{"id":"turn","status":"PROPOSED",
+                "proposal":{"skill":"software_fix","rationale":"Implementation requested"},
+                "policy":{"flow":{"skill":"fix_bug"},"reason":"Engineering required"}}]);
+            assert!(stage_entries(&dashboard).is_empty());
+            assert!(render_conversation(&dashboard).contains("Suggested flow:"));
+            assert!(render_decisions(&dashboard, true).contains("/start turn"));
+            dashboard["decisions"][0]["id"] = json!("older-turn");
+            assert!(!render_conversation(&dashboard).contains("Suggested flow:"));
+        }
+    }
+}
+
+#[test]
+fn admitted_workflows_preserve_stage_progress_and_exact_verification() {
+    use orbit::acp::editor_view::stage_entries;
+    let mut dashboard = json!({"workflow":{"status":"implementing"},
+        "flow":{"read_only":false,"review_tier":"FAST","completion_tier":"FAST"},
+        "effective_tiers":{"review":"STANDARD","completion":"FULL"},
+        "candidate":{"state_id":"exact"},
+        "roles":[{"role_id":"planner","status":"succeeded"}],"verification":[]});
+    let plan = stage_entries(&dashboard);
+    assert_eq!(
+        plan.iter()
+            .map(|p| p["content"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["PLAN", "IMPLEMENT", "FAST", "STANDARD", "REVIEW", "FULL"]
+    );
+    assert_eq!(plan[0]["status"], "completed");
+    assert_eq!(plan[1]["status"], "in_progress");
+    dashboard["workflow"]["status"] = json!("completed");
+    dashboard["roles"] = json!([{"role_id":"planner","status":"succeeded"},
+        {"role_id":"implementer","status":"succeeded"},{"role_id":"reviewer","status":"succeeded"}]);
+    dashboard["verification"] = json!([{"tier":"FAST","result":"PASSED","workspace_state_id":"exact"},
+        {"tier":"STANDARD","result":"PASSED","workspace_state_id":"exact"},
+        {"tier":"FULL","result":"PASSED","workspace_state_id":"stale"}]);
+    assert_eq!(stage_entries(&dashboard)[5]["status"], "pending");
+    dashboard["verification"][2]["workspace_state_id"] = json!("exact");
+    assert!(
+        stage_entries(&dashboard)
+            .iter()
+            .all(|p| p["status"] == "completed")
+    );
+    dashboard["workflow"] = Value::Null;
+    assert!(
+        stage_entries(&dashboard).is_empty(),
+        "retained flow definition became an active plan"
+    );
+}
+
 fn proposal(
     skill: orbit::interactive::intent::IntentSkill,
     flow: orbit::interactive::intent::ProposedFlow,
@@ -1696,6 +1759,160 @@ async fn concurrent_proposals_and_product_close_have_one_fenced_owner() -> Resul
             client.close_product(&product.id).await?;
         }
         ensure!(client.session(&product.id).await?.state=="DISCARDED","product owner was not cleaned up");
+        Ok::<_,anyhow::Error>(())
+    }.await;
+    database.teardown().await?;
+    result
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL"]
+async fn acp_reconnect_reconstructs_chat_proposal_and_admitted_plan() -> Result<()> {
+    let database = common::DisposablePgTestContext::create("presentation", 3).await?;
+    let result = async {
+        let repo = common::TemporaryGitRepo::create()?;
+        let root = tempfile::tempdir()?;
+        let service = service(&database.engine.pool, config(&repo, &root)?)?;
+        let product = service.new_session(repo.path()).await?;
+        service.set_preference(&product.id, "interaction", "chat").await?;
+        let old_plan = json!({"sessionId":product.id,"update":{"sessionUpdate":"plan","entries":[{"content":"old plan","status":"pending","priority":"medium"}]}});
+        let conversation = json!({"sessionId":product.id,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Historical conversation, including diagnostic text, remains intact."}}});
+        service.record_notification(&product.id, &old_plan).await?;
+        service.record_notification(&product.id, &conversation).await?;
+        async fn exchange(client: &mut Wire, id: u64, method: &str, params: Value) -> Result<Vec<Value>> {
+            client.send(json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})).await?;
+            let mut notes = Vec::new();
+            loop {
+                let value = client.read().await?;
+                if value.get("id") == Some(&json!(id)) {
+                    ensure!(value.get("error").is_none(), "ACP request failed: {value}");
+                    return Ok(notes);
+                }
+                if value["method"] == "session/update" {
+                    let _: agent_client_protocol::SessionNotification = serde_json::from_value(value["params"].clone())?;
+                    notes.push(value["params"].clone());
+                }
+            }
+        }
+        async fn connect(service: EditorService) -> Result<(Wire, tokio::task::JoinHandle<Result<()>>)> {
+            let (read, write) = tokio::io::duplex(1024 * 1024);
+            let (server_read, client_write) = tokio::io::duplex(1024 * 1024);
+            let server = tokio::spawn(editor::serve(service, server_read, write));
+            let mut client = Wire::new(read, client_write, 1024 * 1024);
+            exchange(&mut client, 1, "initialize", json!({"protocolVersion":1})).await?;
+            Ok((client, server))
+        }
+        let (mut client, server) = connect(service.clone()).await?;
+        let load = json!({"sessionId":product.id,"cwd":repo.path(),"mcpServers":[]});
+        let chat = exchange(&mut client, 2, "session/load", load.clone()).await?;
+        assert_eq!(chat, vec![conversation.clone(), json!({"sessionId":product.id,"update":{"sessionUpdate":"plan","entries":[]}})]);
+        let stored = service.notifications(&product.id).await?;
+        assert!(stored.starts_with(&[old_plan.clone(), conversation.clone()]));
+        assert!(stored[2..].iter().all(|n| n["update"]["sessionUpdate"] == "available_commands_update"));
+        let status = exchange(&mut client, 3, "session/prompt", json!({"sessionId":product.id,"prompt":[{"type":"text","text":"/status"}]})).await?;
+        assert!(status.iter().any(|n| n["update"]["sessionUpdate"] == "agent_message_chunk" && n["update"]["content"]["text"].as_str().is_some_and(|t| t.contains("Workflow: not started") && t.contains("Candidate:"))));
+        assert!(status.iter().any(|n| n["update"]["sessionUpdate"] == "plan" && n["update"]["entries"] == json!([])));
+        service.set_preference(&product.id, "interaction", "agent").await?;
+        let agent = exchange(&mut client, 4, "session/load", load.clone()).await?;
+        assert_eq!(agent.last().unwrap()["update"]["entries"], json!([]));
+        service.set_preference(&product.id, "interaction", "chat").await?;
+        let decision = complete_intent_fixture(&service, &database.engine.pool, &product.id, "fix application", proposal(orbit::interactive::intent::IntentSkill::SoftwareFix, orbit::interactive::intent::ProposedFlow::Engineering, &["src/app.rs"]), true).await?;
+        let proposed = exchange(&mut client, 5, "session/load", load.clone()).await?;
+        assert_eq!(proposed.last().unwrap()["update"]["entries"], json!([]));
+        let decision_view = exchange(&mut client, 6, "session/prompt", json!({"sessionId":product.id,"prompt":[{"type":"text","text":"/decision"}]})).await?;
+        assert!(decision_view.iter().any(|n| n["update"]["content"]["text"].as_str().is_some_and(|t| t.contains("Suggested flow:") && t.contains(&decision))));
+        service.set_preference(&product.id, "interaction", "flow").await?;
+        let admitted = exchange(&mut client, 7, "session/prompt", json!({"sessionId":product.id,"prompt":[{"type":"text","text":format!("/start {decision}")}]})).await?;
+        let entries = admitted.iter().find(|n| n["update"]["sessionUpdate"] == "plan").unwrap()["update"]["entries"].clone();
+        assert_eq!(entries.as_array().unwrap().len(), 6);
+        let before = service.notifications(&product.id).await?;
+        drop(client);
+        server.await??;
+        let (mut client, server) = connect(service.clone()).await?;
+        let restored = exchange(&mut client, 2, "session/load", load).await?;
+        assert_eq!(restored.last().unwrap()["update"]["entries"], entries);
+        // The registered command menu is published after the load response.
+        let commands = client.read().await?;
+        assert_eq!(commands["params"]["update"]["sessionUpdate"], "available_commands_update");
+        // Reconnect regenerates presentation without adding a dashboard response.
+        assert_eq!(service.notifications(&product.id).await?.len(), before.len() + 1);
+        assert_eq!(std::fs::read_to_string(repo.path().join("README.md"))?, "offline fixture baseline\n");
+        service.cancel(&product.id).await?;
+        let candidate = service.dashboard(&product.id).await?["candidate"]["state_id"].as_str().unwrap().to_owned();
+        service.candidate_action(&product.id, &candidate, false).await?;
+        service.close_product(&product.id).await?;
+        drop(client);
+        server.await??;
+        Ok::<_, anyhow::Error>(())
+    }.await;
+    database.teardown().await?;
+    result
+}
+
+#[cfg(feature = "fault-injection")]
+#[tokio::test]
+#[ignore = "requires explicitly authorized disposable Zed GUI and one bounded live orchestrator turn"]
+async fn real_zed_presentation_smoke_fixture() -> Result<()> {
+    use anyhow::Context;
+    use sqlx::Row;
+    use std::os::unix::fs::OpenOptionsExt;
+    ensure!(
+        std::env::var("ORBIT_EDITOR_GUI_OPT_IN").as_deref() == Ok("I_AUTHORIZE_DISPOSABLE_ZED_GUI"),
+        "GUI opt-in required"
+    );
+    let evidence =
+        std::path::PathBuf::from(std::env::var("ORBIT_EDITOR_GUI_EVIDENCE_DIR")?).canonicalize()?;
+    let database = common::DisposablePgTestContext::create("interactive_editor", 3).await?;
+    let result = async {
+        let repo = common::TemporaryGitRepo::create()?;
+        let root = tempfile::tempdir()?;
+        let operator_config = config(&repo, &root)?;
+        let observer = service(&database.engine.pool, operator_config.clone())?;
+        let config_file = root.path().join("interactive.json");
+        std::fs::write(&config_file, serde_json::to_vec(&operator_config)?)?;
+        let private = tempfile::Builder::new().prefix("presentation-qualification-").permissions(std::fs::Permissions::from_mode(0o700)).tempdir_in(orbit::secret_backend::operator_home()?.join(".orbit/private"))?;
+        let database_file = private.path().join("database-url");
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&database_file)?;
+        std::io::Write::write_all(&mut file, database.url.as_bytes())?;
+        drop(file);
+        let profile = root.path().join("zed-profile");
+        let settings = profile.join("data/config");
+        std::fs::create_dir_all(&settings)?;
+        let catalog_file = std::env::var("ORBIT_B34_LIVE_CREDENTIAL_DATABASE_URL_FILE")?;
+        std::fs::write(settings.join("settings.json"), serde_json::to_vec_pretty(&json!({"telemetry":{"metrics":false,"diagnostics":false},"agent_servers":{"Orbit":{"type":"custom","command":env!("CARGO_BIN_EXE_orbit"),"args":["acp-serve","--config",config_file],"env":{"ORBIT_DATABASE_URL_FILE":database_file,"ORBIT_B34_LIVE_PROVIDER_OPT_IN":"I_AUTHORIZE_LIVE_PROVIDER_CALLS","ORBIT_B34_LIVE_CREDENTIAL_DATABASE_URL_FILE":catalog_file}}}}))?)?;
+        std::fs::write(evidence.join("current.json"), serde_json::to_vec_pretty(&json!({"repository":repo.path(),"schema":database.schema,"profile":profile,"config_file":config_file,"database_file":database_file,"binary":env!("CARGO_BIN_EXE_orbit")}))?)?;
+        tokio::time::timeout(std::time::Duration::from_secs(600), async {
+            loop {
+                let sessions = sqlx::query("SELECT id,state,preferences,workflow_run_id FROM orbit_editor_sessions ORDER BY id").fetch_all(&database.engine.pool).await?;
+                let turns = sqlx::query("SELECT t.session_id,t.workflow_run_id,wf.status,d.status AS decision_status FROM orbit_interactive_turns t JOIN orbit_workflow_runs wf ON wf.id=t.workflow_run_id LEFT JOIN orbit_intent_decisions d ON d.turn_workflow_id=t.workflow_run_id").fetch_all(&database.engine.pool).await?;
+                std::fs::write(evidence.join("state.json"),serde_json::to_vec_pretty(&json!({"sessions":sessions.iter().map(|r|json!({"id":r.get::<String,_>("id"),"state":r.get::<String,_>("state"),"status":null,"preferences":r.get::<Value,_>("preferences"),"workflow":r.get::<Option<String>,_>("workflow_run_id")})).collect::<Vec<_>>(),"turns":turns.iter().map(|r|json!({"session":r.get::<String,_>("session_id"),"workflow":r.get::<String,_>("workflow_run_id"),"status":r.get::<String,_>("status"),"decision_status":r.get::<Option<String>,_>("decision_status")})).collect::<Vec<_>>()}))?)?;
+                if evidence.join("complete.json").exists() {
+                    let products: Vec<String> = sqlx::query_scalar("SELECT DISTINCT session_id FROM orbit_interactive_turns").fetch_all(&database.engine.pool).await?;
+                    ensure!(products.len() == 1 && turns.len() == 1, "smoke dispatched more than one orchestrator turn");
+                    let product = &products[0];
+                    let notes = observer.notifications(product).await?;
+                    ensure!(notes.iter().all(|n| n["update"]["sessionUpdate"] != "plan"), "transient plan persisted");
+                    let text = notes.iter().filter(|n| n["update"]["sessionUpdate"] == "agent_message_chunk").filter_map(|n| n["update"]["content"]["text"].as_str()).collect::<String>();
+                    ensure!(text.matches("## Orbit").count() == 1 && text.contains("**Orchestrator**") && text.contains("Suggested flow:"), "conversation/status presentation mismatch");
+                    let roles = WorkflowStore::new(database.engine.pool.clone()).list_role_executions(&turns[0].get::<String,_>("workflow_run_id")).await?;
+                    ensure!(roles.len()==1 && roles[0].role_id=="orchestrator", "unexpected live role execution");
+                    let executions: Vec<Value> = sqlx::query_scalar("SELECT metadata FROM orbit_agent_executions").fetch_all(&database.engine.pool).await?;
+                    ensure!(executions.len()==1 && executions[0]["cleanup_confirmed"]==true && executions[0]["tool_call_audit"]["summary"]["mutating"]==0 && executions[0]["role_budget"]["usage"]["terminal_calls"]==0,"orchestrator authority/cleanup mismatch");
+                    ensure!(orbit::acp::editor_view::stage_entries(&observer.dashboard(product).await?).len()==6,"admitted plan lost on reconnect");
+                    ensure!(std::fs::read_to_string(repo.path().join("README.md"))?=="offline fixture baseline\n", "main checkout changed");
+                    std::fs::write(evidence.join("transcript.json"),serde_json::to_vec_pretty(&notes)?)?;
+                    std::fs::write(evidence.join("execution-evidence.json"),serde_json::to_vec_pretty(&executions)?)?;
+                    observer.cancel(product).await?;
+                    let candidate = observer.dashboard(product).await?["candidate"]["state_id"].as_str().context("candidate missing")?.to_owned();
+                    observer.candidate_action(product,&candidate,false).await?;
+                    observer.close_product(product).await?;
+                    let retained:i64=sqlx::query_scalar("SELECT count(*) FROM orbit_editor_sessions WHERE state<>'DISCARDED'").fetch_one(&database.engine.pool).await?;
+                    ensure!(retained==0, "managed worktree retained");
+                    return Ok::<_,anyhow::Error>(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+        }).await??;
         Ok::<_,anyhow::Error>(())
     }.await;
     database.teardown().await?;

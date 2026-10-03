@@ -99,7 +99,11 @@ async fn update(
     update: Value,
 ) -> Result<()> {
     let params = json!({"sessionId":session_id,"update":update});
-    service.record_notification(session_id, &params).await?;
+    // Native plans are reconstructed from durable domain state on load. They
+    // are presentation snapshots, not part of the human conversation.
+    if params["update"]["sessionUpdate"] != "plan" {
+        service.record_notification(session_id, &params).await?;
+    }
     output.notify("session/update", params).await
 }
 
@@ -289,14 +293,6 @@ async fn publish_dashboard(
         session_id,
         json!({"sessionUpdate":"plan","entries":editor_view::stage_entries(dashboard)}),
     )
-    .await?;
-    text(
-        service,
-        output,
-        session_id,
-        &render_dashboard(dashboard),
-        false,
-    )
     .await
 }
 
@@ -398,7 +394,13 @@ pub async fn serve(
                             "session/load" => {
                                 ensure!(params.get("mcpServers").is_none_or(|servers| servers == &json!([])), "external MCP authority is not admitted");
                                 ensure!(Path::new(params["cwd"].as_str().context("cwd required")?).canonicalize()? == service.config().repository, "session repository mismatch");
-                                for notification in service.notifications(&session_id).await? { output.notify("session/update", notification).await?; }
+                                for notification in service.notifications(&session_id).await? {
+                                    // Legacy plans are transient views too; preserve all
+                                    // historical conversation text without text matching.
+                                    if notification["update"]["sessionUpdate"] != "plan" {
+                                        output.notify("session/update", notification).await?;
+                                    }
+                                }
                                 dashboard_update(&service,&mut output,&session_id).await?;
                                 Ok(Some(json!({"modes":modes(&service,&session.mode),"configOptions":session_options(&service,&session_id).await?})))
                             }
@@ -433,10 +435,10 @@ pub async fn serve(
                                         }
                                         "/agents" | "/inspect" => { let dashboard=service.dashboard(&session_id).await?; let view=if prompt.trim()=="/agents" {editor_view::render_agents(&dashboard)} else {format!("{}\n{}",editor_view::render_agents(&dashboard),render_inspector(&dashboard))}; text(&service,&mut output,&session_id,&view,false).await?; return Ok(Some(json!({"stopReason":"end_turn"}))); }
                                         "/decision" => {text(&service,&mut output,&session_id,&editor_view::render_decisions(&service.dashboard(&session_id).await?,true),false).await?;return Ok(Some(json!({"stopReason":"end_turn"})));}
-                                        "/start" => {let decision=parts.next().context("decision identity required")?;ensure!(parts.next().is_none(),"unexpected start arguments");let workflow=service.accept_decision(&session_id,decision).await?;text(&service,&mut output,&session_id,&format!("Proposal accepted as `{workflow}`. Use /continue to run the current flow. Replaying acceptance creates no new work."),false).await?;return Ok(Some(json!({"stopReason":"end_turn"})));}
+                                        "/start" => {let decision=parts.next().context("decision identity required")?;ensure!(parts.next().is_none(),"unexpected start arguments");let workflow=service.accept_decision(&session_id,decision).await?;dashboard_update(&service,&mut output,&session_id).await?;text(&service,&mut output,&session_id,&format!("Proposal accepted as `{workflow}`. Use /continue to run the current flow. Replaying acceptance creates no new work."),false).await?;return Ok(Some(json!({"stopReason":"end_turn"})));}
                                         "/close" => {service.close_product(&session_id).await?;text(&service,&mut output,&session_id,"Product session closed; managed context cleaned.",false).await?;return Ok(Some(json!({"stopReason":"end_turn"})));}
                                         "/cli" => { text(&service,&mut output,&session_id,&service.cli_handoff(&session_id),false).await?; return Ok(Some(json!({"stopReason":"end_turn"}))); }
-                                        "/status" => { dashboard_update(&service,&mut output,&session_id).await?; return Ok(Some(json!({"stopReason":"end_turn"}))); }
+                                        "/status" => { let dashboard=service.dashboard(&session_id).await?;publish_dashboard(&service,&mut output,&session_id,&dashboard).await?;text(&service,&mut output,&session_id,&render_dashboard(&dashboard),false).await?; return Ok(Some(json!({"stopReason":"end_turn"}))); }
                                         "/open" => { let target=service.flow_session(&session_id).await?.unwrap_or_else(||session_id.clone());let path = service.session(&target).await?.worktree.context("worktree missing")?.workspace; text(&service,&mut output,&session_id,&format!("Managed attempt: `{}`",path.display()),false).await?; return Ok(Some(json!({"stopReason":"end_turn"}))); }
                                         "/diff" => {
                                             let offset = parts.next().map(str::parse::<usize>).transpose()?.unwrap_or(0);
@@ -445,8 +447,8 @@ pub async fn serve(
                                             text(&service,&mut output,&session_id,&format!("```diff\n{}\n```\nNext offset: {}",page["diff"].as_str().unwrap_or(""),page["nextOffset"]),false).await?;
                                             return Ok(Some(json!({"stopReason":"end_turn"})));
                                         }
-                                        "/cancel" => { service.cancel(&session_id).await?; dashboard_update(&service,&mut output,&session_id).await?; return Ok(Some(json!({"stopReason":"cancelled"}))); }
-                                        command @ ("/apply" | "/discard") => { let expected = parts.next().context("candidate identity required")?; ensure!(parts.next().is_none(), "unexpected candidate action arguments"); service.candidate_action(&session_id,expected,command == "/apply").await?; dashboard_update(&service,&mut output,&session_id).await?; return Ok(Some(json!({"stopReason":"end_turn"}))); }
+                                        "/cancel" => { service.cancel(&session_id).await?; dashboard_update(&service,&mut output,&session_id).await?;text(&service,&mut output,&session_id,"Cancellation requested. Use /status to inspect durable execution and cleanup state.",false).await?; return Ok(Some(json!({"stopReason":"cancelled"}))); }
+                                        command @ ("/apply" | "/discard") => { let expected = parts.next().context("candidate identity required")?; ensure!(parts.next().is_none(), "unexpected candidate action arguments"); service.candidate_action(&session_id,expected,command == "/apply").await?; dashboard_update(&service,&mut output,&session_id).await?;text(&service,&mut output,&session_id,if command == "/apply" {"Exact candidate applied."} else {"Candidate discarded."},false).await?; return Ok(Some(json!({"stopReason":"end_turn"}))); }
                                         "/continue" | "/review" => {}
                                         _ => anyhow::bail!("unknown Orbit command"),
                                     }
@@ -495,14 +497,15 @@ pub async fn serve(
                     dashboard_update(&service,&mut output,&session_id).await?;
                     if result.is_err() { text(&service,&mut output,&session_id,"Orbit could not advance this workflow. Inspect its durable role, verification and cleanup evidence before resuming.",false).await?; }
                     let dashboard = service.dashboard(&session_id).await?;
-                    if conversation && let Some(turn) = dashboard["orchestrator"].as_array().and_then(|v|v.last()) && let Some(answer) = turn["answer"].as_str() { text(&service,&mut output,&session_id,&format!("\n**Orchestrator**\n\n{answer}\n"),false).await?;
+                    if conversation {
+                        text(&service,&mut output,&session_id,&editor_view::render_conversation(&dashboard),false).await?;
                     }
                     output.response_ok(request_id,json!({"stopReason":if (conversation && dashboard["decisions"].as_array().and_then(|v|v.last()).is_some_and(|v|v["status"]=="CANCELLED")) || (conversation && dashboard["orchestrator"].as_array().and_then(|v|v.last()).is_some_and(|v|v["status"]=="CANCELLED")) || (!conversation && dashboard["workflow"]["status"] == "cancelled") {"cancelled"} else {"end_turn"}})).await?;
                 }
                 _ = progress.tick(), if !active.is_empty() => {
                     for session_id in active.keys() {
                         let dashboard = service.dashboard(session_id).await?;
-                        let digest = crate::model::digest(&serde_json::to_vec(&dashboard)?);
+                        let digest = crate::model::digest(&serde_json::to_vec(&editor_view::stage_entries(&dashboard))?);
                         if last_snapshots.get(session_id) != Some(&digest) {
                             publish_dashboard(&service,&mut output,session_id,&dashboard).await?;
                             last_snapshots.insert(session_id.clone(),digest);
@@ -530,4 +533,81 @@ async fn session_options(service: &InteractiveService, session: &str) -> Result<
         ),
         service.config().skill.is_some(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        execution::local::RoleExecutionProfile,
+        interactive::ServiceConfig,
+        regression_strategy::{SelectionPolicy, VerificationCheck, VerificationTier},
+        workflow::flow::Risk,
+        workflow_coordinator::{SimulatedRoleExecutor, WorkflowCoordinator},
+    };
+    use std::{os::unix::fs::PermissionsExt, sync::Arc};
+
+    #[tokio::test]
+    async fn native_plan_publication_is_transient_and_clears_absent_workflows() -> Result<()> {
+        let repository = tempfile::tempdir()?;
+        let workspaces = tempfile::tempdir()?;
+        std::fs::set_permissions(workspaces.path(), std::fs::Permissions::from_mode(0o700))?;
+        let mut policy = SelectionPolicy::new("presentation", "Presentation fixture");
+        policy.canonical_digest = true;
+        policy.checks.push(VerificationCheck::new_command(
+            "fixture",
+            "Fixture",
+            vec![VerificationTier::Fast],
+            vec!["true".into()],
+        ));
+        // No database is available: presentation must not persist snapshots.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://fixture:fixture@127.0.0.1:9/fixture")?;
+        let service = InteractiveService::new(
+            pool.clone(),
+            ServiceConfig {
+                repository: repository.path().canonicalize()?,
+                workspaces: workspaces.path().canonicalize()?,
+                agent_execution_profile: RoleExecutionProfile::Trusted,
+                verification_environment: serde_json::from_value(json!({
+                    "execution_profile":"sandboxed-container","isolation":"rootless-podman",
+                    "oci_runtime":"podman","runtime_image":"localhost/fixture",
+                    "runtime_image_digest":format!("sha256:{}", "a".repeat(64)),
+                    "architecture":"x86_64","os":"linux","orbit_version":"fixture"
+                }))?,
+                selection_policy: policy,
+                risk: Risk::Conservative,
+                skill: None,
+                external_role: None,
+            },
+            Arc::new(WorkflowCoordinator::new(
+                pool,
+                Arc::new(SimulatedRoleExecutor::new()),
+            )),
+        )?;
+        let (read, write) = tokio::io::duplex(65536);
+        let mut output = Wire::new(tokio::io::empty(), write, 65536);
+        let mut input = Wire::new(read, tokio::io::sink(), 65536);
+        let workflow = json!({"workflow":{"status":"planning"},
+            "flow":{"review_tier":"STANDARD","completion_tier":"FULL"}});
+        for dashboard in [
+            workflow,
+            json!({"orchestrator":[{"status":"PLANNING"}]}),
+            json!({"orchestrator":[{"status":"COMPLETED"}],"changed_files":{"total":0}}),
+        ] {
+            publish_dashboard(&service, &mut output, "presentation", &dashboard).await?;
+            let notification = input.read().await?;
+            assert_eq!(notification["params"]["update"]["sessionUpdate"], "plan");
+            assert_eq!(
+                notification["params"]["update"]["entries"],
+                json!(editor_view::stage_entries(&dashboard))
+            );
+        }
+        drop(output);
+        assert!(
+            input.read().await.is_err(),
+            "dashboard emitted unsolicited conversation content"
+        );
+        Ok(())
+    }
 }

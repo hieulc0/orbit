@@ -86,6 +86,10 @@ pub fn config_options(preferences: &Value, dev_local: bool, pinned_flow: bool) -
 }
 
 pub fn stage_entries(d: &Value) -> Vec<Value> {
+    // Proposals and orchestrator executions are not admitted workflows.
+    if !d["workflow"].is_object() {
+        return Vec::new();
+    }
     let read_only = d["flow"]["read_only"] == true;
     let mut names = vec!["PLAN", "IMPLEMENT", "FAST"];
     let review = d["effective_tiers"]
@@ -304,15 +308,46 @@ pub fn render_agents(d: &Value) -> String {
     text
 }
 
+/// A conversational turn may propose work without owning an engineering flow.
+pub fn render_conversation(d: &Value) -> String {
+    let Some(turn) = d["orchestrator"].as_array().and_then(|v| v.last()) else {
+        return String::new();
+    };
+    let mut text = turn["answer"]
+        .as_str()
+        .map(|answer| format!("\n**Orchestrator**\n\n{answer}\n"))
+        .unwrap_or_default();
+    if d["decisions"]
+        .as_array()
+        .and_then(|v| v.last())
+        .is_some_and(|decision| {
+            decision["id"].is_string()
+                && decision["id"] == turn["workflow_run_id"]
+                && matches!(
+                    decision["status"].as_str(),
+                    Some("PROPOSED" | "BLOCKED" | "CLARIFICATION" | "ACCEPTED")
+                )
+        })
+    {
+        text.push_str(&render_decisions(d, false));
+    }
+    text
+}
+
 /// Compact proposal presentation derives only durable policy and associations.
 pub fn render_decisions(d: &Value, detailed: bool) -> String {
     let Some(decision) = d["decisions"].as_array().and_then(|v| v.last()) else {
         return String::new();
     };
     let mut text = format!(
-        "\nSkill: {} · decision: {}\nFlow: {} · policy: {}\nWhy: {}\n",
+        "\nSkill: {} · decision: {}\n{}: {} · policy: {}\nWhy: {}\n",
         label(&decision["proposal"]["skill"]),
         label(&decision["status"]),
+        if decision["status"] == "ACCEPTED" {
+            "Accepted flow"
+        } else {
+            "Suggested flow"
+        },
         if decision["policy"]["flow"].is_null() {
             "none (read-only or pending clarification)".into()
         } else {
