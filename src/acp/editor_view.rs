@@ -12,14 +12,22 @@ fn label(value: &Value) -> String {
 }
 
 pub fn config_options(preferences: &crate::interactive::preferences::SessionPreferences) -> Value {
-    use crate::providers::accepted_runtimes as catalog;
+    config_options_with_catalog(
+        preferences,
+        &crate::providers::runtimes::bootstrap_catalog(),
+    )
+}
+pub fn config_options_with_catalog(
+    preferences: &crate::interactive::preferences::SessionPreferences,
+    catalog: &crate::providers::runtimes::RuntimeCatalog,
+) -> Value {
     let option = |id: &str, name: &str, category: &str, current: &str, values: Vec<Value>| json!({"id":id,"name":name,"category":category,"type":"select","currentValue":current,"options":values});
     let mut orchestrators = vec![json!({"value":"auto","name":"Orchestrator: Auto"})];
-    orchestrators.extend(catalog::ACCEPTED.iter().map(|runtime| json!({"value":runtime.id,"name":format!("{} / {}", runtime.display_name, runtime.model)})));
-    let current = preferences.orchestrator_selection();
+    orchestrators.extend(catalog.0.iter().map(|runtime| json!({"value":runtime.id,"name":format!("{} / {}", runtime.display_name, runtime.model)})));
+    let current = preferences.orchestrator_selection_with_catalog(catalog);
     // Advanced controls can express provider-only or model-only preferences.
     // Show the actual current value rather than relabeling it as unrestricted Auto.
-    if let Some(runtime) = preferences.preferred_runtime() {
+    if let Some(runtime) = preferences.preferred_runtime_with_catalog(catalog) {
         if current.starts_with("provider:") {
             orchestrators.push(
                 json!({"value":current,"name":format!("{} (provider only)", runtime.display_name)}),
@@ -30,20 +38,35 @@ pub fn config_options(preferences: &crate::interactive::preferences::SessionPref
             );
         }
     }
+    if !orchestrators
+        .iter()
+        .any(|option| option["value"] == current)
+    {
+        orchestrators.push(json!({"value":current,"name":format!("{} / {} (not active)",preferences.provider,preferences.model)}));
+    }
     let mut reasoning = vec![json!({"value":"auto","name":"Reasoning: Auto"})];
     let runtimes = preferences
-        .preferred_runtime()
+        .preferred_runtime_with_catalog(catalog)
         .map(std::slice::from_ref)
-        .unwrap_or(catalog::ACCEPTED);
-    let mut seen = std::collections::BTreeSet::new();
-    for runtime in runtimes {
-        for name in runtime.reasoning_efforts {
-            if seen.insert(name) {
-                let mut label = name.to_string();
-                label[..1].make_ascii_uppercase();
-                reasoning.push(json!({"value":name,"name":format!("Reasoning: {label}")}));
+        .unwrap_or(&catalog.0);
+    for name in ["low", "medium", "high", "xhigh", "max"] {
+        if runtimes
+            .iter()
+            .any(|runtime| runtime.effort(name).is_some())
+        {
+            let mut label = name.to_string();
+            label[..1].make_ascii_uppercase();
+            if name == "xhigh" {
+                label = "XHigh".into();
             }
+            reasoning.push(json!({"value":name,"name":format!("Reasoning: {label}")}));
         }
+    }
+    if !reasoning
+        .iter()
+        .any(|option| option["value"] == preferences.reasoning.as_str())
+    {
+        reasoning.push(json!({"value":preferences.reasoning.as_str(),"name":format!("Reasoning: {} (not active)",preferences.reasoning.as_str())}));
     }
     json!([
         option(

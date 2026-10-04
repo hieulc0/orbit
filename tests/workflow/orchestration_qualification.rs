@@ -441,6 +441,7 @@ fn fixture_target() -> ResolvedExecutionTarget {
         requested_model: Some("gpt-6-luna".into()),
         resolved_model: Some("gpt-6-luna".into()),
         runtime_image_digest: None,
+        admitted_runtime: None,
         resolution_reason: "deterministic coordinator fixture".into(),
     }
 }

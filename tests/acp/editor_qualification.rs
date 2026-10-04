@@ -2102,3 +2102,67 @@ async fn real_zed_orchestrator_catalog_preferences() -> Result<()> {
     database.teardown().await?;
     result
 }
+
+#[tokio::test]
+#[ignore = "requires explicit disposable installed-Zed GUI opt-in and PostgreSQL"]
+async fn real_zed_runtime_catalog_reconnect() -> Result<()> {
+    use anyhow::Context;
+    use sqlx::Row;
+    use std::os::unix::fs::OpenOptionsExt;
+    ensure!(
+        std::env::var("ORBIT_EDITOR_GUI_OPT_IN").as_deref() == Ok("I_AUTHORIZE_DISPOSABLE_ZED_GUI"),
+        "GUI opt-in required"
+    );
+    let evidence =
+        std::path::PathBuf::from(std::env::var("ORBIT_EDITOR_GUI_EVIDENCE_DIR")?).canonicalize()?;
+    let database = common::DisposablePgTestContext::create("interactive_editor", 30).await?;
+    let result = async {
+        let repo = common::TemporaryGitRepo::create()?;
+        let root = tempfile::tempdir()?;
+        let operator_config = config(&repo, &root)?;
+        // This observer performs queries and disposal only. The installed Zed
+        // launches the production ACP process; no provider response is simulated.
+        let observer = service(&database.engine.pool, operator_config.clone())?;
+        let config_file = root.path().join("interactive.json");
+        std::fs::write(&config_file, serde_json::to_vec(&operator_config)?)?;
+        let private = tempfile::Builder::new().prefix("runtime-gui-").permissions(std::fs::Permissions::from_mode(0o700)).tempdir_in(orbit::secret_backend::operator_home()?.join(".orbit/private"))?;
+        let database_file = private.path().join("database-url");
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&database_file)?;
+        std::io::Write::write_all(&mut file, database.url.as_bytes())?;
+        drop(file);
+        let profile = root.path().join("zed-profile");
+        let settings = profile.join("data/config");
+        std::fs::create_dir_all(&settings)?;
+        std::fs::write(settings.join("settings.json"), serde_json::to_vec_pretty(&json!({"telemetry":{"metrics":false,"diagnostics":false},"agent_servers":{"Orbit":{"type":"custom","command":env!("CARGO_BIN_EXE_orbit"),"args":["acp-serve","--config",config_file],"env":{"ORBIT_DATABASE_URL_FILE":database_file}}}}))?)?;
+        std::fs::write(evidence.join("current.json"), serde_json::to_vec_pretty(&json!({"repository":repo.path(),"schema":database.schema,"profile":profile,"config_file":config_file,"database_file":database_file,"binary":env!("CARGO_BIN_EXE_orbit")}))?)?;
+        tokio::time::timeout(std::time::Duration::from_secs(300), async {
+            loop {
+                if evidence.join("abort.json").exists() { anyhow::bail!("GUI smoke aborted"); }
+                let sessions = sqlx::query("SELECT id,state,preferences FROM orbit_editor_sessions ORDER BY id").fetch_all(&database.engine.pool).await?;
+                std::fs::write(evidence.join("state.json"), serde_json::to_vec_pretty(&json!({"sessions":sessions.iter().map(|r|json!({"id":r.get::<String,_>("id"),"state":r.get::<String,_>("state"),"status":null,"preferences":r.get::<Value,_>("preferences")})).collect::<Vec<_>>()}))?)?;
+                if evidence.join("complete.json").exists() {
+                    ensure!(sessions.len()==1, "unexpected session count");
+                    let product = sessions[0].get::<String,_>("id");
+                    let preferences = observer.preferences(&product).await?;
+                    ensure!(preferences.interaction==orbit::interactive::preferences::InteractionMode::Chat && preferences.provider=="codex" && preferences.model=="gpt-6-luna" && preferences.reasoning==orbit::interactive::preferences::ReasoningPreference::High, "native preferences/reconnect mismatch");
+                    let catalog = observer.orchestrator_catalog().await?;
+                    let entries = orbit::acp::editor_view::config_options_with_catalog(&preferences,&catalog);
+                    ensure!(entries.as_array().context("options missing")?.len()==3 && entries[2]["options"].as_array().context("efforts missing")?.len()==4, "unqualified effort exposed");
+                    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM orbit_agent_executions").fetch_one(&database.engine.pool).await?;
+                    ensure!(count==0, "inspection dispatched provider work");
+                    let dashboard = observer.dashboard(&product).await?;
+                    ensure!(dashboard["workflow"].is_null() && orbit::acp::editor_view::stage_entries(&dashboard).is_empty(), "Chat has engineering plan");
+                    std::fs::write(evidence.join("recovered-options.json"),serde_json::to_vec_pretty(&entries)?)?;
+                    std::fs::write(evidence.join("recovered-state.json"),serde_json::to_vec_pretty(&dashboard)?)?;
+                    observer.close_product(&product).await?;
+                    ensure!(observer.session(&product).await?.state=="DISCARDED", "candidate cleanup failed");
+                    return Ok::<_,anyhow::Error>(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+        }).await??;
+        Ok::<_,anyhow::Error>(())
+    }.await;
+    database.teardown().await?;
+    result
+}

@@ -151,6 +151,10 @@ impl Engine {
         sqlx::raw_sql(include_str!("../../migrations/0030_interactive_intent.sql"))
             .execute(&mut *migration)
             .await?;
+        sqlx::raw_sql(include_str!("../../migrations/0031_managed_runtimes.sql"))
+            .execute(&mut *migration)
+            .await?;
+        crate::providers::runtimes::bootstrap(&mut migration).await?;
         migration.commit().await?;
         Ok(Self {
             pool,

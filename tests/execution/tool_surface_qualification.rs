@@ -96,6 +96,7 @@ async fn start_fixture_agent_execution(
         requested_model: Some("fixture-model".into()),
         resolved_model: Some("fixture-model".into()),
         runtime_image_digest: None,
+        admitted_runtime: None,
         resolution_reason: "deterministic callback fixture".into(),
     };
     ctx.store
@@ -3211,6 +3212,7 @@ async fn real_acp_execution_row_survives_credential_resolution_failure() -> Resu
             requested_model: Some("gpt-6-luna".into()),
             resolved_model: Some("gpt-6-luna".into()),
             runtime_image_digest: None,
+            admitted_runtime: None,
             resolution_reason: "synthetic deterministic test target".into(),
         };
         ctx.store

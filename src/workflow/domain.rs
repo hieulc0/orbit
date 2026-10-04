@@ -285,6 +285,8 @@ pub struct ResolvedExecutionTarget {
     pub requested_model: Option<String>,
     pub resolved_model: Option<String>,
     pub runtime_image_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admitted_runtime: Option<crate::providers::runtimes::AdmittedRuntime>,
     pub resolution_reason: String,
 }
 
@@ -2725,7 +2727,58 @@ impl RoleRuntimeResolver {
         simulate_quota_exhausted_for: Option<&str>,
         policy: RuntimeQuotaSelectionPolicy,
     ) -> Result<Vec<ResolvedExecutionTarget>> {
+        let catalog = crate::providers::runtimes::catalog(pool).await?;
+        Self::resolve_catalog_targets(
+            pool,
+            role,
+            simulate_quota_exhausted_for,
+            policy,
+            &catalog,
+            None,
+            None,
+        )
+        .await
+    }
+
+    pub async fn resolve_managed_targets(
+        state_pool: &sqlx::PgPool,
+        credential_pool: &sqlx::PgPool,
+        role: &RoleDefinition,
+        simulate_quota_exhausted_for: Option<&str>,
+        policy: RuntimeQuotaSelectionPolicy,
+        preferences: Option<&crate::interactive::preferences::SessionPreferences>,
+    ) -> Result<Vec<ResolvedExecutionTarget>> {
+        let catalog = crate::providers::runtimes::catalog(state_pool).await?;
+        if let Some(preferences) = preferences {
+            preferences.validate_with_catalog(&catalog.for_role("orchestrator"))?;
+        }
+        Self::resolve_catalog_targets(
+            credential_pool,
+            role,
+            simulate_quota_exhausted_for,
+            policy,
+            &catalog,
+            None,
+            preferences
+                .filter(|p| {
+                    p.reasoning != crate::interactive::preferences::ReasoningPreference::Auto
+                })
+                .map(|p| p.reasoning.as_str()),
+        )
+        .await
+    }
+
+    pub(crate) async fn resolve_catalog_targets(
+        pool: &sqlx::PgPool,
+        role: &RoleDefinition,
+        simulate_quota_exhausted_for: Option<&str>,
+        policy: RuntimeQuotaSelectionPolicy,
+        catalog: &crate::providers::runtimes::RuntimeCatalog,
+        preferred_model: Option<&str>,
+        effort: Option<&str>,
+    ) -> Result<Vec<ResolvedExecutionTarget>> {
         policy.validate()?;
+        let catalog = catalog.for_role(&role.role_id);
         let cred_store = crate::credential_registry::CredentialStore::new(pool);
         let credentials = cred_store.list().await?;
         let availability_store = crate::availability::AvailabilityStore::new(pool);
@@ -2741,28 +2794,26 @@ impl RoleRuntimeResolver {
                 continue;
             }
 
-            let (provider, runtime_interface, model, runtime_image_digest, adapter_revision) =
-                if let Some(runtime) =
-                    crate::providers::accepted_runtimes::by_runtime_preference(pref)
-                {
-                    (
-                        runtime.provider,
-                        runtime.runtime_interface,
-                        runtime.model,
-                        runtime.image_digest,
-                        runtime.adapter_revision,
-                    )
-                } else if pref == "antigravity-terminal-acp" {
-                    (
-                        "antigravity",
-                        "antigravity-acp",
-                        "gemini-3.8-flash",
-                        crate::credential_enrollment::ANTIGRAVITY_DIGEST,
-                        crate::acp_capabilities::ANTIGRAVITY_ACP_ADAPTER_REVISION,
-                    )
-                } else {
-                    continue;
-                };
+            let interface = if pref == "antigravity-correlated-acp" {
+                "antigravity-acp"
+            } else {
+                pref.as_str()
+            };
+            let Some(runtime) = catalog.0.iter().find(|r| {
+                r.runtime_interface == interface
+                    && r.admitted.scope.roles.iter().any(|r| r == &role.role_id)
+                    && preferred_model.is_none_or(|m| r.model == m)
+                    && effort.is_none_or(|e| r.effort(e).is_some())
+            }) else {
+                rejected.push(format!("preference={pref}:no_active_qualified_scope"));
+                continue;
+            };
+            let provider = runtime.provider.as_str();
+            let runtime_interface = runtime.runtime_interface.as_str();
+            let model = runtime.model.as_str();
+            let runtime_image_digest = runtime.admitted.descriptor.image_digest();
+            let mut admitted = runtime.admitted.clone();
+            admitted.requested_effort = effort.map(str::to_owned);
 
             for credential in credentials.iter().filter(|credential| {
                 credential.provider == provider
@@ -2790,11 +2841,7 @@ impl RoleRuntimeResolver {
                     continue;
                 }
 
-                let tool_audit_capability =
-                    crate::acp_capabilities::qualified_tool_audit_correlation(
-                        runtime_image_digest,
-                        adapter_revision,
-                    );
+                let tool_audit_capability = runtime.admitted.scope.tool_audit;
                 if let Some(reason) = tool_audit_capability_rejection(
                     role.allowed_capabilities.required_tool_audit_correlation,
                     tool_audit_capability,
@@ -2847,6 +2894,7 @@ impl RoleRuntimeResolver {
                         requested_model: Some(model.into()),
                         resolved_model: Some(model.into()),
                         runtime_image_digest: Some(runtime_image_digest.into()),
+                        admitted_runtime: Some(admitted.clone()),
                         resolution_reason: String::new(),
                     },
                     provider_preference_rank: preference_rank,
@@ -2911,6 +2959,7 @@ impl RoleRuntimeResolver {
                     "gemini-2.5-pro".to_string()
                 }),
                 runtime_image_digest: None,
+                admitted_runtime: None,
                 resolution_reason: format!("resolved by preference '{}'", pref),
             });
         }
@@ -3175,6 +3224,7 @@ mod tests {
                 requested_model: Some("test-model".into()),
                 resolved_model: Some("test-model".into()),
                 runtime_image_digest: Some("sha256:test".into()),
+                admitted_runtime: None,
                 resolution_reason: String::new(),
             },
             provider_preference_rank,

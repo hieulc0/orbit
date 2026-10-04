@@ -1,6 +1,6 @@
-//! The currently accepted runtime/model pairs, not provider discovery results.
-//! Descriptors identify targets; capability and credential/quota eligibility
-//! remain the responsibility of their existing authorities.
+//! Immutable source checkpoint descriptors for bootstrap and legacy compatibility.
+//! Operator activation and scoped qualification live in the durable runtime
+//! catalog; provider discovery cannot expand either authority.
 
 #[derive(Clone, Copy, Debug)]
 pub struct AcceptedRuntime {

@@ -42,7 +42,7 @@ fn configuration_inspection_does_not_resolve_secret_sources() {
     assert_eq!(value["connections"]["database"]["source"], "CLI option");
     assert_eq!(
         value["runtime_lifecycle"]["durable_activation"],
-        "not implemented"
+        "orbit runtime status"
     );
 }
 

@@ -15,6 +15,7 @@
 | `protocol`, `health`, `workers`, `queues`, `limits`, `drain-worker` (including `--resume`) | Inspect lifecycle and control new admission |
 | `signal`, `approve` | Deliver durable signals and assigned human decisions |
 | `credential` | Enroll, inspect, rotate, revoke and observe catalog credentials |
+| `runtime` | Inspect immutable installations, derive scoped qualification and explicitly activate or roll back |
 | `workflow` | Start and advance role workflows under pinned policy |
 | `config show` | Inspect effective configuration and provenance without resolving secrets |
 | `interactive` | Control durable managed-worktree sessions and inspect candidates |
@@ -77,6 +78,44 @@ supervised cleanup. Interrupting `watch` only ends observation. A cancellation
 response can precede cleanup; candidate actions remain denied until cleanup is
 confirmed. Commands never substitute exploratory terminal feedback for trusted
 verification evidence.
+
+## Managed agent runtimes
+
+These are local operator commands over PostgreSQL. Use
+`orbit runtime --database-url-file PRIVATE_FILE ACTION`:
+
+| Action | Contract |
+| --- | --- |
+| `status [--check-updates]` | Read installed identity records, scoped qualifications, active selections and activation history |
+| `install --descriptor FILE` | Verify an already provisioned OCI digest and platform, then record its immutable launch descriptor |
+| `install --bootstrap` | Initialize the accepted source checkpoint identities once; never reset operator activation |
+| `qualify RUNTIME --config FILE --model MODEL [--reasoning LEVEL]` | Request a bounded read-only orchestrator campaign; derive qualification from durable execution evidence |
+| `qualify RUNTIME --execution AGENT [--execution AGENT ...]` | Derive scope from existing Orbit execution records for that exact runtime/model |
+| `activate QUALIFICATION` | Verify the local artifact, select its qualified scope for future admissions and append activation history |
+
+Installation never downloads, qualifies or activates a new artifact. Status is an
+inventory view, not a fresh image-presence or credential/quota observation.
+Update checking reports unsupported when no trustworthy upstream metadata source
+is configured. Supply a verified immutable artifact explicitly in that case.
+
+Qualifications preserve model, role and native effort associations. A new model
+or image must establish successful callbacks plus cancellation and failure cleanup;
+another model's evidence cannot qualify it. The built-in campaign is read-only
+orchestrator scope and never substitutes another provider on candidate failure.
+Reviewer or implementer scope requires corresponding role evidence; it is not
+implied by an orchestrator run. Unsupported native effort transport stays rejected.
+
+Activation is separate from product preferences and credential/quota eligibility.
+One qualified selection is active per provider/interface. Selecting an
+orchestrator-only qualification removes that provider from other roles until a
+qualification with those roles is activated. Roll back with `activate` on a retained
+earlier qualification. Existing admitted executions keep their complete original
+launch snapshot regardless of activation or rollback.
+
+`orbit config show --runtimes --database-url-file PRIVATE_FILE` queries active
+identities and scoped native effort capability read-only. `config show --session`
+also includes that durable catalog. Without either option, inspection shows only
+bootstrap configuration and does not resolve database secrets.
 
 ## Output formats, local probes and review exports
 

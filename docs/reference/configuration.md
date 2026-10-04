@@ -311,9 +311,10 @@ permission approvals do not prove that Orbit executed the effect.
 The CLI/editor workflow requires EXACT provider/tool/callback correlation when
 its policy says so. The legacy Antigravity terminal runtime's PARTIAL correlation
 cannot satisfy that requirement. The `antigravity-acp` and
-`antigravity-correlated-acp` role preferences select the correlated image;
-`antigravity-terminal-acp` explicitly selects the legacy runtime. The current role
-catalog requests `gemini-3.7-flash-high` for the correlated runtime. ACP must
+`antigravity-correlated-acp` role preferences address the same active qualified
+interface. The legacy terminal artifact is not in the bootstrap active catalog.
+Bootstrap binds the correlated image to `gemini-3.7-flash-high`; subsequent
+operator activation selects exact qualified model/role scopes. ACP must
 confirm the selected model before a prompt is dispatched; an unavailable model
 fails closed. The stdio editor service is a distinct interface over Orbit's
 coordinator; protocol qualification is not actual Zed GUI acceptance.
@@ -374,7 +375,7 @@ Use `--config /path/to/orbit-editor.json` to inspect the product configuration,
 `--config ... --session SESSION` to inspect current durable preferences separately
 from the latest 16 immutable turn snapshots. Session inspection requires a
 matching product configuration and uses a read-only PostgreSQL transaction.
-Connection metadata is redacted. A session query reads the private database URL;
+Connection metadata is redacted. A session or `--runtimes` query reads the private database URL;
 ordinary config inspection does not resolve that file or API credentials.
 
 | Domain | Authority and precedence | Persistence and change scope |
@@ -383,15 +384,18 @@ ordinary config inspection does not resolve that file or API credentials.
 | Server bindings, authorization and storage | Explicit server file; inspection reports counts/configured metadata only | File; restart-sensitive, accepted plans retain referenced binding snapshots |
 | Database/API credential input | CLI option overrides environment; direct database operations otherwise use the private default file | Operator private source; credential values are never shown |
 | Resolver quota floors | Domain policy defaults (15% short window, 5% weekly); explicit policy APIs retain ownership | Selection policy; inspection is not a fresh quota observation |
-| Accepted runtime/model descriptors | Source-bound accepted catalog; discovery does not add entries | Immutable source identities; current eligibility still belongs to the resolver |
+| Bootstrap runtime/model descriptors | Immutable accepted source checkpoint; discovery does not add entries | Initialization and old admitted-target compatibility only |
+| Installed, qualified and active agent runtimes | Durable operator registry; inspect `runtime status` or `config show --runtimes` | Exact OCI descriptors, model/role/effort evidence and explicit activation; resolver still owns current eligibility |
 | User preference | PostgreSQL product session, shared by ACP and CLI | Applies to subsequent admitted turns; active turns cannot be retargeted |
 | Admitted turn | Immutable PostgreSQL preference snapshot and resolved execution identity | Existing execution only; current preferences cannot rewrite it |
 
 Reasoning uses provider-native canonical values. The bounded representation can
 express `low`, `medium`, `high`, `xhigh` and `max`, but selectable support comes
-from the qualified runtime/model descriptor. Current Codex support is `low`,
-`medium`, `high`; current Gemini 3.7 supports Auto only. Auto sends no explicit
-effort. Additional native levels and Gemini 3.8 remain unqualified here.
+from the active qualified runtime/model/role scope. Bootstrap Codex support is
+`low`, `medium`, `high`; bootstrap Gemini 3.7 supports Auto only. Auto sends no
+explicit effort. Additional levels require corresponding Orbit execution
+evidence and explicit operator activation; discovery cannot add them. Gemini
+3.8 is not bootstrapped from Gemini 3.7 evidence.
 
 Old persisted reasoning spellings have a read compatibility path that preserves
 their original native effort without rewriting rows. New inputs reject those

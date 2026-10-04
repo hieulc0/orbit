@@ -774,6 +774,7 @@ async fn simulation_is_explicitly_injected() -> Result<()> {
         requested_model: Some("gpt-6-luna".into()),
         resolved_model: Some("gpt-6-luna".into()),
         runtime_image_digest: None,
+        admitted_runtime: None,
         resolution_reason: "test".into(),
     };
     let role_exec = ctx
@@ -828,6 +829,7 @@ async fn orbit_mock_acp_cannot_switch_the_real_executor() -> Result<()> {
         requested_model: Some("gpt-6-luna".into()),
         resolved_model: Some("gpt-6-luna".into()),
         runtime_image_digest: None,
+        admitted_runtime: None,
         resolution_reason: "environment-switch regression test".into(),
     };
     let wf = WorkflowRun {

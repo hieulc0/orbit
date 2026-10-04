@@ -97,6 +97,47 @@ struct RunSubmitArgs {
 }
 
 #[derive(clap::Args)]
+struct RuntimeArgs {
+    #[arg(long, env = "ORBIT_DATABASE_URL_FILE", hide_env_values = true)]
+    database_url_file: Option<PathBuf>,
+    #[command(subcommand)]
+    action: RuntimeAction,
+}
+#[derive(Subcommand)]
+enum RuntimeAction {
+    /// Read installed, scoped qualified and active identities and activation history.
+    Status {
+        #[arg(long)]
+        check_updates: bool,
+    },
+    /// Record an already provisioned artifact. Bootstrap initializes accepted evidence only.
+    Install {
+        #[arg(
+            long,
+            conflicts_with = "bootstrap",
+            required_unless_present = "bootstrap"
+        )]
+        descriptor: Option<PathBuf>,
+        #[arg(long)]
+        bootstrap: bool,
+    },
+    /// Request a bounded read-only campaign or derive scope from Orbit execution IDs.
+    Qualify {
+        runtime: String,
+        #[arg(long, conflicts_with = "config", required_unless_present = "config")]
+        execution: Vec<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long, requires = "config")]
+        model: Option<String>,
+        #[arg(long, requires = "config")]
+        reasoning: Option<String>,
+    },
+    /// Select a qualified entry for future admissions. Also used for rollback.
+    Activate { qualification: String },
+}
+
+#[derive(clap::Args)]
 struct CredentialArgs {
     #[command(subcommand)]
     action: CredentialAction,
@@ -444,6 +485,8 @@ enum Commands {
         #[arg(long, env = "ORBIT_DATABASE_URL_FILE", hide_env_values = true)]
         database_url_file: Option<PathBuf>,
     },
+    /// Inspect, install, qualify and explicitly activate immutable agent runtimes.
+    Runtime(RuntimeArgs),
     /// Operator credential registry and enrollment.
     Credential(CredentialArgs),
     /// Execute or inspect isolated verification evidence.
@@ -672,6 +715,9 @@ enum ConfigAction {
         server_config: Option<PathBuf>,
         #[arg(long, requires = "config")]
         session: Option<String>,
+        /// Read active runtime identities from PostgreSQL without changing state.
+        #[arg(long)]
+        runtimes: bool,
         #[arg(long, env = "ORBIT_DATABASE_URL_FILE", hide_env_values = true)]
         database_url_file: Option<PathBuf>,
     },
@@ -707,6 +753,7 @@ async fn show_configuration(
         config,
         server_config,
         session,
+        runtimes,
         database_url_file,
     } = action;
     let supplied: Option<serde_json::Value> =
@@ -739,8 +786,8 @@ async fn show_configuration(
         argument_source(matches, "token")
     };
     value["connections"] = orbit::control_plane::config_inspection::connection_metadata(
-        database_url_file.is_some() || session.is_some(),
-        if database_url_file.is_none() && session.is_some() {
+        database_url_file.is_some() || session.is_some() || *runtimes,
+        if database_url_file.is_none() && (session.is_some() || *runtimes) {
             "built-in private file default"
         } else {
             argument_source(show, "database_url_file")
@@ -750,7 +797,7 @@ async fn show_configuration(
     );
     value["connections"]["api_credential"]["conflict"] =
         serde_json::json!(!cli.token.is_empty() && cli.token_file.is_some());
-    if let Some(identifier) = session {
+    if session.is_some() || *runtimes {
         let url = read_private_database_url(database_url_file.as_deref()).await?;
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(1)
@@ -765,14 +812,22 @@ async fn show_configuration(
             .connect(url.as_str())
             .await
             .map_err(|_| anyhow::anyhow!("configuration inspection database connection failed"))?;
-        value["session"] = orbit::control_plane::config_inspection::session(
-            &pool,
-            identifier,
-            product
-                .as_ref()
-                .context("product config required for session inspection")?,
-        )
-        .await?;
+        if let Some(identifier) = session {
+            value["session"] = orbit::control_plane::config_inspection::session(
+                &pool,
+                identifier,
+                product
+                    .as_ref()
+                    .context("product config required for session inspection")?,
+            )
+            .await?;
+            value["orchestrator_catalog"] = value["session"]["active_runtime_catalog"].clone();
+        } else {
+            value["orchestrator_catalog"] =
+                orbit::control_plane::config_inspection::runtime_catalog(
+                    &orbit::providers::runtimes::catalog(&pool).await?,
+                );
+        }
         value["connections"]["database"]["resolved"] = serde_json::json!(true);
         pool.close().await;
     }
@@ -2596,7 +2651,7 @@ async fn interactive_service(
         .connect(url.as_str())
         .await
         .map_err(|_| anyhow::anyhow!("interactive control-plane connection failed"))?;
-    let ready: bool = sqlx::query_scalar("SELECT to_regclass('orbit_editor_sessions') IS NOT NULL AND to_regclass('orbit_workflow_runs') IS NOT NULL AND to_regclass('orbit_interactive_turns') IS NOT NULL AND to_regclass('orbit_intent_decisions') IS NOT NULL").fetch_one(&pool).await?;
+    let ready: bool = sqlx::query_scalar("SELECT to_regclass('orbit_editor_sessions') IS NOT NULL AND to_regclass('orbit_workflow_runs') IS NOT NULL AND to_regclass('orbit_interactive_turns') IS NOT NULL AND to_regclass('orbit_intent_decisions') IS NOT NULL AND to_regclass('orbit_active_runtimes') IS NOT NULL").fetch_one(&pool).await?;
     anyhow::ensure!(
         ready,
         "initialize the selected control-plane migrations before interactive use"
@@ -2613,6 +2668,113 @@ async fn interactive_service(
     } else {
         service
     })
+}
+
+async fn run_runtime_cli(args: &RuntimeArgs, output: Output) -> Result<()> {
+    use orbit::providers::runtimes;
+    use tokio::io::AsyncReadExt;
+    let url = read_private_database_url(args.database_url_file.as_deref()).await?;
+    let scratch = orbit::codex_status_probe::private_control_tempdir()?;
+    let pool = if matches!(args.action, RuntimeAction::Install { .. }) {
+        Engine::connect(&url, scratch.path().join("artifacts"), 30)
+            .await
+            .map_err(|_| anyhow::anyhow!("runtime control-plane initialization failed"))?
+            .pool
+    } else {
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&url)
+            .await
+            .map_err(|_| anyhow::anyhow!("runtime control-plane connection failed"))?
+    };
+    let result = match &args.action {
+        RuntimeAction::Status { check_updates } => runtimes::status(&pool, *check_updates).await?,
+        RuntimeAction::Install {
+            descriptor: None,
+            bootstrap: true,
+        } => runtimes::status(&pool, false).await?,
+        RuntimeAction::Install {
+            descriptor: Some(path),
+            ..
+        } => {
+            let mut bytes = Vec::new();
+            tokio::fs::File::open(path)
+                .await?
+                .take(65537)
+                .read_to_end(&mut bytes)
+                .await?;
+            anyhow::ensure!(bytes.len() <= 65536, "runtime descriptor exceeds bounds");
+            let descriptor: runtimes::InstalledRuntime = serde_json::from_slice(&bytes)
+                .map_err(|_| anyhow::anyhow!("invalid immutable runtime descriptor"))?;
+            serde_json::json!({"installed":runtimes::install(&pool, &descriptor).await?,"qualified":false,"active":false})
+        }
+        RuntimeAction::Install { .. } => anyhow::bail!("runtime descriptor or bootstrap required"),
+        RuntimeAction::Activate { qualification } => {
+            let actor = format!("local-uid:{}", unsafe { libc::geteuid() });
+            runtimes::activate(&pool, qualification, &actor).await?;
+            serde_json::json!({"activated":qualification,"applies_to":"future admissions"})
+        }
+        RuntimeAction::Qualify {
+            runtime,
+            execution,
+            config: None,
+            ..
+        } => {
+            serde_json::json!({"qualification":runtimes::qualify(&pool, runtime, execution).await?,"active":false})
+        }
+        RuntimeAction::Qualify {
+            runtime,
+            config: Some(config),
+            model,
+            reasoning,
+            ..
+        } => {
+            let model = model
+                .as_deref()
+                .context("qualification campaign requires --model")?;
+            let effort = reasoning.as_deref().filter(|r| *r != "auto");
+            let service = interactive_service(config, args.database_url_file.as_deref()).await?;
+            let (session, workflow) = service
+                .prepare_runtime_qualification(runtime, model, effort)
+                .await?;
+            let mut run = Box::pin(service.run_conversation(&session));
+            let result = tokio::select! {
+                result = &mut run => result,
+                _ = tokio::signal::ctrl_c() => {
+                    service.cancel(&session).await?;
+                    run.await
+                }
+            };
+            let campaign = service
+                .collect_runtime_qualification(&session, &workflow)
+                .await?;
+            result?;
+            let ids: Vec<String> = serde_json::from_value(campaign["agent_executions"].clone())?;
+            let qualification = runtimes::qualify(&pool, runtime, &ids).await;
+            match qualification {
+                Ok(id) => {
+                    serde_json::json!({"campaign":campaign,"qualification":id,"active":false})
+                }
+                Err(error) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(
+                            &serde_json::json!({"campaign":campaign,"qualified":false,"reason":error.to_string()})
+                        )?
+                    );
+                    anyhow::bail!(
+                        "runtime qualification did not establish sufficient scope; durable campaign retained"
+                    );
+                }
+            }
+        }
+    };
+    match output {
+        Output::Json | Output::Text => println!("{}", serde_json::to_string_pretty(&result)?),
+        Output::Jsonl => println!("{}", serde_json::to_string(&result)?),
+    }
+    pool.close().await;
+    Ok(())
 }
 
 async fn interactive_coordinator(
@@ -3511,6 +3673,9 @@ async fn main() -> Result<()> {
     let cli = Cli::from_arg_matches(&matches)?;
     if let Commands::Config { action } = &cli.command {
         return show_configuration(&cli, &matches, action).await;
+    }
+    if let Commands::Runtime(args) = &cli.command {
+        return run_runtime_cli(args, cli.output_format).await;
     }
     let mut output_format = cli.output_format;
     if let Commands::Interactive(args) = &cli.command {
@@ -4761,6 +4926,9 @@ async fn main() -> Result<()> {
     };
     let client = Client::new(cli.url, token)?;
     let value = match cli.command {
+        Commands::Runtime(_) => {
+            unreachable!("runtime lifecycle precedes API credential resolution")
+        }
         Commands::Config { .. } => unreachable!("inspection precedes secret resolution"),
         Commands::Verification(_) => {
             unreachable!("local verification handled before API credential resolution")

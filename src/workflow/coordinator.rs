@@ -202,6 +202,23 @@ pub struct WorkflowCoordinator {
 }
 
 impl WorkflowCoordinator {
+    pub async fn admit_runtime_campaign(
+        &self,
+        workflow: &str,
+        runtime: &str,
+        model: &str,
+        effort: Option<&str>,
+    ) -> Result<()> {
+        crate::providers::runtimes::admit_campaign(
+            &self.pool,
+            &self.credential_catalog_pool,
+            workflow,
+            runtime,
+            model,
+            effort,
+        )
+        .await
+    }
     pub fn new(pool: PgPool, executor: Arc<dyn RoleAgentExecutor>) -> Self {
         let store = WorkflowStore::new(pool.clone());
         let verification_store = VerificationStore::new(pool.clone());
@@ -300,6 +317,15 @@ impl WorkflowCoordinator {
             Ok(outcome) => return Ok(outcome),
             Err(error) => error,
         };
+        // A campaign proves one exact artifact/model. Substitution would test
+        // another runtime and obscure the candidate's failure evidence.
+        if target
+            .admitted_runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.qualification_id.starts_with("campaign:"))
+        {
+            return Err(error);
+        }
         let Some(failure) = error.downcast_ref::<live_role_execution::RoleOperationalFailure>()
         else {
             return Err(error);
@@ -340,11 +366,15 @@ impl WorkflowCoordinator {
                 == initial_state,
             "WORKSPACE_MUTATION_VIOLATION: pre-prompt fallback candidate changed"
         );
-        let candidates = RoleRuntimeResolver::resolve_ranked_targets_live(
+        let candidates = RoleRuntimeResolver::resolve_managed_targets(
+            &self.pool,
             &self.credential_catalog_pool,
             role,
             None,
             self.quota_selection_policy,
+            crate::interactive::preferences::turn_preferences(&self.pool, &workflow.id)
+                .await?
+                .as_ref(),
         )
         .await?;
         let Some(mut alternate) = candidates
@@ -535,7 +565,7 @@ impl WorkflowCoordinator {
             }
 
             WorkflowStage::Planning => {
-                let role = if let Some(preferences) =
+                let mut role = if let Some(preferences) =
                     crate::interactive::preferences::turn_preferences(&self.pool, wf_id).await?
                 {
                     ensure!(
@@ -545,17 +575,41 @@ impl WorkflowCoordinator {
                             .is_some_and(|flow| flow.read_only),
                         "ORCHESTRATOR_REQUIRES_READ_ONLY_FLOW"
                     );
-                    preferences.orchestrator_role()?
+                    preferences.orchestrator_role_with_catalog(
+                        &crate::providers::runtimes::catalog(&self.pool)
+                            .await?
+                            .for_role("orchestrator"),
+                    )?
                 } else {
                     RoleDefinition::planner_v1()
                 };
-                let target = RoleRuntimeResolver::resolve_target_live_with_policy(
-                    &self.credential_catalog_pool,
-                    &role,
-                    None,
-                    self.quota_selection_policy,
-                )
-                .await?;
+                let target = if let Some(candidate) =
+                    crate::providers::runtimes::campaign_target(&self.pool, wf_id).await?
+                {
+                    ensure!(
+                        role.role_id == "orchestrator"
+                            && !role.allowed_capabilities.repo_write
+                            && !role.allowed_capabilities.shell,
+                        "QUALIFICATION_REQUIRES_READ_ONLY_ORCHESTRATOR"
+                    );
+                    role.allowed_capabilities.required_tool_audit_correlation = None;
+                    candidate
+                } else {
+                    RoleRuntimeResolver::resolve_managed_targets(
+                        &self.pool,
+                        &self.credential_catalog_pool,
+                        &role,
+                        None,
+                        self.quota_selection_policy,
+                        crate::interactive::preferences::turn_preferences(&self.pool, wf_id)
+                            .await?
+                            .as_ref(),
+                    )
+                    .await?
+                    .into_iter()
+                    .next()
+                    .context("no eligible runtime target")?
+                };
 
                 let role_exec = self
                     .store
@@ -754,13 +808,18 @@ impl WorkflowCoordinator {
 
             WorkflowStage::Implementing => {
                 let role = RoleDefinition::implementer_v1();
-                let target = RoleRuntimeResolver::resolve_target_live_with_policy(
+                let target = RoleRuntimeResolver::resolve_managed_targets(
+                    &self.pool,
                     &self.credential_catalog_pool,
                     &role,
                     None,
                     self.quota_selection_policy,
+                    None,
                 )
-                .await?;
+                .await?
+                .into_iter()
+                .next()
+                .context("no eligible runtime target")?;
 
                 let plan_handoff = self
                     .store
@@ -1099,13 +1158,18 @@ impl WorkflowCoordinator {
                     .await?;
 
                 let role = RoleDefinition::implementer_v1();
-                let target = RoleRuntimeResolver::resolve_target_live_with_policy(
+                let target = RoleRuntimeResolver::resolve_managed_targets(
+                    &self.pool,
                     &self.credential_catalog_pool,
                     &role,
                     None,
                     self.quota_selection_policy,
+                    None,
                 )
-                .await?;
+                .await?
+                .into_iter()
+                .next()
+                .context("no eligible runtime target")?;
 
                 let failure_handoff = self
                     .store
@@ -1338,13 +1402,18 @@ impl WorkflowCoordinator {
                     return Ok(WorkflowStepResult::Terminal(WorkflowStage::Failed));
                 }
                 let role = RoleDefinition::reviewer_v1();
-                let target = RoleRuntimeResolver::resolve_target_live_with_policy(
+                let target = RoleRuntimeResolver::resolve_managed_targets(
+                    &self.pool,
                     &self.credential_catalog_pool,
                     &role,
                     None,
                     self.quota_selection_policy,
+                    None,
                 )
-                .await?;
+                .await?
+                .into_iter()
+                .next()
+                .context("no eligible runtime target")?;
 
                 let impl_handoff = self
                     .store

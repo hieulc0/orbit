@@ -137,7 +137,7 @@ async fn atomic_shell_has_one_fenced_callback_and_confirms_cleanup() -> Result<(
         let store = WorkflowStore::new(database.engine.pool.clone());
         let run = store.create_workflow_run_full("task-shell", "attempt-shell", 3, None, None, None, Some("shell fixture"), Some(canonical.to_str().unwrap()), None).await?;
         let role = store.create_role_execution(&run.id, &RoleDefinition::implementer_v1(), "IMPLEMENTING", 0, None, None).await?;
-        store.set_role_execution_resolved(&role.id, &ResolvedExecutionTarget { provider:"fixture".into(),runtime_interface:"fixture".into(), credential_id:None,credential_generation:None,requested_model:None,resolved_model:None,runtime_image_digest:None,resolution_reason:"offline fixture".into() }).await?;
+        store.set_role_execution_resolved(&role.id, &ResolvedExecutionTarget { provider:"fixture".into(),runtime_interface:"fixture".into(), credential_id:None,credential_generation:None,requested_model:None,resolved_model:None,runtime_image_digest:None,admitted_runtime:None,resolution_reason:"offline fixture".into() }).await?;
         store.start_agent_execution("agent-shell", &role.id, "fixture", None, None, 0, None, None, &json!({})).await?;
         store.acquire_workspace_mutation_lock(&run.attempt_id, &role.id).await?;
         let (client_input, server_output) = tokio::io::duplex(65536);

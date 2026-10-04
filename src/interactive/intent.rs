@@ -120,7 +120,22 @@ pub fn validate_intent(
     config: &ServiceConfig,
 ) -> Result<IntentPolicy> {
     proposal.validate()?;
-    preferences.validate()?;
+    // Model/effort admission belongs to the current durable runtime catalog.
+    // Intent policy only controls workflow shape, never runtime eligibility.
+    ensure!(
+        matches!(
+            preferences.profile.as_str(),
+            "auto" | "trusted" | "dev_local"
+        ),
+        "UNSUPPORTED_EXECUTION_PROFILE"
+    );
+    ensure!(
+        matches!(
+            preferences.flow.as_str(),
+            "auto" | "investigate" | "documentation" | "engineering"
+        ),
+        "UNSUPPORTED_FLOW_PREFERENCE"
+    );
     preferences.execution_profile(config)?;
     let result = |status: &str, flow, reason: &str, escalated| IntentPolicy {
         status: status.into(),

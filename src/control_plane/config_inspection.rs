@@ -14,8 +14,8 @@ pub fn effective(product: Option<&ServiceConfig>) -> Value {
             "id":runtime.id,"provider":runtime.provider,"display_name":runtime.display_name,
             "model":runtime.model,"interface":runtime.runtime_interface,"image_digest":runtime.image_digest,
             "adapter_revision":runtime.adapter_revision,"reasoning":runtime.reasoning_efforts
-        })).collect::<Vec<_>>()), "accepted_runtime_descriptors", "source", "new admissions subject to resolver eligibility"),
-        "runtime_lifecycle": {"authority":"source_bound","durable_activation":"not implemented"},
+        })).collect::<Vec<_>>()), "bootstrap_runtime_descriptors", "source", "initial accepted bootstrap only; inspect orbit runtime status for durable active state"),
+        "runtime_lifecycle": {"authority":"durable_operator_registry","durable_activation":"orbit runtime status","bootstrap":"accepted source descriptors; initialization only"},
         "admission": "Current configuration does not rewrite existing admitted execution identities or turn preferences."
     });
     if let Some(config) = product {
@@ -74,14 +74,19 @@ pub fn connection_metadata(
     })
 }
 
+pub fn runtime_catalog(catalog: &crate::providers::runtimes::RuntimeCatalog) -> Value {
+    observation(json!(catalog.0.iter().map(|r| json!({"provider":r.provider,"model":r.model,"runtime_id":r.admitted.runtime_id,"qualification_id":r.admitted.qualification_id,"descriptor":r.admitted.descriptor,"reasoning_by_role":r.admitted.scope.reasoning_efforts,"roles":r.admitted.scope.roles})).collect::<Vec<_>>()), "durable_runtime_registry", "PostgreSQL", "future admissions subject to resolver eligibility")
+}
+
 /// Preserve current versus admitted semantics without emitting requests or answers.
 fn inspected_preferences(
     value: Value,
+    catalog: &crate::providers::runtimes::RuntimeCatalog,
 ) -> anyhow::Result<crate::interactive::preferences::SessionPreferences> {
     let preferences: crate::interactive::preferences::SessionPreferences =
         serde_json::from_value(value)
             .map_err(|_| anyhow::anyhow!("invalid persisted preference representation"))?;
-    preferences.validate()?;
+    preferences.validate_with_catalog(catalog)?;
     Ok(preferences)
 }
 
@@ -108,16 +113,20 @@ pub async fn session(
         "session inspection configuration identity mismatch"
     );
     let preferences: Value = row.get("preferences");
-    let current = inspected_preferences(preferences)?;
+    let catalog = crate::providers::runtimes::catalog_on(&mut *transaction, false)
+        .await?
+        .for_role("orchestrator");
+    let current = inspected_preferences(preferences, &catalog)?;
+    let active = crate::providers::runtimes::catalog_on(&mut *transaction, true).await?;
     let rows = sqlx::query("SELECT sequence, preferences, workflow_run_id FROM orbit_interactive_turns WHERE session_id=$1 ORDER BY sequence DESC LIMIT 16").bind(identifier).fetch_all(&mut *transaction).await?;
     let mut admitted = Vec::new();
     for row in rows {
-        let preferences = inspected_preferences(row.get("preferences"))?;
+        let preferences = inspected_preferences(row.get("preferences"), &catalog)?;
         admitted.push(json!({"sequence":row.get::<i64,_>("sequence"),"workflow":row.get::<String,_>("workflow_run_id"),"preferences":preferences}));
     }
     transaction.commit().await?;
     Ok(
-        json!({"current":observation(json!(current),"durable_product_session","PostgreSQL","next admitted turn"),"admitted_turns":observation(json!(admitted),"immutable_turn_snapshots","PostgreSQL","associated existing executions only"),"limit":16}),
+        json!({"current":observation(json!(current),"durable_product_session","PostgreSQL","next admitted turn"),"admitted_turns":observation(json!(admitted),"immutable_turn_snapshots","PostgreSQL","associated existing executions only"),"limit":16,"active_runtime_catalog":runtime_catalog(&active)}),
     )
 }
 
@@ -131,7 +140,10 @@ mod tests {
             json!({"CANARY_SECRET_FIELD":"hidden"}),
             json!({"provider":"CANARY_SECRET_PROVIDER"}),
         ] {
-            let message = inspected_preferences(value).unwrap_err().to_string();
+            let message =
+                inspected_preferences(value, &crate::providers::runtimes::bootstrap_catalog())
+                    .unwrap_err()
+                    .to_string();
             assert!(!message.contains("CANARY"));
         }
     }

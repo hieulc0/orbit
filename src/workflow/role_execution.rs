@@ -161,10 +161,43 @@ fn antigravity_role_image(target: &ResolvedExecutionTarget) -> &str {
     }
 }
 
+pub(crate) fn pinned_runtime_launch(
+    target: &ResolvedExecutionTarget,
+    legacy: crate::acp_runtime::Launch,
+) -> crate::acp_runtime::Launch {
+    target
+        .admitted_runtime
+        .as_ref()
+        .map(|runtime| runtime.descriptor.launch.clone())
+        .unwrap_or(legacy)
+}
+
 fn validate_role_runtime_target(
     role: &RoleDefinition,
     target: &ResolvedExecutionTarget,
 ) -> Result<()> {
+    if let Some(admitted) = &target.admitted_runtime {
+        admitted.validate(
+            &target.provider,
+            target.resolved_model.as_deref(),
+            &role.role_id,
+        )?;
+        ensure!(
+            target.runtime_interface == admitted.descriptor.interface
+                && target.runtime_image_digest.as_deref()
+                    == Some(admitted.descriptor.image_digest()),
+            "ADMITTED_RUNTIME_IDENTITY_MISMATCH"
+        );
+        if let Some(required) = role.allowed_capabilities.required_tool_audit_correlation {
+            ensure!(
+                admitted.scope.tool_audit.satisfies(required),
+                "RUNTIME_CAPABILITY_MISMATCH"
+            );
+        }
+        return Ok(());
+    }
+    // Old durable roles predate descriptor snapshots. Their exact source-bound
+    // runtime remains usable; a new artifact cannot enter through this path.
     let (image, revision) = match target.provider.as_str() {
         "codex" => (
             target
@@ -181,6 +214,10 @@ fn validate_role_runtime_target(
     };
     let digest = image.rsplit_once('@').map_or(image, |(_, digest)| digest);
     let capability = crate::acp_capabilities::qualified_tool_audit_correlation(digest, revision);
+    ensure!(
+        capability != crate::acp_capabilities::ToolAuditCorrelationCapability::Unknown,
+        "LEGACY_RUNTIME_IDENTITY_UNKNOWN"
+    );
     if let Some(required) = role.allowed_capabilities.required_tool_audit_correlation {
         ensure!(
             capability.satisfies(required),
@@ -789,11 +826,15 @@ async fn execute_real_acp_turn(
             });
     let preferences =
         crate::interactive::preferences::turn_preferences(workflow_state_pool, &wf_run.id).await?;
-    let requested_effort = preferences
-        .as_ref()
-        .map(|p| p.effort(&target.provider))
-        .transpose()?
-        .flatten();
+    let requested_effort = if let Some(admitted) = &target.admitted_runtime {
+        admitted.requested_effort.as_deref()
+    } else {
+        preferences
+            .as_ref()
+            .map(|p| p.effort(&target.provider))
+            .transpose()?
+            .flatten()
+    };
     let initial_metadata = serde_json::json!({
         "provider": target.provider,
         "account_reference": target.credential_id,
@@ -811,6 +852,7 @@ async fn execute_real_acp_turn(
         "input_handoff_id": role_exec.handoff_input_id,
         "input_workspace_state_id": role_exec.input_workspace_state_id,
         "selection_reason": target.resolution_reason,
+        "admitted_runtime": target.admitted_runtime,
     });
     store
         .start_agent_execution(
@@ -956,14 +998,20 @@ async fn execute_real_acp_turn_body(
         "RUNTIME_SELECTION",
     )
     .await?;
+    crate::providers::runtimes::validate_campaign(workflow_state_pool, &wf_run.id, role, target)
+        .await?;
     validate_role_runtime_target(role, target)?;
     let preferences =
         crate::interactive::preferences::turn_preferences(workflow_state_pool, &wf_run.id).await?;
-    let requested_effort = preferences
-        .as_ref()
-        .map(|p| p.effort(&target.provider))
-        .transpose()?
-        .flatten();
+    let requested_effort = if let Some(admitted) = &target.admitted_runtime {
+        admitted.requested_effort.as_deref()
+    } else {
+        preferences
+            .as_ref()
+            .map(|p| p.effort(&target.provider))
+            .transpose()?
+            .flatten()
+    };
     confirm_agent_lifecycle_phase(
         &store,
         lifecycle,
@@ -1025,9 +1073,12 @@ async fn execute_real_acp_turn_body(
 
         use crate::codex_credential_enrollment as enrolled;
         let binding_name = "codex-role-v1";
-        let launch = Launch {
+        let legacy_launch = Launch {
             adapter: Adapter::Codex,
-            image: enrolled::CODEX_IMAGE.into(),
+            image: target
+                .runtime_image_digest
+                .clone()
+                .unwrap_or_else(|| enrolled::CODEX_IMAGE.into()),
             command: vec![enrolled::CODEX_BINARY.into(), "app-server".into()],
             agent_name: "orbit-codex-acp".into(),
             agent_version: "1".into(),
@@ -1036,6 +1087,7 @@ async fn execute_real_acp_turn_body(
             memory_mib: 512,
             network: AgentNetwork::Host,
         };
+        let launch = pinned_runtime_launch(target, legacy_launch);
         let auth = Auth {
             source: "codex".into(),
             owner: credential.reference.clone(),
@@ -1147,7 +1199,7 @@ async fn execute_real_acp_turn_body(
         .await?;
 
         let binding_name = "antigravity-role-v1";
-        let launch = Launch {
+        let legacy_launch = Launch {
             adapter: Adapter::Antigravity,
             image: antigravity_role_image(target).into(),
             command: vec![ACP_EXECUTABLE.into()],
@@ -1158,6 +1210,7 @@ async fn execute_real_acp_turn_body(
             memory_mib: 512,
             network: AgentNetwork::Host,
         };
+        let launch = pinned_runtime_launch(target, legacy_launch);
         let auth = Auth {
             source: "antigravity".into(),
             owner: credential.reference.clone(),
@@ -2035,6 +2088,35 @@ mod tests {
     }
 
     #[test]
+    fn delayed_launch_uses_the_admitted_descriptor_for_each_provider() {
+        for runtime in crate::providers::runtimes::bootstrap_catalog().0 {
+            let mut newly_selected = runtime.admitted.descriptor.launch.clone();
+            newly_selected.image = format!("sha256:{}", "a".repeat(64));
+            newly_selected.memory_mib = 1024;
+            let mut target = ResolvedExecutionTarget {
+                provider: runtime.provider,
+                runtime_interface: runtime.runtime_interface,
+                credential_id: None,
+                credential_generation: None,
+                requested_model: Some(runtime.model.clone()),
+                resolved_model: Some(runtime.model),
+                runtime_image_digest: Some(runtime.admitted.descriptor.image_digest().into()),
+                admitted_runtime: Some(runtime.admitted.clone()),
+                resolution_reason: "admitted before activation".into(),
+            };
+            assert_eq!(
+                pinned_runtime_launch(&target, newly_selected.clone()),
+                runtime.admitted.descriptor.launch
+            );
+            target.admitted_runtime.as_mut().unwrap().descriptor.launch = newly_selected.clone();
+            assert_eq!(
+                pinned_runtime_launch(&target, runtime.admitted.descriptor.launch),
+                newly_selected
+            );
+        }
+    }
+
+    #[test]
     fn wrong_credential_generation_is_rejected() {
         let target = ResolvedExecutionTarget {
             provider: "codex".into(),
@@ -2044,6 +2126,7 @@ mod tests {
             requested_model: Some("requested".into()),
             resolved_model: Some("configured".into()),
             runtime_image_digest: None,
+            admitted_runtime: None,
             resolution_reason: "test".into(),
         };
         let credential = crate::credential_registry::Credential {

@@ -433,7 +433,7 @@ pub async fn serve(
                                             if let Some(key)=parts.next() { let value=parts.next().context("preference value required")?; ensure!(parts.next().is_none(), "unexpected preference arguments"); service.set_preference(&session_id,key,value).await?; }
                                             let options=session_options(&service,&session_id).await?;
                                             update(&service,&mut output,&session_id,json!({"sessionUpdate":"config_option_update","configOptions":options})).await?;
-                                            text(&service,&mut output,&session_id,&format!("Preferences (not authority):\n```json\n{}\n```\nUse /preferences key value (orchestrator auto/codex/gemini; advanced provider/model/profile/flow). Chat/Agent are read-only; Flow starts an explicit task. Gemini supports Auto reasoning only. Non-Auto reasoning uses the pinned Codex bridge with exact effort confirmation. Workflow agents remain independent.",serde_json::to_string_pretty(&service.preferences(&session_id).await?)?),false).await?;
+                                            text(&service,&mut output,&session_id,&format!("Preferences (not authority):\n```json\n{}\n```\nUse /preferences key value (orchestrator auto/codex/gemini; advanced provider/model/profile/flow). Chat/Agent are read-only; Flow starts an explicit task. Reasoning options follow the qualified runtime scope; explicit native levels require exact runtime confirmation. Workflow agents remain independent.",serde_json::to_string_pretty(&service.preferences(&session_id).await?)?),false).await?;
                                             return Ok(Some(json!({"stopReason":"end_turn"})));
                                         }
                                         "/agents" | "/inspect" => { let dashboard=service.dashboard(&session_id).await?; let view=if prompt.trim()=="/agents" {editor_view::render_agents(&dashboard)} else {format!("{}\n{}",editor_view::render_agents(&dashboard),render_inspector(&dashboard))}; text(&service,&mut output,&session_id,&view,false).await?; return Ok(Some(json!({"stopReason":"end_turn"}))); }
@@ -528,8 +528,9 @@ pub async fn serve(
 }
 
 async fn session_options(service: &InteractiveService, session: &str) -> Result<Value> {
-    Ok(editor_view::config_options(
+    Ok(editor_view::config_options_with_catalog(
         &service.preferences(session).await?,
+        &service.orchestrator_catalog().await?,
     ))
 }
 
